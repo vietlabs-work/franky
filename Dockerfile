@@ -28,9 +28,12 @@ RUN apt-get update \
 # Both engines are node CLIs, so one npm install bundles them.
 #   pi     -> @earendil-works/pi-coding-agent  (bin: pi)
 #   claude -> @anthropic-ai/claude-code        (bin: claude)
+# Clean the npm cache in the SAME layer - otherwise ~100MB of /root/.npm download
+# cache commits into the image (it is dead weight at runtime; npm refetches on demand).
 RUN npm install -g \
         @earendil-works/pi-coding-agent \
-        @anthropic-ai/claude-code
+        @anthropic-ai/claude-code \
+    && npm cache clean --force
 
 # Non-root: the agent runs as an unprivileged user inside the disposable container.
 RUN useradd --create-home --shell /bin/bash franky
