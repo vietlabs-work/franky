@@ -1,0 +1,117 @@
+name: Release
+
+# Triggered by a vX.Y.Z tag push (the real release path) or workflow_dispatch for a
+# no-push dry run: single-arch build, push:false, the release job is skipped.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "X.Y.Z to validate (no-push dry run)"
+        required: true
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  # guard-before-publish: assert the three version sources agree before touching GHCR or PyPI.
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check version consistency
+        run: |
+          TAG="${{ github.ref_name }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="v${{ inputs.version }}"
+          fi
+          python3 scripts/release.py guard "$TAG"
+          # On a real tag push the checkout carries the release commit's CHANGELOG, so assert
+          # the notes are extractable BEFORE anything publishes - otherwise a bad changelog
+          # would strand published GHCR images with no GitHub Release. (Skipped on dispatch:
+          # the versioned changelog section only exists after a release commit.)
+          if [ "${{ github.event_name }}" = "push" ]; then
+            python3 scripts/release.py notes "${TAG#v}" > /dev/null
+          fi
+
+  wheel:
+    needs: guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*
+
+  image:
+    needs: guard
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - name: franky
+            context: .
+            dockerfile: Dockerfile
+          - name: franky-proxy
+            context: proxy
+            dockerfile: proxy/Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Compute version
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          else
+            echo "VERSION=${{ inputs.version }}" >> "$GITHUB_ENV"
+          fi
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          platforms: ${{ github.event_name == 'push' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
+          push: ${{ github.event_name == 'push' }}
+          tags: |
+            ghcr.io/vietlabs-work/${{ matrix.name }}:${{ env.VERSION }}
+            ghcr.io/vietlabs-work/${{ matrix.name }}:latest
+
+  # GitHub Release is created last - its existence implies the wheel + images shipped.
+  release:
+    needs: [wheel, image]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Generate release notes
+        run: python3 scripts/release.py notes "${GITHUB_REF_NAME#v}" > /tmp/notes.md
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file /tmp/notes.md

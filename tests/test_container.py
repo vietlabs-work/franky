@@ -3,11 +3,14 @@ import subprocess
 
 from franky.config import Config
 from franky.container import (
+    FRANKY_PROXY_IMAGE_VAR,
     build_docker_argv,
     build_network_argv,
     build_network_connect_argv,
     build_proxy_argv,
-    ensure_image,
+    ensure_image_available,
+    image_exists,
+    resolve_image,
     run_in_container,
 )
 from franky.engine import PiEngine
@@ -380,15 +383,122 @@ def test_run_in_container_secrets_absent_from_task_argv():
     assert "OPENROUTER_API_KEY" in captured["argv"]  # name only
 
 
-def test_ensure_image_true_when_present():
+def test_image_exists_true_when_present():
     def fake_runner(argv, **kwargs):
         return subprocess.CompletedProcess(argv, 0, stdout="[]", stderr="")
 
-    assert ensure_image("franky", runner=fake_runner) is True
+    assert image_exists("franky", runner=fake_runner) is True
 
 
-def test_ensure_image_false_when_absent():
+def test_image_exists_false_when_absent():
     def fake_runner(argv, **kwargs):
         return subprocess.CompletedProcess(argv, 1, stdout="", stderr="no such image")
 
-    assert ensure_image("franky", runner=fake_runner) is False
+    assert image_exists("franky", runner=fake_runner) is False
+
+
+def test_resolve_image_env_override_wins():
+    assert resolve_image({"FRANKY_IMAGE": "my-local"}) == "my-local"
+
+
+def test_resolve_image_default_is_versioned_ghcr():
+    ref = resolve_image({})
+    assert ref.startswith("ghcr.io/vietlabs-work/franky:")
+    assert not ref.endswith(":latest")
+
+
+def test_resolve_image_proxy_uses_proxy_var():
+    ref = resolve_image({}, FRANKY_PROXY_IMAGE_VAR, "franky-proxy")
+    assert ref.startswith("ghcr.io/vietlabs-work/franky-proxy:")
+
+
+def test_ensure_image_available_present_no_pull():
+    calls = []
+
+    def fake_runner(argv, **kwargs):
+        calls.append(argv)
+        if argv[:3] == ["docker", "image", "inspect"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="[]", stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    ok, reason = ensure_image_available("franky", runner=fake_runner)
+    assert ok is True
+    assert reason == ""
+    assert not any(a[:2] == ["docker", "pull"] for a in calls)
+
+
+def test_ensure_image_available_absent_pull_ok():
+    def fake_runner(argv, **kwargs):
+        if argv[:3] == ["docker", "image", "inspect"]:
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="no such image")
+        if argv[:2] == ["docker", "pull"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="Pulled", stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    ok, reason = ensure_image_available("franky:0.1.0", runner=fake_runner)
+    assert ok is True
+    assert reason == ""
+
+
+def test_ensure_image_available_absent_auth_error():
+    def fake_runner(argv, **kwargs):
+        if argv[:3] == ["docker", "image", "inspect"]:
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="no such image")
+        if argv[:2] == ["docker", "pull"]:
+            return subprocess.CompletedProcess(
+                argv, 1, stdout="", stderr="unauthorized: access denied"
+            )
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    ok, reason = ensure_image_available("ghcr.io/vietlabs-work/franky:0.1.0", runner=fake_runner)
+    assert ok is False
+    assert reason == "auth"
+
+
+def test_ensure_image_available_absent_pull_failed():
+    def fake_runner(argv, **kwargs):
+        if argv[:3] == ["docker", "image", "inspect"]:
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="no such image")
+        if argv[:2] == ["docker", "pull"]:
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="network timeout")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    ok, reason = ensure_image_available("ghcr.io/vietlabs-work/franky:0.1.0", runner=fake_runner)
+    assert ok is False
+    assert reason == "pull-failed"
+
+
+def test_ensure_image_available_oserror():
+    def fake_runner(argv, **kwargs):
+        if argv[:3] == ["docker", "image", "inspect"]:
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="no such image")
+        raise OSError("docker not found")
+
+    ok, reason = ensure_image_available("franky:0.1.0", runner=fake_runner)
+    assert ok is False
+    assert reason == "no-docker"
+
+
+def test_run_in_container_threads_proxy_image():
+    proxy_run_calls = []
+
+    def task(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    original_runner, calls = _orchestration_runner(task)
+
+    def capturing_runner(argv, **kwargs):
+        if argv[:3] == ["docker", "run", "-d"]:
+            proxy_run_calls.append(argv)
+        return original_runner(argv, **kwargs)
+
+    run_in_container(
+        _cfg(),
+        ["pi"],
+        runner=capturing_runner,
+        env={},
+        sleeper=NOOP_SLEEP,
+        proxy_image="my-proxy:1.0",
+    )
+    assert len(proxy_run_calls) == 1
+    assert "my-proxy:1.0" in proxy_run_calls[0]

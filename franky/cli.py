@@ -16,7 +16,13 @@ import click
 
 from . import __version__
 from .config import load_config, redact
-from .container import ensure_image, run_in_container
+from .container import (
+    FRANKY_IMAGE_VAR,
+    FRANKY_PROXY_IMAGE_VAR,
+    ensure_image_available,
+    resolve_image,
+    run_in_container,
+)
 from .prompt import build_prompt
 from .task import parse_task
 
@@ -55,16 +61,30 @@ def build(task_input: str, repo: str | None, engine: str | None) -> None:
     prompt = build_prompt(spec)
     inner_argv = cfg.engine.inner_argv(prompt, model=None)
 
-    if not ensure_image():
-        raise click.ClickException(
-            "franky image not found - build it with `docker build -t franky .`"
-        )
-    if not ensure_image("franky-proxy"):
-        raise click.ClickException(
-            "franky-proxy image not found - build it with `docker build -t franky-proxy proxy/`"
-        )
+    franky_img = resolve_image(os.environ, FRANKY_IMAGE_VAR, "franky")
+    proxy_img = resolve_image(os.environ, FRANKY_PROXY_IMAGE_VAR, "franky-proxy")
+    for label, img, dev_build, dev_var in (
+        ("franky", franky_img, "docker build -t franky .", FRANKY_IMAGE_VAR),
+        ("franky-proxy", proxy_img, "docker build -t franky-proxy proxy/", FRANKY_PROXY_IMAGE_VAR),
+    ):
+        ok, reason = ensure_image_available(img)
+        if not ok:
+            if reason == "no-docker":
+                raise click.ClickException(
+                    "docker is not available - is the daemon running and `docker` on PATH?"
+                )
+            if reason == "auth":
+                raise click.ClickException(
+                    f"{label} image '{img}' needs auth to pull - run `docker login ghcr.io` "
+                    f"(a PAT with read:packages), or for local dev `{dev_build}` "
+                    f"and set {dev_var}=<local-tag>."
+                )
+            raise click.ClickException(
+                f"{label} image '{img}' not found locally and could not be pulled. "
+                f"For local dev: `{dev_build}` and set {dev_var}=<local-tag>."
+            )
 
-    code, output = run_in_container(cfg, inner_argv)
+    code, output = run_in_container(cfg, inner_argv, image=franky_img, proxy_image=proxy_img)
 
     _write_log(output, secrets)
 

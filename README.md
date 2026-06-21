@@ -36,16 +36,35 @@ both ship in the one image.
 Select with `--engine pi|claude`, or set `FRANKY_ENGINE`. Resolution order:
 `--engine` flag > `FRANKY_ENGINE` > default `pi`.
 
+## Install
+
+While the repository is private, install from the git tag:
+
+```
+uv tool install git+ssh://git@github.com/vietlabs-work/franky@vX.Y.Z
+# or pipx:
+pipx install git+ssh://git@github.com/vietlabs-work/franky@vX.Y.Z
+# or download the wheel from the GitHub Release and pip install it
+```
+
+On first run the CLI pulls the version-pinned GHCR images
+(`ghcr.io/vietlabs-work/franky:X.Y.Z` and `ghcr.io/vietlabs-work/franky-proxy:X.Y.Z`),
+so you need Docker and, while the packages are private, `docker login ghcr.io`
+with a PAT that has `read:packages`.
+
+**For local development**, skip GHCR and point at local builds:
+
+```
+docker build -t franky .
+docker build -t franky-proxy proxy/
+export FRANKY_IMAGE=franky
+export FRANKY_PROXY_IMAGE=franky-proxy
+```
+
 ## Quickstart
 
-1. Install Docker and build BOTH images once before first use:
-   ```
-   docker build -t franky .
-   docker build -t franky-proxy proxy/
-   ```
-   `franky` runs the agent; `franky-proxy` is the egress allowlist proxy (see
-   Security). Franky checks both images exist before each run and tells you to
-   build them if not.
+1. Install Docker. Images are pulled automatically from GHCR on first run (see
+   Install above). For local dev only, build them manually (see Install above).
 2. Install Franky:
    ```
    python3 -m venv .venv && .venv/bin/pip install -e .
