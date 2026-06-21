@@ -1,0 +1,332 @@
+import importlib.util
+import subprocess
+from pathlib import Path
+
+import pytest
+
+
+def load_release():
+    path = Path(__file__).resolve().parents[1] / "scripts" / "release.py"
+    spec = importlib.util.spec_from_file_location("release", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+release = load_release()
+
+valid_version = release.valid_version
+read_pyproject_version = release.read_pyproject_version
+read_init_version = release.read_init_version
+set_pyproject_version = release.set_pyproject_version
+set_init_version = release.set_init_version
+update_changelog = release.update_changelog
+extract_notes = release.extract_notes
+assert_versions_match = release.assert_versions_match
+main = release.main
+
+
+@pytest.fixture
+def repo(tmp_path):
+    (tmp_path / "pyproject.toml").write_text('[project]\nversion = "0.1.0"\n')
+    (tmp_path / "franky").mkdir()
+    (tmp_path / "franky" / "__init__.py").write_text('__version__ = "0.1.0"\n')
+    (tmp_path / "CHANGELOG.md").write_text(
+        "# Changelog\n\n## [Unreleased]\n\n### Added\n- Some feature\n\n## [0.0.1] - 2026-01-01\n\nOld stuff.\n"
+    )
+    return tmp_path
+
+
+def make_fake_run(responses=None):
+    """responses: list of (argv_prefix_tuple, returncode, stdout, stderr)
+    Returns calls list and runner."""
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        if responses:
+            for prefix, rc, out, err in responses:
+                if list(argv[: len(prefix)]) == list(prefix):
+                    return subprocess.CompletedProcess(argv, rc, out, err)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    return runner, calls
+
+
+# --- valid_version ---
+
+
+def test_valid_version_accepts_plain():
+    assert valid_version("1.2.3") is True
+
+
+def test_valid_version_rejects_prerelease():
+    assert valid_version("1.2.3-rc1") is False
+
+
+def test_valid_version_rejects_leading_v():
+    assert valid_version("v1.2.3") is False
+
+
+def test_valid_version_rejects_two_part():
+    assert valid_version("1.2") is False
+
+
+def test_valid_version_rejects_four_part():
+    assert valid_version("1.2.3.4") is False
+
+
+# --- version read/write roundtrips ---
+
+
+def test_set_pyproject_version_roundtrip(repo):
+    set_pyproject_version(repo, "2.3.4")
+    assert read_pyproject_version(repo) == "2.3.4"
+
+
+def test_set_init_version_roundtrip(repo):
+    set_init_version(repo, "2.3.4")
+    assert read_init_version(repo) == "2.3.4"
+
+
+# --- changelog ---
+
+
+def test_update_changelog_transform(repo):
+    update_changelog(repo, "1.0.0", "2026-06-22")
+    text = (repo / "CHANGELOG.md").read_text()
+    assert "## [1.0.0] - 2026-06-22" in text
+    unreleased_pos = text.find("## [Unreleased]")
+    versioned_pos = text.find("## [1.0.0] - 2026-06-22")
+    assert unreleased_pos != -1
+    assert versioned_pos != -1
+    assert unreleased_pos < versioned_pos
+
+
+def test_extract_notes_returns_section_body(repo):
+    update_changelog(repo, "1.0.0", "2026-06-22")
+    notes = extract_notes(repo, "1.0.0")
+    assert "Some feature" in notes
+
+
+def test_extract_notes_missing_section_exits(repo):
+    with pytest.raises(SystemExit) as exc_info:
+        extract_notes(repo, "9.9.9")
+    assert exc_info.value.code != 0
+
+
+# --- assert_versions_match ---
+
+
+def test_assert_versions_match_passes_on_match(repo):
+    # pyproject and init are both "0.1.0" from the fixture; tag matches
+    assert_versions_match(repo, "v0.1.0")  # should not raise
+
+
+def test_assert_versions_match_pyproject_skew(repo):
+    set_pyproject_version(repo, "1.0.0")
+    # init is still "0.1.0"
+    with pytest.raises(SystemExit):
+        assert_versions_match(repo, "v1.0.0")
+
+
+def test_assert_versions_match_init_skew(repo):
+    set_pyproject_version(repo, "1.0.0")
+    set_init_version(repo, "2.0.0")
+    with pytest.raises(SystemExit):
+        assert_versions_match(repo, "v1.0.0")
+
+
+def test_assert_versions_match_tag_skew(repo):
+    set_pyproject_version(repo, "1.0.0")
+    set_init_version(repo, "1.0.0")
+    with pytest.raises(SystemExit):
+        assert_versions_match(repo, "v2.0.0")
+
+
+def test_assert_versions_match_tag_patch_typo(repo):
+    # pyproject == init == 0.1.0 (fixture) but the tag is a common patch typo v0.1.1.
+    with pytest.raises(SystemExit):
+        assert_versions_match(repo, "v0.1.1")
+
+
+# --- changelog fail-loud guards ---
+
+
+def test_update_changelog_missing_unreleased_raises(repo):
+    (repo / "CHANGELOG.md").write_text("# Changelog\n\n## [0.0.1] - 2026-01-01\n\nOld.\n")
+    with pytest.raises(SystemExit):
+        update_changelog(repo, "1.0.0", "2026-06-22")
+
+
+def test_extract_notes_empty_section_raises(repo):
+    (repo / "CHANGELOG.md").write_text(
+        "# Changelog\n\n## [1.0.0] - 2026-06-22\n\n## [0.0.1]\n\nx\n"
+    )
+    with pytest.raises(SystemExit):
+        extract_notes(repo, "1.0.0")
+
+
+# --- guard subcommand ---
+
+
+def test_guard_subcommand_exit_0_on_match(repo):
+    set_pyproject_version(repo, "1.0.0")
+    set_init_version(repo, "1.0.0")
+    fake_run, _ = make_fake_run()
+    # Should not raise
+    main(["guard", "v1.0.0"], run=fake_run, root=repo)
+
+
+def test_guard_subcommand_nonzero_on_skew(repo):
+    # pyproject/init still "0.1.0", tag is v2.0.0
+    fake_run, _ = make_fake_run()
+    with pytest.raises(SystemExit) as exc_info:
+        main(["guard", "v2.0.0"], run=fake_run, root=repo)
+    assert exc_info.value.code != 0
+
+
+# --- full release happy path ---
+
+
+def test_release_happy_path_git_commands(repo):
+    responses = [
+        (["git", "fetch"], 0, "", ""),
+        (["git", "rev-parse", "--abbrev-ref", "HEAD"], 0, "main", ""),
+        (["git", "status", "--porcelain"], 0, "", ""),
+        (["git", "rev-parse", "HEAD"], 0, "abc123", ""),
+        (["git", "rev-parse", "origin/main"], 0, "abc123", ""),
+        (["git", "rev-parse", "-q", "--verify"], 1, "", ""),
+        (["git", "add"], 0, "", ""),
+        (["git", "commit"], 0, "", ""),
+        (["git", "tag"], 0, "", ""),
+        (["git", "push"], 0, "", ""),
+    ]
+    fake_run, calls = make_fake_run(responses)
+    main(["1.2.3"], run=fake_run, root=repo)
+
+    git_calls = [c for c in calls if c[0] == "git"]
+    subcommands = [c[1] for c in git_calls]
+    add_idx = subcommands.index("add")
+    commit_idx = subcommands.index("commit")
+    tag_idx = subcommands.index("tag")
+    push_idx = subcommands.index("push")
+    assert add_idx < commit_idx < tag_idx < push_idx
+
+    assert read_pyproject_version(repo) == "1.2.3"
+    assert read_init_version(repo) == "1.2.3"
+
+
+def test_release_refuses_dirty_tree(repo):
+    responses = [
+        (["git", "fetch"], 0, "", ""),
+        (["git", "rev-parse", "--abbrev-ref", "HEAD"], 0, "main", ""),
+        (["git", "status", "--porcelain"], 0, "M pyproject.toml", ""),
+    ]
+    fake_run, _ = make_fake_run(responses)
+    with pytest.raises(SystemExit):
+        main(["1.2.3"], run=fake_run, root=repo)
+
+
+def test_release_refuses_wrong_branch(repo):
+    responses = [
+        (["git", "fetch"], 0, "", ""),
+        (["git", "rev-parse", "--abbrev-ref", "HEAD"], 0, "feature-x", ""),
+    ]
+    fake_run, _ = make_fake_run(responses)
+    with pytest.raises(SystemExit):
+        main(["1.2.3"], run=fake_run, root=repo)
+
+
+def test_release_refuses_unsynced_main(repo):
+    responses = [
+        (["git", "fetch"], 0, "", ""),
+        (["git", "rev-parse", "--abbrev-ref", "HEAD"], 0, "main", ""),
+        (["git", "status", "--porcelain"], 0, "", ""),
+        (["git", "rev-parse", "HEAD"], 0, "abc123", ""),
+        (["git", "rev-parse", "origin/main"], 0, "def456", ""),
+    ]
+    fake_run, _ = make_fake_run(responses)
+    with pytest.raises(SystemExit):
+        main(["1.2.3"], run=fake_run, root=repo)
+
+
+def test_release_refuses_existing_tag(repo):
+    responses = [
+        (["git", "fetch"], 0, "", ""),
+        (["git", "rev-parse", "--abbrev-ref", "HEAD"], 0, "main", ""),
+        (["git", "status", "--porcelain"], 0, "", ""),
+        (["git", "rev-parse", "HEAD"], 0, "abc123", ""),
+        (["git", "rev-parse", "origin/main"], 0, "abc123", ""),
+        (["git", "rev-parse", "-q", "--verify"], 0, "abc123", ""),
+    ]
+    fake_run, _ = make_fake_run(responses)
+    with pytest.raises(SystemExit):
+        main(["1.2.3"], run=fake_run, root=repo)
+
+
+def test_release_dry_run_no_file_writes(repo):
+    # Dry-run returns before any git call, so the fake run is never consulted. Assert NO file
+    # was mutated (all three version sources untouched) and NO git mutation ran.
+    fake_run, calls = make_fake_run()
+    main(["1.2.3", "--dry-run"], run=fake_run, root=repo)
+    assert read_pyproject_version(repo) == "0.1.0"
+    assert read_init_version(repo) == "0.1.0"
+    assert "## [Unreleased]" in (repo / "CHANGELOG.md").read_text()
+    git_calls = [c for c in calls if c[0] == "git"]
+    mutating = [c for c in git_calls if c[1] in ("add", "commit", "tag", "push")]
+    assert mutating == []
+
+
+# --- tag recovery ---
+
+
+def test_tag_recovery_happy_path(repo):
+    set_pyproject_version(repo, "1.2.3")
+    set_init_version(repo, "1.2.3")
+    responses = [
+        (["git", "status", "--porcelain"], 0, "", ""),
+        (["git", "rev-parse", "-q", "--verify"], 1, "", ""),
+        (["git", "tag"], 0, "", ""),
+        (["git", "push"], 0, "", ""),
+    ]
+    fake_run, calls = make_fake_run(responses)
+    main(["tag", "1.2.3"], run=fake_run, root=repo)
+    git_calls = [c for c in calls if c[0] == "git"]
+    subcommands = [c[1] for c in git_calls]
+    assert "tag" in subcommands
+    assert "push" in subcommands
+    assert "add" not in subcommands
+    assert "commit" not in subcommands
+
+
+def test_tag_recovery_refuses_dirty_tree(repo):
+    set_pyproject_version(repo, "1.2.3")
+    set_init_version(repo, "1.2.3")
+    responses = [
+        (["git", "status", "--porcelain"], 0, "M somefile.py", ""),
+    ]
+    fake_run, _ = make_fake_run(responses)
+    with pytest.raises(SystemExit):
+        main(["tag", "1.2.3"], run=fake_run, root=repo)
+
+
+def test_tag_recovery_refuses_version_mismatch(repo):
+    # pyproject/init are "0.1.0" from fixture; trying to tag "1.2.3"
+    fake_run, _ = make_fake_run()
+    with pytest.raises(SystemExit):
+        main(["tag", "1.2.3"], run=fake_run, root=repo)
+
+
+def test_tag_recovery_dry_run_no_mutations(repo):
+    set_pyproject_version(repo, "1.2.3")
+    set_init_version(repo, "1.2.3")
+    responses = [
+        (["git", "status", "--porcelain"], 0, "", ""),
+        (["git", "rev-parse", "-q", "--verify"], 1, "", ""),
+    ]
+    fake_run, calls = make_fake_run(responses)
+    main(["tag", "1.2.3", "--dry-run"], run=fake_run, root=repo)
+    git_calls = [c for c in calls if c[0] == "git"]
+    mutating = [c for c in git_calls if c[1] in ("tag", "push")]
+    assert mutating == []

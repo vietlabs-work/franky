@@ -23,7 +23,7 @@ import subprocess
 import time
 import uuid
 
-from . import egress
+from . import egress, franky_version
 from .config import redact
 
 # Long agent runs: a full clone-build-test-PR cycle can take many minutes. 30 min cap.
@@ -57,6 +57,9 @@ _HARDENING = [
 # The Squid proxy image (built from proxy/) and the port it listens on inside the net.
 PROXY_IMAGE = "franky-proxy"
 PROXY_PORT = 3128
+GHCR_REPO = "ghcr.io/vietlabs-work"
+FRANKY_IMAGE_VAR = "FRANKY_IMAGE"
+FRANKY_PROXY_IMAGE_VAR = "FRANKY_PROXY_IMAGE"
 
 # Hardening for the proxy container. Mirrors _HARDENING but the writable tmpfs dirs are
 # squid's, not the agent's: squid (debian package user `proxy`, uid/gid 13 - verified in the
@@ -246,6 +249,7 @@ def run_in_container(
     runner=subprocess.run,
     env: dict[str, str] | None = None,
     sleeper=time.sleep,
+    proxy_image: str = PROXY_IMAGE,
 ) -> tuple[int, str]:
     """Run the inner engine in a hardened, egress-controlled container; return
     (returncode, redacted_output).
@@ -285,7 +289,7 @@ def run_in_container(
 
         # 2. Proxy container (detached). On failure: teardown runs in `finally`.
         if (
-            getattr(_run(runner, build_proxy_argv(PROXY_IMAGE, proxy, allowed)), "returncode", 1)
+            getattr(_run(runner, build_proxy_argv(proxy_image, proxy, allowed)), "returncode", 1)
             != 0
         ):
             raise _AbortRun("franky: could not start egress proxy - refusing to run")
@@ -347,7 +351,7 @@ def run_in_container(
     return code, redact(output, secrets)
 
 
-def ensure_image(image: str = "franky", runner=subprocess.run) -> bool:
+def image_exists(image: str = "franky", runner=subprocess.run) -> bool:
     """True iff the image already exists locally (`docker image inspect`). Does NOT build -
     the caller decides whether to build. `runner` injectable for tests."""
     try:
@@ -359,3 +363,35 @@ def ensure_image(image: str = "franky", runner=subprocess.run) -> bool:
     except OSError:
         return False
     return proc.returncode == 0
+
+
+def resolve_image(env: dict, var: str = FRANKY_IMAGE_VAR, name: str = "franky") -> str:
+    """Return the image ref to use. If the env var is set and truthy, return it (dev override).
+    Otherwise return the version-pinned GHCR ref. NEVER resolves to :latest."""
+    override = env.get(var)
+    if override:
+        return override
+    return f"{GHCR_REPO}/{name}:{franky_version()}"
+
+
+def ensure_image_available(image: str, runner=subprocess.run) -> tuple[bool, str]:
+    """Ensure `image` is available locally, pulling if needed.
+    Returns (True, "") on success.
+    Returns (False, "no-docker") if docker is not available (OSError).
+    Returns (False, "auth") if the pull failed with an auth/credentials error.
+    Returns (False, "pull-failed") for any other pull failure.
+    Never raises."""
+    if image_exists(image, runner):
+        return True, ""
+    try:
+        proc = runner(["docker", "pull", image], capture_output=True, text=True)
+    except OSError:
+        return False, "no-docker"
+    if proc.returncode == 0:
+        return True, ""
+    combined = ((proc.stdout or "") + (proc.stderr or "")).lower()
+    if any(
+        kw in combined for kw in ("denied", "unauthorized", "authentication", "forbidden", "401")
+    ):
+        return False, "auth"
+    return False, "pull-failed"

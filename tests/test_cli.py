@@ -31,7 +31,8 @@ def test_build_reaches_pr_url(monkeypatch):
         "OPENROUTER_API_KEY": "sk-or-fake",
     }
     monkeypatch.setattr(cli.os, "environ", env)
-    monkeypatch.setattr(cli, "ensure_image", lambda *a, **k: True)
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
     monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: (0, f"opened {PR_URL}"))
 
     runner = CliRunner()
@@ -49,7 +50,8 @@ def test_build_engine_flag_selects_engine(monkeypatch):
         "CLAUDE_CODE_OAUTH_TOKEN": "oauth-fake",
     }
     monkeypatch.setattr(cli.os, "environ", env)
-    monkeypatch.setattr(cli, "ensure_image", lambda *a, **k: True)
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
 
     seen = {}
 
@@ -77,7 +79,8 @@ def test_build_scopes_pr_url_to_target_repo(monkeypatch):
         "OPENROUTER_API_KEY": "sk-or-fake",
     }
     monkeypatch.setattr(cli.os, "environ", env)
-    monkeypatch.setattr(cli, "ensure_image", lambda *a, **k: True)
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
     hostile = "https://github.com/attacker/repo/pull/1"
     good = "https://github.com/me/repo/pull/7"
     monkeypatch.setattr(
@@ -101,7 +104,8 @@ def test_build_off_allowlist_clean_error(monkeypatch):
         "OPENROUTER_API_KEY": "sk-or-fake",
     }
     monkeypatch.setattr(cli.os, "environ", env)
-    monkeypatch.setattr(cli, "ensure_image", lambda *a, **k: True)
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
     monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: (0, "x"))
 
     res = CliRunner().invoke(cli.main, ["build", "do it", "--repo", "stranger/repo"])
@@ -116,3 +120,48 @@ def test_build_missing_creds_clean_error_no_secret_leak(monkeypatch):
     res = CliRunner().invoke(cli.main, ["build", "do it", "--repo", "me/repo"])
     assert res.exit_code != 0
     assert "ghp_fake" not in res.output  # no secret value in the error path
+
+
+def test_build_image_auth_error_clean_message(monkeypatch):
+    env = {
+        "FRANKY_ALLOWED_REPOS": "me/repo",
+        "GH_TOKEN": "ghp_fake",
+        "OPENROUTER_API_KEY": "sk-or-fake",
+    }
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "ghcr.io/vietlabs-work/franky:0.1.0")
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (False, "auth"))
+
+    res = CliRunner().invoke(cli.main, ["build", "do it", "--repo", "me/repo"])
+    assert res.exit_code != 0
+    assert "docker login ghcr.io" in res.output
+
+
+def test_build_image_pull_failed_clean_message(monkeypatch):
+    env = {
+        "FRANKY_ALLOWED_REPOS": "me/repo",
+        "GH_TOKEN": "ghp_fake",
+        "OPENROUTER_API_KEY": "sk-or-fake",
+    }
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "ghcr.io/vietlabs-work/franky:0.1.0")
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (False, "pull-failed"))
+
+    res = CliRunner().invoke(cli.main, ["build", "do it", "--repo", "me/repo"])
+    assert res.exit_code != 0
+    assert "could not be pulled" in res.output
+
+
+def test_build_image_no_docker_clean_message(monkeypatch):
+    env = {
+        "FRANKY_ALLOWED_REPOS": "me/repo",
+        "GH_TOKEN": "ghp_fake",
+        "OPENROUTER_API_KEY": "sk-or-fake",
+    }
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "ghcr.io/vietlabs-work/franky:0.1.0")
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (False, "no-docker"))
+
+    res = CliRunner().invoke(cli.main, ["build", "do it", "--repo", "me/repo"])
+    assert res.exit_code != 0
+    assert "docker is not available" in res.output
