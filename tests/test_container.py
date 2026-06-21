@@ -1,6 +1,5 @@
 import subprocess
 
-import pytest
 
 from franky.config import Config
 from franky.container import (
@@ -9,7 +8,6 @@ from franky.container import (
     build_network_connect_argv,
     build_proxy_argv,
     ensure_image,
-    proxy_url,
     run_in_container,
 )
 from franky.engine import PiEngine
@@ -109,7 +107,9 @@ def test_build_docker_argv_cross_engine_env_isolation():
     pi_e = [pi_argv[i + 1] for i, t in enumerate(pi_argv) if t == "-e"]
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in pi_e
 
-    cl_argv = build_docker_argv("franky", {"GH_TOKEN": "x", "CLAUDE_CODE_OAUTH_TOKEN": "z"}, ["claude"])
+    cl_argv = build_docker_argv(
+        "franky", {"GH_TOKEN": "x", "CLAUDE_CODE_OAUTH_TOKEN": "z"}, ["claude"]
+    )
     cl_e = [cl_argv[i + 1] for i, t in enumerate(cl_argv) if t == "-e"]
     assert "OPENROUTER_API_KEY" not in cl_e
     assert "CLAUDE_CODE_OAUTH_TOKEN" in cl_e
@@ -118,7 +118,7 @@ def test_build_docker_argv_cross_engine_env_isolation():
 def test_build_docker_argv_image_and_inner_last():
     inner = ["pi", "-p", "go", "--mode", "json"]
     argv = build_docker_argv("franky", {"GH_TOKEN": "x"}, inner)
-    assert argv[-len(inner):] == inner
+    assert argv[-len(inner) :] == inner
     assert argv[-len(inner) - 1] == "franky"
 
 
@@ -131,7 +131,9 @@ def test_run_in_container_fake_runner_returns_output():
         return subprocess.CompletedProcess(argv, 0, stdout=f"done {PR_URL}", stderr="")
 
     runner, _calls = _orchestration_runner(task)
-    code, out = run_in_container(_cfg(), ["pi", "-p", "go"], runner=runner, env={}, sleeper=NOOP_SLEEP)
+    code, out = run_in_container(
+        _cfg(), ["pi", "-p", "go"], runner=runner, env={}, sleeper=NOOP_SLEEP
+    )
     assert code == 0
     assert PR_URL in out
     # never ran real docker; child env carries the passthrough values
@@ -154,7 +156,9 @@ def test_run_in_container_timeout_returns_nonzero():
         raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout"))
 
     runner, calls = _orchestration_runner(task)
-    code, out = run_in_container(_cfg(), ["pi"], timeout=5, runner=runner, env={}, sleeper=NOOP_SLEEP)
+    code, out = run_in_container(
+        _cfg(), ["pi"], timeout=5, runner=runner, env={}, sleeper=NOOP_SLEEP
+    )
     assert code != 0
     assert "timed out" in out
     # reaper fired (task + proxy reaped, net removed)
@@ -209,12 +213,24 @@ def test_run_in_container_connect_failure_reaps_and_no_task():
 
 def test_build_network_argv_internal():
     argv = build_network_argv("franky-net-abc")
-    assert argv == ["docker", "network", "create", "--internal", "--driver", "bridge", "franky-net-abc"]
+    assert argv == [
+        "docker",
+        "network",
+        "create",
+        "--internal",
+        "--driver",
+        "bridge",
+        "franky-net-abc",
+    ]
 
 
 def test_build_network_connect_argv():
     assert build_network_connect_argv("net1", "proxy1") == [
-        "docker", "network", "connect", "net1", "proxy1",
+        "docker",
+        "network",
+        "connect",
+        "net1",
+        "proxy1",
     ]
 
 
@@ -240,8 +256,12 @@ def test_build_proxy_argv_shape_and_hardening():
 
 def test_build_docker_argv_with_network_and_proxy():
     argv = build_docker_argv(
-        "franky", {"GH_TOKEN": "x"}, ["pi"],
-        name="task1", network="net1", proxy_url="http://proxy1:3128",
+        "franky",
+        {"GH_TOKEN": "x"},
+        ["pi"],
+        name="task1",
+        network="net1",
+        proxy_url="http://proxy1:3128",
     )
     # network joined
     assert "--network" in argv
@@ -282,8 +302,12 @@ def test_run_in_container_orchestration_order():
     i_connect = first_index(lambda a: a[:3] == ["docker", "network", "connect"])
     i_inspect = first_index(lambda a: a[:2] == ["docker", "inspect"])
     i_task_run = first_index(lambda a: a[:2] == ["docker", "run"] and a[2] != "-d")
-    i_rm_task = first_index(lambda a: a[:3] == ["docker", "rm", "-f"] and any("franky-run-" in x for x in a))
-    i_rm_proxy = first_index(lambda a: a[:3] == ["docker", "rm", "-f"] and any("franky-proxy-" in x for x in a))
+    i_rm_task = first_index(
+        lambda a: a[:3] == ["docker", "rm", "-f"] and any("franky-run-" in x for x in a)
+    )
+    i_rm_proxy = first_index(
+        lambda a: a[:3] == ["docker", "rm", "-f"] and any("franky-proxy-" in x for x in a)
+    )
     i_net_rm = first_index(lambda a: a[:3] == ["docker", "network", "rm"])
 
     # network-create -> proxy run -d -> connect -> inspect -> task run -> rm task -> rm proxy -> net rm
@@ -328,11 +352,17 @@ def test_run_in_container_timeout_reaps_task_proxy_net():
         raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout"))
 
     runner, calls = _orchestration_runner(task)
-    code, out = run_in_container(_cfg(), ["pi"], timeout=5, runner=runner, env={}, sleeper=NOOP_SLEEP)
+    code, out = run_in_container(
+        _cfg(), ["pi"], timeout=5, runner=runner, env={}, sleeper=NOOP_SLEEP
+    )
     assert code != 0
     # finally guarantees all three are reaped
-    assert any(a[:3] == ["docker", "rm", "-f"] and any("franky-run-" in x for x in a) for a in calls)
-    assert any(a[:3] == ["docker", "rm", "-f"] and any("franky-proxy-" in x for x in a) for a in calls)
+    assert any(
+        a[:3] == ["docker", "rm", "-f"] and any("franky-run-" in x for x in a) for a in calls
+    )
+    assert any(
+        a[:3] == ["docker", "rm", "-f"] and any("franky-proxy-" in x for x in a) for a in calls
+    )
     assert any(a[:3] == ["docker", "network", "rm"] for a in calls)
 
 

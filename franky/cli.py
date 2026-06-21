@@ -5,6 +5,7 @@ allowlist, off-list repo, missing creds), so a clean non-zero exit with a stderr
 beats a traceback. Every printed or logged string is redacted first - a secret value must
 never reach the terminal or the on-disk log.
 """
+
 from __future__ import annotations
 
 import os
@@ -29,9 +30,16 @@ def main() -> None:
 
 @main.command()
 @click.argument("task_input")
-@click.option("--repo", "repo", default=None, help="Target repo owner/repo (required for prose tasks).")
-@click.option("--engine", "engine", default=None, type=click.Choice(["pi", "claude"]),
-              help="Engine override; else FRANKY_ENGINE, else pi.")
+@click.option(
+    "--repo", "repo", default=None, help="Target repo owner/repo (required for prose tasks)."
+)
+@click.option(
+    "--engine",
+    "engine",
+    default=None,
+    type=click.Choice(["pi", "claude"]),
+    help="Engine override; else FRANKY_ENGINE, else pi.",
+)
 def build(task_input: str, repo: str | None, engine: str | None) -> None:
     """Build TASK_INPUT (a GitHub issue URL or a prose request) and open a PR."""
     # Config + task parse are operator-error surfaces -> clean ClickException, no traceback.
@@ -48,9 +56,13 @@ def build(task_input: str, repo: str | None, engine: str | None) -> None:
     inner_argv = cfg.engine.inner_argv(prompt, model=None)
 
     if not ensure_image():
-        raise click.ClickException("franky image not found - build it with `docker build -t franky .`")
+        raise click.ClickException(
+            "franky image not found - build it with `docker build -t franky .`"
+        )
     if not ensure_image("franky-proxy"):
-        raise click.ClickException("franky-proxy image not found - build it with `docker build -t franky-proxy proxy/`")
+        raise click.ClickException(
+            "franky-proxy image not found - build it with `docker build -t franky-proxy proxy/`"
+        )
 
     code, output = run_in_container(cfg, inner_argv)
 
@@ -62,9 +74,13 @@ def build(task_input: str, repo: str | None, engine: str | None) -> None:
     if pr_url:
         click.echo(pr_url)
     else:
-        click.echo("franky: no PR URL found in agent output - see the redacted log in tasks/", err=True)
+        click.echo(
+            "franky: no PR URL found in agent output - see the redacted log in tasks/", err=True
+        )
     if code != 0:
-        raise click.ClickException(f"agent exited non-zero ({code}) - see the redacted log in tasks/")
+        raise click.ClickException(
+            f"agent exited non-zero ({code}) - see the redacted log in tasks/"
+        )
 
 
 def cfg_secrets_safe() -> list[str]:

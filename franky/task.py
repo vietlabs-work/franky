@@ -4,6 +4,7 @@ WHY the repo-allowlist check lives at parse time: it is the earliest point we kn
 target repo, and refusing here means no off-list repo ever reaches prompt-building or the
 container. JIRA is intentionally cut from v0.
 """
+
 from __future__ import annotations
 
 import re
@@ -43,7 +44,9 @@ def parse_task(raw_input: str, repo_flag: str | None, allowed: list[str]) -> Tas
         spec = TaskSpec(repo=repo, text=text_in, source="issue")
     else:
         if not repo_flag:
-            raise ValueError("prose task needs --repo owner/repo (no repo could be inferred from the input)")
+            raise ValueError(
+                "prose task needs --repo owner/repo (no repo could be inferred from the input)"
+            )
         text = text_in[:PROSE_MAX_CHARS].strip()
         spec = TaskSpec(repo=repo_flag, text=text, source="prose")
 

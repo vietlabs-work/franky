@@ -13,7 +13,9 @@ authors = [{ name = "Viet Tran" }]
 dependencies = ["click>=8.1"]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0"]
+# ruff pinned to a single minor: the formatter can change style across minors, so a wider
+# range would make `ruff format --check` rot and fail CI on unrelated PRs. Bump deliberately.
+dev = ["pytest>=8.0", "ruff>=0.15,<0.16"]
 
 [project.scripts]
 franky = "franky.cli:main"
@@ -23,3 +25,9 @@ packages = ["franky"]
 
 [tool.setuptools.package-data]
 franky = ["persona.md"]
+
+[tool.ruff]
+# 100, not the default 88: the codebase favours longer lines (the load-bearing WHY-comments
+# run wide), so 100 minimises reformat churn while still bounding code width. CI gates on both
+# `ruff check` and `ruff format --check`, which read this config.
+line-length = 100

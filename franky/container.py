@@ -15,6 +15,7 @@ it without the proxy ever seeing them. We refuse to run the task unless the prox
 confirmed healthy first (fail-closed). All docker argv is built by pure functions here;
 the allowlist POLICY lives in egress.py.
 """
+
 from __future__ import annotations
 
 import os
@@ -45,8 +46,10 @@ _HARDENING = [
     "--cap-drop=ALL",
     "--security-opt=no-new-privileges",
     "--read-only",
-    "--tmpfs", f"/work:exec,uid={_RUN_UID},gid={_RUN_GID}",
-    "--tmpfs", f"{_HOME}:exec,uid={_RUN_UID},gid={_RUN_GID}",
+    "--tmpfs",
+    f"/work:exec,uid={_RUN_UID},gid={_RUN_GID}",
+    "--tmpfs",
+    f"{_HOME}:exec,uid={_RUN_UID},gid={_RUN_GID}",
     "--pids-limit=512",
     "--memory=4g",
 ]
@@ -68,9 +71,12 @@ _PROXY_HARDENING = [
     "--cap-drop=ALL",
     "--security-opt=no-new-privileges",
     "--read-only",
-    "--tmpfs", f"/run:exec,uid={_PROXY_UID},gid={_PROXY_GID}",
-    "--tmpfs", f"/var/log/squid:uid={_PROXY_UID},gid={_PROXY_GID}",
-    "--tmpfs", f"/var/spool/squid:uid={_PROXY_UID},gid={_PROXY_GID}",
+    "--tmpfs",
+    f"/run:exec,uid={_PROXY_UID},gid={_PROXY_GID}",
+    "--tmpfs",
+    f"/var/log/squid:uid={_PROXY_UID},gid={_PROXY_GID}",
+    "--tmpfs",
+    f"/var/spool/squid:uid={_PROXY_UID},gid={_PROXY_GID}",
     "--pids-limit=512",
     "--memory=1g",
 ]
@@ -110,13 +116,20 @@ def build_docker_argv(
         # which they read. NO_PROXY keeps loopback direct. --dns 127.0.0.1 kills in-container
         # name resolution so the only way out is via the proxy.
         argv += [
-            "-e", f"HTTP_PROXY={proxy_url}",
-            "-e", f"HTTPS_PROXY={proxy_url}",
-            "-e", f"http_proxy={proxy_url}",
-            "-e", f"https_proxy={proxy_url}",
-            "-e", "NO_PROXY=localhost,127.0.0.1",
-            "-e", "no_proxy=localhost,127.0.0.1",
-            "--dns", "127.0.0.1",
+            "-e",
+            f"HTTP_PROXY={proxy_url}",
+            "-e",
+            f"HTTPS_PROXY={proxy_url}",
+            "-e",
+            f"http_proxy={proxy_url}",
+            "-e",
+            f"https_proxy={proxy_url}",
+            "-e",
+            "NO_PROXY=localhost,127.0.0.1",
+            "-e",
+            "no_proxy=localhost,127.0.0.1",
+            "--dns",
+            "127.0.0.1",
         ]
     for key in passthrough_env:
         argv += ["-e", key]
@@ -143,9 +156,14 @@ def build_proxy_argv(proxy_image: str, proxy_name: str, allowed_domains: list[st
     (which hosts may be reached), not a credential, and the proxy container is given NO cred
     env at all - so there is nothing secret on its argv to leak."""
     return [
-        "docker", "run", "-d", *_PROXY_HARDENING,
-        "--name", proxy_name,
-        "-e", f"FRANKY_ALLOWED_DOMAINS={','.join(allowed_domains)}",
+        "docker",
+        "run",
+        "-d",
+        *_PROXY_HARDENING,
+        "--name",
+        proxy_name,
+        "-e",
+        f"FRANKY_ALLOWED_DOMAINS={','.join(allowed_domains)}",
         proxy_image,
     ]
 
@@ -266,22 +284,33 @@ def run_in_container(
         net_created = True
 
         # 2. Proxy container (detached). On failure: teardown runs in `finally`.
-        if getattr(_run(runner, build_proxy_argv(PROXY_IMAGE, proxy, allowed)), "returncode", 1) != 0:
+        if (
+            getattr(_run(runner, build_proxy_argv(PROXY_IMAGE, proxy, allowed)), "returncode", 1)
+            != 0
+        ):
             raise _AbortRun("franky: could not start egress proxy - refusing to run")
         proxy_launched = True
 
         # 3. Attach the proxy to the internal net (the task joins via --network on run).
         if getattr(_run(runner, build_network_connect_argv(net, proxy)), "returncode", 1) != 0:
-            raise _AbortRun("franky: could not attach egress proxy to the network - refusing to run")
+            raise _AbortRun(
+                "franky: could not attach egress proxy to the network - refusing to run"
+            )
 
         # 4. Fail-closed gate: NEVER run the task without a confirmed-healthy proxy.
         if not _wait_proxy_ready(proxy, runner, sleeper):
-            raise _AbortRun("franky: egress proxy did not become ready - refusing to run (fail-closed)")
+            raise _AbortRun(
+                "franky: egress proxy did not become ready - refusing to run (fail-closed)"
+            )
 
         # 5. The task container: on the internal net, all traffic forced through the proxy.
         argv = build_docker_argv(
-            image, cfg.passthrough_env, inner_argv,
-            name=task, network=net, proxy_url=proxy_url(proxy),
+            image,
+            cfg.passthrough_env,
+            inner_argv,
+            name=task,
+            network=net,
+            proxy_url=proxy_url(proxy),
         )
         try:
             proc = runner(

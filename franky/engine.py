@@ -5,6 +5,7 @@ that do not factor cleanly into data - the headless argv shape, how it streams i
 output (so how we dig the PR URL back out), and which creds it needs. Keeping those
 three together per engine is what lets the rest of Franky stay engine-agnostic.
 """
+
 from __future__ import annotations
 
 import json
@@ -173,8 +174,11 @@ class ClaudeEngine(Engine):
 
     def inner_argv(self, prompt: str, model: str | None) -> list[str]:
         argv = [
-            "claude", "-p", prompt,
-            "--output-format", "stream-json",
+            "claude",
+            "-p",
+            prompt,
+            "--output-format",
+            "stream-json",
             "--dangerously-skip-permissions",
         ]
         if model:
