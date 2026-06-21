@@ -1,0 +1,56 @@
+"""Compose the prompt handed to the inner engine: persona + task + the hard conventions.
+
+WHY the conventions are spelled out literally: the engine is autonomous inside the
+container, so the prompt is the only place we can pin branch naming, the test-before-PR
+rule, commit style, and PR shape. Tests assert these literal substrings survive.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+from .task import TaskSpec
+
+_PERSONA_PATH = Path(__file__).parent / "persona.md"
+
+
+def load_persona() -> str:
+    return _PERSONA_PATH.read_text(encoding="utf-8").strip()
+
+
+def _slug_hint(spec: TaskSpec) -> str:
+    """A short hint the agent turns into the branch slug. Kept loose on purpose - the agent
+    derives the real slug; we only anchor the `franky/` prefix and give it source material."""
+    basis = spec.text if spec.source == "prose" else spec.repo
+    words = [w for w in basis.lower().split() if w.isalnum()][:5]
+    return "-".join(words) or "task"
+
+
+def build_prompt(spec: TaskSpec) -> str:
+    persona = load_persona()
+
+    if spec.source == "issue":
+        task_block = (
+            f"Repo: {spec.repo}\n"
+            f"Task: implement the GitHub issue at this URL. Fetch it first with "
+            f"`gh issue view {spec.text}` to read the full issue body and comments, then build it.\n"
+        )
+    else:
+        task_block = (
+            f"Repo: {spec.repo}\n"
+            f"Task (prose): {spec.text}\n"
+        )
+
+    conventions = (
+        "Conventions (follow exactly):\n"
+        f"- Clone {spec.repo} and work on a new branch named `franky/{_slug_hint(spec)}` "
+        "(the `franky/` prefix is required; pick a short descriptive slug after it).\n"
+        "- Run the repo's tests and make them pass BEFORE opening the PR. Do not open a PR on red tests.\n"
+        "- Use conventional-commit messages: `<type>: <summary>` (e.g. `feat:`, `fix:`, `chore:`).\n"
+        "- PR title uses the same conventional format: `<type>: <summary>`.\n"
+        "- The PR body must contain three sections: what (the change), why (the motivation), "
+        "and a test-plan (how you verified it).\n"
+        "- Open the PR with `gh pr create`. Do NOT merge it - a human reviews every change.\n"
+        "- Keep commit messages and PR text professional; no persona flavor in the deliverables.\n"
+    )
+
+    return f"{persona}\n\n{task_block}\n{conventions}"
