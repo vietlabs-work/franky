@@ -37,4 +37,6 @@ RUN useradd --create-home --shell /bin/bash franky
 WORKDIR /work
 USER franky
 
-CMD ["bash"]
+# This image is always invoked with an explicit command by franky/container.py. The default
+# is just a hint for anyone who runs it bare.
+CMD ["echo", "Run via the franky CLI: franky build <issue-url | prose>"]

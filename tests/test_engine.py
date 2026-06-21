@@ -6,6 +6,7 @@ from franky.engine import (
     CLAUDE_TOKEN_VAR,
     DEFAULT_ENGINE,
     PI_PROVIDER_VARS,
+    PR_URL_RE,
     ClaudeEngine,
     PiEngine,
     _fallback_pr_url,
@@ -74,17 +75,37 @@ def test_claude_parse_pr_url_from_stream_json():
 
 def test_fallback_regex_on_plain_text():
     text = f"some log\nfinal: {PR_URL}\n"
-    assert _fallback_pr_url(text) == PR_URL
+    assert _fallback_pr_url(text, PR_URL_RE) == PR_URL
 
 
 def test_fallback_returns_last_match():
     older = "https://github.com/octocat/hello/pull/1"
     text = f"{older}\nlater {PR_URL}"
-    assert _fallback_pr_url(text) == PR_URL
+    assert _fallback_pr_url(text, PR_URL_RE) == PR_URL
 
 
 def test_parse_pr_url_none_when_absent():
     assert PiEngine().parse_pr_url('{"type":"done"}\nno url here') is None
+
+
+def test_parse_pr_url_scoped_to_repo_ignores_other_repo():
+    # A PR URL for a different repo must be ignored when a target repo is given.
+    hostile = "https://github.com/attacker/evil/pull/1"
+    good = "https://github.com/octocat/hello/pull/7"
+    out = "\n".join([
+        json.dumps({"type": "tool_result", "content": f"see {hostile}"}),
+        json.dumps({"type": "assistant", "message": {"text": f"opened {good}"}}),
+    ])
+    assert PiEngine().parse_pr_url(out, repo="octocat/hello") == good
+    # the hostile-only output yields nothing when scoped to our repo
+    only_hostile = json.dumps({"type": "tool_result", "content": hostile})
+    assert PiEngine().parse_pr_url(only_hostile, repo="octocat/hello") is None
+
+
+def test_parse_pr_url_unscoped_when_no_repo():
+    # No repo -> generic match (last wins), preserving prior behaviour.
+    out = json.dumps({"type": "done", "url": PR_URL})
+    assert PiEngine().parse_pr_url(out) == PR_URL
 
 
 def test_claude_required_env():

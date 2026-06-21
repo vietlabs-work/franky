@@ -79,12 +79,18 @@ def test_fail_closed_claude_token_missing():
         load_config("claude", _env())
 
 
-def test_no_secret_value_in_exception_messages():
+@pytest.mark.parametrize("flag, env", [
+    # claude path: token missing, GH_TOKEN present (must not be echoed)
+    ("claude", {"FRANKY_ALLOWED_REPOS": "me/repo", "GH_TOKEN": SECRET}),
+    # GH_TOKEN missing path: a provider key present (must not be echoed)
+    (None, {"FRANKY_ALLOWED_REPOS": "me/repo", "OPENROUTER_API_KEY": SECRET}),
+    # allowlist-missing path: secrets present (must not be echoed)
+    (None, {"GH_TOKEN": SECRET, "OPENROUTER_API_KEY": SECRET}),
+])
+def test_no_secret_value_in_exception_messages(flag, env):
     # every fail-closed path must name the VAR, never echo a secret value
-    env = _env(GH_TOKEN=SECRET, OPENROUTER_API_KEY=SECRET)
-    # claude path: token missing, GH_TOKEN present but should not be echoed
     with pytest.raises(ValueError) as ei:
-        load_config("claude", env)
+        load_config(flag, env)
     assert SECRET not in str(ei.value)
 
 

@@ -32,8 +32,7 @@ def main() -> None:
 @click.option("--repo", "repo", default=None, help="Target repo owner/repo (required for prose tasks).")
 @click.option("--engine", "engine", default=None, type=click.Choice(["pi", "claude"]),
               help="Engine override; else FRANKY_ENGINE, else pi.")
-@click.option("--rebuild", is_flag=True, help="Rebuild the image even if it exists (reserved; v0 only checks presence).")
-def build(task_input: str, repo: str | None, engine: str | None, rebuild: bool) -> None:
+def build(task_input: str, repo: str | None, engine: str | None) -> None:
     """Build TASK_INPUT (a GitHub issue URL or a prose request) and open a PR."""
     # Config + task parse are operator-error surfaces -> clean ClickException, no traceback.
     try:
@@ -48,14 +47,16 @@ def build(task_input: str, repo: str | None, engine: str | None, rebuild: bool) 
     prompt = build_prompt(spec)
     inner_argv = cfg.engine.inner_argv(prompt, model=None)
 
-    if not rebuild and not ensure_image():
+    if not ensure_image():
         raise click.ClickException("franky image not found - build it with `docker build -t franky .`")
 
     code, output = run_in_container(cfg, inner_argv)
 
     _write_log(output, secrets)
 
-    pr_url = cfg.engine.parse_pr_url(output)
+    # Scope PR-URL detection to the task's own repo so a hostile issue body cannot make
+    # Franky report a PR URL for some other (attacker) repo.
+    pr_url = cfg.engine.parse_pr_url(output, repo=spec.repo)
     if pr_url:
         click.echo(pr_url)
     else:

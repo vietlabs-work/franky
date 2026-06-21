@@ -37,11 +37,11 @@ Select with `--engine pi|claude`, or set `FRANKY_ENGINE`. Resolution order:
 
 ## Quickstart
 
-1. Install Docker and build the image (Franky does this for you on first run, or
-   force it with `franky build ... --rebuild`):
+1. Install Docker and build the image once before first use:
    ```
    docker build -t franky .
    ```
+   Franky checks the image exists before each run and tells you to build it if not.
 2. Install Franky:
    ```
    python3 -m venv .venv && .venv/bin/pip install -e .

@@ -7,16 +7,12 @@ printed. A secret value must never survive into a log file or the terminal.
 """
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 
-from .engine import CLAUDE_TOKEN_VAR, PI_PROVIDER_VARS, Engine, resolve_engine
+from .engine import PI_PROVIDER_VARS, Engine, resolve_engine
 
 REDACT_TOKEN = "***REDACTED***"
-
-# Every secret-bearing var name Franky might pass through: all engine creds + the GitHub
-# token. Used for naming (never for reading values into messages).
-REDACTABLE_ENV = (*PI_PROVIDER_VARS, CLAUDE_TOKEN_VAR, "GH_TOKEN")
 
 GH_TOKEN_VAR = "GH_TOKEN"
 ALLOWED_REPOS_VAR = "FRANKY_ALLOWED_REPOS"
@@ -49,7 +45,7 @@ class Config:
         return [v for v in self.passthrough_env.values() if v]
 
 
-def load_config(flag_engine: str | None, env) -> Config:
+def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
     """Resolve engine + build the fail-closed passthrough env.
 
     Order of refusals (all fail-closed; no exception message ever contains a secret VALUE,

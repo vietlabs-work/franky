@@ -41,6 +41,60 @@ def test_build_reaches_pr_url(monkeypatch):
     assert PR_URL in res.output
 
 
+def test_build_engine_flag_selects_engine(monkeypatch):
+    # --engine claude must reach config + select ClaudeEngine end-to-end through the CLI.
+    env = {
+        "FRANKY_ALLOWED_REPOS": "me/repo",
+        "GH_TOKEN": "ghp_fake",
+        "CLAUDE_CODE_OAUTH_TOKEN": "oauth-fake",
+    }
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(cli, "ensure_image", lambda *a, **k: True)
+
+    seen = {}
+
+    def fake_run(cfg, inner_argv, *a, **k):
+        seen["engine"] = cfg.engine.name
+        seen["argv0"] = inner_argv[0]
+        return 0, f"opened {PR_URL}"
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(
+            cli.main, ["build", "do it", "--repo", "me/repo", "--engine", "claude"]
+        )
+    assert res.exit_code == 0, res.output
+    assert seen["engine"] == "claude"
+    assert seen["argv0"] == "claude"
+
+
+def test_build_scopes_pr_url_to_target_repo(monkeypatch):
+    # A hostile PR URL for another repo in the output must NOT be reported; only the
+    # target repo's PR URL is.
+    env = {
+        "FRANKY_ALLOWED_REPOS": "me/repo",
+        "GH_TOKEN": "ghp_fake",
+        "OPENROUTER_API_KEY": "sk-or-fake",
+    }
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(cli, "ensure_image", lambda *a, **k: True)
+    hostile = "https://github.com/attacker/repo/pull/1"
+    good = "https://github.com/me/repo/pull/7"
+    monkeypatch.setattr(
+        cli, "run_in_container",
+        lambda *a, **k: (0, f"saw {good} then {hostile}"),
+    )
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo"])
+    assert res.exit_code == 0, res.output
+    assert good in res.output
+    assert "attacker" not in res.output
+
+
 def test_build_off_allowlist_clean_error(monkeypatch):
     env = {
         "FRANKY_ALLOWED_REPOS": "me/repo",

@@ -26,9 +26,14 @@ def test_build_docker_argv_hardening_flags():
     assert "--security-opt=no-new-privileges" in argv
     assert "--pids-limit=512" in argv
     assert "--memory=4g" in argv
-    # tmpfs is a two-token pair
-    i = argv.index("--tmpfs")
-    assert argv[i + 1] == "/work:exec"
+    # /work and HOME are both writable tmpfs, owned by the non-root run uid so git/gh work
+    # under --read-only. (Verified against the real image: bare /work:exec is root-owned and
+    # a non-root agent cannot write to it; uid= fixes that.)
+    tmpfs_specs = [argv[i + 1] for i, t in enumerate(argv) if t == "--tmpfs"]
+    work = next(s for s in tmpfs_specs if s.startswith("/work:"))
+    home = next(s for s in tmpfs_specs if s.startswith("/home/franky:"))
+    assert "exec" in work and "uid=1001" in work and "gid=1001" in work
+    assert "exec" in home and "uid=1001" in home and "gid=1001" in home
 
 
 def test_build_docker_argv_no_mounts_or_socket():
@@ -48,6 +53,19 @@ def test_build_docker_argv_only_passthrough_env_as_e_flags():
     # only the var NAME appears, never the value
     assert "x" not in argv
     assert "y" not in argv
+
+
+def test_build_docker_argv_cross_engine_env_isolation():
+    # A pi run must never carry the claude token, and a claude run must never carry a pi
+    # provider key. Only the selected engine's creds (+ GH_TOKEN) are passed.
+    pi_argv = build_docker_argv("franky", {"GH_TOKEN": "x", "OPENROUTER_API_KEY": "y"}, ["pi"])
+    pi_e = [pi_argv[i + 1] for i, t in enumerate(pi_argv) if t == "-e"]
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in pi_e
+
+    cl_argv = build_docker_argv("franky", {"GH_TOKEN": "x", "CLAUDE_CODE_OAUTH_TOKEN": "z"}, ["claude"])
+    cl_e = [cl_argv[i + 1] for i, t in enumerate(cl_argv) if t == "-e"]
+    assert "OPENROUTER_API_KEY" not in cl_e
+    assert "CLAUDE_CODE_OAUTH_TOKEN" in cl_e
 
 
 def test_build_docker_argv_image_and_inner_last():
@@ -109,6 +127,19 @@ def test_run_in_container_oserror_returns_nonzero():
     code, out = run_in_container(_cfg(), ["pi"], runner=fake_runner, env={})
     assert code != 0
     assert "could not launch docker" in out
+
+
+def test_run_in_container_warns_on_reap_failure():
+    # If `docker rm -f` fails on a launched run, the container may survive holding the
+    # injected tokens; that must be surfaced (not raised, not silent).
+    def fake_runner(argv, **kwargs):
+        if argv[:2] == ["docker", "run"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="rm failed")  # reaper fails
+
+    code, out = run_in_container(_cfg(), ["pi"], runner=fake_runner, env={})
+    assert code == 0
+    assert "may not have been removed" in out
 
 
 def test_ensure_image_true_when_present():

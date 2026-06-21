@@ -6,6 +6,7 @@ rule, commit style, and PR shape. Tests assert these literal substrings survive.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from .task import TaskSpec
@@ -19,9 +20,11 @@ def load_persona() -> str:
 
 def _slug_hint(spec: TaskSpec) -> str:
     """A short hint the agent turns into the branch slug. Kept loose on purpose - the agent
-    derives the real slug; we only anchor the `franky/` prefix and give it source material."""
+    derives the real slug; we only anchor the `franky/` prefix and give it source material.
+    Non-alphanumerics (incl. the `/` in owner/repo) split into separate words so an issue
+    task hints from the repo name rather than collapsing to the empty default."""
     basis = spec.text if spec.source == "prose" else spec.repo
-    words = [w for w in basis.lower().split() if w.isalnum()][:5]
+    words = [w for w in re.split(r"[^a-z0-9]+", basis.lower()) if w][:5]
     return "-".join(words) or "task"
 
 

@@ -32,22 +32,34 @@ PI_PROVIDER_VARS = (
 CLAUDE_TOKEN_VAR = "CLAUDE_CODE_OAUTH_TOKEN"
 
 
-def _fallback_pr_url(output: str) -> str | None:
-    """Return the LAST github PR URL in plain text, or None. Used when structured
-    per-line parsing yields nothing."""
-    matches = PR_URL_RE.findall(output)
+def _pr_url_pattern(repo: str | None) -> re.Pattern[str]:
+    """A PR-URL regex scoped to `repo` (owner/repo) when given, else the generic one.
+    WHY scope it: the agent echoes issue/comment bodies, so a hostile issue can plant a PR
+    URL for an attacker repo. Anchoring to the task's own repo means we never report a URL
+    that points somewhere we were not asked to act on."""
+    if not repo:
+        return PR_URL_RE
+    return re.compile(r"https://github\.com/" + re.escape(repo) + r"/pull/\d+")
+
+
+def _fallback_pr_url(output: str, pattern: re.Pattern[str]) -> str | None:
+    """Return the LAST PR URL matching `pattern` in plain text, or None. Used when
+    structured per-line parsing yields nothing."""
+    matches = pattern.findall(output)
     return matches[-1] if matches else None
 
 
-def _scan_jsonl_for_pr_url(output: str) -> str | None:
+def _scan_jsonl_for_pr_url(output: str, repo: str | None = None) -> str | None:
     """Both engines emit one JSON object per line. Walk lines, json.loads each (skip any
     non-JSON line, never raise), and return the last PR URL found in the stringified event
     values. Falls back to the plain-text regex over the whole output if nothing is found.
+    Matches are scoped to `repo` when given (see _pr_url_pattern).
 
     WHY scan stringified values rather than a known key: the PR URL can surface in a tool
     result, an assistant text block, or a final summary - the key varies by engine version,
     the URL shape does not.
     """
+    pattern = _pr_url_pattern(repo)
     found: str | None = None
     for line in output.splitlines():
         line = line.strip()
@@ -57,10 +69,10 @@ def _scan_jsonl_for_pr_url(output: str) -> str | None:
             event = json.loads(line)
         except (ValueError, TypeError):
             continue  # not JSON (banner, log line) - skip, never raise
-        match = PR_URL_RE.search(json.dumps(event))
+        match = pattern.search(json.dumps(event))
         if match:
             found = match.group(0)  # keep walking; last wins
-    return found or _fallback_pr_url(output)
+    return found or _fallback_pr_url(output, pattern)
 
 
 class Engine:
@@ -71,7 +83,7 @@ class Engine:
     def inner_argv(self, prompt: str, model: str | None) -> list[str]:
         raise NotImplementedError
 
-    def parse_pr_url(self, output: str) -> str | None:
+    def parse_pr_url(self, output: str, repo: str | None = None) -> str | None:
         raise NotImplementedError
 
     def required_env(self, env: Mapping[str, str] | None = None) -> list[str]:
@@ -87,8 +99,8 @@ class PiEngine(Engine):
             argv += ["--model", model]
         return argv
 
-    def parse_pr_url(self, output: str) -> str | None:
-        return _scan_jsonl_for_pr_url(output)
+    def parse_pr_url(self, output: str, repo: str | None = None) -> str | None:
+        return _scan_jsonl_for_pr_url(output, repo)
 
     def required_env(self, env: Mapping[str, str] | None = None) -> list[str]:
         """The provider vars that ARE set (non-empty) in `env` (defaults to os.environ).
@@ -111,10 +123,12 @@ class ClaudeEngine(Engine):
             argv += ["--model", model]
         return argv
 
-    def parse_pr_url(self, output: str) -> str | None:
-        return _scan_jsonl_for_pr_url(output)
+    def parse_pr_url(self, output: str, repo: str | None = None) -> str | None:
+        return _scan_jsonl_for_pr_url(output, repo)
 
     def required_env(self, env: Mapping[str, str] | None = None) -> list[str]:
+        # env is part of the Engine interface but unused here: claude always needs exactly
+        # this one token, regardless of what else is in the environment.
         return [CLAUDE_TOKEN_VAR]
 
 
