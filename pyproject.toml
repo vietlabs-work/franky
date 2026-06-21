@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "franky"
+version = "0.1.0"
+description = "Franky - a lean personal coding agent that builds in a hardened container and opens a PR."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Viet Tran" }]
+dependencies = ["click>=8.1"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+franky = "franky.cli:main"
+
+[tool.setuptools]
+packages = ["franky"]
+
+[tool.setuptools.package-data]
+franky = ["persona.md"]
