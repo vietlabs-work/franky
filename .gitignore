@@ -7,3 +7,4 @@ tasks/
 *.egg-info/
 build/
 dist/
+.worktrees/
