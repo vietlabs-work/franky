@@ -5,6 +5,7 @@ WHY redaction lives here and is load-bearing: the engine cred and GH_TOKEN value
 through the container env, and the agent's captured stdout/stderr is logged to disk and
 printed. A secret value must never survive into a log file or the terminal.
 """
+
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
@@ -68,7 +69,9 @@ def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
 
     gh_token = env.get(GH_TOKEN_VAR)
     if not gh_token:
-        raise ValueError(f"{GH_TOKEN_VAR} is unset or empty - refusing (needed to clone + open the PR)")
+        raise ValueError(
+            f"{GH_TOKEN_VAR} is unset or empty - refusing (needed to clone + open the PR)"
+        )
 
     cred_vars = engine.required_env(env)
     if not cred_vars:

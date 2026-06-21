@@ -4,6 +4,7 @@ WHY the conventions are spelled out literally: the engine is autonomous inside t
 container, so the prompt is the only place we can pin branch naming, the test-before-PR
 rule, commit style, and PR shape. Tests assert these literal substrings survive.
 """
+
 from __future__ import annotations
 
 import re
@@ -38,10 +39,7 @@ def build_prompt(spec: TaskSpec) -> str:
             f"`gh issue view {spec.text}` to read the full issue body and comments, then build it.\n"
         )
     else:
-        task_block = (
-            f"Repo: {spec.repo}\n"
-            f"Task (prose): {spec.text}\n"
-        )
+        task_block = f"Repo: {spec.repo}\nTask (prose): {spec.text}\n"
 
     conventions = (
         "Conventions (follow exactly):\n"

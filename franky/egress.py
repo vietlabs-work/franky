@@ -5,6 +5,7 @@ from the docker mechanics in container.py. Keeping policy out of the argv builde
 test can assert exactly which hosts are permitted without reasoning about docker flags, and a
 future policy change (a new provider, a new registry) never touches the container plumbing.
 """
+
 from __future__ import annotations
 
 from collections.abc import Mapping

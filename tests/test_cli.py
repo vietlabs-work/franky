@@ -62,9 +62,7 @@ def test_build_engine_flag_selects_engine(monkeypatch):
 
     runner = CliRunner()
     with runner.isolated_filesystem():
-        res = runner.invoke(
-            cli.main, ["build", "do it", "--repo", "me/repo", "--engine", "claude"]
-        )
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo", "--engine", "claude"])
     assert res.exit_code == 0, res.output
     assert seen["engine"] == "claude"
     assert seen["argv0"] == "claude"
@@ -83,7 +81,8 @@ def test_build_scopes_pr_url_to_target_repo(monkeypatch):
     hostile = "https://github.com/attacker/repo/pull/1"
     good = "https://github.com/me/repo/pull/7"
     monkeypatch.setattr(
-        cli, "run_in_container",
+        cli,
+        "run_in_container",
         lambda *a, **k: (0, f"saw {good} then {hostile}"),
     )
 

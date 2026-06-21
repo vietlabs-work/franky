@@ -37,6 +37,8 @@ def test_build_prompt_issue_mentions_fetch():
 def test_issue_branch_hint_uses_repo_name_not_empty_default():
     # Regression: owner/repo has a slash, so a naive isalnum() filter collapsed every
     # issue branch hint to `franky/task`. The hint must reflect the repo.
-    spec = TaskSpec(repo="octocat/hello", text="https://github.com/octocat/hello/issues/42", source="issue")
+    spec = TaskSpec(
+        repo="octocat/hello", text="https://github.com/octocat/hello/issues/42", source="issue"
+    )
     p = build_prompt(spec)
     assert "franky/octocat-hello" in p

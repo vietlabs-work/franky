@@ -22,13 +22,24 @@ def test_pi_inner_argv_without_model():
 
 def test_pi_inner_argv_with_model():
     assert PiEngine().inner_argv("do it", "gpt-x") == [
-        "pi", "-p", "do it", "--mode", "json", "--model", "gpt-x",
+        "pi",
+        "-p",
+        "do it",
+        "--mode",
+        "json",
+        "--model",
+        "gpt-x",
     ]
 
 
 def test_claude_inner_argv_without_model():
     assert ClaudeEngine().inner_argv("do it", None) == [
-        "claude", "-p", "do it", "--output-format", "stream-json", "--dangerously-skip-permissions",
+        "claude",
+        "-p",
+        "do it",
+        "--output-format",
+        "stream-json",
+        "--dangerously-skip-permissions",
     ]
 
 
@@ -92,10 +103,12 @@ def test_parse_pr_url_scoped_to_repo_ignores_other_repo():
     # A PR URL for a different repo must be ignored when a target repo is given.
     hostile = "https://github.com/attacker/evil/pull/1"
     good = "https://github.com/octocat/hello/pull/7"
-    out = "\n".join([
-        json.dumps({"type": "tool_result", "content": f"see {hostile}"}),
-        json.dumps({"type": "assistant", "message": {"text": f"opened {good}"}}),
-    ])
+    out = "\n".join(
+        [
+            json.dumps({"type": "tool_result", "content": f"see {hostile}"}),
+            json.dumps({"type": "assistant", "message": {"text": f"opened {good}"}}),
+        ]
+    )
     assert PiEngine().parse_pr_url(out, repo="octocat/hello") == good
     # the hostile-only output yields nothing when scoped to our repo
     only_hostile = json.dumps({"type": "tool_result", "content": hostile})

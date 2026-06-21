@@ -10,7 +10,9 @@ def test_every_pi_provider_var_maps_to_a_host():
     for var in PI_PROVIDER_VARS:
         if var == "OLLAMA_HOST":
             continue
-        assert var in PI_PROVIDER_HOSTS, f"{var} is in PI_PROVIDER_VARS but missing from PI_PROVIDER_HOSTS"
+        assert var in PI_PROVIDER_HOSTS, (
+            f"{var} is in PI_PROVIDER_VARS but missing from PI_PROVIDER_HOSTS"
+        )
 
 
 def test_claude_allowlist_has_anthropic_github_registries():
