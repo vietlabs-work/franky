@@ -49,6 +49,8 @@ def build(task_input: str, repo: str | None, engine: str | None) -> None:
 
     if not ensure_image():
         raise click.ClickException("franky image not found - build it with `docker build -t franky .`")
+    if not ensure_image("franky-proxy"):
+        raise click.ClickException("franky-proxy image not found - build it with `docker build -t franky-proxy proxy/`")
 
     code, output = run_in_container(cfg, inner_argv)
 
