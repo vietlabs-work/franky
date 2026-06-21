@@ -16,6 +16,7 @@ REDACT_TOKEN = "***REDACTED***"
 
 GH_TOKEN_VAR = "GH_TOKEN"
 ALLOWED_REPOS_VAR = "FRANKY_ALLOWED_REPOS"
+EXTRA_ALLOWED_DOMAINS_VAR = "FRANKY_EXTRA_ALLOWED_DOMAINS"
 
 
 def redact(text: str, secrets: Iterable[str]) -> str:
@@ -38,6 +39,7 @@ class Config:
     engine: Engine
     allowed_repos: list[str]
     passthrough_env: dict[str, str] = field(default_factory=dict)
+    extra_allowed_domains: list[str] = field(default_factory=list)
 
     def secret_values(self) -> list[str]:
         """The actual secret strings to scrub from any output. Just the values of the
@@ -88,7 +90,18 @@ def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
             f"engine '{engine.name}' requires {', '.join(missing)} but they are unset - refusing"
         )
 
-    return Config(engine=engine, allowed_repos=allowed, passthrough_env=passthrough)
+    # Extra egress-allowlist domains are OPTIONAL (not fail-closed): the default allowlist
+    # already covers the provider + GitHub + registries; this is for the occasional extra
+    # host a specific task needs. Domains are policy, not secrets, so no redaction concern.
+    raw_extra = env.get(EXTRA_ALLOWED_DOMAINS_VAR, "") or ""
+    extra_domains = [d.strip() for d in raw_extra.split(",") if d.strip()]
+
+    return Config(
+        engine=engine,
+        allowed_repos=allowed,
+        passthrough_env=passthrough,
+        extra_allowed_domains=extra_domains,
+    )
 
 
 def repo_allowed(repo: str, allowed: list[str]) -> bool:

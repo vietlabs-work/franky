@@ -11,6 +11,7 @@ import json
 import os
 import re
 from collections.abc import Mapping
+from urllib.parse import urlparse
 
 # Fallback when structured parsing finds nothing: agents print the PR URL near the end,
 # so the LAST match is the real one (earlier matches may be a quoted issue link etc).
@@ -30,6 +31,37 @@ PI_PROVIDER_VARS = (
 )
 
 CLAUDE_TOKEN_VAR = "CLAUDE_CODE_OAUTH_TOKEN"
+
+# Which network host each provider cred talks to. WHY this is SEPARATE from required_env:
+# required_env is about cred gating (do we have a key at all), this is about the egress
+# allowlist (which host must the proxy let through so the engine can reach its provider).
+# OLLAMA_HOST is deliberately absent here - its value is a URL, not a fixed host, so it is
+# parsed at runtime (see PiEngine.provider_hosts).
+PI_PROVIDER_HOSTS = {
+    "ANTHROPIC_API_KEY": "api.anthropic.com",
+    "ANTHROPIC_OAUTH_TOKEN": "api.anthropic.com",
+    "OPENROUTER_API_KEY": "openrouter.ai",
+    "OPENAI_API_KEY": "api.openai.com",
+    "GEMINI_API_KEY": "generativelanguage.googleapis.com",
+    "GROQ_API_KEY": "api.groq.com",
+    "MISTRAL_API_KEY": "api.mistral.ai",
+}
+
+
+def _ollama_host(value: str) -> str | None:
+    """Parse the host out of an OLLAMA_HOST value. The value is a URL (e.g.
+    http://host:11434); urlparse gives us its netloc host. If there is no scheme, urlparse
+    treats the whole thing as a path, so fall back to the bare value as a host. Returns None
+    for an empty value (nothing to allow)."""
+    value = value.strip()
+    if not value:
+        return None
+    host = urlparse(value).hostname
+    if host:
+        return host
+    # No scheme -> urlparse parsed it as a path. Re-parse with a dummy `//` prefix so netloc
+    # parsing handles host[:port] AND bracketed IPv6 ([::1]:11434 -> ::1) correctly.
+    return urlparse(f"//{value}").hostname
 
 
 def _pr_url_pattern(repo: str | None) -> re.Pattern[str]:
@@ -89,6 +121,12 @@ class Engine:
     def required_env(self, env: Mapping[str, str] | None = None) -> list[str]:
         raise NotImplementedError
 
+    def provider_hosts(self, env: Mapping[str, str] | None = None) -> list[str]:
+        """The network hosts the engine must reach to talk to its model provider. Feeds the
+        egress allowlist. SEPARATE from required_env (cred gating) on purpose - same source
+        data, different concern."""
+        raise NotImplementedError
+
 
 class PiEngine(Engine):
     name = "pi"
@@ -108,6 +146,26 @@ class PiEngine(Engine):
         same mapping it resolves the rest of the config from."""
         env = os.environ if env is None else env
         return [v for v in PI_PROVIDER_VARS if env.get(v)]
+
+    def provider_hosts(self, env: Mapping[str, str] | None = None) -> list[str]:
+        """For each provider var actually set in `env` (defaults to os.environ), the host it
+        talks to. OLLAMA_HOST is parsed from its URL value; the rest map via
+        PI_PROVIDER_HOSTS. Deduped, empties dropped, sorted for a deterministic allowlist."""
+        env = os.environ if env is None else env
+        hosts: set[str] = set()
+        # Iterate the KNOWN provider vars (not env.items()) so an unrelated env var that
+        # happens to collide with a map key can never widen the allowlist. Mirrors required_env.
+        for var in PI_PROVIDER_VARS:
+            value = env.get(var)
+            if not value:
+                continue
+            if var == "OLLAMA_HOST":
+                host = _ollama_host(value)
+                if host:
+                    hosts.add(host)
+            elif var in PI_PROVIDER_HOSTS:
+                hosts.add(PI_PROVIDER_HOSTS[var])
+        return sorted(hosts)
 
 
 class ClaudeEngine(Engine):
@@ -130,6 +188,10 @@ class ClaudeEngine(Engine):
         # env is part of the Engine interface but unused here: claude always needs exactly
         # this one token, regardless of what else is in the environment.
         return [CLAUDE_TOKEN_VAR]
+
+    def provider_hosts(self, env: Mapping[str, str] | None = None) -> list[str]:
+        # Like required_env, claude ignores env: it always talks to exactly one host.
+        return ["api.anthropic.com"]
 
 
 ENGINES: dict[str, type[Engine]] = {"pi": PiEngine, "claude": ClaudeEngine}

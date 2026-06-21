@@ -10,10 +10,11 @@ franky build "add a --json flag to the export command" --repo you/repo
 franky build "fix the flaky retry test" --repo you/repo --engine claude
 ```
 
-The agent is autonomous inside the container. The safety gate is three layers:
-a hardened, network-isolated-from-the-host container, a fail-closed trusted-repo
-allowlist, and the fact that Franky opens a PR rather than merging - a human still
-reviews every change.
+The agent is autonomous inside the container. The safety gate is four layers:
+a hardened container, a default-deny egress allowlist (the container reaches only
+your provider + GitHub + registries, via a creds-blind proxy), a fail-closed
+trusted-repo allowlist, and the fact that Franky opens a PR rather than merging -
+a human still reviews every change.
 
 ## Why
 
@@ -37,11 +38,14 @@ Select with `--engine pi|claude`, or set `FRANKY_ENGINE`. Resolution order:
 
 ## Quickstart
 
-1. Install Docker and build the image once before first use:
+1. Install Docker and build BOTH images once before first use:
    ```
    docker build -t franky .
+   docker build -t franky-proxy proxy/
    ```
-   Franky checks the image exists before each run and tells you to build it if not.
+   `franky` runs the agent; `franky-proxy` is the egress allowlist proxy (see
+   Security). Franky checks both images exist before each run and tells you to
+   build them if not.
 2. Install Franky:
    ```
    python3 -m venv .venv && .venv/bin/pip install -e .
@@ -75,14 +79,42 @@ container with:
   the container, so the agent never touches your filesystem
 - only the selected engine's required env vars passed in; nothing else
 
-**Open egress is the v0 residual risk.** The container can still reach the network
-(it has to, to clone and push). That means a prompt-injected agent - fed a
-malicious issue or a poisoned repo - could exfiltrate whatever credentials are in
-the container env: your Claude subscription token, or your BYOK API key. The
-disposable container does NOT bound this. Only egress control does, and that is
-deferred to v0.2 (an egress-proxy sidecar).
+### Egress control (v0.2)
 
-v0 mitigations, none of which fully close the above:
+The big v0 hole - a prompt-injected agent exfiltrating the creds it carries -
+is now closed by a default-deny egress allowlist. The task container runs on a
+Docker `--internal` network with NO route to the internet; its only peer is a
+Squid proxy enforcing a domain allowlist.
+
+```
+                  Docker --internal network (no internet route)
+   +-----------------------------------------------------------------+
+   |                                                                 |
+   |   [ task container ] --HTTP(S)_PROXY--> [ franky-proxy (Squid) ]-+--> allowlisted
+   |    --dns 127.0.0.1                       default-deny allowlist  |    hosts only
+   |    (no creds on argv)                    (sees NO creds)         |
+   +-----------------------------------------------------------------+
+```
+
+- **Blind CONNECT, no creds at the proxy.** Egress is HTTPS-only (port 443):
+  Squid tunnels it with a blind CONNECT (no TLS termination), so it never sees the
+  bytes - your Claude token or BYOK key tunnel through encrypted and are never
+  visible to the proxy. Plain HTTP (port 80) is denied outright, so there is no
+  cleartext, proxy-visible path even to an allowlisted host.
+- **DNS is killed in the task container** (`--dns 127.0.0.1`), so a hostile agent
+  cannot resolve or reach an off-allowlist host directly; only the proxy resolves.
+- **Fail-closed.** Franky refuses to start the task unless the proxy is confirmed
+  healthy, and the proxy refuses to start with an empty or malformed allowlist.
+- **The allowlist** covers: your engine's provider host (e.g. `api.anthropic.com`,
+  `openrouter.ai`), GitHub (clone/push/PR), and the npm + PyPI registries. Add
+  extra hosts with `FRANKY_EXTRA_ALLOWED_DOMAINS` (comma-separated).
+
+**Residual risk.** The allowlisted hosts are high-trust, but the agent can still
+reach GitHub, your model provider, and the package registries - so a determined
+injection could still smuggle data to one of those (e.g. a gist, an issue
+comment). Treat allowlisted destinations as trusted, not inert.
+
+v0 mitigations, still in force:
 
 1. **Fail-closed trusted-repo allowlist.** Franky refuses any repo not in
    `FRANKY_ALLOWED_REPOS`, and refuses everything if that var is unset. This
@@ -91,9 +123,6 @@ v0 mitigations, none of which fully close the above:
    on the target repos. Prefer a low-spend or separate API key for `pi`.
 3. **PR, not merge.** Franky only opens PRs. You review before anything lands.
 
-**Do not point Franky at issues or repos whose content you do not trust until
-egress filtering lands (v0.2).**
-
 **GitHub Actions warning.** Opening a PR can trigger workflows. A PR built from an
 attacker-influenced issue could run attacker-influenced workflow code with your
 repo's Actions secrets. Review workflow changes in the PR diff, and consider
@@ -101,6 +130,7 @@ requiring approval for workflow runs on PRs.
 
 ## Status
 
-v0. Real end-to-end runs need live engine credentials, supplied out-of-band by the
-operator. The pieces under test here are the container hardening, the secret
-redaction, the allowlist, and the engine abstraction.
+v0.2. Real end-to-end runs need live engine credentials, supplied out-of-band by
+the operator. The pieces under test here are the container hardening, the egress
+allowlist + proxy orchestration, the secret redaction, the trusted-repo allowlist,
+and the engine abstraction.
