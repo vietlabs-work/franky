@@ -81,10 +81,15 @@ export FRANKY_PROXY_IMAGE=franky-proxy
      `CLAUDE_CODE_OAUTH_TOKEN` for `claude`).
 4. Run:
    ```
-   franky build <gh-issue-url | "prose"> [--repo owner/repo] [--engine pi|claude]
+   franky build <gh-issue-url | "prose"> [--repo owner/repo] [--engine pi|claude] [--plan-first]
    ```
 
 Each run writes a redacted log to `tasks/<timestamp>.log` and prints the PR URL.
+
+`--plan-first` adds an opt-in approval gate for sensitive targets: Franky runs a
+read-only planning pass, prints the plan, and waits for explicit confirmation
+before it builds or opens a PR. Decline (or run non-interactively) and nothing is
+written. The default stays autonomous - the sandbox plus PR review is the gate.
 
 `franky build` also does a quick (~1s, cached) check for a newer release and
 prints a one-line hint if one exists - it never blocks the build. Silence it with

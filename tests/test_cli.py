@@ -261,6 +261,117 @@ def test_build_scopes_pr_url_to_target_repo(monkeypatch):
     assert "attacker" not in res.output
 
 
+def _plan_first_env():
+    return {
+        "FRANKY_ALLOWED_REPOS": "me/repo",
+        "GH_TOKEN": "ghp_fake",
+        "OPENROUTER_API_KEY": "sk-or-fake",
+    }
+
+
+def test_build_plan_first_help_shows_flag():
+    res = CliRunner().invoke(cli.main, ["build", "--help"])
+    assert res.exit_code == 0
+    assert "--plan-first" in res.output
+
+
+def test_build_plan_first_declined_does_not_execute(monkeypatch):
+    # Declining the gate: the planning pass runs ONCE, the plan is shown, and no build pass
+    # or PR follows.
+    monkeypatch.setattr(cli.os, "environ", _plan_first_env())
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+
+    calls = {"n": 0}
+
+    def fake_run(*a, **k):
+        calls["n"] += 1
+        return 0, "PLAN: step 1, step 2"
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(
+            cli.main, ["build", "do it", "--repo", "me/repo", "--plan-first"], input="n\n"
+        )
+    assert res.exit_code == 0, res.output
+    assert calls["n"] == 1  # only the planning pass ran
+    assert "PLAN: step 1, step 2" in res.output  # the plan was surfaced
+    assert "aborted" in res.output
+    assert PR_URL not in res.output
+
+
+def test_build_plan_first_approved_executes_and_prs(monkeypatch):
+    # Approving the gate: planning pass THEN build pass; the build pass's PR URL is reported.
+    monkeypatch.setattr(cli.os, "environ", _plan_first_env())
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+
+    outputs = ["PLAN: do the thing", f"opened {PR_URL}"]
+
+    def fake_run(*a, **k):
+        return 0, outputs.pop(0)
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(
+            cli.main, ["build", "do it", "--repo", "me/repo", "--plan-first"], input="y\n"
+        )
+    assert res.exit_code == 0, res.output
+    assert not outputs  # both passes ran
+    assert PR_URL in res.output
+
+
+def test_build_plan_first_non_interactive_fails_closed(monkeypatch):
+    # No stdin to answer the gate (CI / piped) must fail closed: the planning pass runs, the
+    # gate aborts (no approval), and the build pass never runs.
+    monkeypatch.setattr(cli.os, "environ", _plan_first_env())
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+
+    calls = {"n": 0}
+
+    def fake_run(*a, **k):
+        calls["n"] += 1
+        return 0, "PLAN: step 1"
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo", "--plan-first"])
+    assert res.exit_code != 0  # click aborts the confirm cleanly (no traceback)
+    assert calls["n"] == 1  # only the planning pass ran; no build
+    assert PR_URL not in res.output
+
+
+def test_build_plan_first_planning_failure_aborts_before_gate(monkeypatch):
+    # A planning pass that errors must NOT proceed to a build pass.
+    monkeypatch.setattr(cli.os, "environ", _plan_first_env())
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+
+    calls = {"n": 0}
+
+    def fake_run(*a, **k):
+        calls["n"] += 1
+        return 1, "boom"
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(
+            cli.main, ["build", "do it", "--repo", "me/repo", "--plan-first"], input="y\n"
+        )
+    assert res.exit_code != 0
+    assert calls["n"] == 1  # never reached the build pass
+    assert "planning pass" in res.output
+
+
 def test_build_off_allowlist_clean_error(monkeypatch):
     env = {
         "FRANKY_ALLOWED_REPOS": "me/repo",
