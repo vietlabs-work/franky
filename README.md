@@ -113,13 +113,43 @@ Read this before pointing Franky at anything.
 OS-level isolation is what bounds it, not tool-permission prompts. Franky runs the
 container with:
 
-- `--cap-drop=ALL` and `--security-opt=no-new-privileges`
-- `--read-only` root filesystem, writable work only via `--tmpfs /work`
-- `--pids-limit` and `--memory` caps
-- a non-root user baked into the image
+- `--cap-drop=ALL`, then adds back only `CAP_SETUID`/`CAP_SETGID` (needed by the
+  rootless Docker daemon - see "Docker-in-Docker" below)
+- `--read-only` root filesystem; writable paths only via `--tmpfs` (the clone, the
+  agent's HOME, and the rootless Docker data root, each owned by the non-root uid)
+- `--pids-limit` and `--memory` caps (with `--memory-swap` = `--memory`, no swap)
+- a non-root user (uid 1001) baked into the image
 - **no Docker socket mount and no host bind mounts** - the repo is cloned inside
-  the container, so the agent never touches your filesystem
+  the container and the nested Docker daemon is rootless, so the agent never
+  touches your filesystem or your host's Docker daemon
 - only the selected engine's required env vars passed in; nothing else
+
+### Docker-in-Docker (always on)
+
+Many repos cannot run their test suite without Docker (compose-based integration
+tests, testcontainers, a `docker build` step). So every Franky container runs its
+**own rootless Docker daemon** - the agent can `docker build`, `docker compose up`
+test infra, and run testcontainers entirely inside the sandbox. Nothing to enable;
+it is always available.
+
+This is rootless DinD (a daemon running as the non-root `franky` user inside its
+own user namespace), **not** a mounted host Docker socket and **not** `--privileged`.
+It needs a few specific, minimal relaxations of the locked profile, applied to every
+task and verified on Docker Desktop for Mac:
+
+- `--security-opt=no-new-privileges` is **dropped** (it blocks the setuid uid-map
+  helpers rootless Docker needs to start),
+- `--security-opt=systempaths=unconfined` (unmasks `/proc` so the nested runtime can
+  mount it for inner containers - far narrower than `--privileged`/`seccomp=unconfined`),
+- `CAP_SETUID`/`CAP_SETGID` added back on top of `--cap-drop=ALL`, and `/dev/net/tun`
+  for the rootless network stack.
+
+The blast radius stays bounded by everything else (rootless user namespace, read-only
+root, the egress cage below, no host FS, repo allowlist, PR-not-merge). The nested
+daemon's image pulls and `docker build` fetches go **through the same egress proxy**
+(it inherits `HTTP(S)_PROXY`), and inner containers have no route to the internet
+except that proxy - verified: an off-allowlist `docker build` `FROM` or `RUN` fetch is
+refused by the proxy, and a nested container's direct egress has no route out.
 
 ### Egress control
 
@@ -148,13 +178,28 @@ Squid proxy enforcing a domain allowlist.
 - **Fail-closed.** Franky refuses to start the task unless the proxy is confirmed
   healthy, and the proxy refuses to start with an empty or malformed allowlist.
 - **The allowlist** covers: your engine's provider host (e.g. `api.anthropic.com`,
-  `openrouter.ai`), GitHub (clone/push/PR), and the npm + PyPI registries. Add
+  `openrouter.ai`), GitHub (clone/push/PR), the npm + PyPI registries, and - because
+  Docker-in-Docker is always on - a broad set of well-known **container image
+  registries** (Docker Hub + CDN, GHCR, GCR/Artifact Registry, `registry.k8s.io`,
+  Quay, ECR Public, MCR, GitLab, plus the CDNs they serve layer blobs from). Add
   extra hosts with `FRANKY_EXTRA_ALLOWED_DOMAINS` (comma-separated).
 
 **Residual risk.** The allowlisted hosts are high-trust, but the agent can still
-reach GitHub, your model provider, and the package registries - so a determined
-injection could still smuggle data to one of those (e.g. a gist, an issue
-comment). Treat allowlisted destinations as trusted, not inert.
+reach GitHub, your model provider, the package registries, and the container
+registries above - so a determined injection could still smuggle data to one of
+those (e.g. a gist, an issue comment). Treat allowlisted destinations as trusted,
+not inert. Two consequences of always-on DinD specifically:
+
+- **Wider reachable set + a relaxed profile on every task** (incl. non-Docker ones):
+  the registry allowlist is broad (notably `.cloudfront.net`, a shared CDN), and the
+  hardening relaxations above apply universally. This is a deliberate trade for
+  "building/testing just works".
+- **The agent can move its own creds into nested containers** (e.g. `docker run -e
+  GH_TOKEN ...`). The egress allowlist still bounds *where* anything can go and
+  PR-not-merge still bounds the damage, but the secret is no longer confined to a
+  single process. There is also no per-inner-container resource limit and no
+  cross-task concurrency cap - the outer `--memory`/`--pids` cap (~8 GB, tmpfs image
+  storage is RAM) bounds one task's whole container tree.
 
 v0 mitigations, still in force:
 
