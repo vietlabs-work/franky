@@ -472,3 +472,66 @@ def test_update_nonzero_exit_propagates(monkeypatch):
     monkeypatch.setattr(cli, "force_update", lambda *, force, out: 1)
     res = CliRunner().invoke(cli.main, ["update"])
     assert res.exit_code == 1
+
+
+# ---------------------------------------------------------------------------
+# JIRA input via CLI
+# ---------------------------------------------------------------------------
+
+
+def test_build_jira_reaches_pr_url(monkeypatch):
+    """franky build jira FOO-123 --repo me/repo fetches the issue and reaches the PR URL."""
+    env = {
+        "FRANKY_ALLOWED_REPOS": "me/repo",
+        "GH_TOKEN": "ghp_fake",
+        "OPENROUTER_API_KEY": "sk-or-fake",
+        "JIRA_BASE_URL": "https://example.atlassian.net",
+        "JIRA_EMAIL": "user@example.com",
+        "JIRA_API_TOKEN": "tok-fake",
+    }
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: (0, f"opened {PR_URL}"))
+    monkeypatch.setattr(cli, "fetch_jira_issue", lambda key, env: f"[{key}] do it")
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "jira", "FOO-123", "--repo", "me/repo"])
+    assert res.exit_code == 0, res.output
+    assert PR_URL in res.output
+
+
+def test_build_jira_fetch_failure_clean_error_no_container(monkeypatch):
+    """A JIRA fetch failure must surface as a clean ClickException and never reach the container."""
+    env = {
+        "FRANKY_ALLOWED_REPOS": "me/repo",
+        "GH_TOKEN": "ghp_fake",
+        "OPENROUTER_API_KEY": "sk-or-fake",
+        "JIRA_BASE_URL": "https://example.atlassian.net",
+        "JIRA_EMAIL": "user@example.com",
+        "JIRA_API_TOKEN": "tok-fake",
+    }
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+
+    ran = {"container": False}
+
+    def _no_container(*a, **k):
+        ran["container"] = True
+        return 0, ""
+
+    monkeypatch.setattr(cli, "run_in_container", _no_container)
+
+    def _boom(key, env):
+        raise ValueError("JIRA issue FOO-123 not found")
+
+    monkeypatch.setattr(cli, "fetch_jira_issue", _boom)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "jira", "FOO-123", "--repo", "me/repo"])
+    assert res.exit_code != 0
+    assert "not found" in res.output
+    assert ran["container"] is False  # fetch failure short-circuits before any container run

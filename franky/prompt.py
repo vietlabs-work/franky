@@ -23,8 +23,12 @@ def _slug_hint(spec: TaskSpec) -> str:
     """A short hint the agent turns into the branch slug. Kept loose on purpose - the agent
     derives the real slug; we only anchor the `franky/` prefix and give it source material.
     Non-alphanumerics (incl. the `/` in owner/repo) split into separate words so an issue
-    task hints from the repo name rather than collapsing to the empty default."""
-    basis = spec.text if spec.source == "prose" else spec.repo
+    task hints from the repo name rather than collapsing to the empty default.
+
+    issue -> slug from repo name (owner/repo has no useful text).
+    prose/jira -> slug from text (jira text begins "[FOO-123] ..." -> readable slug).
+    """
+    basis = spec.repo if spec.source == "issue" else spec.text
     words = [w for w in re.split(r"[^a-z0-9]+", basis.lower()) if w][:5]
     return "-".join(words) or "task"
 
@@ -58,6 +62,9 @@ def _task_block(spec: TaskSpec, *, plan: bool) -> tuple[str, str]:
                     f"- The PR body must include `Closes #{m.group('number')}` (a GitHub closing "
                     "keyword) so the issue auto-closes when the PR is merged.\n"
                 )
+    elif spec.source == "jira":
+        label = "Task to plan (from JIRA)" if plan else "Task (from JIRA)"
+        task_block = f"Repo: {spec.repo}\n{label}: {spec.text}\n"
     else:
         label = "Task to plan (prose)" if plan else "Task (prose)"
         task_block = f"Repo: {spec.repo}\n{label}: {spec.text}\n"

@@ -6,6 +6,7 @@ implements the change, and opens a pull request for you to review.
 
 ```
 franky build https://github.com/you/repo/issues/42
+franky build jira FOO-123 --repo you/repo
 franky build "add a --json flag to the export command" --repo you/repo
 franky build "fix the flaky retry test" --repo you/repo --engine claude
 ```
@@ -79,9 +80,11 @@ export FRANKY_PROXY_IMAGE=franky-proxy
    - `GH_TOKEN` - scoped to contents + pull_requests on those repos.
    - the selected engine's creds (a provider key for `pi`, or
      `CLAUDE_CODE_OAUTH_TOKEN` for `claude`).
+   - for JIRA tasks: `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN` (host-side only,
+     never forwarded into the container).
 4. Run:
    ```
-   franky build <gh-issue-url | "prose"> [--repo owner/repo] [--engine pi|claude] [--plan-first]
+   franky build <gh-issue-url | jira KEY | "prose"> [--repo owner/repo] [--engine pi|claude] [--plan-first]
    ```
 
 Each run writes a redacted log to `tasks/<timestamp>.log` and prints the PR URL.

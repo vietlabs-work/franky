@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 from collections.abc import Mapping
+from dataclasses import replace as dc_replace
 from datetime import datetime
 from pathlib import Path
 
@@ -28,8 +29,9 @@ from .container import (
     run_in_container,
 )
 from .engine import resolve_engine
+from .jira import JIRA_API_TOKEN_VAR, JIRA_EMAIL_VAR, fetch_jira_issue
 from .prompt import build_plan_prompt, build_prompt
-from .task import parse_task
+from .task import PROSE_MAX_CHARS, parse_task
 from .update_check import force_update, maybe_auto_update
 
 TASKS_DIR = Path("tasks")
@@ -41,9 +43,9 @@ def main() -> None:
 
 
 @main.command()
-@click.argument("task_input")
+@click.argument("task_input", nargs=-1, required=True)
 @click.option(
-    "--repo", "repo", default=None, help="Target repo owner/repo (required for prose tasks)."
+    "--repo", "repo", default=None, help="Target repo owner/repo (required for prose/jira tasks)."
 )
 @click.option(
     "--engine",
@@ -58,14 +60,23 @@ def main() -> None:
     is_flag=True,
     help="Run a read-only planning pass first, show the plan, and execute only after approval.",
 )
-def build(task_input: str, repo: str | None, engine: str | None, plan_first: bool) -> None:
-    """Build TASK_INPUT (a GitHub issue URL or a prose request) and open a PR.
+def build(
+    task_input: tuple[str, ...], repo: str | None, engine: str | None, plan_first: bool
+) -> None:
+    """Build TASK_INPUT (a GitHub issue URL, a JIRA key, or a prose request) and open a PR.
+
+    Examples:
+      franky build https://github.com/you/repo/issues/42
+      franky build jira FOO-123 --repo you/repo
+      franky build "add a --json flag" --repo you/repo
 
     With --plan-first, Franky first runs the engine in a read-only planning pass, prints the
     plan, and waits for explicit approval; nothing is built or PR'd until you confirm. The
     approval gate is the hard guarantee (the planning container is still autonomous), so a
     declined or non-interactive run writes nothing.
     """
+    task_input_str = " ".join(task_input)
+
     # Best-effort, hint-only update check (never blocks/raises; ~1s budget, cached). Prints
     # a one-line stderr hint if a newer release exists. Silenced by FRANKY_NO_UPDATE_CHECK=1.
     maybe_auto_update()
@@ -73,10 +84,15 @@ def build(task_input: str, repo: str | None, engine: str | None, plan_first: boo
     # Config + task parse are operator-error surfaces -> clean ClickException, no traceback.
     try:
         cfg = load_config(engine, os.environ)
-        spec = parse_task(task_input, repo, cfg.allowed_repos)
+        spec = parse_task(task_input_str, repo, cfg.allowed_repos)
+        if spec.source == "jira":
+            # Fetch the JIRA issue host-side (the container has no JIRA creds or egress).
+            # A fetch failure raises ValueError, caught by the same handler below.
+            body = fetch_jira_issue(spec.text, os.environ)
+            spec = dc_replace(spec, text=body[:PROSE_MAX_CHARS].strip())
     except ValueError as exc:
-        # load_config/parse_task never put a secret value in their messages, but redact
-        # defensively in case a future message ever interpolates env.
+        # load_config/parse_task/fetch_jira_issue never put a secret value in their
+        # messages, but redact defensively in case a future message ever interpolates env.
         raise click.ClickException(redact(str(exc), cfg_secrets_safe())) from exc
 
     secrets = cfg.secret_values()
@@ -147,8 +163,14 @@ def build(task_input: str, repo: str | None, engine: str | None, plan_first: boo
 
 def cfg_secrets_safe() -> list[str]:
     """Best-effort secret list for redacting an error raised before cfg fully exists.
-    Falls back to empty (load_config messages are already value-free)."""
-    return []
+
+    Reads the JIRA token (and email) directly from os.environ so they are available even
+    when load_config raised before cfg was assigned, and on the host-side JIRA fetch path
+    which never reaches passthrough_env. Falls back gracefully (empty list) when the vars
+    are absent - load_config/parse_task/fetch_jira_issue messages are already value-free,
+    so this is a defensive backstop.
+    """
+    return [v for v in (os.environ.get(JIRA_API_TOKEN_VAR), os.environ.get(JIRA_EMAIL_VAR)) if v]
 
 
 def _write_log(output: str, secrets: list[str]) -> None:
