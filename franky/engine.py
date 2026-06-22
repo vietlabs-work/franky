@@ -109,7 +109,7 @@ def _scan_jsonl_for_pr_url(output: str, repo: str | None = None) -> str | None:
 
 
 class Engine:
-    """Base engine. Subclasses set `name` and implement the three behaviours."""
+    """Base engine. Subclasses set `name` and implement the required behaviours."""
 
     name: str = ""
 
@@ -126,6 +126,14 @@ class Engine:
         """The network hosts the engine must reach to talk to its model provider. Feeds the
         egress allowlist. SEPARATE from required_env (cred gating) on purpose - same source
         data, different concern."""
+        raise NotImplementedError
+
+    def cred_hint(self) -> str:
+        """Operator-facing description of which cred var(s) to set when NONE are present, for
+        load_config's fail-closed refusal. Each engine owns its own hint so the refusal names
+        THIS engine's vars - shared config never hardcodes one engine's vars. Only called when
+        `required_env` returns [] (no creds at all), so it answers "what should the operator
+        set" rather than "which creds are usable now"."""
         raise NotImplementedError
 
 
@@ -168,6 +176,10 @@ class PiEngine(Engine):
                 hosts.add(PI_PROVIDER_HOSTS[var])
         return sorted(hosts)
 
+    def cred_hint(self) -> str:
+        # pi is BYOK: any one of the provider vars is enough, so list them all.
+        return f"set one of: {', '.join(PI_PROVIDER_VARS)}"
+
 
 class ClaudeEngine(Engine):
     name = "claude"
@@ -196,6 +208,9 @@ class ClaudeEngine(Engine):
     def provider_hosts(self, env: Mapping[str, str] | None = None) -> list[str]:
         # Like required_env, claude ignores env: it always talks to exactly one host.
         return ["api.anthropic.com"]
+
+    def cred_hint(self) -> str:
+        return f"set {CLAUDE_TOKEN_VAR}"
 
 
 ENGINES: dict[str, type[Engine]] = {"pi": PiEngine, "claude": ClaudeEngine}
