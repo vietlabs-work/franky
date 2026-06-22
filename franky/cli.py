@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import time
 from collections.abc import Mapping
 from dataclasses import replace as dc_replace
 from datetime import datetime
@@ -21,6 +22,7 @@ import click
 from . import franky_version
 from ._install import detect_install
 from .config import load_config, redact
+from .economics import Usage, format_economics, parse_usage
 from .container import (
     FRANKY_IMAGE_VAR,
     FRANKY_PROXY_IMAGE_VAR,
@@ -120,18 +122,25 @@ def build(
                 f"For local dev: `{dev_build}` and set {dev_var}=<local-tag>."
             )
 
-    def _run(prompt: str) -> tuple[int, str]:
-        """Run one container pass for `prompt`; log the redacted output. Used by both the
-        planning pass and the build pass so they share the image/proxy/log plumbing."""
+    def _run(prompt: str) -> tuple[int, str, float]:
+        """Run one container pass for `prompt` and return (exit_code, output, duration_secs).
+
+        Duration is measured with time.monotonic() around run_in_container only.
+        Logging is the caller's responsibility so the build pass can attach an economics
+        footer while the planning pass logs without one.
+        """
         inner_argv = cfg.engine.inner_argv(prompt, model=None)
+        t0 = time.monotonic()
         code, output = run_in_container(cfg, inner_argv, image=franky_img, proxy_image=proxy_img)
-        _write_log(output, secrets)
-        return code, output
+        duration = time.monotonic() - t0
+        return code, output, duration
 
     if plan_first:
         # PHASE 1: planning pass. Show the plan, then gate on explicit approval. A plan that
-        # errored is not a plan to approve, so abort before the gate.
-        code, output = _run(build_plan_prompt(spec))
+        # errored is not a plan to approve, so abort before the gate. No economics on this
+        # pass - economics is build-pass only.
+        code, output, _plan_dur = _run(build_plan_prompt(spec))
+        _write_log(output, secrets)
         click.echo("franky: --- plan (read-only, nothing written yet) ---", err=True)
         click.echo(output)
         if code != 0:
@@ -144,7 +153,17 @@ def build(
             return
 
     # PHASE 2 (or the only phase without --plan-first): build it and open the PR.
-    code, output = _run(build_prompt(spec))
+    code, output, duration = _run(build_prompt(spec))
+
+    # Compute and emit economics before the PR-URL echo and before any ClickException so
+    # the summary is always shown (even when the agent exits non-zero). Degrade to all-unknown
+    # on any parse/format error so the run never fails due to economics.
+    try:
+        econ = redact(format_economics(parse_usage(output), duration), secrets)
+    except Exception:
+        econ = redact(format_economics(Usage(), duration), secrets)
+    click.echo(econ, err=True)
+    _write_log(output, secrets, footer=econ)
 
     # Scope PR-URL detection to the task's own repo so a hostile issue body cannot make
     # Franky report a PR URL for some other (attacker) repo.
@@ -173,11 +192,18 @@ def cfg_secrets_safe() -> list[str]:
     return [v for v in (os.environ.get(JIRA_API_TOKEN_VAR), os.environ.get(JIRA_EMAIL_VAR)) if v]
 
 
-def _write_log(output: str, secrets: list[str]) -> None:
-    """Write the REDACTED agent output to tasks/<timestamp>.log."""
+def _write_log(output: str, secrets: list[str], footer: str | None = None) -> None:
+    """Write the REDACTED agent output to tasks/<timestamp>.log.
+
+    When `footer` is given, it is appended after the transcript (also redacted) separated
+    by a newline so the economics summary lands in the same timestamped file.
+    """
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    (TASKS_DIR / f"{stamp}.log").write_text(redact(output, secrets) + "\n", encoding="utf-8")
+    body = redact(output, secrets) + "\n"
+    if footer is not None:
+        body += redact(footer, secrets) + "\n"
+    (TASKS_DIR / f"{stamp}.log").write_text(body, encoding="utf-8")
 
 
 def _engine_binary_version(

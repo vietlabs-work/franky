@@ -60,6 +60,7 @@ Module responsibilities:
 | `franky-dind-entrypoint.sh` | Image ENTRYPOINT (not a Python module): starts the rootless Docker daemon, renders `~/.docker/config.json` proxies so inner containers inherit the cage (proxy URLs only, never creds), waits for the socket (30s cap, proceeds on timeout), then execs the engine argv. |
 | `franky/update_check.py` | `force_update` (behind `franky update [--force]`): fresh latest-release fetch (`gh` then REST w/ `GH_TOKEN` fallback), `X.Y.Z` compare, reinstall via the `_install.py`-detected manager (uv tool/pipx/pip). `maybe_auto_update` (top of `franky build`): hint-only best-effort sibling - tight ~1s fetch, tiered `~/.franky/update_check.json` cache, prints a stderr hint and proceeds; never blocks or re-execs. Stdlib-only. |
 | `franky/_install.py` | Install-provenance detection shared by `franky version` and `franky update`: `detect_install` -> `Install(kind, path)` from interpreter path + editable metadata. |
+| `franky/economics.py` | Best-effort per-run economics: `parse_usage` (walk engine JSONL, take the terminal event's token/cost totals, never sum) + `format_economics` (one-line summary). Pure, no I/O; never raises - degrades to all-unknown so economics can never fail a build. |
 | `proxy/` | The `franky-proxy` image: Squid + an entrypoint that renders a default-deny, HTTPS-only allowlist config from `FRANKY_ALLOWED_DOMAINS`. |
 | `franky/persona.md` | The agent's working persona. Packaged via `package-data`; loaded at runtime by `prompt.py`. |
 
