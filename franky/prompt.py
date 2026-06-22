@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from .task import TaskSpec
+from .task import GH_ISSUE_RE, TaskSpec
 
 _PERSONA_PATH = Path(__file__).parent / "persona.md"
 
@@ -32,12 +32,23 @@ def _slug_hint(spec: TaskSpec) -> str:
 def build_prompt(spec: TaskSpec) -> str:
     persona = load_persona()
 
+    # close_line tells the agent to link the issue with a GitHub closing keyword so the issue
+    # auto-closes when the PR merges. Without it, merged PRs leave their issue open. Only issue
+    # tasks have an issue to close; the regex always matches a parse_task-produced issue spec,
+    # but we guard so a directly-built spec degrades to no keyword rather than crashing.
+    close_line = ""
     if spec.source == "issue":
         task_block = (
             f"Repo: {spec.repo}\n"
             f"Task: implement the GitHub issue at this URL. Fetch it first with "
             f"`gh issue view {spec.text}` to read the full issue body and comments, then build it.\n"
         )
+        m = GH_ISSUE_RE.search(spec.text)
+        if m:
+            close_line = (
+                f"- The PR body must include `Closes #{m.group('number')}` (a GitHub closing "
+                "keyword) so the issue auto-closes when the PR is merged.\n"
+            )
     else:
         task_block = f"Repo: {spec.repo}\nTask (prose): {spec.text}\n"
 
@@ -50,6 +61,7 @@ def build_prompt(spec: TaskSpec) -> str:
         "- PR title uses the same conventional format: `<type>: <summary>`.\n"
         "- The PR body must contain three sections: what (the change), why (the motivation), "
         "and a test-plan (how you verified it).\n"
+        f"{close_line}"
         "- Open the PR with `gh pr create`. Do NOT merge it - a human reviews every change.\n"
         "- Keep commit messages and PR text professional; no persona flavor in the deliverables.\n"
     )

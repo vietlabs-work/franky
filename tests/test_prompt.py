@@ -34,6 +34,30 @@ def test_build_prompt_issue_mentions_fetch():
     assert "franky/" in p
 
 
+def test_build_prompt_issue_includes_closing_keyword():
+    # The PR body must carry a closing keyword so the issue auto-closes on merge.
+    spec = TaskSpec(
+        repo="octocat/hello", text="https://github.com/octocat/hello/issues/42", source="issue"
+    )
+    p = build_prompt(spec)
+    assert "Closes #42" in p
+
+
+def test_build_prompt_prose_has_no_closing_keyword():
+    # Prose tasks have no issue to close.
+    spec = TaskSpec(repo="me/repo", text="add a --json flag", source="prose")
+    p = build_prompt(spec)
+    assert "Closes #" not in p
+
+
+def test_build_prompt_issue_without_parseable_url_degrades_gracefully():
+    # parse_task guarantees a real issue URL, but a directly-built spec with unparseable text
+    # must degrade to no closing keyword rather than crash.
+    spec = TaskSpec(repo="octocat/hello", text="not-a-url", source="issue")
+    p = build_prompt(spec)
+    assert "Closes #" not in p
+
+
 def test_issue_branch_hint_uses_repo_name_not_empty_default():
     # Regression: owner/repo has a slash, so a naive isalnum() filter collapsed every
     # issue branch hint to `franky/task`. The hint must reflect the repo.
