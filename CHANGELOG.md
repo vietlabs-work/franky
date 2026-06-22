@@ -38,3 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `+/dev/net/tun`; `--memory` 4g->8g (`--memory-swap` pinned, no swap), `--pids-limit`
   512->2048, rootless data root on a size-capped tmpfs. No host socket / no host bind mount
   still hold. See the README security section for the rationale and residual risk (#12).
+- Engine abstraction decoupled from pi-specifics: each `Engine` now owns its own missing-creds
+  hint (`cred_hint`), so the fail-closed refusal names the resolved engine's vars and shared
+  `config.py` no longer imports `PI_PROVIDER_VARS`. Documented the per-engine guardrail-bypass
+  invariant (each engine disables its own approval/sandbox because the container is the
+  boundary). Part of #29; the CodexEngine itself is still to come.

@@ -1,5 +1,6 @@
 import pytest
 
+import franky.config as config_mod
 from franky.config import Config, load_config, redact
 from franky.engine import ClaudeEngine, PiEngine
 
@@ -69,8 +70,17 @@ def test_fail_closed_gh_token_missing():
 def test_fail_closed_pi_no_provider():
     env = _env()
     del env["OPENROUTER_API_KEY"]
-    with pytest.raises(ValueError, match="creds"):
+    with pytest.raises(ValueError, match="creds") as ei:
         load_config(None, env)
+    # The refusal hint must be sourced from the pi engine (cred_hint), naming pi's vars -
+    # not hardcoded in shared config. A concrete var proves the wiring, not just non-emptiness.
+    assert "OPENROUTER_API_KEY" in str(ei.value)
+    assert "engine 'pi'" in str(ei.value)
+
+
+def test_config_no_longer_couples_to_pi_provider_vars():
+    # Acceptance (#29): shared config must not import/re-export one engine's provider vars.
+    assert not hasattr(config_mod, "PI_PROVIDER_VARS")
 
 
 def test_fail_closed_claude_token_missing():

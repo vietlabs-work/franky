@@ -8,6 +8,7 @@ from franky.engine import (
     PI_PROVIDER_VARS,
     PR_URL_RE,
     ClaudeEngine,
+    Engine,
     PiEngine,
     _fallback_pr_url,
     resolve_engine,
@@ -140,3 +141,25 @@ def test_pi_required_env_empty_when_none_set(monkeypatch):
     for v in PI_PROVIDER_VARS:
         monkeypatch.delenv(v, raising=False)
     assert PiEngine().required_env() == []
+
+
+def test_pi_cred_hint_lists_provider_vars():
+    hint = PiEngine().cred_hint()
+    # The hint must enumerate the BYOK provider vars so a keyless pi user knows the options.
+    assert "OPENROUTER_API_KEY" in hint
+    assert "ANTHROPIC_API_KEY" in hint
+    for v in PI_PROVIDER_VARS:
+        assert v in hint
+
+
+def test_claude_cred_hint_names_its_token():
+    hint = ClaudeEngine().cred_hint()
+    assert CLAUDE_TOKEN_VAR in hint
+    # claude must NOT advertise pi's provider vars.
+    assert "OPENROUTER_API_KEY" not in hint
+
+
+def test_engine_base_cred_hint_not_implemented():
+    # The base contract is abstract so a new engine that forgets cred_hint fails loudly.
+    with pytest.raises(NotImplementedError):
+        Engine().cred_hint()

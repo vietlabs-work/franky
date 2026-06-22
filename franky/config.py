@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 
-from .engine import PI_PROVIDER_VARS, Engine, resolve_engine
+from .engine import Engine, resolve_engine
 
 REDACT_TOKEN = "***REDACTED***"
 
@@ -75,9 +75,10 @@ def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
 
     cred_vars = engine.required_env(env)
     if not cred_vars:
+        # The hint comes from the engine itself so the refusal names THIS engine's vars -
+        # shared config stays engine-agnostic (no hardcoded pi vars).
         raise ValueError(
-            f"no creds present for engine '{engine.name}' - refusing "
-            f"(set one of: {', '.join(PI_PROVIDER_VARS)})"
+            f"no creds present for engine '{engine.name}' - refusing ({engine.cred_hint()})"
         )
 
     passthrough: dict[str, str] = {GH_TOKEN_VAR: gh_token}
