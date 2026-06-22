@@ -308,3 +308,35 @@ def test_build_image_no_docker_clean_message(monkeypatch):
     res = CliRunner().invoke(cli.main, ["build", "do it", "--repo", "me/repo"])
     assert res.exit_code != 0
     assert "docker is not available" in res.output
+
+
+# ---------------------------------------------------------------------------
+# update command (wiring only - force_update logic is covered in test_update_check)
+# ---------------------------------------------------------------------------
+
+
+def test_update_help_shows_force():
+    res = CliRunner().invoke(cli.main, ["update", "--help"])
+    assert res.exit_code == 0
+    assert "--force" in res.output
+
+
+def test_update_propagates_exit_code_and_force_flag(monkeypatch):
+    seen = {}
+
+    def fake_force_update(*, force, out):
+        seen["force"] = force
+        out("franky: updated to v9.9.9")
+        return 0
+
+    monkeypatch.setattr(cli, "force_update", fake_force_update)
+    res = CliRunner().invoke(cli.main, ["update", "--force"])
+    assert res.exit_code == 0, res.output
+    assert seen["force"] is True
+    assert "updated to v9.9.9" in res.output
+
+
+def test_update_nonzero_exit_propagates(monkeypatch):
+    monkeypatch.setattr(cli, "force_update", lambda *, force, out: 1)
+    res = CliRunner().invoke(cli.main, ["update"])
+    assert res.exit_code == 1

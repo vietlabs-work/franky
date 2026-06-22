@@ -52,6 +52,11 @@ On first run the CLI pulls the version-pinned GHCR images
 so you need Docker and, while the packages are private, `docker login ghcr.io`
 with a PAT that has `read:packages`.
 
+To move to a newer release later, run `franky update` - it detects how you
+installed (uv tool / pipx / pip) and reinstalls the latest tag via the same
+manager. `franky update --force` reinstalls even when already current. (A dev
+checkout updates via `git`; `franky update` is a no-op there.)
+
 **For local development**, skip GHCR and point at local builds:
 
 ```
