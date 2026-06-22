@@ -33,6 +33,14 @@ PI_PROVIDER_VARS = (
 
 CLAUDE_TOKEN_VAR = "CLAUDE_CODE_OAUTH_TOKEN"
 
+# codex authenticates with an API key. BOTH vars work: CODEX_API_KEY is the automation-
+# recommended one, OPENAI_API_KEY also authenticates (it doubles as the codex key). Gate on
+# whichever is present, BYOK-style like pi - so a keyless codex run is the fail-closed case.
+# OPENAI_API_KEY is deliberately shared with PI_PROVIDER_VARS: it is a different engine, gated
+# independently, and build_allowlist only ever consults the ONE resolved engine's hosts.
+CODEX_PROVIDER_VARS = ("CODEX_API_KEY", "OPENAI_API_KEY")
+CODEX_PROVIDER_HOST = "api.openai.com"
+
 # Which network host each provider cred talks to. WHY this is SEPARATE from required_env:
 # required_env is about cred gating (do we have a key at all), this is about the egress
 # allowlist (which host must the proxy let through so the engine can reach its provider).
@@ -213,7 +221,57 @@ class ClaudeEngine(Engine):
         return f"set {CLAUDE_TOKEN_VAR}"
 
 
-ENGINES: dict[str, type[Engine]] = {"pi": PiEngine, "claude": ClaudeEngine}
+class CodexEngine(Engine):
+    name = "codex"
+
+    def inner_argv(self, prompt: str, model: str | None) -> list[str]:
+        # --dangerously-bypass-approvals-and-sandbox is load-bearing, not a convenience: codex
+        # both prompts for approval AND self-sandboxes (Landlock/seccomp). A headless run must
+        # have approvals off, and the nested self-sandbox is redundant-and-fragile inside
+        # Franky's already-hardened container, so we bypass it and trust the container - the
+        # same bargain claude makes with --dangerously-skip-permissions. See the per-engine
+        # guardrail-bypass invariant in AGENTS.md.
+        argv = [
+            "codex",
+            "exec",
+            prompt,
+            "--json",
+            "--dangerously-bypass-approvals-and-sandbox",
+        ]
+        if model:
+            argv += ["--model", model]
+        return argv
+
+    def parse_pr_url(self, output: str, repo: str | None = None) -> str | None:
+        return _scan_jsonl_for_pr_url(output, repo)
+
+    def required_env(self, env: Mapping[str, str] | None = None) -> list[str]:
+        """The codex provider vars that ARE set (non-empty) in `env` (defaults to os.environ).
+        Empty list => no creds => fail-closed. Mirrors PiEngine: gate on whichever key the
+        operator actually set."""
+        env = os.environ if env is None else env
+        return [v for v in CODEX_PROVIDER_VARS if env.get(v)]
+
+    def provider_hosts(self, env: Mapping[str, str] | None = None) -> list[str]:
+        # Both codex keys talk to the same host, so this is all-or-nothing: the host opens iff
+        # ANY codex key is present. Gating on key presence (rather than claude's unconditional
+        # return) keeps required_env and provider_hosts parallel and never opens api.openai.com
+        # for a keyless run.
+        env = os.environ if env is None else env
+        if any(env.get(v) for v in CODEX_PROVIDER_VARS):
+            return [CODEX_PROVIDER_HOST]
+        return []
+
+    def cred_hint(self) -> str:
+        # codex accepts either var; CODEX_API_KEY is the automation-recommended one.
+        return f"set one of: {', '.join(CODEX_PROVIDER_VARS)}"
+
+
+ENGINES: dict[str, type[Engine]] = {
+    "pi": PiEngine,
+    "claude": ClaudeEngine,
+    "codex": CodexEngine,
+}
 DEFAULT_ENGINE = "pi"
 
 

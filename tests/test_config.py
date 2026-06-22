@@ -2,7 +2,7 @@ import pytest
 
 import franky.config as config_mod
 from franky.config import Config, load_config, redact
-from franky.engine import ClaudeEngine, PiEngine
+from franky.engine import ClaudeEngine, CodexEngine, PiEngine
 
 SECRET = "sk-super-secret-value-123"
 
@@ -48,6 +48,16 @@ def test_load_config_engine_resolution_claude():
     assert cfg.passthrough_env["CLAUDE_CODE_OAUTH_TOKEN"] == "oauth-fake"
 
 
+def test_load_config_engine_resolution_codex():
+    # codex selected: only the codex key lands in passthrough; the pi var in _env (OPENROUTER)
+    # must NOT, even though it is set - it is not a codex cred.
+    env = _env(CODEX_API_KEY="sk-codex-fake")
+    cfg = load_config("codex", env)
+    assert isinstance(cfg.engine, CodexEngine)
+    assert cfg.passthrough_env["CODEX_API_KEY"] == "sk-codex-fake"
+    assert "OPENROUTER_API_KEY" not in cfg.passthrough_env
+
+
 def test_fail_closed_allowlist_unset():
     env = _env()
     del env["FRANKY_ALLOWED_REPOS"]
@@ -76,6 +86,18 @@ def test_fail_closed_pi_no_provider():
     # not hardcoded in shared config. A concrete var proves the wiring, not just non-emptiness.
     assert "OPENROUTER_API_KEY" in str(ei.value)
     assert "engine 'pi'" in str(ei.value)
+
+
+def test_fail_closed_codex_no_provider():
+    # codex selected but neither CODEX_API_KEY nor OPENAI_API_KEY set -> refuse, and the hint
+    # must name codex's own vars (sourced from CodexEngine.cred_hint), never pi's.
+    env = _env()  # carries OPENROUTER_API_KEY (a pi var), which must NOT satisfy codex
+    with pytest.raises(ValueError, match="creds") as ei:
+        load_config("codex", env)
+    msg = str(ei.value)
+    assert "engine 'codex'" in msg
+    assert "CODEX_API_KEY" in msg
+    assert "OPENROUTER_API_KEY" not in msg  # no pi vars leak into the codex refusal
 
 
 def test_config_no_longer_couples_to_pi_provider_vars():

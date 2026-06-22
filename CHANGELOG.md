@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Third engine `codex` (OpenAI Codex, `@openai/codex`): `franky build --engine codex` runs
+  `codex exec --json --dangerously-bypass-approvals-and-sandbox` headless in the container.
+  API-key auth (`CODEX_API_KEY` or `OPENAI_API_KEY`); `api.openai.com` is allowlisted only
+  when a codex key is present. OAuth/file-based auth is out of scope. The `--engine` CLI
+  choice is now derived from the engine registry so it can never drift. Completes #29.
 - Per-run economics summary (tokens, est. cost, duration) printed at the end of
   `franky build` and appended to `tasks/<ts>.log`, redacted. Best-effort: unparseable
   usage degrades to "unknown" and never fails the run; cost is always labeled an
@@ -42,4 +47,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hint (`cred_hint`), so the fail-closed refusal names the resolved engine's vars and shared
   `config.py` no longer imports `PI_PROVIDER_VARS`. Documented the per-engine guardrail-bypass
   invariant (each engine disables its own approval/sandbox because the container is the
-  boundary). Part of #29; the CodexEngine itself is still to come.
+  boundary). Part of #29 (the CodexEngine that completes it is in Added above).

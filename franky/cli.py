@@ -30,7 +30,7 @@ from .container import (
     resolve_image,
     run_in_container,
 )
-from .engine import resolve_engine
+from .engine import ENGINES, resolve_engine
 from .jira import JIRA_API_TOKEN_VAR, JIRA_EMAIL_VAR, fetch_jira_issue
 from .prompt import build_plan_prompt, build_prompt
 from .task import PROSE_MAX_CHARS, parse_task
@@ -53,7 +53,10 @@ def main() -> None:
     "--engine",
     "engine",
     default=None,
-    type=click.Choice(["pi", "claude"]),
+    # Derived from the registry so a new engine never has to be added in two places (the
+    # --help listing comes out alphabetical, not resolution order - cosmetic, behaviour is
+    # identical to the old hardcoded list).
+    type=click.Choice(sorted(ENGINES)),
     help="Engine override; else FRANKY_ENGINE, else pi.",
 )
 @click.option(

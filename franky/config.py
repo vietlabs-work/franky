@@ -55,7 +55,8 @@ def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
     only the VAR name):
       1. allowlist unset/blank -> refuse (we will not act on an open set of repos)
       2. GH_TOKEN missing -> refuse (cannot clone or open a PR without it)
-      3. engine creds missing -> refuse (pi: no provider var set; claude: token missing)
+      3. engine creds missing -> refuse (pi: no provider var set; claude: token missing;
+         codex: neither CODEX_API_KEY nor OPENAI_API_KEY set)
     """
     engine = resolve_engine(flag_engine, env)
 

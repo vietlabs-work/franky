@@ -4,7 +4,13 @@ from franky.egress import (
     REGISTRY_DOMAINS,
     build_allowlist,
 )
-from franky.engine import PI_PROVIDER_HOSTS, PI_PROVIDER_VARS, ClaudeEngine, PiEngine
+from franky.engine import (
+    PI_PROVIDER_HOSTS,
+    PI_PROVIDER_VARS,
+    ClaudeEngine,
+    CodexEngine,
+    PiEngine,
+)
 
 
 def test_every_pi_provider_var_maps_to_a_host():
@@ -39,6 +45,22 @@ def test_pi_openrouter_host():
 def test_pi_openai_host():
     allow = build_allowlist(PiEngine(), {"OPENAI_API_KEY": "x"}, [])
     assert "api.openai.com" in allow
+
+
+def test_codex_allowlist_has_openai_when_key_present():
+    # api.openai.com opens only when a codex key is present (gated like pi's per-cred hosts).
+    # CODEX_API_KEY is the automation-recommended var; OPENAI_API_KEY (the shared var) must
+    # open the same host - that shared path is the one the #29 acceptance criterion calls out.
+    for key in ("CODEX_API_KEY", "OPENAI_API_KEY"):
+        allow = build_allowlist(CodexEngine(), {key: "x"}, [])
+        assert "api.openai.com" in allow
+        for d in GITHUB_DOMAINS:
+            assert d in allow
+
+
+def test_codex_allowlist_no_openai_when_no_key():
+    allow = build_allowlist(CodexEngine(), {}, [])
+    assert "api.openai.com" not in allow
 
 
 def test_pi_ollama_host_parsed_from_url():

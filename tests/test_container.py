@@ -146,6 +146,15 @@ def test_build_docker_argv_cross_engine_env_isolation():
     assert "OPENROUTER_API_KEY" not in cl_e
     assert "CLAUDE_CODE_OAUTH_TOKEN" in cl_e
 
+    # A codex run carries only its own key (+ GH_TOKEN), never the other engines' creds.
+    cx_argv = build_docker_argv(
+        "franky", {"GH_TOKEN": "x", "CODEX_API_KEY": "c"}, ["codex", "exec"]
+    )
+    cx_e = [cx_argv[i + 1] for i, t in enumerate(cx_argv) if t == "-e"]
+    assert "CODEX_API_KEY" in cx_e
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in cx_e
+    assert "OPENROUTER_API_KEY" not in cx_e
+
 
 def test_build_docker_argv_image_and_inner_last():
     inner = ["pi", "-p", "go", "--mode", "json"]
