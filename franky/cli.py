@@ -28,7 +28,7 @@ from .container import (
     run_in_container,
 )
 from .engine import resolve_engine
-from .prompt import build_prompt
+from .prompt import build_plan_prompt, build_prompt
 from .task import parse_task
 from .update_check import force_update, maybe_auto_update
 
@@ -52,8 +52,20 @@ def main() -> None:
     type=click.Choice(["pi", "claude"]),
     help="Engine override; else FRANKY_ENGINE, else pi.",
 )
-def build(task_input: str, repo: str | None, engine: str | None) -> None:
-    """Build TASK_INPUT (a GitHub issue URL or a prose request) and open a PR."""
+@click.option(
+    "--plan-first",
+    "plan_first",
+    is_flag=True,
+    help="Run a read-only planning pass first, show the plan, and execute only after approval.",
+)
+def build(task_input: str, repo: str | None, engine: str | None, plan_first: bool) -> None:
+    """Build TASK_INPUT (a GitHub issue URL or a prose request) and open a PR.
+
+    With --plan-first, Franky first runs the engine in a read-only planning pass, prints the
+    plan, and waits for explicit approval; nothing is built or PR'd until you confirm. The
+    approval gate is the hard guarantee (the planning container is still autonomous), so a
+    declined or non-interactive run writes nothing.
+    """
     # Best-effort, hint-only update check (never blocks/raises; ~1s budget, cached). Prints
     # a one-line stderr hint if a newer release exists. Silenced by FRANKY_NO_UPDATE_CHECK=1.
     maybe_auto_update()
@@ -68,8 +80,6 @@ def build(task_input: str, repo: str | None, engine: str | None) -> None:
         raise click.ClickException(redact(str(exc), cfg_secrets_safe())) from exc
 
     secrets = cfg.secret_values()
-    prompt = build_prompt(spec)
-    inner_argv = cfg.engine.inner_argv(prompt, model=None)
 
     franky_img = resolve_image(os.environ, FRANKY_IMAGE_VAR, "franky")
     proxy_img = resolve_image(os.environ, FRANKY_PROXY_IMAGE_VAR, "franky-proxy")
@@ -94,9 +104,31 @@ def build(task_input: str, repo: str | None, engine: str | None) -> None:
                 f"For local dev: `{dev_build}` and set {dev_var}=<local-tag>."
             )
 
-    code, output = run_in_container(cfg, inner_argv, image=franky_img, proxy_image=proxy_img)
+    def _run(prompt: str) -> tuple[int, str]:
+        """Run one container pass for `prompt`; log the redacted output. Used by both the
+        planning pass and the build pass so they share the image/proxy/log plumbing."""
+        inner_argv = cfg.engine.inner_argv(prompt, model=None)
+        code, output = run_in_container(cfg, inner_argv, image=franky_img, proxy_image=proxy_img)
+        _write_log(output, secrets)
+        return code, output
 
-    _write_log(output, secrets)
+    if plan_first:
+        # PHASE 1: planning pass. Show the plan, then gate on explicit approval. A plan that
+        # errored is not a plan to approve, so abort before the gate.
+        code, output = _run(build_plan_prompt(spec))
+        click.echo("franky: --- plan (read-only, nothing written yet) ---", err=True)
+        click.echo(output)
+        if code != 0:
+            raise click.ClickException(
+                f"planning pass exited non-zero ({code}) - see the redacted log in tasks/"
+            )
+        # default=False and non-interactive abort both fail closed: no approval -> no build.
+        if not click.confirm("franky: proceed to execute this plan?", default=False):
+            click.echo("franky: plan-first aborted - nothing was built or opened.", err=True)
+            return
+
+    # PHASE 2 (or the only phase without --plan-first): build it and open the PR.
+    code, output = _run(build_prompt(spec))
 
     # Scope PR-URL detection to the task's own repo so a hostile issue body cannot make
     # Franky report a PR URL for some other (attacker) repo.

@@ -1,4 +1,4 @@
-from franky.prompt import build_prompt, load_persona
+from franky.prompt import build_plan_prompt, build_prompt, load_persona
 from franky.task import TaskSpec
 
 
@@ -66,3 +66,30 @@ def test_issue_branch_hint_uses_repo_name_not_empty_default():
     )
     p = build_prompt(spec)
     assert "franky/octocat-hello" in p
+
+
+# ---------------------------------------------------------------------------
+# build_plan_prompt (the --plan-first read-only planning pass)
+# ---------------------------------------------------------------------------
+
+
+def test_plan_prompt_asks_for_a_plan_and_forbids_writing():
+    spec = TaskSpec(repo="me/repo", text="add a --json flag", source="prose")
+    p = build_plan_prompt(spec)
+    assert "me/repo" in p
+    assert "add a --json flag" in p
+    assert "plan" in p.lower()
+    # The planning pass must not instruct the agent to open a PR.
+    assert "gh pr create" not in p
+    # ...and must explicitly forbid mutating actions.
+    assert "Do NOT" in p
+
+
+def test_plan_prompt_issue_still_fetches_but_does_not_close():
+    url = "https://github.com/octocat/hello/issues/42"
+    spec = TaskSpec(repo="octocat/hello", text=url, source="issue")
+    p = build_plan_prompt(spec)
+    assert url in p
+    assert "gh issue view" in p
+    # No PR is opened in a planning pass, so no closing keyword either.
+    assert "Closes #" not in p

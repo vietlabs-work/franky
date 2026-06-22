@@ -24,7 +24,7 @@ docker build -t franky-proxy proxy/
 .venv/bin/python -m pytest tests/test_container.py::test_build_docker_argv_hardening_flags -q
 
 # Invoke the CLI
-franky build <gh-issue-url | "prose"> [--repo owner/repo] [--engine pi|claude]
+franky build <gh-issue-url | "prose"> [--repo owner/repo] [--engine pi|claude] [--plan-first]
 franky version
 ```
 
