@@ -30,7 +30,7 @@ from .container import (
 from .engine import resolve_engine
 from .prompt import build_prompt
 from .task import parse_task
-from .update_check import force_update
+from .update_check import force_update, maybe_auto_update
 
 TASKS_DIR = Path("tasks")
 
@@ -54,6 +54,10 @@ def main() -> None:
 )
 def build(task_input: str, repo: str | None, engine: str | None) -> None:
     """Build TASK_INPUT (a GitHub issue URL or a prose request) and open a PR."""
+    # Best-effort, hint-only update check (never blocks/raises; ~1s budget, cached). Prints
+    # a one-line stderr hint if a newer release exists. Silenced by FRANKY_NO_UPDATE_CHECK=1.
+    maybe_auto_update()
+
     # Config + task parse are operator-error surfaces -> clean ClickException, no traceback.
     try:
         cfg = load_config(engine, os.environ)

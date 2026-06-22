@@ -185,6 +185,27 @@ def test_build_reaches_pr_url(monkeypatch):
     assert PR_URL in res.output
 
 
+def test_build_invokes_auto_update_hint(monkeypatch):
+    # build must call maybe_auto_update at the top; failures there must never break the build.
+    seen = {"called": False}
+    monkeypatch.setattr(cli, "maybe_auto_update", lambda *a, **k: seen.update(called=True))
+    env = {
+        "FRANKY_ALLOWED_REPOS": "me/repo",
+        "GH_TOKEN": "ghp_fake",
+        "OPENROUTER_API_KEY": "sk-or-fake",
+    }
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: (0, f"opened {PR_URL}"))
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo"])
+    assert res.exit_code == 0, res.output
+    assert seen["called"] is True
+
+
 def test_build_engine_flag_selects_engine(monkeypatch):
     # --engine claude must reach config + select ClaudeEngine end-to-end through the CLI.
     env = {
