@@ -42,9 +42,9 @@ Select with `--engine pi|claude`, or set `FRANKY_ENGINE`. Resolution order:
 While the repository is private, install from the git tag:
 
 ```
-uv tool install git+ssh://git@github.com/vietlabs-work/franky@vX.Y.Z
+uv tool install git+ssh://git@github.com/vietlabs-work/franky@v0.1.0
 # or pipx:
-pipx install git+ssh://git@github.com/vietlabs-work/franky@vX.Y.Z
+pipx install git+ssh://git@github.com/vietlabs-work/franky@v0.1.0
 # or download the wheel from the GitHub Release and pip install it
 ```
 
@@ -116,7 +116,7 @@ container with:
   the container, so the agent never touches your filesystem
 - only the selected engine's required env vars passed in; nothing else
 
-### Egress control (v0.2)
+### Egress control
 
 The big v0 hole - a prompt-injected agent exfiltrating the creds it carries -
 is now closed by a default-deny egress allowlist. The task container runs on a
@@ -167,7 +167,7 @@ requiring approval for workflow runs on PRs.
 
 ## Status
 
-v0.2. Real end-to-end runs need live engine credentials, supplied out-of-band by
+v0.1.0. Real end-to-end runs need live engine credentials, supplied out-of-band by
 the operator. The pieces under test here are the container hardening, the egress
 allowlist + proxy orchestration, the secret redaction, the trusted-repo allowlist,
 and the engine abstraction.
