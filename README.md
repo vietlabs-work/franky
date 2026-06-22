@@ -86,6 +86,11 @@ export FRANKY_PROXY_IMAGE=franky-proxy
 
 Each run writes a redacted log to `tasks/<timestamp>.log` and prints the PR URL.
 
+`franky build` also does a quick (~1s, cached) check for a newer release and
+prints a one-line hint if one exists - it never blocks the build. Silence it with
+`FRANKY_NO_UPDATE_CHECK=1`, or set `FRANKY_AUTO_UPDATE=1` to auto-install the new
+release for your next run. (Both are host-CLI only; neither reaches the container.)
+
 ## Security
 
 Read this before pointing Franky at anything.
