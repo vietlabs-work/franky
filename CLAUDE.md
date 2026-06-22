@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Franky is a lean personal coding agent. Given a GitHub issue URL or a prose sentence, it runs a pluggable coding agent (`pi` default, `claude` alt) inside a fresh, hardened Docker container that clones the target repo, makes the change, and opens a PR. The agent is autonomous inside the container; safety comes from OS-level container isolation + a default-deny egress allowlist + a fail-closed repo allowlist + opening a PR (never merging).
+Franky is a lean personal coding agent. Given a GitHub issue URL, a JIRA key, or a prose sentence, it runs a pluggable coding agent (`pi` default, `claude` alt) inside a fresh, hardened Docker container that clones the target repo, makes the change, and opens a PR. The agent is autonomous inside the container; safety comes from OS-level container isolation + a default-deny egress allowlist + a fail-closed repo allowlist + opening a PR (never merging).
 
 ## Commands
 
@@ -24,7 +24,7 @@ docker build -t franky-proxy proxy/
 .venv/bin/python -m pytest tests/test_container.py::test_build_docker_argv_hardening_flags -q
 
 # Invoke the CLI
-franky build <gh-issue-url | "prose"> [--repo owner/repo] [--engine pi|claude] [--plan-first]
+franky build <gh-issue-url | jira KEY | "prose"> [--repo owner/repo] [--engine pi|claude] [--plan-first]
 franky version
 ```
 
@@ -52,7 +52,7 @@ Module responsibilities:
 |--------|------|
 | `franky/cli.py` | Click entrypoint. Wires the pipeline; config/task errors become `ClickException` (operator errors, no traceback). Requires both the `franky` and `franky-proxy` images. Writes a redacted log to `tasks/<timestamp>.log`. |
 | `franky/config.py` | `Config` dataclass + `load_config` (fail-closed) + `redact`. Owns the secret list and optional `FRANKY_EXTRA_ALLOWED_DOMAINS`. |
-| `franky/task.py` | `parse_task` -> `TaskSpec`. Earliest point the target repo is known, so the allowlist gate lives here. |
+| `franky/task.py` | `parse_task` -> `TaskSpec`. Earliest point the target repo is known, so the allowlist gate lives here. Handles GitHub issue URLs, JIRA keys, and prose. |
 | `franky/engine.py` | `Engine` base + `PiEngine`/`ClaudeEngine`. Each engine owns: headless argv, PR-URL parsing, required creds, and `provider_hosts` (which network host(s) feed the egress allowlist). `resolve_engine` order: `--engine` flag > `FRANKY_ENGINE` > default `pi`. |
 | `franky/egress.py` | Pure allowlist POLICY: `build_allowlist` = engine provider host(s) + GitHub + npm/PyPI + operator extras. No docker, no I/O. |
 | `franky/prompt.py` | `build_prompt` = `persona.md` + task block + literal conventions (branch `franky/<slug>`, tests-green-before-PR, conventional commits, 3-section PR body, never merge). |

@@ -93,3 +93,39 @@ def test_plan_prompt_issue_still_fetches_but_does_not_close():
     assert "gh issue view" in p
     # No PR is opened in a planning pass, so no closing keyword either.
     assert "Closes #" not in p
+
+
+# ---------------------------------------------------------------------------
+# JIRA task prompts
+# ---------------------------------------------------------------------------
+
+
+def test_build_prompt_jira_includes_text_and_no_closing_keyword():
+    spec = TaskSpec(repo="me/repo", text="[FOO-123] do a thing", source="jira")
+    p = build_prompt(spec)
+    assert "[FOO-123] do a thing" in p
+    assert "me/repo" in p
+    assert "Closes #" not in p
+    assert "gh pr create" in p
+
+
+def test_build_plan_prompt_jira_mentions_plan_not_pr():
+    spec = TaskSpec(repo="me/repo", text="[FOO-123] do a thing", source="jira")
+    p = build_plan_prompt(spec)
+    assert "[FOO-123] do a thing" in p
+    assert "plan" in p.lower()
+    assert "gh pr create" not in p
+
+
+def test_build_prompt_jira_label_says_from_jira():
+    spec = TaskSpec(repo="me/repo", text="[FOO-123] do a thing", source="jira")
+    p = build_prompt(spec)
+    assert "JIRA" in p
+
+
+def test_build_prompt_jira_slug_uses_text():
+    # JIRA text starts with "[FOO-123] ..." so the slug should include those tokens.
+    spec = TaskSpec(repo="me/repo", text="[FOO-123] fix the thing", source="jira")
+    p = build_prompt(spec)
+    # The slug is derived from the text, not the repo name.
+    assert "franky/foo" in p.lower() or "franky/fix" in p.lower()
