@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Per-run economics summary (tokens, est. cost, duration) printed at the end of
+  `franky build` and appended to `tasks/<ts>.log`, redacted. Best-effort: unparseable
+  usage degrades to "unknown" and never fails the run; cost is always labeled an
+  estimate (#26).
 - Best-effort auto-update hint on `franky build`: a tight (~1s), cached check prints a
   one-line stderr hint when a newer release exists, then proceeds - never blocks, never
   re-execs. `FRANKY_NO_UPDATE_CHECK=1` silences it; `FRANKY_AUTO_UPDATE=1` opts in to

@@ -535,3 +535,114 @@ def test_build_jira_fetch_failure_clean_error_no_container(monkeypatch):
     assert res.exit_code != 0
     assert "not found" in res.output
     assert ran["container"] is False  # fetch failure short-circuits before any container run
+
+
+# ---------------------------------------------------------------------------
+# Economics (tokens, est. cost, duration)
+# ---------------------------------------------------------------------------
+
+
+def _build_env():
+    return {
+        "FRANKY_ALLOWED_REPOS": "me/repo",
+        "GH_TOKEN": "ghp_fake",
+        "OPENROUTER_API_KEY": "sk-or-fake",
+    }
+
+
+def test_build_prints_economics_line_and_writes_to_log(monkeypatch):
+    """build prints an economics line and writes it into the tasks log file."""
+    import json as _json
+
+    agent_output = _json.dumps(
+        {
+            "type": "result",
+            "usage": {"input_tokens": 100, "output_tokens": 50},
+            "total_cost_usd": 0.001,
+        }
+    ) + f"\nopened {PR_URL}"
+
+    monkeypatch.setattr(cli.os, "environ", _build_env())
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: (0, agent_output))
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo"])
+        assert res.exit_code == 0, res.output
+        # Economics line must appear in the combined output.
+        assert "economics" in res.output
+        # The log file must also contain the economics text.
+        from pathlib import Path
+
+        logs = list(Path("tasks").glob("*.log"))
+        assert logs, "no log file written"
+        log_text = logs[0].read_text()
+        assert "economics" in log_text
+
+
+def test_build_plan_first_approved_emits_exactly_one_economics_line(monkeypatch):
+    """--plan-first approved run emits exactly ONE economics line (build pass only)."""
+    monkeypatch.setattr(cli.os, "environ", _build_env())
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+
+    outputs = ["PLAN: do the thing", f"opened {PR_URL}"]
+
+    def fake_run(*a, **k):
+        return 0, outputs.pop(0)
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(
+            cli.main, ["build", "do it", "--repo", "me/repo", "--plan-first"], input="y\n"
+        )
+    assert res.exit_code == 0, res.output
+    # Exactly one economics line in the combined output.
+    assert res.output.count("franky: economics") == 1
+
+
+def test_build_unknown_usage_degrades_gracefully(monkeypatch):
+    """When agent output has no parseable usage, build exits 0 and still prints economics."""
+    monkeypatch.setattr(cli.os, "environ", _build_env())
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    # Output with no JSON usage at all.
+    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: (0, f"opened {PR_URL}"))
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo"])
+    assert res.exit_code == 0, res.output
+    assert "economics" in res.output
+    assert "unknown" in res.output
+
+
+def test_build_prints_economics_even_when_agent_exits_nonzero(monkeypatch):
+    """A non-zero agent exit still raises, but the economics summary must be printed first
+    (emitted before the ClickException), so spend is always visible even on failure."""
+    import json as _json
+
+    agent_output = _json.dumps(
+        {"type": "result", "usage": {"input_tokens": 100, "output_tokens": 50}, "cost": 0.002}
+    )
+
+    monkeypatch.setattr(cli.os, "environ", _build_env())
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: (1, agent_output))
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo"])
+        # Non-zero agent exit surfaces as a non-zero CLI exit...
+        assert res.exit_code != 0
+        # ...but the economics line was still emitted (and logged) before the failure.
+        assert "franky: economics" in res.output
+        from pathlib import Path
+
+        logs = list(Path("tasks").glob("*.log"))
+        assert logs and "economics" in logs[0].read_text()
