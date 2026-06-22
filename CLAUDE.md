@@ -57,6 +57,8 @@ Module responsibilities:
 | `franky/egress.py` | Pure allowlist POLICY: `build_allowlist` = engine provider host(s) + GitHub + npm/PyPI + operator extras. No docker, no I/O. |
 | `franky/prompt.py` | `build_prompt` = `persona.md` + task block + literal conventions (branch `franky/<slug>`, tests-green-before-PR, conventional commits, 3-section PR body, never merge). |
 | `franky/container.py` | All docker MECHANICS (pure argv builders, testable without Docker): task/proxy/network argv + `run_in_container` (injectable `runner`/`sleeper`) + `ensure_image`. |
+| `franky/update_check.py` | `force_update` (behind `franky update [--force]`): fresh latest-release fetch (`gh` then REST w/ `GH_TOKEN` fallback), `X.Y.Z` compare, reinstall via the `_install.py`-detected manager (uv tool/pipx/pip). Stdlib-only; no re-exec. |
+| `franky/_install.py` | Install-provenance detection shared by `franky version` and `franky update`: `detect_install` -> `Install(kind, path)` from interpreter path + editable metadata. |
 | `proxy/` | The `franky-proxy` image: Squid + an entrypoint that renders a default-deny, HTTPS-only allowlist config from `FRANKY_ALLOWED_DOMAINS`. |
 | `franky/persona.md` | The agent's working persona. Packaged via `package-data`; loaded at runtime by `prompt.py`. |
 

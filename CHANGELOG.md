@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `franky update [--force]`: on-demand self-update to the latest published release via the
+  detected installer (uv tool / pipx / pip). Dev checkout -> git hint; undetectable installer
+  -> manual hint, nonzero exit. Latest-tag fetch via `gh` then REST (`GH_TOKEN` fallback) (#10).
 - Release pipeline: `make release VERSION=x.y.z` bumps version, commits, tags, pushes; CI
   publishes wheel + both GHCR images (franky, franky-proxy) + a GitHub Release (#8).
 - Default-deny egress proxy (Squid) over a Docker `--internal` network; task container

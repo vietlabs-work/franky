@@ -30,6 +30,7 @@ from .container import (
 from .engine import resolve_engine
 from .prompt import build_prompt
 from .task import parse_task
+from .update_check import force_update
 
 TASKS_DIR = Path("tasks")
 
@@ -223,6 +224,17 @@ def version(as_json: bool) -> None:
     else:
         click.echo(f"  engine:     {eng['name']}")
     click.echo(f"  image:      {img}")
+
+
+@main.command()
+@click.option("--force", is_flag=True, help="Reinstall even when already on the latest release.")
+@click.pass_context
+def update(ctx: click.Context, force: bool) -> None:
+    """Install the latest published release via the detected installer (uv tool/pipx/pip).
+
+    Dev checkout -> git hint, no-op. Undetectable installer -> manual hint, nonzero exit.
+    """
+    ctx.exit(force_update(force=force, out=click.echo))
 
 
 if __name__ == "__main__":
