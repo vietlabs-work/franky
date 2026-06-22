@@ -128,7 +128,9 @@ def test_parse_usage_nested_message_usage():
 
 def test_parse_usage_cost_usd_key():
     """cost_usd top-level key is recognised as a cost source."""
-    output = _line({"type": "result", "usage": {"input_tokens": 1, "output_tokens": 1}, "cost_usd": 0.001})
+    output = _line(
+        {"type": "result", "usage": {"input_tokens": 1, "output_tokens": 1}, "cost_usd": 0.001}
+    )
     u = parse_usage(output)
     assert u.cost_usd == pytest.approx(0.001)
 
@@ -140,7 +142,9 @@ def test_parse_usage_rejects_negative_and_non_finite_values():
     treated as absent -> the corresponding field is None rather than a garbage value.
     """
     # Negative tokens + negative cost -> all dropped.
-    neg = _line({"type": "result", "usage": {"input_tokens": -5, "output_tokens": -1}, "cost": -0.5})
+    neg = _line(
+        {"type": "result", "usage": {"input_tokens": -5, "output_tokens": -1}, "cost": -0.5}
+    )
     u = parse_usage(neg)
     assert u == Usage()
     # JSON Infinity cost (json.loads parses `Infinity`) is non-finite -> dropped.

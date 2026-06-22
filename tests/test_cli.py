@@ -554,13 +554,16 @@ def test_build_prints_economics_line_and_writes_to_log(monkeypatch):
     """build prints an economics line and writes it into the tasks log file."""
     import json as _json
 
-    agent_output = _json.dumps(
-        {
-            "type": "result",
-            "usage": {"input_tokens": 100, "output_tokens": 50},
-            "total_cost_usd": 0.001,
-        }
-    ) + f"\nopened {PR_URL}"
+    agent_output = (
+        _json.dumps(
+            {
+                "type": "result",
+                "usage": {"input_tokens": 100, "output_tokens": 50},
+                "total_cost_usd": 0.001,
+            }
+        )
+        + f"\nopened {PR_URL}"
+    )
 
     monkeypatch.setattr(cli.os, "environ", _build_env())
     monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
