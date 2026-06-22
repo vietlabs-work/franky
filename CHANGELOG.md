@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Always-on rootless Docker-in-Docker: every task container runs its own rootless Docker
+  daemon, so the agent can `docker build`, `docker compose up` test infra, and run
+  testcontainers inside the sandbox - building/testing repos whose suites need local infra.
+  No host socket, no `--privileged`; the nested daemon's pulls + builds go through the egress
+  proxy and the container registries are added to the default allowlist (#12).
+
+### Changed
+- Container hardening profile relaxed (minimally) to support rootless DinD, applied to every
+  task: `--security-opt=no-new-privileges` dropped (incompatible with the rootless uid-map
+  helpers), `+systempaths=unconfined`, `CAP_SETUID`/`CAP_SETGID` added back on `--cap-drop=ALL`,
+  `+/dev/net/tun`; `--memory` 4g->8g (`--memory-swap` pinned, no swap), `--pids-limit`
+  512->2048, rootless data root on a size-capped tmpfs. No host socket / no host bind mount
+  still hold. See the README security section for the rationale and residual risk (#12).
+
 - Best-effort auto-update hint on `franky build`: a tight (~1s), cached check prints a
   one-line stderr hint when a newer release exists, then proceeds - never blocks, never
   re-execs. `FRANKY_NO_UPDATE_CHECK=1` silences it; `FRANKY_AUTO_UPDATE=1` opts in to

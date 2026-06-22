@@ -29,29 +29,75 @@ from .config import redact
 # Long agent runs: a full clone-build-test-PR cycle can take many minutes. 30 min cap.
 FALLBACK_TIMEOUT_SECS = 1800
 
-# The non-root user baked into the image (Dockerfile: useradd franky). The writable tmpfs
-# mounts are owned by this uid/gid so the agent can actually clone, commit, and write its
+# The non-root user baked into the image (Dockerfile: useradd --uid 1001 franky). The writable
+# tmpfs mounts are owned by this uid/gid so the agent can actually clone, commit, and write its
 # HOME config under a --read-only root. (The --tmpfs PATH:opts short form silently ignores
 # mode=, but honours uid=/gid=, which is what makes the dirs writable by a non-root user.)
 _RUN_UID = 1001
 _RUN_GID = 1001
 _HOME = "/home/franky"
+# XDG_RUNTIME_DIR for the always-on rootless Docker daemon: it puts docker.sock + runtime state
+# here (dockerd-rootless.sh defaults to /run/user/<uid>).
+_XDG_RUNTIME = f"/run/user/{_RUN_UID}"
+# HOME tmpfs size cap. HOME holds git/gh config AND the rootless Docker data root
+# ($HOME/.local/share/docker - images/layers live here, in RAM). Capping it BELOW --memory
+# means a runaway or huge `docker pull` hits a clean tmpfs ENOSPC (the pull fails) instead of
+# OOM-killing dockerd and taking the whole task down with it.
+_HOME_TMPFS_SIZE = "6g"
 
-# Hardening flags applied to every run. No bind mounts, no docker socket: the repo is
-# cloned INSIDE the container, so the agent never touches the host filesystem. Root FS is
-# read-only; only /work (the clone) and the agent's HOME (git/gh config) are writable tmpfs,
-# both owned by the non-root run user so git/gh actually work under --read-only.
+# Hardening flags applied to every run. No bind mounts, no docker socket: the repo is cloned
+# INSIDE the container and so is everything the always-on rootless Docker daemon does, so the
+# agent never touches the host filesystem. Root FS is read-only; only the tmpfs paths below are
+# writable, all owned by the non-root run user so git/gh and rootless dockerd work under
+# --read-only.
+#
+# WHY this profile is RELAXED vs a non-DinD container: franky runs a rootless Docker daemon
+# inside this container (always on - see Dockerfile + franky-dind-entrypoint.sh) so a task can
+# build/test repos whose suites need local infra (compose, testcontainers). Rootless dockerd
+# needs a few specific, MINIMAL relaxations (validated empirically in the issue-12 spike); each
+# is justified inline. This is NOT --privileged and NOT seccomp=unconfined.
 _HARDENING = [
     "--rm",
+    # newuidmap/newgidmap (the setuid helpers rootlesskit uses to map the subordinate uid/gid
+    # range) need CAP_SETUID/CAP_SETGID. So we drop ALL caps then add back exactly those two -
+    # not a blanket grant.
     "--cap-drop=ALL",
-    "--security-opt=no-new-privileges",
+    "--cap-add=SETUID",
+    "--cap-add=SETGID",
+    # systempaths=unconfined UNMASKS /proc so the nested runc can mount a fresh procfs for inner
+    # containers (Docker's default masked /proc paths are locked mounts the inner user namespace
+    # cannot mount over -> "mounting proc: operation not permitted"). This ONLY lifts the /proc
+    # path masking; it is NOT --privileged and NOT seccomp=unconfined.
+    "--security-opt=systempaths=unconfined",
+    # NOTE: --security-opt=no-new-privileges is DELIBERATELY ABSENT (it used to be here). It
+    # blocks the setuid escalation newuidmap/newgidmap rely on, so rootless dockerd cannot set
+    # up its uid map and refuses to start - even WITH CAP_SETUID/SETGID added. It is incompatible
+    # with rootless DinD. The remaining boundary (cap-drop=ALL baseline, rootless user namespace,
+    # --read-only root, the egress proxy cage, no host bind mount / no host docker socket) still
+    # bounds the autonomous agent.
+    # /dev/net/tun: rootlesskit's slirp4netns needs it to create the tap device for the nested
+    # daemon's network. The daemon FAILS to start without it (spike Exp1).
+    "--device",
+    "/dev/net/tun",
     "--read-only",
     "--tmpfs",
     f"/work:exec,uid={_RUN_UID},gid={_RUN_GID}",
     "--tmpfs",
-    f"{_HOME}:exec,uid={_RUN_UID},gid={_RUN_GID}",
-    "--pids-limit=512",
-    "--memory=4g",
+    f"{_HOME}:exec,uid={_RUN_UID},gid={_RUN_GID},size={_HOME_TMPFS_SIZE}",
+    "--tmpfs",
+    f"{_XDG_RUNTIME}:exec,uid={_RUN_UID},gid={_RUN_GID}",
+    # rootlesskit + dockerd also write under /run and /tmp (root-owned bare tmpfs is fine; they
+    # create their own subdirs).
+    "--tmpfs",
+    "/run:exec",
+    "--tmpfs",
+    "/tmp:exec",
+    # dockerd + containerd + nested containers spawn many processes - 512 is too tight.
+    "--pids-limit=2048",
+    # tmpfs image storage is RAM; the cap sits above the 6g HOME tmpfs with headroom, and
+    # --memory-swap=--memory forbids swap so a hostile workload cannot balloon past the cap.
+    "--memory=8g",
+    "--memory-swap=8g",
 ]
 
 # The Squid proxy image (built from proxy/) and the port it listens on inside the net.
