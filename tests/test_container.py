@@ -4,6 +4,7 @@ import subprocess
 from franky.config import Config
 from franky.container import (
     FRANKY_PROXY_IMAGE_VAR,
+    _HOME_TMPFS_SIZE,
     build_docker_argv,
     build_network_argv,
     build_network_connect_argv,
@@ -71,9 +72,6 @@ def test_build_docker_argv_hardening_flags():
     assert "--cap-drop=ALL" in argv
     assert "--read-only" in argv
     assert "--rm" in argv
-    assert "--security-opt=no-new-privileges" in argv
-    assert "--pids-limit=512" in argv
-    assert "--memory=4g" in argv
     # /work and HOME are both writable tmpfs, owned by the non-root run uid so git/gh work
     # under --read-only. (Verified against the real image: bare /work:exec is root-owned and
     # a non-root agent cannot write to it; uid= fixes that.)
@@ -82,6 +80,37 @@ def test_build_docker_argv_hardening_flags():
     home = next(s for s in tmpfs_specs if s.startswith("/home/franky:"))
     assert "exec" in work and "uid=1001" in work and "gid=1001" in work
     assert "exec" in home and "uid=1001" in home and "gid=1001" in home
+
+
+def test_build_docker_argv_dind_relaxations():
+    """Always-on rootless DinD (issue #12) needs a MINIMAL, deliberate relaxation of the locked
+    profile. These assertions pin exactly what changed so a regression (re-adding
+    no-new-privileges, dropping a cap) is caught."""
+    argv = build_docker_argv("franky", {"GH_TOKEN": "x"}, ["pi", "-p", "go"])
+    # no-new-privileges is DELIBERATELY GONE: it blocks rootlesskit's setuid uid-map helpers.
+    assert "--security-opt=no-new-privileges" not in argv
+    # cap-drop=ALL stays, but SETUID/SETGID are added back for newuidmap/newgidmap.
+    assert "--cap-add=SETUID" in argv
+    assert "--cap-add=SETGID" in argv
+    # /proc unmasked so the nested runc can mount procfs for inner containers.
+    assert "--security-opt=systempaths=unconfined" in argv
+    # slirp4netns tap device for the nested daemon's network.
+    assert "--device" in argv
+    assert "/dev/net/tun" in argv
+    # Raised limits: dockerd+containerd+nested procs need headroom; tmpfs image storage is RAM,
+    # capped with no swap blow-up.
+    assert "--pids-limit=2048" in argv
+    assert "--memory=8g" in argv
+    assert "--memory-swap=8g" in argv
+    # HOME tmpfs is size-capped (holds the rootless docker data root) so a huge pull ENOSPCs
+    # before the --memory cap OOM-kills dockerd. The XDG runtime dir holds docker.sock.
+    tmpfs_specs = [argv[i + 1] for i, t in enumerate(argv) if t == "--tmpfs"]
+    home = next(s for s in tmpfs_specs if s.startswith("/home/franky:"))
+    assert f"size={_HOME_TMPFS_SIZE}" in home
+    assert any(s.startswith("/run/user/1001:") and "uid=1001" in s for s in tmpfs_specs)
+    # rootless dockerd + rootlesskit also write under /run and /tmp (bare tmpfs).
+    assert "/run:exec" in tmpfs_specs
+    assert "/tmp:exec" in tmpfs_specs
 
 
 def test_build_docker_argv_no_mounts_or_socket():

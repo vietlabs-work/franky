@@ -1,4 +1,9 @@
-from franky.egress import GITHUB_DOMAINS, REGISTRY_DOMAINS, build_allowlist
+from franky.egress import (
+    DOCKER_REGISTRY_DOMAINS,
+    GITHUB_DOMAINS,
+    REGISTRY_DOMAINS,
+    build_allowlist,
+)
 from franky.engine import PI_PROVIDER_HOSTS, PI_PROVIDER_VARS, ClaudeEngine, PiEngine
 
 
@@ -68,6 +73,25 @@ def test_allowlist_dedup_and_sorted():
     # whitespace stripped before dedup
     assert "api.anthropic.com" in allow
     assert allow.count("github.com") == 1
+
+
+def test_docker_registries_always_allowlisted():
+    # Always-on rootless DinD: the container image registries are in every allowlist so a
+    # nested `docker pull` reaches them through the proxy. Engine-independent.
+    allow = build_allowlist(PiEngine(), {"OPENROUTER_API_KEY": "x"}, [])
+    for d in DOCKER_REGISTRY_DOMAINS:
+        assert d in allow
+    # Docker Hub is the load-bearing one (proven in the spike).
+    assert ".docker.io" in allow
+
+
+def test_docker_registries_use_dot_forms_without_apex_overlap():
+    # Same Squid rule as GitHub: a dot-form and its bare apex together FATAL the proxy. Assert
+    # no entry in the docker registry set has both forms present.
+    allow = build_allowlist(ClaudeEngine(), {}, [])
+    for d in DOCKER_REGISTRY_DOMAINS:
+        if d.startswith("."):
+            assert d[1:] not in allow, f"apex {d[1:]} overlaps dot-form {d} (FATAL in Squid)"
 
 
 def test_github_uses_dot_forms_only():
