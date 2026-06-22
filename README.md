@@ -67,6 +67,11 @@ export FRANKY_IMAGE=franky
 export FRANKY_PROXY_IMAGE=franky-proxy
 ```
 
+Franky is agent-agnostic to develop, not just to run: `AGENTS.md` is the canonical
+agent guide (build/test commands, architecture, the load-bearing invariants, how to
+add an engine), so Codex, Cursor, pi, or Claude Code all start with the same context.
+`CLAUDE.md` is a symlink to it.
+
 ## Quickstart
 
 1. Install Docker. Images are pulled automatically from GHCR on first run (see
