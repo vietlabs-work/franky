@@ -219,6 +219,24 @@ attacker-influenced issue could run attacker-influenced workflow code with your
 repo's Actions secrets. Review workflow changes in the PR diff, and consider
 requiring approval for workflow runs on PRs.
 
+## Evals
+
+Agent quality is probabilistic, so changes to the persona, prompt, model, or profile
+should be gated on a measured **pass-rate**, not a hunch. The eval harness runs a golden
+task set through the *real* Franky flow N times and reports pass-rate, plus a comparison
+mode that reports the delta between two configs (e.g. one engine vs another).
+
+It is **opt-in and out-of-band** (like the manual egress check) - it needs real Docker +
+creds + a throwaway sandbox repo, so it is not part of the fast hermetic unit suite. Point
+`evals/tasks.json` at your sandbox repo and run:
+
+```
+make eval ARGS="-n 3 --engine pi --compare-engine codex"
+```
+
+See [`evals/README.md`](evals/README.md) for setup, the task schema, and the success
+checkers.
+
 ## Status
 
 v0.1.0. Real end-to-end runs need live engine credentials, supplied out-of-band by

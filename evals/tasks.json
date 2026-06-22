@@ -1,0 +1,20 @@
+[
+  {
+    "id": "add-flag",
+    "input": "Add a --verbose flag to the CLI that prints debug output, with a test.",
+    "repo": "<your-sandbox-repo>",
+    "expect": ["pr_opened", "exit_zero"]
+  },
+  {
+    "id": "fix-readme-typo",
+    "input": "Fix the typos in README.md.",
+    "repo": "<your-sandbox-repo>",
+    "expect": ["pr_opened"]
+  },
+  {
+    "id": "issue-driven",
+    "input": "https://github.com/<your-sandbox-repo>/issues/1",
+    "repo": "<your-sandbox-repo>",
+    "expect": ["pr_opened"]
+  }
+]
