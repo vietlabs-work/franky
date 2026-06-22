@@ -20,6 +20,7 @@ read_pyproject_version = release.read_pyproject_version
 read_init_version = release.read_init_version
 set_pyproject_version = release.set_pyproject_version
 set_init_version = release.set_init_version
+set_readme_version = release.set_readme_version
 update_changelog = release.update_changelog
 extract_notes = release.extract_notes
 assert_versions_match = release.assert_versions_match
@@ -33,6 +34,15 @@ def repo(tmp_path):
     (tmp_path / "franky" / "__init__.py").write_text('__version__ = "0.1.0"\n')
     (tmp_path / "CHANGELOG.md").write_text(
         "# Changelog\n\n## [Unreleased]\n\n### Added\n- Some feature\n\n## [0.0.1] - 2026-01-01\n\nOld stuff.\n"
+    )
+    (tmp_path / "README.md").write_text(
+        "# Franky\n\n"
+        "```\n"
+        "uv tool install git+ssh://git@github.com/vietlabs-work/franky@v0.1.0\n"
+        "pipx install git+ssh://git@github.com/vietlabs-work/franky@v0.1.0\n"
+        "```\n\n"
+        "Egress kills DNS with --dns 127.0.0.1 inside the container.\n\n"
+        "## Status\n\nv0.1.0. Under test.\n"
     )
     return tmp_path
 
@@ -87,6 +97,39 @@ def test_set_pyproject_version_roundtrip(repo):
 def test_set_init_version_roundtrip(repo):
     set_init_version(repo, "2.3.4")
     assert read_init_version(repo) == "2.3.4"
+
+
+# --- README version sync ---
+
+
+def test_set_readme_version_roundtrip(repo):
+    set_readme_version(repo, "2.3.4")
+    text = (repo / "README.md").read_text()
+    assert "franky@v2.3.4" in text
+    assert "franky@v0.1.0" not in text
+    assert "v0.1.0" not in text  # the Status line was bumped too
+    assert "## Status\n\nv2.3.4." in text
+    assert "--dns 127.0.0.1" in text  # the IP is not a version and must be left alone
+
+
+def test_set_readme_version_replaces_pins_and_status_independently(repo):
+    # Pins and Status start at DIFFERENT versions; both must be set to the new one.
+    (repo / "README.md").write_text(
+        "```\nuv tool install ...franky@v0.1.0\n```\n\n## Status\n\nv0.0.9. Skewed.\n"
+    )
+    set_readme_version(repo, "2.3.4")
+    text = (repo / "README.md").read_text()
+    assert "franky@v2.3.4" in text
+    assert "## Status\n\nv2.3.4." in text
+    assert "v0.0.9" not in text
+
+
+def test_set_readme_version_no_pin_raises(repo):
+    # A README that no longer carries an install pin must fail loudly, not silently skip
+    # the sync and let a release ship with a stale documented version.
+    (repo / "README.md").write_text("# Franky\n\nNo install pin here.\n")
+    with pytest.raises(SystemExit):
+        set_readme_version(repo, "2.3.4")
 
 
 # --- changelog ---
@@ -215,6 +258,9 @@ def test_release_happy_path_git_commands(repo):
 
     assert read_pyproject_version(repo) == "1.2.3"
     assert read_init_version(repo) == "1.2.3"
+    # README version refs are bumped in lockstep and staged.
+    assert "franky@v1.2.3" in (repo / "README.md").read_text()
+    assert "README.md" in git_calls[add_idx]
 
 
 def test_release_refuses_dirty_tree(repo):
@@ -273,6 +319,7 @@ def test_release_dry_run_no_file_writes(repo):
     assert read_pyproject_version(repo) == "0.1.0"
     assert read_init_version(repo) == "0.1.0"
     assert "## [Unreleased]" in (repo / "CHANGELOG.md").read_text()
+    assert "franky@v0.1.0" in (repo / "README.md").read_text()  # README untouched
     git_calls = [c for c in calls if c[0] == "git"]
     mutating = [c for c in git_calls if c[1] in ("add", "commit", "tag", "push")]
     assert mutating == []
