@@ -67,6 +67,29 @@ def set_init_version(root: Path, v: str) -> None:
     path.write_text(new_text, encoding="utf-8")
 
 
+def set_readme_version(root: Path, v: str) -> None:
+    """Bump the version references README carries so the docs track a release in lockstep
+    with pyproject/__init__. Targets exactly two anchored spots so unrelated dotted numbers
+    (e.g. the `127.0.0.1` in the egress diagram) are never touched:
+      - the `...franky@vX.Y.Z` install pins (both uv + pipx lines)
+      - the `vX.Y.Z` on the line right under the `## Status` header
+
+    Fails loudly if no install pin is found: a silent no-op would let a release ship with a
+    stale documented install command (the exact #21 drift this is meant to prevent)."""
+    path = root / "README.md"
+    text = path.read_text(encoding="utf-8")
+    text, n_pins = re.subn(r"(franky@)v\d+\.\d+\.\d+", rf"\g<1>v{v}", text)
+    if n_pins == 0:
+        print(
+            "release.py: no `franky@vX.Y.Z` install pin found in README.md to bump",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    # Status line is optional; bump it only if present (the guard catches any straggler).
+    text = re.sub(r"(## Status\s+)v\d+\.\d+\.\d+", rf"\g<1>v{v}", text, count=1)
+    path.write_text(text, encoding="utf-8")
+
+
 def update_changelog(root: Path, v: str, date_str: str) -> None:
     """Replace first ## [Unreleased] with ## [X.Y.Z] - DATE and insert a fresh ## [Unreleased] above.
 
@@ -191,7 +214,8 @@ def cmd_release(args, run, root: Path) -> None:
     if args.dry_run:
         print(f"[dry-run] would bump pyproject.toml and franky/__init__.py to {v}")
         print(f"[dry-run] would update CHANGELOG.md: ## [Unreleased] -> ## [{v}] - {date.today()}")
-        print("[dry-run] git add pyproject.toml franky/__init__.py CHANGELOG.md")
+        print(f"[dry-run] would bump README.md version refs (install pins + Status) to v{v}")
+        print("[dry-run] git add pyproject.toml franky/__init__.py CHANGELOG.md README.md")
         print(f"[dry-run] git commit -m 'release: v{v}'")
         print(f"[dry-run] git tag -a v{v} -m v{v}")
         print(f"[dry-run] git push origin main v{v}")
@@ -203,8 +227,9 @@ def cmd_release(args, run, root: Path) -> None:
     set_pyproject_version(root, v)
     set_init_version(root, v)
     update_changelog(root, v, today)
+    set_readme_version(root, v)
 
-    _git(run, ["add", "pyproject.toml", "franky/__init__.py", "CHANGELOG.md"])
+    _git(run, ["add", "pyproject.toml", "franky/__init__.py", "CHANGELOG.md", "README.md"])
     _git(run, ["commit", "-m", f"release: v{v}"])
     _git(run, ["tag", "-a", f"v{v}", "-m", f"v{v}"])
 

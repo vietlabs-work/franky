@@ -14,8 +14,15 @@ This runs `scripts/release.py x.y.z`, which:
 4. Bumps `version` in `pyproject.toml` and `__version__` in `franky/__init__.py` in lockstep.
 5. Retitles the `## [Unreleased]` section in `CHANGELOG.md` to `## [X.Y.Z] - YYYY-MM-DD`
    and inserts a fresh empty `## [Unreleased]` block above it.
-6. Commits (`release: vX.Y.Z`), creates an annotated tag (`vX.Y.Z`), and pushes both
+6. Bumps the version refs in `README.md` (the `@vX.Y.Z` install pins and the `## Status`
+   line) so the docs track the release. Fails loudly if no install pin is found.
+7. Commits (`release: vX.Y.Z`), creates an annotated tag (`vX.Y.Z`), and pushes both
    in a single `git push origin main vX.Y.Z`.
+
+A CI doc-coherence guard (`tests/test_doc_coherence.py`, in the pytest job) asserts on every
+PR that the README version refs and the newest CHANGELOG section stay in step with
+`pyproject.toml`, and that no literal `X.Y.Z` placeholder lingers in a README command block -
+so drift cannot creep back in between releases.
 
 ## Dry run
 
