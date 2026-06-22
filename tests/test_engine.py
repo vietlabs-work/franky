@@ -4,10 +4,13 @@ import pytest
 
 from franky.engine import (
     CLAUDE_TOKEN_VAR,
+    CODEX_PROVIDER_VARS,
     DEFAULT_ENGINE,
+    ENGINES,
     PI_PROVIDER_VARS,
     PR_URL_RE,
     ClaudeEngine,
+    CodexEngine,
     Engine,
     PiEngine,
     _fallback_pr_url,
@@ -163,3 +166,78 @@ def test_engine_base_cred_hint_not_implemented():
     # The base contract is abstract so a new engine that forgets cred_hint fails loudly.
     with pytest.raises(NotImplementedError):
         Engine().cred_hint()
+
+
+# --- codex engine -----------------------------------------------------------
+
+
+def test_codex_inner_argv_without_model():
+    # The dangerous-bypass flag is load-bearing: codex self-sandboxes (Landlock/seccomp) and
+    # prompts for approval; both must be off for a headless run inside Franky's container.
+    assert CodexEngine().inner_argv("do it", None) == [
+        "codex",
+        "exec",
+        "do it",
+        "--json",
+        "--dangerously-bypass-approvals-and-sandbox",
+    ]
+
+
+def test_codex_inner_argv_with_model():
+    argv = CodexEngine().inner_argv("do it", "gpt-5.4")
+    assert argv[-2:] == ["--model", "gpt-5.4"]
+    assert "--dangerously-bypass-approvals-and-sandbox" in argv
+    assert "--json" in argv
+
+
+def test_codex_registered_and_resolvable():
+    assert ENGINES.get("codex") is CodexEngine
+    # both the flag and the FRANKY_ENGINE env path must reach codex
+    assert isinstance(resolve_engine("codex", {}), CodexEngine)
+    assert isinstance(resolve_engine(None, {"FRANKY_ENGINE": "codex"}), CodexEngine)
+
+
+def test_codex_parse_pr_url_from_jsonl():
+    # codex --json emits JSONL, so the shared scanner handles it like the other engines.
+    line = json.dumps({"type": "item.completed", "text": f"opened {PR_URL}"})
+    assert CodexEngine().parse_pr_url(line) == PR_URL
+
+
+def test_codex_required_env_returns_present_subset(monkeypatch):
+    for v in CODEX_PROVIDER_VARS:
+        monkeypatch.delenv(v, raising=False)
+    monkeypatch.setenv("CODEX_API_KEY", "sk-codex-fake")
+    assert CodexEngine().required_env() == ["CODEX_API_KEY"]
+
+
+def test_codex_required_env_both_keys_present(monkeypatch):
+    # The shared OPENAI_API_KEY makes the both-set case the non-obvious one: both are returned,
+    # in declaration order (CODEX_API_KEY first).
+    for v in CODEX_PROVIDER_VARS:
+        monkeypatch.delenv(v, raising=False)
+    monkeypatch.setenv("CODEX_API_KEY", "sk-codex-fake")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-fake")
+    assert CodexEngine().required_env() == ["CODEX_API_KEY", "OPENAI_API_KEY"]
+
+
+def test_codex_required_env_accepts_openai_key(monkeypatch):
+    # OPENAI_API_KEY also authenticates codex (it doubles as the codex key).
+    for v in CODEX_PROVIDER_VARS:
+        monkeypatch.delenv(v, raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-fake")
+    assert CodexEngine().required_env() == ["OPENAI_API_KEY"]
+
+
+def test_codex_required_env_empty_when_none_set(monkeypatch):
+    for v in CODEX_PROVIDER_VARS:
+        monkeypatch.delenv(v, raising=False)
+    assert CodexEngine().required_env() == []
+
+
+def test_codex_cred_hint_names_its_vars():
+    hint = CodexEngine().cred_hint()
+    assert "CODEX_API_KEY" in hint
+    assert "OPENAI_API_KEY" in hint
+    # codex must NOT advertise the other engines' creds.
+    assert "ANTHROPIC_API_KEY" not in hint
+    assert CLAUDE_TOKEN_VAR not in hint

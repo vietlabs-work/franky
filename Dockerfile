@@ -77,14 +77,16 @@ RUN apt-get update \
 COPY --from=docker-dl /out/bin/ /usr/local/bin/
 COPY --from=docker-dl /out/cli-plugins/ /usr/local/lib/docker/cli-plugins/
 
-# Both engines are node CLIs, so one npm install bundles them.
+# All engines are node CLIs, so one npm install bundles them.
 #   pi     -> @earendil-works/pi-coding-agent  (bin: pi)
 #   claude -> @anthropic-ai/claude-code        (bin: claude)
+#   codex  -> @openai/codex                    (bin: codex)
 # Clean the npm cache in the SAME layer - otherwise ~100MB of /root/.npm download
 # cache commits into the image (it is dead weight at runtime; npm refetches on demand).
 RUN npm install -g \
         @earendil-works/pi-coding-agent \
         @anthropic-ai/claude-code \
+        @openai/codex \
     && npm cache clean --force
 
 # Non-root: the agent (and the rootless Docker daemon) run as this unprivileged user inside the

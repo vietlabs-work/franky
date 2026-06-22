@@ -27,14 +27,15 @@ throwaway container with a narrowly scoped token.
 ## Engines
 
 Franky is vendor-neutral. The engine that runs inside the container is pluggable;
-both ship in the one image.
+all ship in the one image.
 
 | Engine | CLI | Auth | Notes |
 |--------|-----|------|-------|
 | `pi` (default) | `@earendil-works/pi-coding-agent` | BYOK provider key | MIT, 15+ providers (OpenRouter, Anthropic, OpenAI, Ollama, ...) |
 | `claude` | `@anthropic-ai/claude-code` | `CLAUDE_CODE_OAUTH_TOKEN` | Most capable; uses your Claude subscription |
+| `codex` | `@openai/codex` | `CODEX_API_KEY` or `OPENAI_API_KEY` | OpenAI Codex headless (`codex exec`); API-key auth only |
 
-Select with `--engine pi|claude`, or set `FRANKY_ENGINE`. Resolution order:
+Select with `--engine pi|claude|codex`, or set `FRANKY_ENGINE`. Resolution order:
 `--engine` flag > `FRANKY_ENGINE` > default `pi`.
 
 ## Install
@@ -83,13 +84,14 @@ add an engine), so Codex, Cursor, pi, or Claude Code all start with the same con
 3. Configure credentials. Copy `.env.example` to `.env` and fill it in. At minimum:
    - `FRANKY_ALLOWED_REPOS` - comma-separated `owner/repo` allowlist (required).
    - `GH_TOKEN` - scoped to contents + pull_requests on those repos.
-   - the selected engine's creds (a provider key for `pi`, or
-     `CLAUDE_CODE_OAUTH_TOKEN` for `claude`).
+   - the selected engine's creds (a provider key for `pi`,
+     `CLAUDE_CODE_OAUTH_TOKEN` for `claude`, or `CODEX_API_KEY` / `OPENAI_API_KEY`
+     for `codex`).
    - for JIRA tasks: `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN` (host-side only,
      never forwarded into the container).
 4. Run:
    ```
-   franky build <gh-issue-url | jira KEY | "prose"> [--repo owner/repo] [--engine pi|claude] [--plan-first]
+   franky build <gh-issue-url | jira KEY | "prose"> [--repo owner/repo] [--engine pi|claude|codex] [--plan-first]
    ```
 
 Each run writes a redacted log to `tasks/<timestamp>.log` and prints the PR URL.
@@ -109,7 +111,8 @@ release for your next run. (Both are host-CLI only; neither reaches the containe
 Read this before pointing Franky at anything.
 
 **Container hardening is load-bearing.** Because the agent runs autonomously
-(claude with `--dangerously-skip-permissions`, pi with its default tools), the
+(claude with `--dangerously-skip-permissions`, codex with
+`--dangerously-bypass-approvals-and-sandbox`, pi with its default tools), the
 OS-level isolation is what bounds it, not tool-permission prompts. Franky runs the
 container with:
 
@@ -178,7 +181,8 @@ Squid proxy enforcing a domain allowlist.
 - **Fail-closed.** Franky refuses to start the task unless the proxy is confirmed
   healthy, and the proxy refuses to start with an empty or malformed allowlist.
 - **The allowlist** covers: your engine's provider host (e.g. `api.anthropic.com`,
-  `openrouter.ai`), GitHub (clone/push/PR), the npm + PyPI registries, and - because
+  `openrouter.ai`, `api.openai.com`), GitHub (clone/push/PR), the npm + PyPI
+  registries, and - because
   Docker-in-Docker is always on - a broad set of well-known **container image
   registries** (Docker Hub + CDN, GHCR, GCR/Artifact Registry, `registry.k8s.io`,
   Quay, ECR Public, MCR, GitLab, plus the CDNs they serve layer blobs from). Add
