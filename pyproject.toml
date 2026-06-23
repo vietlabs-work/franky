@@ -2,14 +2,32 @@
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
+# The PyPI distribution name. `franky` was already taken, so the public package is
+# `franky-agent`; the installed command and the import package both stay `franky` (see
+# [project.scripts] and [tool.setuptools]). If this name changes, also update
+# `detect_install`'s default in franky/_install.py and DIST_NAME in franky/update_check.py -
+# self-update reinstalls by this name and install-provenance detection looks it up.
 [project]
-name = "franky"
+name = "franky-agent"
 version = "0.0.1"
 description = "Franky - a lean personal coding agent that builds in a hardened container and opens a PR."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Viet Tran" }]
+keywords = ["coding-agent", "cli", "docker", "github", "automation", "pull-request"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Build Tools",
+]
 dependencies = ["click>=8.1", "tomli>=2.0; python_version<'3.11'"]
 
 [project.optional-dependencies]

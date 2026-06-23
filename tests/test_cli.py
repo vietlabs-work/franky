@@ -405,7 +405,7 @@ def test_build_image_auth_error_clean_message(monkeypatch):
         "OPENROUTER_API_KEY": "sk-or-fake",
     }
     monkeypatch.setattr(cli.os, "environ", env)
-    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "ghcr.io/vietlabs-work/franky:0.1.0")
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "ghcr.io/franky-agent/franky:0.1.0")
     monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (False, "auth"))
 
     res = CliRunner().invoke(cli.main, ["build", "do it", "--repo", "me/repo"])
@@ -420,7 +420,7 @@ def test_build_image_pull_failed_clean_message(monkeypatch):
         "OPENROUTER_API_KEY": "sk-or-fake",
     }
     monkeypatch.setattr(cli.os, "environ", env)
-    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "ghcr.io/vietlabs-work/franky:0.1.0")
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "ghcr.io/franky-agent/franky:0.1.0")
     monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (False, "pull-failed"))
 
     res = CliRunner().invoke(cli.main, ["build", "do it", "--repo", "me/repo"])
@@ -435,7 +435,7 @@ def test_build_image_no_docker_clean_message(monkeypatch):
         "OPENROUTER_API_KEY": "sk-or-fake",
     }
     monkeypatch.setattr(cli.os, "environ", env)
-    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "ghcr.io/vietlabs-work/franky:0.1.0")
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "ghcr.io/franky-agent/franky:0.1.0")
     monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (False, "no-docker"))
 
     res = CliRunner().invoke(cli.main, ["build", "do it", "--repo", "me/repo"])
@@ -795,7 +795,7 @@ def test_iterate_image_no_docker_clean_message(monkeypatch):
     # iterate shares _ensure_images with build; confirm the image gate fires on the iterate
     # path too (clean message, no container run).
     monkeypatch.setattr(cli.os, "environ", _iterate_env())
-    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "ghcr.io/vietlabs-work/franky:0.1.0")
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "ghcr.io/franky-agent/franky:0.1.0")
     monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (False, "no-docker"))
     ran = {"container": False}
     monkeypatch.setattr(

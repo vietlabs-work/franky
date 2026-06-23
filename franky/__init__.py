@@ -2,16 +2,18 @@ __version__ = "0.0.1"
 
 
 def franky_version() -> str:
-    """Resolve the running version. Prefer installed package metadata (what `pip install
-    franky==X` pins and what the published image tag is keyed to); fall back to __version__
-    when metadata is absent (running from a source checkout with no install). If both resolve
-    and DISAGREE it's a dev-env skew (stale editable metadata vs a bumped __version__) - warn
-    to stderr and trust metadata."""
+    """Resolve the running version. Prefer installed package metadata (what
+    `pip install franky-agent==X` pins and what the published image tag is keyed to); fall back
+    to __version__ when metadata is absent (running from a source checkout with no install). If
+    both resolve and DISAGREE it's a dev-env skew (stale editable metadata vs a bumped
+    __version__) - warn to stderr and trust metadata."""
     import sys
     import importlib.metadata
 
+    from ._install import DIST_NAME
+
     try:
-        meta = importlib.metadata.version("franky")
+        meta = importlib.metadata.version(DIST_NAME)
     except Exception:
         return __version__
     if meta != __version__:

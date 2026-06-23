@@ -4,6 +4,7 @@ import subprocess
 from franky.config import Config
 from franky.container import (
     FRANKY_PROXY_IMAGE_VAR,
+    GHCR_REPO_VAR,
     _HOME_TMPFS_SIZE,
     build_docker_argv,
     build_network_argv,
@@ -441,13 +442,21 @@ def test_resolve_image_env_override_wins():
 
 def test_resolve_image_default_is_versioned_ghcr():
     ref = resolve_image({})
-    assert ref.startswith("ghcr.io/vietlabs-work/franky:")
+    assert ref.startswith("ghcr.io/franky-agent/franky:")
     assert not ref.endswith(":latest")
 
 
 def test_resolve_image_proxy_uses_proxy_var():
     ref = resolve_image({}, FRANKY_PROXY_IMAGE_VAR, "franky-proxy")
-    assert ref.startswith("ghcr.io/vietlabs-work/franky-proxy:")
+    assert ref.startswith("ghcr.io/franky-agent/franky-proxy:")
+
+
+def test_resolve_image_ghcr_repo_override():
+    # FRANKY_GHCR_REPO retargets the namespace (publishing org can move with no code change),
+    # while the per-image FRANKY_IMAGE override still wins outright.
+    ref = resolve_image({GHCR_REPO_VAR: "ghcr.io/acme"})
+    assert ref.startswith("ghcr.io/acme/franky:")
+    assert resolve_image({GHCR_REPO_VAR: "ghcr.io/acme", "FRANKY_IMAGE": "local"}) == "local"
 
 
 def test_ensure_image_available_present_no_pull():
@@ -488,7 +497,7 @@ def test_ensure_image_available_absent_auth_error():
             )
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-    ok, reason = ensure_image_available("ghcr.io/vietlabs-work/franky:0.1.0", runner=fake_runner)
+    ok, reason = ensure_image_available("ghcr.io/franky-agent/franky:0.1.0", runner=fake_runner)
     assert ok is False
     assert reason == "auth"
 
@@ -501,7 +510,7 @@ def test_ensure_image_available_absent_pull_failed():
             return subprocess.CompletedProcess(argv, 1, stdout="", stderr="network timeout")
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-    ok, reason = ensure_image_available("ghcr.io/vietlabs-work/franky:0.1.0", runner=fake_runner)
+    ok, reason = ensure_image_available("ghcr.io/franky-agent/franky:0.1.0", runner=fake_runner)
     assert ok is False
     assert reason == "pull-failed"
 

@@ -57,6 +57,29 @@ jobs:
           name: dist
           path: dist/*
 
+  # Publish the built wheel + sdist to PyPI via Trusted Publishing (OIDC) - no stored token.
+  # Push-only (a workflow_dispatch dry run builds the wheel but never publishes). Requires a
+  # one-time PyPI "trusted publisher" registered for this repo + workflow + the `pypi`
+  # environment (see docs/releasing.md).
+  pypi:
+    needs: wheel
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      # Pinned to a commit SHA (v1.14.0): a floating ref on an OIDC job holding id-token:write
+      # is a supply-chain risk. skip-existing makes a re-run idempotent if a later job failed
+      # after PyPI already published this version (PyPI forbids re-upload).
+      - uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b
+        with:
+          skip-existing: true
+
   image:
     needs: guard
     runs-on: ubuntu-latest
@@ -91,13 +114,15 @@ jobs:
           file: ${{ matrix.dockerfile }}
           platforms: ${{ github.event_name == 'push' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
           push: ${{ github.event_name == 'push' }}
+          # Namespace tracks the repo's owning org, so moving the repo retargets the images
+          # with no edit. The CLI's DEFAULT_GHCR_REPO (franky/container.py) must match that org.
           tags: |
-            ghcr.io/vietlabs-work/${{ matrix.name }}:${{ env.VERSION }}
-            ghcr.io/vietlabs-work/${{ matrix.name }}:latest
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}:${{ env.VERSION }}
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}:latest
 
-  # GitHub Release is created last - its existence implies the wheel + images shipped.
+  # GitHub Release is created last - its existence implies the wheel + PyPI + images shipped.
   release:
-    needs: [wheel, image]
+    needs: [wheel, pypi, image]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:

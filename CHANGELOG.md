@@ -7,7 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Public distribution: Franky is published to PyPI as `franky-agent` (the command stays
+  `franky`), so `uv tool install franky-agent` / `pipx` / `pip` work with no GitHub auth while
+  the repo stays private. The release workflow publishes the wheel + sdist via PyPI Trusted
+  Publishing (OIDC, no stored token), and the GHCR images are public.
+- `FRANKY_GHCR_REPO` env/config knob to retarget the image namespace without a code change;
+  the default (`ghcr.io/franky-agent`) and the release workflow both track the repo's owning
+  org.
+
 ### Changed
+- `franky update` and the build-time update hint now check the public PyPI JSON API for the
+  latest version and reinstall `franky-agent==X.Y.Z`, replacing the private-repo
+  `gh`/GitHub-releases fetch and the `git+ssh` install spec (no `GH_TOKEN` needed).
 - `make release` no longer prints a misleading `Released vX.Y.Z` the instant the tag is pushed.
   The push only triggers the async Release workflow (wheel + GHCR images + GitHub Release,
   several minutes), so the command now says so and, by default, tails that workflow to

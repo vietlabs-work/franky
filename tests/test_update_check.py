@@ -11,7 +11,7 @@ from franky._install import Install
 from franky.update_check import (
     _TTL_AVAILABLE,
     _TTL_CURRENT,
-    REPO_GIT_URL,
+    DIST_NAME,
     UpdateError,
     _cache_fresh,
     _flag,
@@ -20,7 +20,7 @@ from franky.update_check import (
     _spec,
     _tail,
     _write_cache,
-    fetch_latest_tag,
+    fetch_latest_version,
     force_update,
     is_newer,
     maybe_auto_update,
@@ -71,8 +71,13 @@ def test_is_newer_unparseable_falls_back_to_string_diff():
 # ---------------------------------------------------------------------------
 
 
-def test_spec_pins_the_tag():
-    assert _spec("v1.2.3") == f"{REPO_GIT_URL}@v1.2.3"
+def test_spec_pins_the_pypi_version():
+    assert _spec("1.2.3") == f"{DIST_NAME}==1.2.3"
+
+
+def test_spec_strips_leading_v():
+    # PyPI versions are plain X.Y.Z, but a v-prefixed string must still yield a valid spec.
+    assert _spec("v1.2.3") == f"{DIST_NAME}==1.2.3"
 
 
 def test_install_command_uv_tool():
@@ -101,81 +106,55 @@ def test_tail_returns_last_lines():
 
 
 # ---------------------------------------------------------------------------
-# fetch_latest_tag
+# fetch_latest_version (PyPI JSON API)
 # ---------------------------------------------------------------------------
 
 
-def test_fetch_prefers_gh():
-    def runner(argv, **kw):
-        assert argv[:2] == ["gh", "api"]
-        return _proc(returncode=0, stdout="v0.3.0\n")
+class _Resp:
+    """Minimal context-manager stand-in for a urllib response carrying `body` bytes."""
 
-    def opener(*a, **k):  # pragma: no cover - must not be called
-        raise AssertionError("REST should not be hit when gh succeeds")
+    def __init__(self, body: bytes):
+        self._body = body
 
-    assert fetch_latest_tag(runner=runner, opener=opener, env={}) == "v0.3.0"
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def read(self):
+        return self._body
 
 
-def test_fetch_falls_back_to_rest_with_token_header():
+def test_fetch_returns_info_version_from_pypi():
     captured = {}
 
-    def runner(argv, **kw):
-        return _proc(returncode=1, stderr="gh not logged in")
-
-    class _Resp:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def read(self):
-            return b'{"tag_name": "v0.4.0"}'
-
     def opener(req, timeout=None):
-        captured["auth"] = req.headers.get("Authorization")
-        return _Resp()
+        captured["url"] = req.full_url
+        captured["ua"] = req.headers.get("User-agent")
+        return _Resp(b'{"info": {"version": "0.4.0"}}')
 
-    tag = fetch_latest_tag(runner=runner, opener=opener, env={"GH_TOKEN": "secret-tok"})
-    assert tag == "v0.4.0"
-    assert captured["auth"] == "Bearer secret-tok"
-
-
-def test_fetch_rest_without_token_omits_auth():
-    captured = {}
-
-    def runner(argv, **kw):
-        raise FileNotFoundError("no gh on PATH")
-
-    class _Resp:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def read(self):
-            return b'{"tag_name": "v0.5.0"}'
-
-    def opener(req, timeout=None):
-        captured["auth"] = req.headers.get("Authorization")
-        return _Resp()
-
-    tag = fetch_latest_tag(runner=runner, opener=opener, env={})
-    assert tag == "v0.5.0"
-    assert captured["auth"] is None
+    assert fetch_latest_version(opener=opener) == "0.4.0"
+    assert captured["url"] == "https://pypi.org/pypi/franky-agent/json"
+    assert captured["ua"] == "franky-update"  # named, never anonymous
 
 
-def test_fetch_raises_update_error_when_all_paths_fail():
-    def runner(argv, **kw):
-        return _proc(returncode=1)
-
+def test_fetch_raises_update_error_on_network_failure():
     def opener(req, timeout=None):
         raise OSError("network down")
 
     with pytest.raises(UpdateError) as exc:
-        fetch_latest_tag(runner=runner, opener=opener, env={})
-    assert "could not reach GitHub" in str(exc.value)
+        fetch_latest_version(opener=opener)
+    assert "could not reach PyPI" in str(exc.value)
+
+
+def test_fetch_raises_update_error_when_version_missing():
+    def opener(req, timeout=None):
+        return _Resp(b'{"info": {}}')
+
+    with pytest.raises(UpdateError) as exc:
+        fetch_latest_version(opener=opener)
+    assert "no info.version" in str(exc.value)
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +192,7 @@ def test_force_update_already_current():
     assert any("already on the latest release" in ln for ln in lines)
 
 
-def test_force_update_upgrades_and_reports_tag():
+def test_force_update_upgrades_and_reports_version():
     calls = {}
     lines, out = _collect()
 

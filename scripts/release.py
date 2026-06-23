@@ -75,25 +75,23 @@ def set_init_version(root: Path, v: str) -> None:
 
 
 def set_readme_version(root: Path, v: str) -> None:
-    """Bump the version references README carries so the docs track a release in lockstep
-    with pyproject/__init__. Targets exactly two anchored spots so unrelated dotted numbers
-    (e.g. the `127.0.0.1` in the egress diagram) are never touched:
-      - the `...franky@vX.Y.Z` install pins (both uv + pipx lines)
-      - the `vX.Y.Z` on the line right under the `## Status` header
+    """Bump the `vX.Y.Z` on the line right under the `## Status` header so the docs track a
+    release in lockstep with pyproject/__init__. Anchored to that one spot so unrelated dotted
+    numbers (e.g. the `127.0.0.1` in the egress diagram) are never touched.
 
-    Fails loudly if no install pin is found: a silent no-op would let a release ship with a
-    stale documented install command (the exact #21 drift this is meant to prevent)."""
+    The PyPI install command carries no version pin (`uv tool install franky-agent` always
+    fetches the latest), so there is no install pin to bump - the Status line is the only
+    versioned README reference. Fails loudly if it is missing: a silent no-op would let a
+    release ship with a stale documented version (the #21 drift this guards against)."""
     path = root / "README.md"
     text = path.read_text(encoding="utf-8")
-    text, n_pins = re.subn(r"(franky@)v\d+\.\d+\.\d+", rf"\g<1>v{v}", text)
-    if n_pins == 0:
+    text, n = re.subn(r"(## Status\s+)v\d+\.\d+\.\d+", rf"\g<1>v{v}", text, count=1)
+    if n == 0:
         print(
-            "release.py: no `franky@vX.Y.Z` install pin found in README.md to bump",
+            "release.py: no `## Status` version line found in README.md to bump",
             file=sys.stderr,
         )
         raise SystemExit(1)
-    # Status line is optional; bump it only if present (the guard catches any straggler).
-    text = re.sub(r"(## Status\s+)v\d+\.\d+\.\d+", rf"\g<1>v{v}", text, count=1)
     path.write_text(text, encoding="utf-8")
 
 
@@ -278,8 +276,9 @@ def _watch_release(run, v: str, sleep) -> None:
     release_url = f"{web}/releases/tag/v{v}" if web else f"the v{v} release page"
 
     print(
-        f"\nPushed release commit and tag v{v}. The Release workflow now builds the wheel\n"
-        "+ GHCR images and publishes the GitHub Release - this takes several minutes.",
+        f"\nPushed release commit and tag v{v}. The Release workflow now builds the wheel,\n"
+        "publishes it to PyPI, pushes the GHCR images, and publishes the GitHub Release -\n"
+        "this takes several minutes.",
     )
 
     run_id = _find_release_run_id(run, v, sleep)
@@ -342,8 +341,8 @@ def cmd_release(args, run, root: Path, sleep=time.sleep) -> None:
         print(f"[dry-run] git commit -m 'release: v{v}'")
         print(f"[dry-run] git tag -a v{v} -m v{v}")
         print(f"[dry-run] git push origin main v{v}")
-        print("[dry-run] the tag push triggers the Release workflow (wheel + GHCR images +")
-        print("[dry-run]   GitHub Release); would then watch it to completion unless --no-watch")
+        print("[dry-run] the tag push triggers the Release workflow (wheel -> PyPI, GHCR")
+        print("[dry-run]   images, GitHub Release); would then watch it unless --no-watch")
         return
 
     _assert_release_preconditions(root, v, run)
