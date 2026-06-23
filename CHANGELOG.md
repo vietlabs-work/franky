@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- `make release` no longer prints a misleading `Released vX.Y.Z` the instant the tag is pushed.
+  The push only triggers the async Release workflow (wheel + GHCR images + GitHub Release,
+  several minutes), so the command now says so and, by default, tails that workflow to
+  completion via `gh run watch` - printing the published Release URL on success or a failure
+  pointer otherwise. `--no-watch` prints the Actions + Release links instead of waiting.
+  Watching is best-effort: it degrades to links (never errors) when `gh` is missing/unauthed
+  or the run can't be found, and caps the wait at 20 min.
+
 ## [0.0.1] - 2026-06-23
 
 ### Added

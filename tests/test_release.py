@@ -236,7 +236,7 @@ def test_release_happy_path_git_commands(repo):
     responses = [
         (["git", "fetch"], 0, "", ""),
         (["git", "rev-parse", "--abbrev-ref", "HEAD"], 0, "main", ""),
-        (["git", "status", "--porcelain"], 0, "", ""),
+        (["git", "status", "--porcelain", "--untracked-files=no"], 0, "", ""),
         (["git", "rev-parse", "HEAD"], 0, "abc123", ""),
         (["git", "rev-parse", "origin/main"], 0, "abc123", ""),
         (["git", "rev-parse", "-q", "--verify"], 1, "", ""),
@@ -246,7 +246,7 @@ def test_release_happy_path_git_commands(repo):
         (["git", "push"], 0, "", ""),
     ]
     fake_run, calls = make_fake_run(responses)
-    main(["1.2.3"], run=fake_run, root=repo)
+    main(["1.2.3", "--no-watch"], run=fake_run, root=repo)
 
     git_calls = [c for c in calls if c[0] == "git"]
     subcommands = [c[1] for c in git_calls]
@@ -294,11 +294,105 @@ def test_release_clean_tree_ignores_untracked(repo):
         (["git", "push"], 0, "", ""),
     ]
     fake_run, calls = make_fake_run(responses)
-    main(["1.2.3"], run=fake_run, root=repo)
+    main(["1.2.3", "--no-watch"], run=fake_run, root=repo)
     subcommands = [c[1] for c in calls if c[0] == "git"]
     assert "push" in subcommands  # reached the end despite untracked .claude/
     status_calls = [c for c in calls if list(c[:2]) == ["git", "status"]]
     assert status_calls and all("--untracked-files=no" in c for c in status_calls)
+
+
+def _happy_release_responses():
+    """Git responses for a clean, synced, tag-absent release that reaches push."""
+    return [
+        (["git", "fetch"], 0, "", ""),
+        (["git", "rev-parse", "--abbrev-ref", "HEAD"], 0, "main", ""),
+        (["git", "status", "--porcelain", "--untracked-files=no"], 0, "", ""),
+        (["git", "rev-parse", "HEAD"], 0, "abc123", ""),
+        (["git", "rev-parse", "origin/main"], 0, "abc123", ""),
+        (["git", "rev-parse", "-q", "--verify"], 1, "", ""),
+        (["git", "add"], 0, "", ""),
+        (["git", "commit"], 0, "", ""),
+        (["git", "tag"], 0, "", ""),
+        (["git", "push"], 0, "", ""),
+    ]
+
+
+def test_release_no_watch_prints_links(repo, capsys):
+    responses = _happy_release_responses() + [
+        (["git", "remote", "get-url"], 0, "https://github.com/vietlabs-work/franky.git", ""),
+    ]
+    fake_run, calls = make_fake_run(responses)
+    main(["1.2.3", "--no-watch"], run=fake_run, root=repo, sleep=lambda *_: None)
+    # --no-watch never tails the workflow.
+    assert not any(c[:3] == ["gh", "run", "watch"] for c in calls)
+    out = capsys.readouterr().out
+    assert "https://github.com/vietlabs-work/franky/actions" in out
+    assert "releases/tag/v1.2.3" in out
+
+
+def test_release_watch_happy_path(repo, capsys):
+    responses = _happy_release_responses() + [
+        (["git", "remote", "get-url"], 0, "git@github.com:vietlabs-work/franky.git", ""),
+        (["gh", "run", "list"], 0, '[{"databaseId": 28002437360}]', ""),
+        (["gh", "run", "watch"], 0, "", ""),
+    ]
+    fake_run, calls = make_fake_run(responses)
+    main(["1.2.3"], run=fake_run, root=repo, sleep=lambda *_: None)
+    watch_calls = [c for c in calls if c[:3] == ["gh", "run", "watch"]]
+    assert watch_calls == [["gh", "run", "watch", "28002437360", "--exit-status"]]
+    out = capsys.readouterr().out
+    assert "Release published" in out
+    assert "releases/tag/v1.2.3" in out
+
+
+def test_release_watch_reports_workflow_failure(repo, capsys):
+    responses = _happy_release_responses() + [
+        (["git", "remote", "get-url"], 0, "https://github.com/vietlabs-work/franky.git", ""),
+        (["gh", "run", "list"], 0, '[{"databaseId": 999}]', ""),
+        (["gh", "run", "watch"], 1, "", ""),  # --exit-status -> nonzero on a failed run
+    ]
+    fake_run, _ = make_fake_run(responses)
+    main(["1.2.3"], run=fake_run, root=repo, sleep=lambda *_: None)
+    out = capsys.readouterr().out
+    assert "did NOT succeed" in out
+
+
+def test_release_watch_degrades_when_gh_missing(repo, capsys):
+    base = dict(
+        (tuple(prefix), (rc, out, err))
+        for prefix, rc, out, err in _happy_release_responses()
+        + [(["git", "remote", "get-url"], 0, "https://github.com/vietlabs-work/franky.git", "")]
+    )
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        if argv and argv[0] == "gh":
+            raise FileNotFoundError("gh")  # gh not installed
+        for prefix, (rc, out, err) in base.items():
+            if tuple(argv[: len(prefix)]) == prefix:
+                return subprocess.CompletedProcess(argv, rc, out, err)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    # Must not raise: the release is already pushed, watch is best-effort.
+    main(["1.2.3"], run=runner, root=repo, sleep=lambda *_: None)
+    out = capsys.readouterr().out
+    assert "Couldn't attach" in out
+    assert "https://github.com/vietlabs-work/franky/actions" in out
+    assert not any(c[:3] == ["gh", "run", "watch"] for c in calls)
+
+
+def test_origin_web_url_normalizes_remote_forms(repo):
+    for remote in (
+        "git@github.com:vietlabs-work/franky.git",
+        "https://github.com/vietlabs-work/franky.git",
+        "ssh://git@github.com/vietlabs-work/franky",
+    ):
+        fake_run, _ = make_fake_run([(["git", "remote", "get-url"], 0, remote, "")])
+        assert release._origin_web_url(fake_run) == "https://github.com/vietlabs-work/franky"
+    # Non-GitHub remote -> None (best-effort, no crash).
+    fake_run, _ = make_fake_run([(["git", "remote", "get-url"], 0, "https://gitlab.com/x/y", "")])
+    assert release._origin_web_url(fake_run) is None
 
 
 def test_release_refuses_wrong_branch(repo):
@@ -315,7 +409,7 @@ def test_release_refuses_unsynced_main(repo):
     responses = [
         (["git", "fetch"], 0, "", ""),
         (["git", "rev-parse", "--abbrev-ref", "HEAD"], 0, "main", ""),
-        (["git", "status", "--porcelain"], 0, "", ""),
+        (["git", "status", "--porcelain", "--untracked-files=no"], 0, "", ""),
         (["git", "rev-parse", "HEAD"], 0, "abc123", ""),
         (["git", "rev-parse", "origin/main"], 0, "def456", ""),
     ]
@@ -328,7 +422,7 @@ def test_release_refuses_existing_tag(repo):
     responses = [
         (["git", "fetch"], 0, "", ""),
         (["git", "rev-parse", "--abbrev-ref", "HEAD"], 0, "main", ""),
-        (["git", "status", "--porcelain"], 0, "", ""),
+        (["git", "status", "--porcelain", "--untracked-files=no"], 0, "", ""),
         (["git", "rev-parse", "HEAD"], 0, "abc123", ""),
         (["git", "rev-parse", "origin/main"], 0, "abc123", ""),
         (["git", "rev-parse", "-q", "--verify"], 0, "abc123", ""),
@@ -359,7 +453,7 @@ def test_tag_recovery_happy_path(repo):
     set_pyproject_version(repo, "1.2.3")
     set_init_version(repo, "1.2.3")
     responses = [
-        (["git", "status", "--porcelain"], 0, "", ""),
+        (["git", "status", "--porcelain", "--untracked-files=no"], 0, "", ""),
         (["git", "rev-parse", "-q", "--verify"], 1, "", ""),
         (["git", "tag"], 0, "", ""),
         (["git", "push"], 0, "", ""),
@@ -396,7 +490,7 @@ def test_tag_recovery_dry_run_no_mutations(repo):
     set_pyproject_version(repo, "1.2.3")
     set_init_version(repo, "1.2.3")
     responses = [
-        (["git", "status", "--porcelain"], 0, "", ""),
+        (["git", "status", "--porcelain", "--untracked-files=no"], 0, "", ""),
         (["git", "rev-parse", "-q", "--verify"], 1, "", ""),
     ]
     fake_run, calls = make_fake_run(responses)
