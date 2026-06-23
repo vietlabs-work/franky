@@ -8,3 +8,4 @@ tasks/
 build/
 dist/
 .worktrees/
+.claude/worktrees/
