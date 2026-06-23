@@ -806,3 +806,204 @@ def test_iterate_image_no_docker_clean_message(monkeypatch):
     assert res.exit_code != 0
     assert "docker is not available" in res.output
     assert ran["container"] is False
+
+
+# ---------------------------------------------------------------------------
+# config subgroup
+# ---------------------------------------------------------------------------
+# All these tests use tmp_path-rooted paths (via FRANKY_CONFIG_FILE override set
+# by the autouse fixture in conftest.py, with per-test overrides where needed).
+
+
+def _cfg_env(tmp_path) -> dict[str, str]:
+    """A fresh env dict with FRANKY_CONFIG_FILE pointing at a non-existent tmp path."""
+    return {"FRANKY_CONFIG_FILE": str(tmp_path / "franky-config")}
+
+
+def test_config_path_prints_path(tmp_path, monkeypatch):
+    cfg_path = str(tmp_path / "franky-config")
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", cfg_path)
+    res = CliRunner().invoke(cli.main, ["config", "path"])
+    assert res.exit_code == 0, res.output
+    assert cfg_path in res.output
+
+
+def test_config_list_absent_file(tmp_path, monkeypatch):
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", str(tmp_path / "nonexistent"))
+    res = CliRunner().invoke(cli.main, ["config", "list"])
+    assert res.exit_code == 0
+    assert "not found" in res.output
+
+
+def test_config_list_shows_masked_secrets(tmp_path, monkeypatch):
+    from franky.userconfig import write_config_file
+
+    cfg_path = tmp_path / "franky-config"
+    write_config_file(cfg_path, {"GH_TOKEN": "ghp_real", "FRANKY_ENGINE": "pi"})
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
+    res = CliRunner().invoke(cli.main, ["config", "list"])
+    assert res.exit_code == 0, res.output
+    assert "ghp_real" not in res.output
+    assert "***REDACTED***" in res.output
+    assert "FRANKY_ENGINE" in res.output
+    assert "pi" in res.output
+
+
+def test_config_list_reveal_shows_plain_values(tmp_path, monkeypatch):
+    from franky.userconfig import write_config_file
+
+    cfg_path = tmp_path / "franky-config"
+    write_config_file(cfg_path, {"GH_TOKEN": "ghp_real"})
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
+    res = CliRunner().invoke(cli.main, ["config", "list", "--reveal"])
+    assert res.exit_code == 0, res.output
+    assert "ghp_real" in res.output
+
+
+def test_config_set_non_secret_positional(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "franky-config"
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
+    res = CliRunner().invoke(cli.main, ["config", "set", "FRANKY_ENGINE", "pi"])
+    assert res.exit_code == 0, res.output
+    from franky.userconfig import read_config_file
+
+    assert read_config_file(cfg_path)["FRANKY_ENGINE"] == "pi"
+
+
+def test_config_set_secret_refuses_positional_value(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "franky-config"
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
+    res = CliRunner().invoke(cli.main, ["config", "set", "GH_TOKEN", "ghp_bad"])
+    assert res.exit_code != 0
+    assert "shell history" in res.output or "secret" in res.output
+
+
+def test_config_set_secret_via_hidden_prompt(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "franky-config"
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
+    runner = CliRunner()
+    res = runner.invoke(cli.main, ["config", "set", "GH_TOKEN"], input="ghp_from_prompt\n")
+    assert res.exit_code == 0, res.output
+    from franky.userconfig import read_config_file
+
+    assert read_config_file(cfg_path)["GH_TOKEN"] == "ghp_from_prompt"
+
+
+def test_config_set_unknown_key_rejected(tmp_path, monkeypatch):
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", str(tmp_path / "franky-config"))
+    res = CliRunner().invoke(cli.main, ["config", "set", "TOTALLY_UNKNOWN_KEY", "val"])
+    assert res.exit_code != 0
+    assert "unknown config key" in res.output or "TOTALLY_UNKNOWN_KEY" in res.output
+
+
+def test_config_init_full_wizard(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "franky-config"
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
+    runner = CliRunner()
+    # Simulate: engine=pi, repos=me/repo, GH_TOKEN=ghp_wiz, provider=OPENROUTER,
+    # key=sk-or-wiz, no JIRA
+    wizard_input = (
+        "pi\n"  # engine
+        "me/repo\n"  # FRANKY_ALLOWED_REPOS
+        "ghp_wiz\n"  # GH_TOKEN
+        "OPENROUTER_API_KEY\n"  # provider var choice
+        "sk-or-wiz\n"  # provider value
+        "n\n"  # JIRA: no
+    )
+    res = runner.invoke(cli.main, ["config", "init"], input=wizard_input)
+    assert res.exit_code == 0, res.output
+    assert cfg_path.exists()
+    from franky.userconfig import read_config_file
+
+    data = read_config_file(cfg_path)
+    assert data["FRANKY_ENGINE"] == "pi"
+    assert data["FRANKY_ALLOWED_REPOS"] == "me/repo"
+    assert data["GH_TOKEN"] == "ghp_wiz"
+    assert data["OPENROUTER_API_KEY"] == "sk-or-wiz"
+
+
+def test_config_init_claude_wizard(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "franky-config"
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
+    wizard_input = (
+        "claude\n"  # engine
+        "me/repo\n"  # FRANKY_ALLOWED_REPOS
+        "ghp_wiz\n"  # GH_TOKEN
+        "claude-tok\n"  # CLAUDE_CODE_OAUTH_TOKEN
+        "n\n"  # JIRA: no
+    )
+    res = CliRunner().invoke(cli.main, ["config", "init"], input=wizard_input)
+    assert res.exit_code == 0, res.output
+    from franky.userconfig import read_config_file
+
+    data = read_config_file(cfg_path)
+    assert data["FRANKY_ENGINE"] == "claude"
+    assert data["CLAUDE_CODE_OAUTH_TOKEN"] == "claude-tok"
+
+
+def test_config_init_codex_wizard_with_codex_key(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "franky-config"
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
+    wizard_input = (
+        "codex\n"  # engine
+        "me/repo\n"  # FRANKY_ALLOWED_REPOS
+        "ghp_wiz\n"  # GH_TOKEN
+        "codex-key\n"  # CODEX_API_KEY
+        "n\n"  # JIRA: no
+    )
+    res = CliRunner().invoke(cli.main, ["config", "init"], input=wizard_input)
+    assert res.exit_code == 0, res.output
+    from franky.userconfig import read_config_file
+
+    data = read_config_file(cfg_path)
+    assert data["CODEX_API_KEY"] == "codex-key"
+    assert "OPENAI_API_KEY" not in data
+
+
+def test_config_init_codex_wizard_falls_back_to_openai(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "franky-config"
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
+    wizard_input = (
+        "codex\n"  # engine
+        "me/repo\n"  # FRANKY_ALLOWED_REPOS
+        "ghp_wiz\n"  # GH_TOKEN
+        "\n"  # CODEX_API_KEY empty -> fall through to OPENAI_API_KEY
+        "sk-openai\n"  # OPENAI_API_KEY
+        "n\n"  # JIRA: no
+    )
+    res = CliRunner().invoke(cli.main, ["config", "init"], input=wizard_input)
+    assert res.exit_code == 0, res.output
+    from franky.userconfig import read_config_file
+
+    data = read_config_file(cfg_path)
+    assert data["OPENAI_API_KEY"] == "sk-openai"
+    assert "CODEX_API_KEY" not in data
+
+
+def test_iterate_load_config_file_malformed_gives_clean_error(tmp_path, monkeypatch):
+    """A malformed ~/.franky/config must produce a clean ClickException in iterate too."""
+    cfg_path = tmp_path / "franky-config"
+    cfg_path.write_text("[franky\nbroken", encoding="utf-8")
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
+    res = CliRunner().invoke(cli.main, ["iterate", "https://github.com/me/repo/pull/1"])
+    assert res.exit_code != 0
+    assert "config file error" in res.output or "malformed" in res.output
+    assert "Traceback" not in res.output
+
+
+def test_main_help_shows_config_group():
+    res = CliRunner().invoke(cli.main, ["--help"])
+    assert res.exit_code == 0
+    assert "config" in res.output
+
+
+def test_build_load_config_file_malformed_gives_clean_error(tmp_path, monkeypatch):
+    """A malformed ~/.franky/config must produce a clean ClickException in build, not a traceback."""
+    cfg_path = tmp_path / "franky-config"
+    cfg_path.write_text("[franky\nbroken", encoding="utf-8")
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
+    res = CliRunner().invoke(cli.main, ["build", "do it", "--repo", "me/repo"])
+    assert res.exit_code != 0
+    # Should be a ClickException (clean message), not a raw traceback.
+    assert "config file error" in res.output or "malformed" in res.output
+    assert "Traceback" not in res.output

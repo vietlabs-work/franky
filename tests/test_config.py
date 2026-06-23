@@ -1,7 +1,7 @@
 import pytest
 
 import franky.config as config_mod
-from franky.config import Config, load_config, redact
+from franky.config import Config, load_config, redact, repo_allowed, validate_allowlist_entry
 from franky.engine import ClaudeEngine, CodexEngine, PiEngine
 
 SECRET = "sk-super-secret-value-123"
@@ -139,3 +139,126 @@ def test_secret_values_lists_passthrough_values():
 def test_config_is_dataclass_like():
     cfg = Config(engine=PiEngine(), allowed_repos=["a/b"], passthrough_env={"GH_TOKEN": "x"})
     assert cfg.secret_values() == ["x"]
+
+
+# ---------------------------------------------------------------------------
+# repo_allowed - glob / segment-wise matching
+# ---------------------------------------------------------------------------
+
+
+def test_repo_allowed_exact_match():
+    assert repo_allowed("my-org/my-repo", ["my-org/my-repo"])
+
+
+def test_repo_allowed_exact_no_match():
+    assert not repo_allowed("my-org/other", ["my-org/my-repo"])
+
+
+def test_repo_allowed_wildcard_name():
+    assert repo_allowed("my-org/anything", ["my-org/*"])
+
+
+def test_repo_allowed_wildcard_name_does_not_cross_owner():
+    # "my-org/*" must NOT match "my-org-evil/x" - the "*" is in the name segment only.
+    assert not repo_allowed("my-org-evil/x", ["my-org/*"])
+
+
+def test_repo_allowed_wildcard_name_does_not_match_other_owner():
+    assert not repo_allowed("other/anything", ["my-org/*"])
+
+
+def test_repo_allowed_prefix_wildcard():
+    assert repo_allowed("my-org/team-alpha", ["my-org/team-*"])
+    assert repo_allowed("my-org/team-beta", ["my-org/team-*"])
+    assert not repo_allowed("my-org/prod-repo", ["my-org/team-*"])
+
+
+def test_repo_allowed_global_wildcard_matches_everything():
+    assert repo_allowed("any-org/any-repo", ["*"])
+    assert repo_allowed("owner/repo", ["*"])
+
+
+def test_repo_allowed_case_insensitive():
+    assert repo_allowed("Owner/Repo", ["owner/repo"])
+    assert repo_allowed("owner/repo", ["Owner/Repo"])
+    assert repo_allowed("MY-ORG/MY-REPO", ["my-org/*"])
+
+
+def test_repo_allowed_multiple_patterns_first_match_wins():
+    assert repo_allowed("a/b", ["x/y", "a/b", "a/*"])
+    assert repo_allowed("a/z", ["x/y", "a/b", "a/*"])
+
+
+def test_repo_allowed_no_match_returns_false():
+    assert not repo_allowed("stranger/repo", ["my-org/*", "other/x"])
+
+
+def test_repo_allowed_malformed_repo_returns_false():
+    # A bare owner with no slash should never match.
+    assert not repo_allowed("badowner", ["badowner/*"])
+
+
+def test_repo_allowed_multi_slash_repo_does_not_satisfy_owner_glob():
+    # A multi-slash repo must NOT sneak past "owner/*" by matching the trailing
+    # "sub/path" against the name glob - repo must be exactly owner/name.
+    assert not repo_allowed("owner/sub/path", ["owner/*"])
+    assert not repo_allowed("owner/sub/path", ["*"])
+    assert not repo_allowed("owner/", ["owner/*"])
+    assert not repo_allowed("/repo", ["*"])
+
+
+# ---------------------------------------------------------------------------
+# validate_allowlist_entry
+# ---------------------------------------------------------------------------
+
+
+def test_validate_allowlist_entry_exact():
+    validate_allowlist_entry("owner/repo")  # should not raise
+
+
+def test_validate_allowlist_entry_wildcard_name():
+    validate_allowlist_entry("owner/*")  # should not raise
+
+
+def test_validate_allowlist_entry_global_wildcard():
+    validate_allowlist_entry("*")  # should not raise
+
+
+def test_validate_allowlist_entry_prefix_glob():
+    validate_allowlist_entry("my-org/team-*")  # should not raise
+
+
+@pytest.mark.parametrize(
+    "bad_entry",
+    [
+        "foo",  # no slash
+        "a/b/c",  # two slashes
+        "a/",  # empty name segment
+        "/b",  # empty owner segment
+        "owner /repo",  # whitespace
+        "",  # empty
+        "a/ b",  # whitespace in name
+        "*/repo",  # owner glob - only the bare "*" may match across owners
+        "*/*",  # owner glob
+        "my-*/repo",  # partial owner glob
+    ],
+)
+def test_validate_allowlist_entry_rejects_bad(bad_entry: str) -> None:
+    with pytest.raises(ValueError):
+        validate_allowlist_entry(bad_entry)
+
+
+def test_load_config_rejects_malformed_allowlist_entry(monkeypatch):
+    """A malformed entry in FRANKY_ALLOWED_REPOS must raise at load_config time."""
+
+    def _env(**extra):
+        base = {
+            "FRANKY_ALLOWED_REPOS": "me/repo",
+            "GH_TOKEN": "ghp_fake",
+            "OPENROUTER_API_KEY": "sk-or-fake",
+        }
+        base.update(extra)
+        return base
+
+    with pytest.raises(ValueError, match="invalid allowlist entry"):
+        load_config(None, _env(FRANKY_ALLOWED_REPOS="just-owner"))

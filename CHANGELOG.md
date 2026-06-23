@@ -8,6 +8,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `franky config` subgroup with four subcommands: `path` (print config file location),
+  `list [--reveal]` (show all keys, secrets masked by default), `set KEY [VALUE]` (set a
+  key; secrets must be entered at a hidden prompt - positional value refused to protect shell
+  history), and `init` (interactive wizard that walks engine, allowlist, GH_TOKEN, engine
+  creds, and optional JIRA settings). Config is stored in `~/.franky/config` as TOML at
+  mode 0600. `FRANKY_CONFIG_FILE` env var overrides the path (used by tests for hermeticity).
+  The file is injected into `franky build` and `franky iterate` via `setdefault` so the
+  process environment always wins. `franky version` and `franky config` are deliberately
+  not affected (config must be writable even when the file is malformed).
+- Tiered repo allowlist with per-segment glob patterns in `FRANKY_ALLOWED_REPOS`:
+  `my-org/*` (whole org), `my-org/team-*` (prefix), exact `owner/repo`, and `*`
+  (every repo the token can reach - opt-in, not the default). Matching is case-insensitive
+  and segment-wise (globs cannot cross `/`). Malformed entries are rejected at load time.
+- `config.example.toml`: replaces `.env.example` as the reference config template.
+  Shows the `[franky]` TOML table with placeholder string values and comments.
+- `franky/userconfig.py`: the persistence module backing the config subgroup. Atomic
+  write (temp + `os.replace`), 0600 mode, hand-rolled TOML serializer for the constrained
+  single-table schema (no extra write dependency), `SECRET_KEYS` frozenset as the single
+  source of truth for which keys are masked/argv-refused.
+- `tomli>=2.0; python_version<"3.11"` runtime dependency for TOML parsing on Python 3.10
+  (stdlib `tomllib` was added in 3.11).
 - `franky iterate <pr-url>`: a second entry point that responds to PR review comments and
   failing CI with ADDITIVE follow-up commits on the existing branch, instead of re-running
   from scratch. Runs the identical hardened + egress-controlled container as `franky build`;

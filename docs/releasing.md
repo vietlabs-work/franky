@@ -84,7 +84,7 @@ docker login ghcr.io
 ```
 
 Set `FRANKY_IMAGE` and `FRANKY_PROXY_IMAGE` to point at local builds to bypass GHCR
-entirely during development (see `.env.example`).
+entirely during development (see `config.example.toml`, or run `franky config path`).
 
 ## Trust model for images
 

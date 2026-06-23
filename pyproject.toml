@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Viet Tran" }]
-dependencies = ["click>=8.1"]
+dependencies = ["click>=8.1", "tomli>=2.0; python_version<'3.11'"]
 
 [project.optional-dependencies]
 # ruff pinned to a single minor: the formatter can change style across minors, so a wider

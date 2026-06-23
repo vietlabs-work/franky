@@ -30,11 +30,21 @@ from .container import (
     resolve_image,
     run_in_container,
 )
-from .engine import ENGINES, resolve_engine
+from .engine import ENGINES, PI_PROVIDER_VARS, resolve_engine
 from .jira import JIRA_API_TOKEN_VAR, JIRA_EMAIL_VAR, fetch_jira_issue
 from .prompt import build_iterate_prompt, build_plan_prompt, build_prompt
 from .task import PROSE_MAX_CHARS, parse_pr_task, parse_task
 from .update_check import force_update, maybe_auto_update
+from .userconfig import (
+    SECRET_KEYS,
+    SETTABLE_KEYS,
+    config_file_path,
+    load_config_file,
+    mask_value,
+    read_config_file,
+    set_value,
+    write_config_file,
+)
 
 TASKS_DIR = Path("tasks")
 
@@ -85,6 +95,16 @@ def build(
     # Best-effort, hint-only update check (never blocks/raises; ~1s budget, cached). Prints
     # a one-line stderr hint if a newer release exists. Silenced by FRANKY_NO_UPDATE_CHECK=1.
     maybe_auto_update()
+
+    # Inject user config file values into os.environ via setdefault (process env wins).
+    # WHY here and not in the group callback or `version`: the `config` subgroup must
+    # remain usable even when the config file is malformed (so the user can `config set`
+    # to fix it), and `version` is intentionally lightweight.  A malformed file raises
+    # ValueError here -> caught below -> clean ClickException, no traceback.
+    try:
+        load_config_file(os.environ)
+    except ValueError as exc:
+        raise click.ClickException(f"config file error: {exc}") from exc
 
     # Config + task parse are operator-error surfaces -> clean ClickException, no traceback.
     try:
@@ -168,6 +188,12 @@ def iterate(pr_url: str, engine: str | None) -> None:
     """
     # Best-effort, hint-only update check - same as build (never blocks/raises).
     maybe_auto_update()
+
+    # Same config-file injection as `build` (see that command's WHY comment).
+    try:
+        load_config_file(os.environ)
+    except ValueError as exc:
+        raise click.ClickException(f"config file error: {exc}") from exc
 
     # Config + PR-URL parse are operator-error surfaces -> clean ClickException, no traceback.
     try:
@@ -394,6 +420,195 @@ def update(ctx: click.Context, force: bool) -> None:
     Dev checkout -> git hint, no-op. Undetectable installer -> manual hint, nonzero exit.
     """
     ctx.exit(force_update(force=force, out=click.echo))
+
+
+# ---------------------------------------------------------------------------
+# `franky config` subgroup
+# ---------------------------------------------------------------------------
+# WHY a separate group (not just more top-level commands):
+#   - Groups in Click produce a clean `franky config --help` with the sub-commands
+#     listed, and `franky --help` shows the group as a single line.
+#   - Config subcommands MUST be usable even when the config file is malformed
+#     (the user needs `config set` to fix it).  Loading the file in the group
+#     callback would block that - so we do NOT call load_config_file here.
+#   - Config commands write nothing to tasks/*.log (they are not build passes).
+
+
+@main.group("config")
+def config_group() -> None:
+    """Read and write the Franky user config file (~/.franky/config)."""
+
+
+@config_group.command("path")
+def config_path() -> None:
+    """Print the path of the config file (whether or not it exists)."""
+    click.echo(config_file_path(dict(os.environ)))
+
+
+@config_group.command("list")
+@click.option(
+    "--reveal",
+    is_flag=True,
+    default=False,
+    help="Show secret values in plain text instead of masking them.",
+)
+def config_list(reveal: bool) -> None:
+    """List all keys in the config file.  Secrets are masked unless --reveal is given."""
+    path = config_file_path(dict(os.environ))
+    if not path.exists():
+        click.echo(f"config file not found: {path}", err=True)
+        return
+    try:
+        data = read_config_file(path)
+    except ValueError as exc:
+        raise click.ClickException(f"config file error: {exc}") from exc
+    if not data:
+        click.echo("(config file is empty)")
+        return
+    for key in sorted(data):
+        value = data[key]
+        display = value if reveal else mask_value(key, value)
+        click.echo(f"{key} = {display}")
+
+
+@config_group.command("set")
+@click.argument("key")
+@click.argument("value", required=False, default=None)
+def config_set(key: str, value: str | None) -> None:
+    """Set a config key.
+
+    Secrets (GH_TOKEN, API keys, etc.) must be entered at the prompt;
+    passing them as a positional VALUE leaks into shell history.
+    """
+    if key not in SETTABLE_KEYS:
+        sorted_keys = ", ".join(sorted(SETTABLE_KEYS))
+        raise click.ClickException(f"unknown config key {key!r}. Valid keys: {sorted_keys}")
+
+    if key in SECRET_KEYS:
+        if value is not None:
+            # Refuse early: a secret value on argv is visible in `ps` and shell history.
+            raise click.ClickException(
+                f"{key} is a secret; run `franky config set {key}` and enter it at "
+                "the prompt - a value on the command line leaks into shell history"
+            )
+        # Hidden prompt - value never echoed to the terminal.
+        value = click.prompt(key, hide_input=True)
+    else:
+        if value is None:
+            value = click.prompt(key)
+
+    path = config_file_path(dict(os.environ))
+    try:
+        set_value(path, key, value)
+    except ValueError as exc:
+        raise click.ClickException(f"could not write config: {exc}") from exc
+    click.echo(f"wrote {key} to {path}", err=True)
+
+
+@config_group.command("init")
+def config_init() -> None:
+    """Interactive wizard to create or overwrite the config file.
+
+    Walks through engine selection, repo allowlist, GitHub token,
+    engine creds, and optional JIRA settings.
+    """
+    path = config_file_path(dict(os.environ))
+    click.echo(f"franky config init - writing to {path}")
+    click.echo(
+        "Press Enter to skip optional fields. "
+        "Existing values are overwritten only for keys you fill in."
+    )
+    click.echo()
+
+    data: dict[str, str] = {}
+
+    # Engine selection
+    engine_choice = click.prompt(
+        "Engine",
+        type=click.Choice(sorted(ENGINES)),
+        default="pi",
+        show_default=True,
+    )
+    data["FRANKY_ENGINE"] = engine_choice
+
+    # Repo allowlist - required for build to work
+    click.echo()
+    click.echo("FRANKY_ALLOWED_REPOS: comma-separated owner/repo entries Franky may act on.")
+    click.echo("  Examples: my-org/my-repo  OR  my-org/*  (whole org)  OR  * (all repos).")
+    click.echo("  WARNING: '*' trusts every repo the GH_TOKEN can reach - its FULL scope.")
+    repos = click.prompt(
+        "FRANKY_ALLOWED_REPOS (e.g. my-org/* ; leave empty to skip)", default="", show_default=False
+    ).strip()
+    if repos:
+        data["FRANKY_ALLOWED_REPOS"] = repos
+
+    # GitHub token
+    click.echo()
+    gh = click.prompt("GH_TOKEN", hide_input=True).strip()
+    if gh:
+        data["GH_TOKEN"] = gh
+
+    # Engine-specific creds
+    click.echo()
+    if engine_choice == "pi":
+        click.echo("pi engine: set one provider key (BYOK). Common choices:")
+        click.echo("  OPENROUTER_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY")
+        provider_choice = click.prompt(
+            "Provider key name",
+            type=click.Choice(list(PI_PROVIDER_VARS)),
+            default="OPENROUTER_API_KEY",
+            show_default=True,
+        )
+        provider_val = click.prompt(f"{provider_choice}", hide_input=True).strip()
+        if provider_val:
+            data[provider_choice] = provider_val
+    elif engine_choice == "claude":
+        val = click.prompt("CLAUDE_CODE_OAUTH_TOKEN", hide_input=True).strip()
+        if val:
+            data["CLAUDE_CODE_OAUTH_TOKEN"] = val
+    elif engine_choice == "codex":
+        val = click.prompt(
+            "CODEX_API_KEY (or press Enter to use OPENAI_API_KEY instead)",
+            hide_input=True,
+            default="",
+        ).strip()
+        if val:
+            data["CODEX_API_KEY"] = val
+        else:
+            oai = click.prompt("OPENAI_API_KEY", hide_input=True).strip()
+            if oai:
+                data["OPENAI_API_KEY"] = oai
+
+    # Optional JIRA
+    click.echo()
+    if click.confirm("Configure JIRA (for `franky build jira <KEY>`)?", default=False):
+        base = click.prompt("JIRA_BASE_URL (e.g. https://your-org.atlassian.net)").strip()
+        if base:
+            data["JIRA_BASE_URL"] = base
+        email = click.prompt("JIRA_EMAIL").strip()
+        if email:
+            data["JIRA_EMAIL"] = email
+        token = click.prompt("JIRA_API_TOKEN", hide_input=True).strip()
+        if token:
+            data["JIRA_API_TOKEN"] = token
+
+    # Write (non-empty values only)
+    data = {k: v for k, v in data.items() if v}
+    try:
+        # Merge with existing file so we only overwrite keys the user filled in.
+        existing: dict[str, str] = {}
+        if path.exists():
+            try:
+                existing = read_config_file(path)
+            except ValueError:
+                existing = {}
+        existing.update(data)
+        write_config_file(path, existing)
+    except ValueError as exc:
+        raise click.ClickException(f"could not write config: {exc}") from exc
+
+    click.echo()
+    click.echo(f"wrote config to {path}")
 
 
 if __name__ == "__main__":

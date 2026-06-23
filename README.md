@@ -84,8 +84,21 @@ add an engine), so Codex, Cursor, pi, or Claude Code all start with the same con
    ```
    python3 -m venv .venv && .venv/bin/pip install -e .
    ```
-3. Configure credentials. Copy `.env.example` to `.env` and fill it in. At minimum:
-   - `FRANKY_ALLOWED_REPOS` - comma-separated `owner/repo` allowlist (required).
+3. Configure credentials with the interactive wizard:
+   ```
+   franky config init
+   ```
+   This writes `~/.franky/config` (mode 0600) and walks you through engine selection,
+   `FRANKY_ALLOWED_REPOS`, `GH_TOKEN`, and engine creds. You can also set individual
+   keys later:
+   ```
+   franky config set FRANKY_ALLOWED_REPOS
+   franky config set GH_TOKEN          # secret - entered at a hidden prompt
+   franky config list                  # view the file (secrets masked)
+   franky config path                  # show where the file lives
+   ```
+   At minimum you need:
+   - `FRANKY_ALLOWED_REPOS` - the trusted-repo allowlist (see below).
    - `GH_TOKEN` - scoped to contents + pull_requests on those repos.
    - the selected engine's creds (a provider key for `pi`,
      `CLAUDE_CODE_OAUTH_TOKEN` for `claude`, or `CODEX_API_KEY` / `OPENAI_API_KEY`
@@ -241,6 +254,13 @@ v0 mitigations, still in force:
 1. **Fail-closed trusted-repo allowlist.** Franky refuses any repo not in
    `FRANKY_ALLOWED_REPOS`, and refuses everything if that var is unset. This
    limits injection to content you already trust.
+
+   The allowlist supports per-segment glob patterns (case-insensitive):
+   - `my-org/my-repo` - exact match
+   - `my-org/*` - every repo in `my-org`
+   - `my-org/team-*` - repos with a name prefix
+   - `*` - every repo the `GH_TOKEN` can reach (its **full scope** - a conscious opt-in,
+     not the default; use only if the token is already narrowly scoped)
 2. **Scope your tokens narrowly.** Give `GH_TOKEN` only contents + pull_requests
    on the target repos. Prefer a low-spend or separate API key for `pi`.
 3. **PR, not merge.** Franky only opens PRs. You review before anything lands.
