@@ -267,11 +267,38 @@ def test_release_refuses_dirty_tree(repo):
     responses = [
         (["git", "fetch"], 0, "", ""),
         (["git", "rev-parse", "--abbrev-ref", "HEAD"], 0, "main", ""),
-        (["git", "status", "--porcelain"], 0, "M pyproject.toml", ""),
+        (["git", "status", "--porcelain", "--untracked-files=no"], 0, "M pyproject.toml", ""),
     ]
     fake_run, _ = make_fake_run(responses)
     with pytest.raises(SystemExit):
         main(["1.2.3"], run=fake_run, root=repo)
+
+
+def test_release_clean_tree_ignores_untracked(repo):
+    # Untracked files (agent worktrees, scratch) must NOT block a release - the release commit
+    # stages only named files. Flag-aware fake: the --untracked-files=no call (longer prefix,
+    # matched first) returns a clean tree, while a bare --porcelain call would surface the
+    # untracked `.claude/` worktree. So this only reaches `push` because the code passes the
+    # flag; a regression that drops it falls through to the dirty response and aborts.
+    responses = [
+        (["git", "fetch"], 0, "", ""),
+        (["git", "rev-parse", "--abbrev-ref", "HEAD"], 0, "main", ""),
+        (["git", "status", "--porcelain", "--untracked-files=no"], 0, "", ""),
+        (["git", "status", "--porcelain"], 0, "?? .claude/", ""),
+        (["git", "rev-parse", "HEAD"], 0, "abc123", ""),
+        (["git", "rev-parse", "origin/main"], 0, "abc123", ""),
+        (["git", "rev-parse", "-q", "--verify"], 1, "", ""),
+        (["git", "add"], 0, "", ""),
+        (["git", "commit"], 0, "", ""),
+        (["git", "tag"], 0, "", ""),
+        (["git", "push"], 0, "", ""),
+    ]
+    fake_run, calls = make_fake_run(responses)
+    main(["1.2.3"], run=fake_run, root=repo)
+    subcommands = [c[1] for c in calls if c[0] == "git"]
+    assert "push" in subcommands  # reached the end despite untracked .claude/
+    status_calls = [c for c in calls if list(c[:2]) == ["git", "status"]]
+    assert status_calls and all("--untracked-files=no" in c for c in status_calls)
 
 
 def test_release_refuses_wrong_branch(repo):
@@ -351,7 +378,7 @@ def test_tag_recovery_refuses_dirty_tree(repo):
     set_pyproject_version(repo, "1.2.3")
     set_init_version(repo, "1.2.3")
     responses = [
-        (["git", "status", "--porcelain"], 0, "M somefile.py", ""),
+        (["git", "status", "--porcelain", "--untracked-files=no"], 0, "M somefile.py", ""),
     ]
     fake_run, _ = make_fake_run(responses)
     with pytest.raises(SystemExit):
