@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.1] - 2026-06-23
+
 ### Added
 - `franky config` subgroup with four subcommands: `path` (print config file location),
   `list [--reveal]` (show all keys, secrets masked by default), `set KEY [VALUE]` (set a

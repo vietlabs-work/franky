@@ -46,9 +46,9 @@ Select with `--engine pi|claude|codex`, or set `FRANKY_ENGINE`. Resolution order
 While the repository is private, install from the git tag:
 
 ```
-uv tool install git+ssh://git@github.com/vietlabs-work/franky@v0.1.0
+uv tool install git+ssh://git@github.com/vietlabs-work/franky@v0.0.1
 # or pipx:
-pipx install git+ssh://git@github.com/vietlabs-work/franky@v0.1.0
+pipx install git+ssh://git@github.com/vietlabs-work/franky@v0.0.1
 # or download the wheel from the GitHub Release and pip install it
 ```
 
@@ -294,7 +294,7 @@ checkers.
 
 ## Status
 
-v0.1.0. Real end-to-end runs need live engine credentials, supplied out-of-band by
+v0.0.1. Real end-to-end runs need live engine credentials, supplied out-of-band by
 the operator. The pieces under test here are the container hardening, the egress
 allowlist + proxy orchestration, the secret redaction, the trusted-repo allowlist,
 and the engine abstraction.
