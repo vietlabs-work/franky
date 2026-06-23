@@ -103,7 +103,12 @@ _HARDENING = [
 # The Squid proxy image (built from proxy/) and the port it listens on inside the net.
 PROXY_IMAGE = "franky-proxy"
 PROXY_PORT = 3128
-GHCR_REPO = "ghcr.io/vietlabs-work"
+# The GHCR namespace the public images live under. Overridable via FRANKY_GHCR_REPO so the
+# publishing org can move without a code change (and for dev/testing against a fork). The
+# default MUST match the org that hosts the public packages; the release workflow pushes to
+# ${{ github.repository_owner }}, so this default tracks the repo's owning org.
+DEFAULT_GHCR_REPO = "ghcr.io/vietlabs-work"
+GHCR_REPO_VAR = "FRANKY_GHCR_REPO"
 FRANKY_IMAGE_VAR = "FRANKY_IMAGE"
 FRANKY_PROXY_IMAGE_VAR = "FRANKY_PROXY_IMAGE"
 
@@ -412,12 +417,14 @@ def image_exists(image: str = "franky", runner=subprocess.run) -> bool:
 
 
 def resolve_image(env: dict, var: str = FRANKY_IMAGE_VAR, name: str = "franky") -> str:
-    """Return the image ref to use. If the env var is set and truthy, return it (dev override).
-    Otherwise return the version-pinned GHCR ref. NEVER resolves to :latest."""
+    """Return the image ref to use. If the per-image env var is set and truthy, return it
+    (dev override). Otherwise return the version-pinned GHCR ref, with the GHCR namespace
+    taken from FRANKY_GHCR_REPO when set, else DEFAULT_GHCR_REPO. NEVER resolves to :latest."""
     override = env.get(var)
     if override:
         return override
-    return f"{GHCR_REPO}/{name}:{franky_version()}"
+    repo = env.get(GHCR_REPO_VAR) or DEFAULT_GHCR_REPO
+    return f"{repo}/{name}:{franky_version()}"
 
 
 def ensure_image_available(image: str, runner=subprocess.run) -> tuple[bool, str]:

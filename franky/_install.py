@@ -18,6 +18,12 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+# The PyPI distribution name. The import package + the installed command are both `franky`,
+# but the published distribution is `franky-agent` (`franky` was taken). This is the single
+# source of truth for the name: `franky.__init__.franky_version` reads its metadata,
+# `detect_install` looks it up, and `update_check` reinstalls by it.
+DIST_NAME = "franky-agent"
+
 
 @dataclass
 class Install:
@@ -63,14 +69,15 @@ def _is_editable(dist) -> bool:
 
 
 def detect_install(
-    package: str = "franky",
+    package: str = DIST_NAME,
     executable: str | None = None,
     dist_lookup=importlib.metadata.distribution,
 ) -> Install:
     """Detect how `package` was installed on this machine.
 
     Args:
-        package: The package name to look up (default: "franky").
+        package: The PyPI distribution name to look up (default: "franky-agent"; the
+            import package is "franky" but the published distribution is "franky-agent").
         executable: The Python interpreter path to classify (default: sys.executable).
         dist_lookup: Callable ``(package_name: str) -> Distribution``-like object with
             a ``read_text(filename: str) -> str | None`` method. Defaults to

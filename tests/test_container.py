@@ -4,6 +4,7 @@ import subprocess
 from franky.config import Config
 from franky.container import (
     FRANKY_PROXY_IMAGE_VAR,
+    GHCR_REPO_VAR,
     _HOME_TMPFS_SIZE,
     build_docker_argv,
     build_network_argv,
@@ -448,6 +449,14 @@ def test_resolve_image_default_is_versioned_ghcr():
 def test_resolve_image_proxy_uses_proxy_var():
     ref = resolve_image({}, FRANKY_PROXY_IMAGE_VAR, "franky-proxy")
     assert ref.startswith("ghcr.io/vietlabs-work/franky-proxy:")
+
+
+def test_resolve_image_ghcr_repo_override():
+    # FRANKY_GHCR_REPO retargets the namespace (publishing org can move with no code change),
+    # while the per-image FRANKY_IMAGE override still wins outright.
+    ref = resolve_image({GHCR_REPO_VAR: "ghcr.io/acme"})
+    assert ref.startswith("ghcr.io/acme/franky:")
+    assert resolve_image({GHCR_REPO_VAR: "ghcr.io/acme", "FRANKY_IMAGE": "local"}) == "local"
 
 
 def test_ensure_image_available_present_no_pull():

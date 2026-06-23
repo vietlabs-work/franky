@@ -38,8 +38,8 @@ def repo(tmp_path):
     (tmp_path / "README.md").write_text(
         "# Franky\n\n"
         "```\n"
-        "uv tool install git+ssh://git@github.com/vietlabs-work/franky@v0.1.0\n"
-        "pipx install git+ssh://git@github.com/vietlabs-work/franky@v0.1.0\n"
+        "uv tool install franky-agent\n"
+        "pipx install franky-agent\n"
         "```\n\n"
         "Egress kills DNS with --dns 127.0.0.1 inside the container.\n\n"
         "## Status\n\nv0.1.0. Under test.\n"
@@ -105,29 +105,16 @@ def test_set_init_version_roundtrip(repo):
 def test_set_readme_version_roundtrip(repo):
     set_readme_version(repo, "2.3.4")
     text = (repo / "README.md").read_text()
-    assert "franky@v2.3.4" in text
-    assert "franky@v0.1.0" not in text
-    assert "v0.1.0" not in text  # the Status line was bumped too
     assert "## Status\n\nv2.3.4." in text
+    assert "v0.1.0" not in text  # the old Status version is gone
+    assert "uv tool install franky-agent" in text  # the unversioned install line is untouched
     assert "--dns 127.0.0.1" in text  # the IP is not a version and must be left alone
 
 
-def test_set_readme_version_replaces_pins_and_status_independently(repo):
-    # Pins and Status start at DIFFERENT versions; both must be set to the new one.
-    (repo / "README.md").write_text(
-        "```\nuv tool install ...franky@v0.1.0\n```\n\n## Status\n\nv0.0.9. Skewed.\n"
-    )
-    set_readme_version(repo, "2.3.4")
-    text = (repo / "README.md").read_text()
-    assert "franky@v2.3.4" in text
-    assert "## Status\n\nv2.3.4." in text
-    assert "v0.0.9" not in text
-
-
-def test_set_readme_version_no_pin_raises(repo):
-    # A README that no longer carries an install pin must fail loudly, not silently skip
-    # the sync and let a release ship with a stale documented version.
-    (repo / "README.md").write_text("# Franky\n\nNo install pin here.\n")
+def test_set_readme_version_no_status_raises(repo):
+    # The PyPI install line has no version pin, so the Status line is the only versioned
+    # reference. A README without it must fail loudly, not silently ship a stale version.
+    (repo / "README.md").write_text("# Franky\n\nNo status line here.\n")
     with pytest.raises(SystemExit):
         set_readme_version(repo, "2.3.4")
 
@@ -258,8 +245,8 @@ def test_release_happy_path_git_commands(repo):
 
     assert read_pyproject_version(repo) == "1.2.3"
     assert read_init_version(repo) == "1.2.3"
-    # README version refs are bumped in lockstep and staged.
-    assert "franky@v1.2.3" in (repo / "README.md").read_text()
+    # README version ref (the Status line) is bumped in lockstep and staged.
+    assert "## Status\n\nv1.2.3." in (repo / "README.md").read_text()
     assert "README.md" in git_calls[add_idx]
 
 
@@ -319,20 +306,20 @@ def _happy_release_responses():
 
 def test_release_no_watch_prints_links(repo, capsys):
     responses = _happy_release_responses() + [
-        (["git", "remote", "get-url"], 0, "https://github.com/vietlabs-work/franky.git", ""),
+        (["git", "remote", "get-url"], 0, "https://github.com/franky-agent/franky.git", ""),
     ]
     fake_run, calls = make_fake_run(responses)
     main(["1.2.3", "--no-watch"], run=fake_run, root=repo, sleep=lambda *_: None)
     # --no-watch never tails the workflow.
     assert not any(c[:3] == ["gh", "run", "watch"] for c in calls)
     out = capsys.readouterr().out
-    assert "https://github.com/vietlabs-work/franky/actions" in out
+    assert "https://github.com/franky-agent/franky/actions" in out
     assert "releases/tag/v1.2.3" in out
 
 
 def test_release_watch_happy_path(repo, capsys):
     responses = _happy_release_responses() + [
-        (["git", "remote", "get-url"], 0, "git@github.com:vietlabs-work/franky.git", ""),
+        (["git", "remote", "get-url"], 0, "git@github.com:franky-agent/franky.git", ""),
         (["gh", "run", "list"], 0, '[{"databaseId": 28002437360}]', ""),
         (["gh", "run", "watch"], 0, "", ""),
     ]
@@ -347,7 +334,7 @@ def test_release_watch_happy_path(repo, capsys):
 
 def test_release_watch_reports_workflow_failure(repo, capsys):
     responses = _happy_release_responses() + [
-        (["git", "remote", "get-url"], 0, "https://github.com/vietlabs-work/franky.git", ""),
+        (["git", "remote", "get-url"], 0, "https://github.com/franky-agent/franky.git", ""),
         (["gh", "run", "list"], 0, '[{"databaseId": 999}]', ""),
         (["gh", "run", "watch"], 1, "", ""),  # --exit-status -> nonzero on a failed run
     ]
@@ -361,7 +348,7 @@ def test_release_watch_degrades_when_gh_missing(repo, capsys):
     base = dict(
         (tuple(prefix), (rc, out, err))
         for prefix, rc, out, err in _happy_release_responses()
-        + [(["git", "remote", "get-url"], 0, "https://github.com/vietlabs-work/franky.git", "")]
+        + [(["git", "remote", "get-url"], 0, "https://github.com/franky-agent/franky.git", "")]
     )
     calls = []
 
@@ -378,18 +365,18 @@ def test_release_watch_degrades_when_gh_missing(repo, capsys):
     main(["1.2.3"], run=runner, root=repo, sleep=lambda *_: None)
     out = capsys.readouterr().out
     assert "Couldn't attach" in out
-    assert "https://github.com/vietlabs-work/franky/actions" in out
+    assert "https://github.com/franky-agent/franky/actions" in out
     assert not any(c[:3] == ["gh", "run", "watch"] for c in calls)
 
 
 def test_origin_web_url_normalizes_remote_forms(repo):
     for remote in (
-        "git@github.com:vietlabs-work/franky.git",
-        "https://github.com/vietlabs-work/franky.git",
-        "ssh://git@github.com/vietlabs-work/franky",
+        "git@github.com:franky-agent/franky.git",
+        "https://github.com/franky-agent/franky.git",
+        "ssh://git@github.com/franky-agent/franky",
     ):
         fake_run, _ = make_fake_run([(["git", "remote", "get-url"], 0, remote, "")])
-        assert release._origin_web_url(fake_run) == "https://github.com/vietlabs-work/franky"
+        assert release._origin_web_url(fake_run) == "https://github.com/franky-agent/franky"
     # Non-GitHub remote -> None (best-effort, no crash).
     fake_run, _ = make_fake_run([(["git", "remote", "get-url"], 0, "https://gitlab.com/x/y", "")])
     assert release._origin_web_url(fake_run) is None
@@ -440,7 +427,7 @@ def test_release_dry_run_no_file_writes(repo):
     assert read_pyproject_version(repo) == "0.1.0"
     assert read_init_version(repo) == "0.1.0"
     assert "## [Unreleased]" in (repo / "CHANGELOG.md").read_text()
-    assert "franky@v0.1.0" in (repo / "README.md").read_text()  # README untouched
+    assert "## Status\n\nv0.1.0." in (repo / "README.md").read_text()  # README untouched
     git_calls = [c for c in calls if c[0] == "git"]
     mutating = [c for c in git_calls if c[1] in ("add", "commit", "tag", "push")]
     assert mutating == []

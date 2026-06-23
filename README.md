@@ -43,22 +43,23 @@ Select with `--engine pi|claude|codex`, or set `FRANKY_ENGINE`. Resolution order
 
 ## Install
 
-While the repository is private, install from the git tag:
+Franky is published to PyPI as `franky-agent` (the installed command is `franky`):
 
 ```
-uv tool install git+ssh://git@github.com/vietlabs-work/franky@v0.0.1
+uv tool install franky-agent
 # or pipx:
-pipx install git+ssh://git@github.com/vietlabs-work/franky@v0.0.1
-# or download the wheel from the GitHub Release and pip install it
+pipx install franky-agent
+# or:
+pip install franky-agent
 ```
 
-On first run the CLI pulls the version-pinned GHCR images
+On first run the CLI pulls the version-pinned, public GHCR images
 (`ghcr.io/vietlabs-work/franky:X.Y.Z` and `ghcr.io/vietlabs-work/franky-proxy:X.Y.Z`),
-so you need Docker and, while the packages are private, `docker login ghcr.io`
-with a PAT that has `read:packages`.
+so all you need is Docker - no registry login. (Point `FRANKY_GHCR_REPO` at a different
+namespace if you host the images elsewhere.)
 
 To move to a newer release later, run `franky update` - it detects how you
-installed (uv tool / pipx / pip) and reinstalls the latest tag via the same
+installed (uv tool / pipx / pip) and reinstalls the latest version from PyPI via the same
 manager. `franky update --force` reinstalls even when already current. (A dev
 checkout updates via `git`; `franky update` is a no-op there.)
 

@@ -70,3 +70,5 @@ OPENROUTER_API_KEY = "sk-or-your_key_here"
 # --- Image overrides (dev only) -----------------------------------------------
 # FRANKY_IMAGE = "franky"
 # FRANKY_PROXY_IMAGE = "franky-proxy"
+# Retarget just the GHCR namespace (e.g. if you host the public images under a different org):
+# FRANKY_GHCR_REPO = "ghcr.io/your-org"

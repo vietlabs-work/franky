@@ -3,7 +3,8 @@
 import importlib.metadata
 import json
 
-from franky._install import _is_editable, classify_executable, detect_install
+import franky
+from franky._install import DIST_NAME, _is_editable, classify_executable, detect_install
 
 
 # ---------------------------------------------------------------------------
@@ -147,3 +148,35 @@ def test_detect_install_non_editable_pip():
     )
     assert result.kind == "pip"
     assert result.path == "/usr/bin/python3"
+
+
+# ---------------------------------------------------------------------------
+# franky_version: reads the franky-agent distribution metadata, not "franky"
+# ---------------------------------------------------------------------------
+
+
+def test_dist_name_is_franky_agent():
+    # The import package is `franky`, the published distribution is `franky-agent`.
+    assert DIST_NAME == "franky-agent"
+
+
+def test_franky_version_reads_franky_agent_metadata(monkeypatch):
+    # The distribution is `franky-agent`; a lookup of "franky" would PackageNotFoundError and
+    # silently fall back to __version__, defeating metadata precedence + skew detection.
+    captured = {}
+
+    def fake_version(name):
+        captured["name"] = name
+        return "9.9.9"
+
+    monkeypatch.setattr(importlib.metadata, "version", fake_version)
+    assert franky.franky_version() == "9.9.9"  # metadata wins over the baked-in __version__
+    assert captured["name"] == DIST_NAME
+
+
+def test_franky_version_falls_back_to_dunder_when_metadata_absent(monkeypatch):
+    def boom(name):
+        raise importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(importlib.metadata, "version", boom)
+    assert franky.franky_version() == franky.__version__

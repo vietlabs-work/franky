@@ -6,12 +6,12 @@ is its passive, best-effort sibling run at the top of `franky build`. Both share
 
 Stdlib only (subprocess + urllib + json + re + time + pathlib) plus `franky._install`.
 
-`force_update` shape (replicated from the reference tool's `force_update`, not imported):
-- Always a FRESH release fetch (no cache) - the operator is waiting, so a generous ~10s
+`force_update` shape:
+- Always a FRESH version fetch (no cache) - the operator is waiting, so a generous ~10s
   budget is fine.
-- Fetch precedence: `gh api .../releases/latest` first (reuses the operator's `gh` auth,
-  and the repo is private), then the REST API with a `GH_TOKEN` fallback, then unauth
-  (dormant until the repo is public).
+- Fetch source: the public PyPI JSON API (`https://pypi.org/pypi/franky-agent/json`,
+  `info.version`). No auth, no `gh`, no `GH_TOKEN` - the package is public even though the
+  source repo is private, so a single unauthenticated HTTPS GET is all it takes.
 - Installer detected from the resolved interpreter path (via `_install.detect_install`):
   `uv tool` -> `uv tool install --force`, `pipx` -> `pipx install --force`, else the
   running env's `python -m pip install --upgrade`. Undetectable -> manual hint + exit 1
@@ -21,9 +21,9 @@ Stdlib only (subprocess + urllib + json + re + time + pathlib) plus `franky._ins
   exit plus the install stderr tail.
 - Does NOT re-exec: the only job is to install; the next `franky` invocation runs new code.
 
-`maybe_auto_update` shape (the parts of the reference tool's `maybe_auto_update` that transfer):
-- HINT ONLY by default - Franky has NO version-pinned host<->container wire contract (unlike
-  the reference tool's ipc_schema), so a stale CLI talking to a newer image is not a correctness hazard.
+`maybe_auto_update` shape:
+- HINT ONLY by default - Franky has NO version-pinned host<->container wire contract, so a
+  stale CLI talking to a newer image is not a correctness hazard.
   Never blocks, never re-execs. Prints a one-line hint to stderr and returns.
 - Never raises into the build (telemetry, not a gate - the whole body is wrapped).
 - Tight ~1s fetch budget; results cached in `~/.franky/update_check.json` with tiered TTLs
@@ -46,22 +46,20 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from . import franky_version
-from ._install import Install, detect_install
+from ._install import DIST_NAME, Install, detect_install
 
-# The install source while the repo is private (mirrors README's install incantation);
-# `@<tag>` is appended to pin the exact release.
-REPO_GIT_URL = "git+ssh://git@github.com/vietlabs-work/franky"
-_RELEASES_LATEST_PATH = "repos/vietlabs-work/franky/releases/latest"
-_RELEASES_LATEST_URL = f"https://api.github.com/{_RELEASES_LATEST_PATH}"
+# Self-update reinstalls by the published distribution name (DIST_NAME, defined once in
+# _install.py); the latest version is read from PyPI's JSON API for the same package.
+_PYPI_JSON_URL = f"https://pypi.org/pypi/{DIST_NAME}/json"
 
-# A generous budget for the gh/REST fetch: the operator is waiting on a single fetch.
+# A generous budget for the PyPI fetch: the operator is waiting on a single HTTPS GET.
 _FETCH_TIMEOUT = 10.0
 
 _VERSION_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 
 
 class UpdateError(Exception):
-    """Raised when the latest release tag cannot be fetched (network/auth/parse)."""
+    """Raised when the latest version cannot be fetched from PyPI (network/parse failure)."""
 
 
 def parse_version(s: str) -> tuple[int, int, int] | None:
@@ -75,9 +73,9 @@ def parse_version(s: str) -> tuple[int, int, int] | None:
 def is_newer(latest_tag: str, current: str) -> bool:
     """True iff `latest_tag` should trigger an install relative to `current`.
 
-    Both parse as X.Y.Z -> numeric tuple ordering. Otherwise (an unparseable tag on either
-    side) fall back to an exact-string compare: differ -> treat as newer. This mirrors
-    the reference tool's caveat - we never silently swallow an update just because a tag is non-semver.
+    Both parse as X.Y.Z -> numeric tuple ordering. Otherwise (an unparseable value on either
+    side) fall back to an exact-string compare: differ -> treat as newer. We never silently
+    swallow an update just because a version string is non-semver.
     """
     lv = parse_version(latest_tag)
     cv = parse_version(current)
@@ -86,83 +84,54 @@ def is_newer(latest_tag: str, current: str) -> bool:
     return latest_tag.strip().lstrip("v") != str(current).strip().lstrip("v")
 
 
-def _spec(tag: str) -> str:
-    """The pip/uv/pipx install spec pinning the given release tag."""
-    return f"{REPO_GIT_URL}@{tag}"
+def _spec(version: str) -> str:
+    """The pip/uv/pipx install spec pinning the given release version, e.g.
+    `franky-agent==1.2.3`. A leading `v` is stripped (PyPI versions are plain `X.Y.Z`; this
+    keeps the spec valid even if a `vX.Y.Z`-shaped string is passed in)."""
+    v = version.strip()
+    if v.startswith("v"):
+        v = v[1:]
+    return f"{DIST_NAME}=={v}"
 
 
-def _try_gh(runner: Callable, timeout: float) -> str | None:
-    """Fetch the latest tag via `gh api` (reuses the operator's gh auth). None on any failure."""
-    try:
-        proc = runner(
-            ["gh", "api", _RELEASES_LATEST_PATH, "--jq", ".tag_name"],
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except Exception:
-        return None
-    if proc.returncode != 0:
-        return None
-    tag = (proc.stdout or "").strip()
-    return tag or None
+def _vstr(version: str) -> str:
+    """A `v`-prefixed display string for a version. PyPI versions are bare `X.Y.Z`, but the
+    CLI shows versions v-prefixed everywhere, so user-facing messages route through this.
+    Idempotent for an already-`v`-prefixed value."""
+    v = version.strip()
+    return v if v.startswith("v") else f"v{v}"
 
 
-def _try_rest(opener: Callable, env: Mapping[str, str], timeout: float) -> str:
-    """Fetch the latest tag via the REST API. Adds a Bearer header if GH_TOKEN is set
-    (private repo); without it the call is unauth and dormant until the repo is public.
-    Raises on any failure - the caller wraps it in UpdateError."""
-    headers = {
-        "Accept": "application/vnd.github+json",
-        "User-Agent": "franky-update",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
-    token = env.get("GH_TOKEN")
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(_RELEASES_LATEST_URL, headers=headers)
-    with opener(req, timeout=timeout) as resp:
-        data = json.load(resp)
-    tag = data.get("tag_name")
-    if not tag:
-        raise UpdateError("release response had no tag_name")
-    return tag
-
-
-def fetch_latest_tag(
+def fetch_latest_version(
     *,
-    runner: Callable = subprocess.run,
     opener: Callable = urllib.request.urlopen,
-    env: Mapping[str, str] | None = None,
     timeout: float = _FETCH_TIMEOUT,
 ) -> str:
-    """Fetch the latest release tag, fresh (no cache). Tries `gh` first, then REST.
+    """Fetch the latest published version from PyPI, fresh (no cache).
 
-    Raises UpdateError with an operator-readable message if neither path yields a tag.
+    A single unauthenticated HTTPS GET of the package's JSON metadata; `info.version` is the
+    latest non-yanked release. Raises UpdateError with an operator-readable message on any
+    network/parse failure or a missing version field.
     """
-    if env is None:
-        env = os.environ
-
-    tag = _try_gh(runner, timeout)
-    if tag:
-        return tag
+    req = urllib.request.Request(_PYPI_JSON_URL, headers={"User-Agent": "franky-update"})
     try:
-        return _try_rest(opener, env, timeout)
-    except UpdateError:
-        raise
+        with opener(req, timeout=timeout) as resp:
+            data = json.load(resp)
     except Exception as exc:
-        raise UpdateError(
-            f"could not reach GitHub to check for the latest release ({exc})"
-        ) from exc
+        raise UpdateError(f"could not reach PyPI to check for the latest release ({exc})") from exc
+    version = (data.get("info") or {}).get("version")
+    if not version:
+        raise UpdateError("PyPI response had no info.version")
+    return version
 
 
-def _install_command(install: Install, tag: str) -> list[str] | None:
+def _install_command(install: Install, version: str) -> list[str] | None:
     """Build the reinstall argv for the detected manager, or None if undetectable.
 
     pip targets `install.path` (the resolved interpreter) so the upgrade lands in the exact
     running env - never a blind install into the wrong one.
     """
-    spec = _spec(tag)
+    spec = _spec(version)
     if install.kind == "uv tool":
         return ["uv", "tool", "install", "--force", spec]
     if install.kind == "pipx":
@@ -182,7 +151,7 @@ def force_update(
     force: bool = False,
     install: Install | None = None,
     current: str | None = None,
-    fetch: Callable[[], str] = fetch_latest_tag,
+    fetch: Callable[[], str] = fetch_latest_version,
     runner: Callable = subprocess.run,
     out: Callable[[str], None] = print,
 ) -> int:
@@ -192,7 +161,7 @@ def force_update(
         force: Reinstall even when already on the latest release.
         install: Injectable install provenance (default: detect_install()).
         current: Injectable running version (default: franky_version()).
-        fetch: Injectable latest-tag fetcher (default: fetch_latest_tag).
+        fetch: Injectable latest-version fetcher (default: fetch_latest_version).
         runner: Injectable subprocess.run-compatible callable for the install command.
         out: Injectable line printer (default: print).
     """
@@ -214,7 +183,7 @@ def force_update(
 
     newer = is_newer(tag, current)
     if not newer and not force:
-        out(f"franky: already on the latest release ({current})")
+        out(f"franky: already on the latest release ({_vstr(current)})")
         return 0
 
     argv = _install_command(install, tag)
@@ -226,7 +195,7 @@ def force_update(
         )
         return 1
 
-    out(f"franky: {'reinstalling' if (not newer and force) else f'updating to {tag}'} ...")
+    out(f"franky: {'reinstalling' if (not newer and force) else f'updating to {_vstr(tag)}'} ...")
     try:
         proc = runner(argv, capture_output=True, text=True)
     except OSError as exc:
@@ -237,7 +206,7 @@ def force_update(
         out(f"franky: update failed (exit {proc.returncode})" + (f":\n{tail}" if tail else ""))
         return 1
 
-    out(f"franky: {'reinstalled' if (not newer and force) else 'updated to'} {tag}")
+    out(f"franky: {'reinstalled' if (not newer and force) else 'updated to'} {_vstr(tag)}")
     return 0
 
 
@@ -246,7 +215,7 @@ def force_update(
 # ---------------------------------------------------------------------------
 
 # A tight budget: the build is waiting, so a check that can't answer fast is negative-cached
-# and skipped. The common path (gh present + authed) returns well under this.
+# and skipped. PyPI is a fast CDN; anything slower than this is effectively down, so skip it.
 _BUILD_FETCH_TIMEOUT = 1.0
 
 # Tiered cache TTLs (seconds). "available" lingers (you already know); "current" is short so a
@@ -323,15 +292,18 @@ def _install_for_next_run(
     argv = _install_command(install, tag)
     if argv is None:
         return
-    out(f"franky: {AUTO_UPDATE_VAR}=1 - installing {tag} for your next build ...")
+    out(f"franky: {AUTO_UPDATE_VAR}=1 - installing {_vstr(tag)} for your next build ...")
     try:
         proc = runner(argv, capture_output=True, text=True)
     except OSError:
         return
     if proc.returncode == 0:
-        out(f"franky: installed {tag}; it takes effect on your next `franky build`")
+        out(f"franky: installed {_vstr(tag)}; it takes effect on your next `franky build`")
     else:
-        out(f"franky: auto-install of {tag} failed (exit {proc.returncode}) - run `franky update`")
+        out(
+            f"franky: auto-install of {_vstr(tag)} failed (exit {proc.returncode}) "
+            "- run `franky update`"
+        )
 
 
 def _auto_update(
@@ -366,7 +338,10 @@ def _auto_update(
     if status != "available" or not tag:
         return
 
-    out(f"franky: {tag} available (installed v{current}) - run `franky update` to upgrade")
+    out(
+        f"franky: {_vstr(tag)} available (installed {_vstr(current)}) "
+        "- run `franky update` to upgrade"
+    )
     if _flag(env, AUTO_UPDATE_VAR):
         _install_for_next_run(install, tag, runner, out)
 
@@ -391,7 +366,7 @@ def maybe_auto_update(
         env: Environment mapping (default: os.environ).
         install: Install provenance (default: detect_install()).
         current: Running version (default: franky_version()).
-        fetch: Zero-arg latest-tag fetcher (default: fetch_latest_tag with a ~1s budget).
+        fetch: Zero-arg latest-version fetcher (default: fetch_latest_version, ~1s budget).
         now: Clock (default: time.time).
         cache_path: Cache file (default: ~/.franky/update_check.json).
         out: Line printer (default: stderr).
@@ -405,7 +380,7 @@ def maybe_auto_update(
         if current is None:
             current = franky_version()
         if fetch is None:
-            fetch = lambda: fetch_latest_tag(runner=runner, timeout=_BUILD_FETCH_TIMEOUT)  # noqa: E731
+            fetch = lambda: fetch_latest_version(timeout=_BUILD_FETCH_TIMEOUT)  # noqa: E731
         if cache_path is None:
             cache_path = default_cache_path()
         _auto_update(env, install, current, fetch, now, cache_path, out, runner)

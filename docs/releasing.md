@@ -14,8 +14,9 @@ This runs `scripts/release.py x.y.z`, which:
 4. Bumps `version` in `pyproject.toml` and `__version__` in `franky/__init__.py` in lockstep.
 5. Retitles the `## [Unreleased]` section in `CHANGELOG.md` to `## [X.Y.Z] - YYYY-MM-DD`
    and inserts a fresh empty `## [Unreleased]` block above it.
-6. Bumps the version refs in `README.md` (the `@vX.Y.Z` install pins and the `## Status`
-   line) so the docs track the release. Fails loudly if no install pin is found.
+6. Bumps the `vX.Y.Z` on the `## Status` line in `README.md` so the docs track the release.
+   (The PyPI install command has no version pin, so there is nothing else to bump.) Fails
+   loudly if the Status line is missing.
 7. Commits (`release: vX.Y.Z`), creates an annotated tag (`vX.Y.Z`), and pushes both
    in a single `git push origin main vX.Y.Z`.
 
@@ -65,37 +66,42 @@ the tag is absent, and the tree is clean - then creates and pushes the tag only.
 On a `vX.Y.Z` tag push, the `release.yml` workflow:
 1. Runs the guard.
 2. Builds the Python wheel and sdist (`python -m build`).
-3. Builds and pushes both Docker images to GHCR:
-   - `ghcr.io/vietlabs-work/franky:X.Y.Z`
-   - `ghcr.io/vietlabs-work/franky-proxy:X.Y.Z`
-   - (also `:latest` convenience tags)
-4. Creates a GitHub Release with the wheel/sdist attached and the changelog section as
+3. Publishes the wheel + sdist to PyPI (as `franky-agent`) via Trusted Publishing (OIDC) -
+   no stored token.
+4. Builds and pushes both Docker images to GHCR under the repo's owning org
+   (`ghcr.io/<owner>/franky:X.Y.Z` and `ghcr.io/<owner>/franky-proxy:X.Y.Z`, plus `:latest`
+   convenience tags).
+5. Creates a GitHub Release with the wheel/sdist attached and the changelog section as
    release notes.
 
-The GitHub Release is the last job so its existence implies wheel + images were published.
+The GitHub Release is the last job (`needs: [wheel, pypi, image]`) so its existence implies
+the wheel, the PyPI publish, and the images all shipped.
 
-## GHCR auth (while the repo is private)
+## One-time publishing prerequisites
 
-The CLI pulls its images from GHCR on first run. While the repo and packages are private:
+Before the first public release these must be set up out-of-band (no secret is stored in the
+repo for either):
 
-```bash
-docker login ghcr.io
-# enter your GitHub username and a PAT with read:packages scope
-```
+- **PyPI Trusted Publisher** for `franky-agent`: on PyPI, add a pending publisher bound to
+  this repo, workflow `release.yml`, and environment `pypi`. The `pypi` job uses OIDC
+  (`id-token: write`) - no API token.
+- **Public GHCR packages**: set the `franky` and `franky-proxy` packages to public visibility
+  in the owning org's package settings, so the CLI pulls them with no `docker login`.
 
-Set `FRANKY_IMAGE` and `FRANKY_PROXY_IMAGE` to point at local builds to bypass GHCR
-entirely during development (see `config.example.toml`, or run `franky config path`).
+The CLI's default GHCR namespace (`DEFAULT_GHCR_REPO` in `franky/container.py`) must match the
+org that hosts the public packages. The release workflow pushes to
+`ghcr.io/${{ github.repository_owner }}`, so moving the repo to a new org retargets the images
+automatically; update `DEFAULT_GHCR_REPO` to the same org. Until they align, set
+`FRANKY_GHCR_REPO=ghcr.io/<owner>` to point the CLI at wherever the images currently live.
+
+## Image overrides for local dev
+
+Set `FRANKY_IMAGE` and `FRANKY_PROXY_IMAGE` to point at local builds to bypass GHCR entirely,
+or `FRANKY_GHCR_REPO` to retarget just the namespace (see `config.example.toml`, or run
+`franky config path`).
 
 ## Trust model for images
 
-The CLI always resolves to the version-pinned tag (`ghcr.io/vietlabs-work/franky:X.Y.Z`),
+The CLI always resolves to the version-pinned tag (`ghcr.io/<owner>/franky:X.Y.Z`),
 not `:latest`. That tag is treated as immutable: once published it is never overwritten.
 `:latest` is a human convenience tag; the CLI never uses it.
-
-## Making the repo public (follow-up)
-
-Once the GitHub repo and packages are public:
-- The `docker login ghcr.io` prerequisite for `read:packages` drops away.
-- Add PyPI trusted publishing (OIDC) to publish the wheel to PyPI without a token; update
-  the release workflow to add a `pypi-publish` step using `pypa/gh-action-pypi-publish`.
-- Update the README install section to use `pip install franky` / `uv tool install franky`.
