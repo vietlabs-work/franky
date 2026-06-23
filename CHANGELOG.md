@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Eval harness (`scripts/eval.py` + `make eval`, opt-in/out-of-band): runs a golden task set
+  (`evals/tasks.json`) through the real `franky build` flow N times and reports pass-rate, plus
+  a comparison mode for the delta between two engines. Success checkers (`pr_opened`,
+  `exit_zero`) are derived from the build result; the harness logic is unit-tested with an
+  injected fake runner so the fast suite stays docker-free. Needs real Docker + creds + a
+  sandbox repo to actually run (#25).
 - Third engine `codex` (OpenAI Codex, `@openai/codex`): `franky build --engine codex` runs
   `codex exec --json --dangerously-bypass-approvals-and-sandbox` headless in the container.
   API-key auth (`CODEX_API_KEY` or `OPENAI_API_KEY`); `api.openai.com` is allowlisted only

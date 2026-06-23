@@ -26,9 +26,13 @@ docker build -t franky-proxy proxy/
 # Invoke the CLI
 franky build <gh-issue-url | jira KEY | "prose"> [--repo owner/repo] [--engine pi|claude|codex] [--plan-first]
 franky version
+
+# Opt-in, OUT-OF-BAND agent-quality eval (#25) - needs real Docker + creds + a sandbox repo.
+# Bare runs evals/tasks.json once; ARGS passes flags. See evals/README.md.
+make eval ARGS="-n 3 --engine pi --compare-engine codex"
 ```
 
-Tests use no real Docker, no network, and no live creds: every side effect (subprocess runner, env mapping, sleeper) is dependency-injected, so the suite runs in well under a second. Keep it that way - never reach for real `docker`/`gh` in a test. The egress block/allow *behavior* is verified manually against real Docker (see the PR for issue #1), not in CI.
+Tests use no real Docker, no network, and no live creds: every side effect (subprocess runner, env mapping, sleeper) is dependency-injected, so the suite runs in well under a second. Keep it that way - never reach for real `docker`/`gh` in a test. The egress block/allow *behavior* is verified manually against real Docker (see the PR for issue #1), not in CI. The **eval harness** (`scripts/eval.py`, #25) is the other out-of-band tool: it drives the real `franky build` flow to measure agent pass-rate, so its actual runs need creds/Docker - but its *logic* is unit-tested with an injected fake runner (`tests/test_eval.py`), staying in the fast suite.
 
 ## Architecture
 
