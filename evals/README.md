@@ -14,7 +14,8 @@ Only the harness *logic* is unit-tested (`tests/test_eval.py`, with an injected 
 Same as a normal `franky build` (see the top-level README "Security" + "Install"):
 
 - Both images built/pulled (`docker build -t franky . && docker build -t franky-proxy proxy/`).
-- A `.env` with `FRANKY_ALLOWED_REPOS`, `GH_TOKEN`, and the selected engine's creds.
+- `FRANKY_ALLOWED_REPOS`, `GH_TOKEN`, and the selected engine's creds configured - run
+  `franky config init` (writes `~/.franky/config`) or export them as env vars.
 - A **throwaway sandbox repo** you own and are happy to have PRs opened against. Use a junk
   repo - the agent is autonomous and will push branches + open PRs.
 

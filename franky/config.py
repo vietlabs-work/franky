@@ -8,6 +8,8 @@ printed. A secret value must never survive into a log file or the terminal.
 
 from __future__ import annotations
 
+import fnmatch
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 
@@ -18,6 +20,23 @@ REDACT_TOKEN = "***REDACTED***"
 GH_TOKEN_VAR = "GH_TOKEN"
 ALLOWED_REPOS_VAR = "FRANKY_ALLOWED_REPOS"
 EXTRA_ALLOWED_DOMAINS_VAR = "FRANKY_EXTRA_ALLOWED_DOMAINS"
+
+# Valid allowlist entry pattern: the literal "*" (match any repo) OR exactly one "/"
+# with GitHub-compatible owner/name segments (alphanumeric, dash, underscore, dot).
+# The NAME segment also accepts "*" as a glob wildcard (so "my-org/*" and "my-org/team-*"
+# work); the OWNER segment does NOT - an owner glob like "*/repo" would silently match
+# every owner, a surprising breadth for a security boundary, so it is rejected (the only
+# way to match across owners is the deliberate bare "*"). Empty segments and extra
+# slashes are rejected.
+# WHY validate strictly: a malformed entry is almost certainly a typo (e.g. a bare
+# "owner" with no slash, or a triple-component "org/team/repo") and silently accepting
+# it would produce confusing behaviour at runtime.
+_ALLOWLIST_ENTRY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.*-]+$")
+
+# A concrete repo is always exactly "owner/name": two non-empty, slash-free segments.
+# This guards repo_allowed against a multi-slash repo (e.g. "owner/sub/path") sneaking
+# past an "owner/*" pattern by matching the trailing "sub/path" against the name glob.
+_REPO_RE = re.compile(r"^[^/\s]+/[^/\s]+$")
 
 
 def redact(text: str, secrets: Iterable[str]) -> str:
@@ -48,6 +67,29 @@ class Config:
         return [v for v in self.passthrough_env.values() if v]
 
 
+def validate_allowlist_entry(entry: str) -> None:
+    """Raise ValueError if `entry` is not a valid allowlist pattern.
+
+    Valid forms:
+      - "*"  (literal asterisk - matches any repo the token can reach)
+      - "owner/repo" style: GitHub charset (A-Za-z0-9_.-) in the owner segment, plus
+        an optional glob "*" in the NAME segment only ("my-org/*", "my-org/team-*").
+        An owner glob ("*/repo") is rejected - the only cross-owner match is bare "*".
+
+    Malformed entries (bare owner, triple-slash, empty segment, whitespace, owner
+    glob) are rejected so load_config surfaces them immediately rather than silently
+    producing a surprising or non-matching allowlist.
+    """
+    if entry == "*":
+        return
+    if not _ALLOWLIST_ENTRY_RE.match(entry):
+        raise ValueError(
+            f"invalid allowlist entry {entry!r}: expected 'owner/repo' or 'owner/*' "
+            "or '*' (each segment: alphanumeric/dash/underscore/dot/asterisk, "
+            "exactly one slash)"
+        )
+
+
 def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
     """Resolve engine + build the fail-closed passthrough env.
 
@@ -67,6 +109,10 @@ def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
             f"{ALLOWED_REPOS_VAR} is unset or empty - refusing (set a comma-separated "
             "owner/repo allowlist)"
         )
+    # Validate each pattern now, at load time, so a malformed entry surfaces as a
+    # clean ClickException rather than silently failing to match anything at runtime.
+    for entry in allowed:
+        validate_allowlist_entry(entry)
 
     gh_token = env.get(GH_TOKEN_VAR)
     if not gh_token:
@@ -110,4 +156,37 @@ def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
 
 
 def repo_allowed(repo: str, allowed: list[str]) -> bool:
-    return repo in allowed
+    """Return True if `repo` matches any pattern in `allowed`.
+
+    Matching rules (segment-wise, case-insensitive):
+    - Pattern "*" -> matches ANY repo unconditionally.
+    - Otherwise split BOTH repo and pattern on the FIRST "/" into (owner, name),
+      then fnmatch.fnmatchcase on lowercased owner and name independently.
+
+    WHY segment-wise instead of a single fnmatch over "owner/repo":
+      A pattern like "owner*" with plain fnmatch would match "owner-evil/repo" AND
+      "owner/repo" - both segments must match independently.  More importantly,
+      "owner*" must NOT match "owner-evil/anything" by crossing the "/" boundary.
+      Splitting on "/" and matching each segment in isolation is the fix.
+
+    WHY case-insensitive: GitHub org/repo names are case-preserving but case-
+    insensitive in practice (github.com/OWNER/REPO and github.com/owner/repo
+    resolve to the same thing).
+    """
+    if not _REPO_RE.match(repo):
+        # repo must be exactly "owner/name" (two non-empty, slash-free segments). A
+        # multi-slash repo like "owner/sub/path" must NOT satisfy an "owner/*" pattern
+        # by matching "sub/path" against the name glob.
+        return False
+    r_owner, r_name = repo.lower().split("/", 1)
+
+    for pattern in allowed:
+        if pattern == "*":
+            return True
+        p_parts = pattern.lower().split("/", 1)
+        if len(p_parts) != 2:
+            continue  # should have been caught by validate_allowlist_entry; skip
+        p_owner, p_name = p_parts
+        if fnmatch.fnmatchcase(r_owner, p_owner) and fnmatch.fnmatchcase(r_name, p_name):
+            return True
+    return False
