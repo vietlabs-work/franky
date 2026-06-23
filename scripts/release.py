@@ -164,9 +164,14 @@ def _git(run, argv, check=True):
 
 
 def _assert_clean_tree(run) -> None:
-    status = _git(run, ["status", "--porcelain"]).stdout.strip()
+    # Only uncommitted edits to TRACKED files matter: both callers (cmd_release, cmd_tag) stage
+    # by name (git add pyproject.toml ...) or don't stage at all - never `git add .` - so a stray
+    # tracked edit would be swept into the release commit, but untracked files (agent worktrees,
+    # editor scratch) can never enter the release. --untracked-files=no lets a release run in a
+    # working dir that has unrelated untracked clutter.
+    status = _git(run, ["status", "--porcelain", "--untracked-files=no"]).stdout.strip()
     if status:
-        print(f"release.py: working tree is dirty:\n{status}", file=sys.stderr)
+        print(f"release.py: tracked files have uncommitted changes:\n{status}", file=sys.stderr)
         raise SystemExit(1)
 
 
