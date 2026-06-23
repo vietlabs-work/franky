@@ -107,7 +107,7 @@ PROXY_PORT = 3128
 # publishing org can move without a code change (and for dev/testing against a fork). The
 # default MUST match the org that hosts the public packages; the release workflow pushes to
 # ${{ github.repository_owner }}, so this default tracks the repo's owning org.
-DEFAULT_GHCR_REPO = "ghcr.io/franky-agent"
+DEFAULT_GHCR_REPO = "ghcr.io/vietlabs-work"
 GHCR_REPO_VAR = "FRANKY_GHCR_REPO"
 FRANKY_IMAGE_VAR = "FRANKY_IMAGE"
 FRANKY_PROXY_IMAGE_VAR = "FRANKY_PROXY_IMAGE"

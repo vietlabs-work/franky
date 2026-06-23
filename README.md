@@ -54,7 +54,7 @@ pip install franky-agent
 ```
 
 On first run the CLI pulls the version-pinned, public GHCR images
-(`ghcr.io/franky-agent/franky:X.Y.Z` and `ghcr.io/franky-agent/franky-proxy:X.Y.Z`),
+(`ghcr.io/vietlabs-work/franky:X.Y.Z` and `ghcr.io/vietlabs-work/franky-proxy:X.Y.Z`),
 so all you need is Docker - no registry login. (Point `FRANKY_GHCR_REPO` at a different
 namespace if you host the images elsewhere.)
 

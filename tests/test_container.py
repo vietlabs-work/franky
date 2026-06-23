@@ -442,13 +442,13 @@ def test_resolve_image_env_override_wins():
 
 def test_resolve_image_default_is_versioned_ghcr():
     ref = resolve_image({})
-    assert ref.startswith("ghcr.io/franky-agent/franky:")
+    assert ref.startswith("ghcr.io/vietlabs-work/franky:")
     assert not ref.endswith(":latest")
 
 
 def test_resolve_image_proxy_uses_proxy_var():
     ref = resolve_image({}, FRANKY_PROXY_IMAGE_VAR, "franky-proxy")
-    assert ref.startswith("ghcr.io/franky-agent/franky-proxy:")
+    assert ref.startswith("ghcr.io/vietlabs-work/franky-proxy:")
 
 
 def test_resolve_image_ghcr_repo_override():
@@ -497,7 +497,7 @@ def test_ensure_image_available_absent_auth_error():
             )
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-    ok, reason = ensure_image_available("ghcr.io/franky-agent/franky:0.1.0", runner=fake_runner)
+    ok, reason = ensure_image_available("ghcr.io/vietlabs-work/franky:0.1.0", runner=fake_runner)
     assert ok is False
     assert reason == "auth"
 
@@ -510,7 +510,7 @@ def test_ensure_image_available_absent_pull_failed():
             return subprocess.CompletedProcess(argv, 1, stdout="", stderr="network timeout")
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-    ok, reason = ensure_image_available("ghcr.io/franky-agent/franky:0.1.0", runner=fake_runner)
+    ok, reason = ensure_image_available("ghcr.io/vietlabs-work/franky:0.1.0", runner=fake_runner)
     assert ok is False
     assert reason == "pull-failed"
 

@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the repo stays private. The release workflow publishes the wheel + sdist via PyPI Trusted
   Publishing (OIDC, no stored token), and the GHCR images are public.
 - `FRANKY_GHCR_REPO` env/config knob to retarget the image namespace without a code change;
-  the default (`ghcr.io/franky-agent`) and the release workflow both track the repo's owning
+  the default (`ghcr.io/vietlabs-work`) and the release workflow both track the repo's owning
   org.
 
 ### Changed
