@@ -9,11 +9,18 @@ Subcommands:
 """
 
 import argparse
+import json
 import re
 import subprocess
 import sys
+import time
 from datetime import date
 from pathlib import Path
+
+# Cap on how long `make release` will tail the triggered workflow before it stops watching
+# (the release itself is already pushed and keeps going regardless). The multi-arch image
+# builds dominate and run several minutes; 20 min is comfortable headroom.
+_WATCH_TIMEOUT = 1200
 
 
 def _find_root(start: Path) -> Path:
@@ -207,7 +214,118 @@ def _assert_release_preconditions(root: Path, v: str, run) -> None:
     _assert_tag_absent(run, v)
 
 
-def cmd_release(args, run, root: Path) -> None:
+def _origin_web_url(run):
+    """Best-effort https://github.com/owner/repo from the origin remote, or None if it can't be
+    derived. Handles ssh (git@github.com:o/r.git), ssh-url, and https forms."""
+    try:
+        proc = run(["git", "remote", "get-url", "origin"], capture_output=True, text=True)
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    m = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$", proc.stdout.strip())
+    return f"https://github.com/{m.group(1)}" if m else None
+
+
+def _find_release_run_id(run, v: str, sleep, attempts: int = 6, delay: int = 5):
+    """Poll for the tag-triggered Release run and return its id as a str, else None.
+
+    A tag-triggered run carries the tag name in headBranch, so `--branch vX.Y.Z` finds it
+    (`--limit 1` = the newest, which is what a fresh push or a manual re-run produces). The
+    default budget (~25s: attempts at t=0,5,10,15,20,25) covers GitHub's usual push->run
+    registration latency; on a slow-dispatch day it returns None and the caller degrades to
+    links. Returns None on gh-not-installed (OSError) or a persistent gh error."""
+    tag = f"v{v}"
+    for i in range(attempts):
+        try:
+            proc = run(
+                [
+                    "gh",
+                    "run",
+                    "list",
+                    "--workflow",
+                    "release.yml",
+                    "--branch",
+                    tag,
+                    "--limit",
+                    "1",
+                    "--json",
+                    "databaseId",
+                ],
+                capture_output=True,
+                text=True,
+            )
+        except OSError:
+            return None  # gh not installed
+        if proc.returncode == 0 and proc.stdout.strip():
+            try:
+                runs = json.loads(proc.stdout)
+            except (json.JSONDecodeError, TypeError):
+                runs = []
+            if runs:
+                return str(runs[0]["databaseId"])
+        if i < attempts - 1:
+            sleep(delay)
+    return None
+
+
+def _watch_release(run, v: str, sleep) -> None:
+    """After the tag push, tail the triggered Release workflow to completion and report the
+    outcome. Best-effort: degrades to printable links if gh is missing or the run can't be
+    found, and never raises (the release is already pushed)."""
+    web = _origin_web_url(run)
+    actions_url = f"{web}/actions" if web else "the repo's Actions tab"
+    release_url = f"{web}/releases/tag/v{v}" if web else f"the v{v} release page"
+
+    print(
+        f"\nPushed release commit and tag v{v}. The Release workflow now builds the wheel\n"
+        "+ GHCR images and publishes the GitHub Release - this takes several minutes.",
+    )
+
+    run_id = _find_release_run_id(run, v, sleep)
+    if run_id is None:
+        # The release IS pushed and the workflow runs regardless - we just couldn't tail it.
+        print("\nCouldn't attach to the workflow run. If gh is installed, check `gh auth status`;")
+        print("otherwise the run may simply not have registered yet. The release is unaffected:")
+        print(f"  Progress: {actions_url}")
+        print(f"  Release:  {release_url}  (appears when the workflow finishes)")
+        return
+
+    print(f"\nWatching run {run_id} (Ctrl-C stops watching; the release keeps running):\n")
+    try:
+        # start_new_session so the timeout kill reaps gh and any child (e.g. a pager), not just
+        # the parent. No capture_output: gh run watch streams its live progress to the terminal.
+        proc = run(
+            ["gh", "run", "watch", run_id, "--exit-status"],
+            timeout=_WATCH_TIMEOUT,
+            start_new_session=True,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"\nStopped watching after {_WATCH_TIMEOUT // 60} min; the workflow may still run.")
+        print(f"  Progress: {actions_url}")
+        return
+    except OSError:
+        print(f"  Progress: {actions_url}")
+        return
+
+    if proc.returncode == 0:
+        print(f"\nRelease published: {release_url}")
+    else:
+        print("\nThe Release workflow did NOT succeed. Commit + tag are pushed; inspect:")
+        print(f"  Progress: {actions_url}")
+
+
+def _print_release_links(run, v: str) -> None:
+    """Honest one-shot status used with --no-watch: the push triggered the workflow, here's where
+    to track it."""
+    web = _origin_web_url(run)
+    print(f"\nPushed release commit and tag v{v}. The Release workflow is now building +")
+    print("publishing (several minutes; not done yet). Track it:")
+    print(f"  Progress: {web + '/actions' if web else 'the repo Actions tab'}")
+    print(f"  Release:  {web + f'/releases/tag/v{v}' if web else f'the v{v} release page'}")
+
+
+def cmd_release(args, run, root: Path, sleep=time.sleep) -> None:
     v = args.version
     if not valid_version(v):
         print(
@@ -224,6 +342,8 @@ def cmd_release(args, run, root: Path) -> None:
         print(f"[dry-run] git commit -m 'release: v{v}'")
         print(f"[dry-run] git tag -a v{v} -m v{v}")
         print(f"[dry-run] git push origin main v{v}")
+        print("[dry-run] the tag push triggers the Release workflow (wheel + GHCR images +")
+        print("[dry-run]   GitHub Release); would then watch it to completion unless --no-watch")
         return
 
     _assert_release_preconditions(root, v, run)
@@ -251,7 +371,12 @@ def cmd_release(args, run, root: Path) -> None:
         )
         raise SystemExit(1)
 
-    print(f"Released v{v}")
+    # The push only TRIGGERS the release; the GitHub Release + GHCR images are built async by
+    # the tag workflow. Don't claim "Released" - report the real state and (by default) watch.
+    if args.no_watch:
+        _print_release_links(run, v)
+    else:
+        _watch_release(run, v, sleep)
 
 
 def cmd_tag(args, run, root: Path) -> None:
@@ -285,11 +410,13 @@ def cmd_notes(args, run, root: Path) -> None:
     print(notes)
 
 
-def main(argv=None, run=None, root=None) -> None:
+def main(argv=None, run=None, root=None, sleep=None) -> None:
     if run is None:
         run = subprocess.run
     if root is None:
         root = ROOT
+    if sleep is None:
+        sleep = time.sleep
 
     if argv is None:
         argv = sys.argv[1:]
@@ -303,9 +430,14 @@ def main(argv=None, run=None, root=None) -> None:
         release_parser = argparse.ArgumentParser(prog="release.py X.Y.Z")
         release_parser.add_argument("version", metavar="X.Y.Z")
         release_parser.add_argument("--dry-run", action="store_true")
+        release_parser.add_argument(
+            "--no-watch",
+            action="store_true",
+            help="Don't tail the triggered Release workflow; just print where to track it.",
+        )
         args = release_parser.parse_args(argv)
         args.subcommand = None
-        cmd_release(args, run, root)
+        cmd_release(args, run, root, sleep)
         return
 
     parser = argparse.ArgumentParser(
