@@ -1,6 +1,9 @@
-# Accept VERSION=, version=, or v= (precedence: VERSION > version > v).
-VERSION ?= $(version)
-VERSION ?= $(v)
+# Accept the version arg under ANY casing: VERSION=, version=, v=, V=, vERsiOn=, ...
+# Make vars are case-sensitive, so we scan the raw command-line assignments
+# ($(MAKEOVERRIDES)) and match the name case-insensitively against `version`/`v`.
+# `?=` so an exact `VERSION=` on the command line short-circuits the scan.
+# The `\#` is escaped: a bare `#` would start a Make comment and eat the `)`.
+VERSION ?= $(shell for kv in $(MAKEOVERRIDES); do n=$${kv%%=*}; l=$$(printf '%s' "$$n" | tr A-Z a-z); if [ "$$l" = version ] || [ "$$l" = v ]; then printf '%s' "$${kv\#*=}"; break; fi; done)
 
 .PHONY: smoke-dind eval release release-dry
 # Manual gate for always-on rootless Docker-in-Docker (#12). Needs real Docker; not in CI (the
