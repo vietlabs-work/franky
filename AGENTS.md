@@ -25,6 +25,8 @@ docker build -t franky-proxy proxy/
 
 # Invoke the CLI
 franky build <gh-issue-url | jira KEY | "prose"> [--repo owner/repo] [--engine pi|claude|codex] [--plan-first]
+# Follow-up pass on an existing Franky PR: address review/CI feedback with additive commits.
+franky iterate <gh-pr-url> [--engine pi|claude|codex]
 franky version
 
 # Opt-in, OUT-OF-BAND agent-quality eval (#25) - needs real Docker + creds + a sandbox repo.
@@ -54,12 +56,12 @@ Module responsibilities:
 
 | Module | Role |
 |--------|------|
-| `franky/cli.py` | Click entrypoint. Wires the pipeline; config/task errors become `ClickException` (operator errors, no traceback). Requires both the `franky` and `franky-proxy` images. Writes a redacted log to `tasks/<timestamp>.log`. |
+| `franky/cli.py` | Click entrypoint. Wires the pipeline; config/task errors become `ClickException` (operator errors, no traceback). Requires both the `franky` and `franky-proxy` images. Writes a redacted log to `tasks/<timestamp>.log`. The `build` and `iterate` commands share `_ensure_images` / `_run_pass` / `_economics_line`; the only difference between them is the prompt. |
 | `franky/config.py` | `Config` dataclass + `load_config` (fail-closed) + `redact`. Owns the secret list and optional `FRANKY_EXTRA_ALLOWED_DOMAINS`. |
-| `franky/task.py` | `parse_task` -> `TaskSpec`. Earliest point the target repo is known, so the allowlist gate lives here. Handles GitHub issue URLs, JIRA keys, and prose. |
+| `franky/task.py` | `parse_task` -> `TaskSpec` (issue URL / JIRA key / prose, for `build`) and `parse_pr_task` -> `TaskSpec(source="pr")` (a PR URL, for `iterate`). Earliest point the target repo is known, so the allowlist gate lives here. `GH_PR_RE` is anchored and `parse_pr_task` reconstructs the canonical URL from the captured groups so the gate and what `gh pr checkout` acts on can never diverge. |
 | `franky/engine.py` | `Engine` base + `PiEngine`/`ClaudeEngine`. Each engine owns: headless argv, PR-URL parsing, required creds, and `provider_hosts` (which network host(s) feed the egress allowlist). `resolve_engine` order: `--engine` flag > `FRANKY_ENGINE` > default `pi`. |
 | `franky/egress.py` | Pure allowlist POLICY: `build_allowlist` = engine provider host(s) + GitHub + npm/PyPI + container image registries (`DOCKER_REGISTRY_DOMAINS`, for always-on DinD) + operator extras. No docker, no I/O. |
-| `franky/prompt.py` | `build_prompt` = `persona.md` + task block + literal conventions (branch `franky/<slug>`, tests-green-before-PR, conventional commits, 3-section PR body, never merge). |
+| `franky/prompt.py` | `build_prompt` = `persona.md` + task block + literal conventions (branch `franky/<slug>`, tests-green-before-PR, conventional commits, 3-section PR body, never merge). `build_iterate_prompt` is the `iterate` variant: check out the existing branch (`gh pr checkout`, no new branch), gather review/CI feedback via `gh`, push ADDITIVE commits, never force-push / new-PR / merge, with a prompt-level own-PR guard (head `franky/*` + not cross-repo). Standalone - it does not reuse `_task_block`, so `source="pr"` never hits build-mode logic. |
 | `franky/container.py` | All docker MECHANICS (pure argv builders, testable without Docker): task/proxy/network argv + `run_in_container` (injectable `runner`/`sleeper`) + `ensure_image`. `_HARDENING` is the relaxed-for-DinD profile (see invariants). |
 | `franky-dind-entrypoint.sh` | Image ENTRYPOINT (not a Python module): starts the rootless Docker daemon, renders `~/.docker/config.json` proxies so inner containers inherit the cage (proxy URLs only, never creds), waits for the socket (30s cap, proceeds on timeout), then execs the engine argv. |
 | `franky/update_check.py` | `force_update` (behind `franky update [--force]`): fresh latest-release fetch (`gh` then REST w/ `GH_TOKEN` fallback), `X.Y.Z` compare, reinstall via the `_install.py`-detected manager (uv tool/pipx/pip). `maybe_auto_update` (top of `franky build`): hint-only best-effort sibling - tight ~1s fetch, tiered `~/.franky/update_check.json` cache, prints a stderr hint and proceeds; never blocks or re-execs. Stdlib-only. |

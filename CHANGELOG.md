@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `franky iterate <pr-url>`: a second entry point that responds to PR review comments and
+  failing CI with ADDITIVE follow-up commits on the existing branch, instead of re-running
+  from scratch. Runs the identical hardened + egress-controlled container as `franky build`;
+  checks out the PR's branch (`gh pr checkout`), gathers feedback in-container via `gh`, runs
+  tests green, then pushes. Never force-pushes, rewrites history, opens a new PR, or merges
+  (all prompt-level, same trust model as build's never-merge). A prompt-level own-PR guard
+  (head `franky/*` + same-repo, not a fork) keeps it off arbitrary branches; the hard bounds
+  stay the repo allowlist + egress cage + PR-not-merge. The PR URL is authoritative (no
+  `--repo`), and the parsing regex is anchored + canonicalized so the allowlist gate and the
+  branch the agent acts on cannot diverge (#24).
 - Eval harness (`scripts/eval.py` + `make eval`, opt-in/out-of-band): runs a golden task set
   (`evals/tasks.json`) through the real `franky build` flow N times and reports pass-rate, plus
   a comparison mode for the delta between two engines. Success checkers (`pr_opened`,

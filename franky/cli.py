@@ -32,8 +32,8 @@ from .container import (
 )
 from .engine import ENGINES, resolve_engine
 from .jira import JIRA_API_TOKEN_VAR, JIRA_EMAIL_VAR, fetch_jira_issue
-from .prompt import build_plan_prompt, build_prompt
-from .task import PROSE_MAX_CHARS, parse_task
+from .prompt import build_iterate_prompt, build_plan_prompt, build_prompt
+from .task import PROSE_MAX_CHARS, parse_pr_task, parse_task
 from .update_check import force_update, maybe_auto_update
 
 TASKS_DIR = Path("tasks")
@@ -101,9 +101,114 @@ def build(
         raise click.ClickException(redact(str(exc), cfg_secrets_safe())) from exc
 
     secrets = cfg.secret_values()
+    franky_img, proxy_img = _ensure_images(os.environ)
 
-    franky_img = resolve_image(os.environ, FRANKY_IMAGE_VAR, "franky")
-    proxy_img = resolve_image(os.environ, FRANKY_PROXY_IMAGE_VAR, "franky-proxy")
+    if plan_first:
+        # PHASE 1: planning pass. Show the plan, then gate on explicit approval. A plan that
+        # errored is not a plan to approve, so abort before the gate. No economics on this
+        # pass - economics is build-pass only.
+        code, output, _plan_dur = _run_pass(cfg, build_plan_prompt(spec), franky_img, proxy_img)
+        _write_log(output, secrets)
+        click.echo("franky: --- plan (read-only, nothing written yet) ---", err=True)
+        click.echo(output)
+        if code != 0:
+            raise click.ClickException(
+                f"planning pass exited non-zero ({code}) - see the redacted log in tasks/"
+            )
+        # default=False and non-interactive abort both fail closed: no approval -> no build.
+        if not click.confirm("franky: proceed to execute this plan?", default=False):
+            click.echo("franky: plan-first aborted - nothing was built or opened.", err=True)
+            return
+
+    # PHASE 2 (or the only phase without --plan-first): build it and open the PR.
+    code, output, duration = _run_pass(cfg, build_prompt(spec), franky_img, proxy_img)
+
+    # Emit economics before the PR-URL echo and before any ClickException so the summary is
+    # always shown (even when the agent exits non-zero).
+    econ = _economics_line(output, duration, secrets)
+    click.echo(econ, err=True)
+    _write_log(output, secrets, footer=econ)
+
+    # Scope PR-URL detection to the task's own repo so a hostile issue body cannot make
+    # Franky report a PR URL for some other (attacker) repo.
+    pr_url = cfg.engine.parse_pr_url(output, repo=spec.repo)
+    if pr_url:
+        click.echo(pr_url)
+    else:
+        click.echo(
+            "franky: no PR URL found in agent output - see the redacted log in tasks/", err=True
+        )
+    if code != 0:
+        raise click.ClickException(
+            f"agent exited non-zero ({code}) - see the redacted log in tasks/"
+        )
+
+
+@main.command()
+@click.argument("pr_url")
+@click.option(
+    "--engine",
+    "engine",
+    default=None,
+    # Same registry-derived choice as `build` (see that command's note).
+    type=click.Choice(sorted(ENGINES)),
+    help="Engine override; else FRANKY_ENGINE, else pi.",
+)
+def iterate(pr_url: str, engine: str | None) -> None:
+    """Address review feedback / failing CI on an existing Franky PR with follow-up commits.
+
+    Example:
+      franky iterate https://github.com/you/repo/pull/42
+
+    Runs the SAME hardened, egress-controlled container as `franky build`, but instead of
+    starting fresh it checks out the PR's existing branch, reads the review comments and
+    failing checks via `gh`, and pushes ADDITIVE follow-up commits to that branch. It never
+    force-pushes, never merges, and never opens a new PR - a human still reviews every change.
+    The PR URL is authoritative (it carries owner/repo), so there is no --repo flag.
+    """
+    # Best-effort, hint-only update check - same as build (never blocks/raises).
+    maybe_auto_update()
+
+    # Config + PR-URL parse are operator-error surfaces -> clean ClickException, no traceback.
+    try:
+        cfg = load_config(engine, os.environ)
+        spec = parse_pr_task(pr_url, cfg.allowed_repos)
+    except ValueError as exc:
+        raise click.ClickException(redact(str(exc), cfg_secrets_safe())) from exc
+
+    secrets = cfg.secret_values()
+    franky_img, proxy_img = _ensure_images(os.environ)
+
+    code, output, duration = _run_pass(cfg, build_iterate_prompt(spec), franky_img, proxy_img)
+
+    # Economics first (same as build) so spend is visible even when the agent exits non-zero.
+    econ = _economics_line(output, duration, secrets)
+    click.echo(econ, err=True)
+    _write_log(output, secrets, footer=econ)
+
+    # iterate produces NO new PR; the existing PR gains commits. Report a labeled line rather
+    # than a bare URL on stdout - exit 0 means the pass ran, NOT that a push necessarily landed
+    # (the agent correctly pushes nothing on red tests or a failed own-PR check), so we never
+    # present the URL as a fresh success artifact.
+    click.echo(
+        f"franky: iterate pass complete for {spec.text} - review the PR for the new commits",
+        err=True,
+    )
+    if code != 0:
+        raise click.ClickException(
+            f"agent exited non-zero ({code}) - see the redacted log in tasks/"
+        )
+
+
+def _ensure_images(env: Mapping[str, str]) -> tuple[str, str]:
+    """Resolve + ensure the franky and franky-proxy images are available locally.
+
+    Returns (franky_image, proxy_image). Raises a clean ClickException (no traceback) for the
+    operator-facing failure modes: docker absent, auth needed, or pull failed. Shared by
+    `build` and `iterate` - the only difference between them is the prompt, not the plumbing.
+    """
+    franky_img = resolve_image(env, FRANKY_IMAGE_VAR, "franky")
+    proxy_img = resolve_image(env, FRANKY_PROXY_IMAGE_VAR, "franky-proxy")
     for label, img, dev_build, dev_var in (
         ("franky", franky_img, "docker build -t franky .", FRANKY_IMAGE_VAR),
         ("franky-proxy", proxy_img, "docker build -t franky-proxy proxy/", FRANKY_PROXY_IMAGE_VAR),
@@ -124,63 +229,30 @@ def build(
                 f"{label} image '{img}' not found locally and could not be pulled. "
                 f"For local dev: `{dev_build}` and set {dev_var}=<local-tag>."
             )
+    return franky_img, proxy_img
 
-    def _run(prompt: str) -> tuple[int, str, float]:
-        """Run one container pass for `prompt` and return (exit_code, output, duration_secs).
 
-        Duration is measured with time.monotonic() around run_in_container only.
-        Logging is the caller's responsibility so the build pass can attach an economics
-        footer while the planning pass logs without one.
-        """
-        inner_argv = cfg.engine.inner_argv(prompt, model=None)
-        t0 = time.monotonic()
-        code, output = run_in_container(cfg, inner_argv, image=franky_img, proxy_image=proxy_img)
-        duration = time.monotonic() - t0
-        return code, output, duration
+def _run_pass(cfg, prompt: str, franky_img: str, proxy_img: str) -> tuple[int, str, float]:
+    """Run one container pass for `prompt` and return (exit_code, output, duration_secs).
 
-    if plan_first:
-        # PHASE 1: planning pass. Show the plan, then gate on explicit approval. A plan that
-        # errored is not a plan to approve, so abort before the gate. No economics on this
-        # pass - economics is build-pass only.
-        code, output, _plan_dur = _run(build_plan_prompt(spec))
-        _write_log(output, secrets)
-        click.echo("franky: --- plan (read-only, nothing written yet) ---", err=True)
-        click.echo(output)
-        if code != 0:
-            raise click.ClickException(
-                f"planning pass exited non-zero ({code}) - see the redacted log in tasks/"
-            )
-        # default=False and non-interactive abort both fail closed: no approval -> no build.
-        if not click.confirm("franky: proceed to execute this plan?", default=False):
-            click.echo("franky: plan-first aborted - nothing was built or opened.", err=True)
-            return
+    Duration is measured with time.monotonic() around run_in_container only. Logging and the
+    economics summary are the CALLER's responsibility (the planning pass logs without an
+    economics footer; the build and iterate passes attach one). Shared by build and iterate.
+    """
+    inner_argv = cfg.engine.inner_argv(prompt, model=None)
+    t0 = time.monotonic()
+    code, output = run_in_container(cfg, inner_argv, image=franky_img, proxy_image=proxy_img)
+    duration = time.monotonic() - t0
+    return code, output, duration
 
-    # PHASE 2 (or the only phase without --plan-first): build it and open the PR.
-    code, output, duration = _run(build_prompt(spec))
 
-    # Compute and emit economics before the PR-URL echo and before any ClickException so
-    # the summary is always shown (even when the agent exits non-zero). Degrade to all-unknown
-    # on any parse/format error so the run never fails due to economics.
+def _economics_line(output: str, duration: float, secrets: list[str]) -> str:
+    """The redacted one-line economics summary for a pass. Degrades to all-unknown on any
+    parse/format error so economics can never fail a run. Shared by build and iterate."""
     try:
-        econ = redact(format_economics(parse_usage(output), duration), secrets)
+        return redact(format_economics(parse_usage(output), duration), secrets)
     except Exception:
-        econ = redact(format_economics(Usage(), duration), secrets)
-    click.echo(econ, err=True)
-    _write_log(output, secrets, footer=econ)
-
-    # Scope PR-URL detection to the task's own repo so a hostile issue body cannot make
-    # Franky report a PR URL for some other (attacker) repo.
-    pr_url = cfg.engine.parse_pr_url(output, repo=spec.repo)
-    if pr_url:
-        click.echo(pr_url)
-    else:
-        click.echo(
-            "franky: no PR URL found in agent output - see the redacted log in tasks/", err=True
-        )
-    if code != 0:
-        raise click.ClickException(
-            f"agent exited non-zero ({code}) - see the redacted log in tasks/"
-        )
+        return redact(format_economics(Usage(), duration), secrets)
 
 
 def cfg_secrets_safe() -> list[str]:

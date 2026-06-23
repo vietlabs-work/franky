@@ -1,6 +1,6 @@
 import pytest
 
-from franky.task import PROSE_MAX_CHARS, parse_task
+from franky.task import PROSE_MAX_CHARS, parse_pr_task, parse_task
 
 ALLOWED = ["me/repo", "octocat/hello"]
 
@@ -98,3 +98,48 @@ def test_jira_does_not_match_gh_issue_url():
     url = "https://github.com/me/repo/issues/1"
     spec = parse_task(url, None, ALLOWED)
     assert spec.source == "issue"
+
+
+# ---------------------------------------------------------------------------
+# PR URL parsing (the `iterate` command)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_pr_task_happy():
+    spec = parse_pr_task("https://github.com/octocat/hello/pull/42", ALLOWED)
+    assert spec.source == "pr"
+    assert spec.repo == "octocat/hello"
+    # text is the canonical URL reconstructed from the captured groups.
+    assert spec.text == "https://github.com/octocat/hello/pull/42"
+
+
+def test_parse_pr_task_off_allowlist_raises():
+    with pytest.raises(ValueError, match="allowlist"):
+        parse_pr_task("https://github.com/stranger/repo/pull/1", ALLOWED)
+
+
+def test_parse_pr_task_rejects_non_pr_url():
+    # An issue URL is NOT a PR URL - iterate must refuse it.
+    with pytest.raises(ValueError, match="PR URL"):
+        parse_pr_task("https://github.com/me/repo/issues/1", ALLOWED)
+
+
+def test_parse_pr_task_rejects_prose():
+    with pytest.raises(ValueError, match="PR URL"):
+        parse_pr_task("fix the flaky test", ALLOWED)
+
+
+def test_parse_pr_task_anchored_rejects_trailing_path():
+    # Anchoring is load-bearing: a trailing path/traversal must NOT slip an off-allowlist
+    # repo past the gate (the agent clones + pushes, so a repo/URL mismatch is a write escape).
+    with pytest.raises(ValueError, match="PR URL"):
+        parse_pr_task("https://github.com/me/repo/pull/1/../../stranger/evil/pull/2", ALLOWED)
+    with pytest.raises(ValueError, match="PR URL"):
+        parse_pr_task("https://github.com/me/repo/pull/1/files", ALLOWED)
+
+
+def test_parse_pr_task_canonicalizes_away_query_via_anchor():
+    # A trailing query is rejected by the anchored regex (the operator pastes a clean URL);
+    # this proves raw input never reaches downstream with extra cruft.
+    with pytest.raises(ValueError, match="PR URL"):
+        parse_pr_task("https://github.com/me/repo/pull/1?diff=split", ALLOWED)

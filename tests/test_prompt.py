@@ -1,4 +1,4 @@
-from franky.prompt import build_plan_prompt, build_prompt, load_persona
+from franky.prompt import build_iterate_prompt, build_plan_prompt, build_prompt, load_persona
 from franky.task import TaskSpec
 
 
@@ -129,3 +129,53 @@ def test_build_prompt_jira_slug_uses_text():
     p = build_prompt(spec)
     # The slug is derived from the text, not the repo name.
     assert "franky/foo" in p.lower() or "franky/fix" in p.lower()
+
+
+# ---------------------------------------------------------------------------
+# build_iterate_prompt (the `iterate` follow-up pass)
+# ---------------------------------------------------------------------------
+
+
+def _pr_spec():
+    return TaskSpec(repo="me/repo", text="https://github.com/me/repo/pull/42", source="pr")
+
+
+def test_iterate_prompt_checks_out_existing_branch_and_gathers_feedback():
+    p = build_iterate_prompt(_pr_spec())
+    assert "me/repo" in p
+    assert "https://github.com/me/repo/pull/42" in p
+    # It checks out the EXISTING branch and reads the feedback in-container via gh.
+    assert "gh pr checkout" in p
+    assert "gh pr view" in p
+    assert "gh pr checks" in p
+    assert "gh pr diff" in p
+    assert "Do NOT create a new branch" in p
+
+
+def test_iterate_prompt_forbids_force_push_new_pr_and_merge():
+    p = build_iterate_prompt(_pr_spec())
+    # Additive only: never force-push (incl. the "safe" force) and never rewrite history.
+    # Assert the two prohibitions distinctly - "--force" alone is a substring of
+    # "--force-with-lease", so it would pass even if the plain-force ban were deleted.
+    assert "`git push --force`" in p
+    assert "`git push --force-with-lease`" in p
+    # Never open a new PR and never merge - a human reviews every change.
+    assert "gh pr create" in p  # appears only inside the prohibition ("no gh pr create")
+    assert p.count("gh pr create") == 1
+    assert "open a new PR" in p
+    assert "gh pr merge" in p
+    assert "merge the PR" in p
+
+
+def test_iterate_prompt_own_pr_guard_and_test_before_push():
+    p = build_iterate_prompt(_pr_spec())
+    # Own-PR guard inspects all three gh fields: head branch franky/*, not cross-repository,
+    # and head-repo owner == the task owner. A typo in any field name silently weakens it.
+    assert "headRefName" in p
+    assert "isCrossRepository" in p
+    assert "headRepositoryOwner" in p
+    assert "franky/" in p
+    # Tests green before pushing; professional deliverables; no issue-close keyword (no issue).
+    assert "BEFORE pushing" in p
+    assert "professional" in p.lower()
+    assert "Closes #" not in p
