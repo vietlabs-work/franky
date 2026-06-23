@@ -1,5 +1,6 @@
 import json
 import subprocess
+from pathlib import Path
 
 import franky.cli as cli
 from click.testing import CliRunner
@@ -649,3 +650,159 @@ def test_build_prints_economics_even_when_agent_exits_nonzero(monkeypatch):
 
         logs = list(Path("tasks").glob("*.log"))
         assert logs and "economics" in logs[0].read_text()
+
+
+# ---------------------------------------------------------------------------
+# iterate command (follow-up pass on an existing PR)
+# ---------------------------------------------------------------------------
+# Reuses the module-level PR_URL (https://github.com/me/repo/pull/11) - me/repo is allowlisted.
+
+
+def _iterate_env():
+    return {
+        "FRANKY_ALLOWED_REPOS": "me/repo",
+        "GH_TOKEN": "ghp_fake",
+        "OPENROUTER_API_KEY": "sk-or-fake",
+    }
+
+
+def test_iterate_help_shows_engine():
+    res = CliRunner().invoke(cli.main, ["iterate", "--help"])
+    assert res.exit_code == 0
+    assert "--engine" in res.output
+
+
+def test_iterate_reaches_completion_and_economics(monkeypatch):
+    # Hermetic: valid env, image present, container mocked to a clean exit with usage.
+    agent_output = (
+        json.dumps({"type": "result", "usage": {"input_tokens": 80, "output_tokens": 40}})
+        + "\npushed follow-up commits"
+    )
+    monkeypatch.setattr(cli.os, "environ", _iterate_env())
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: (0, agent_output))
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["iterate", PR_URL])
+        assert res.exit_code == 0, res.output
+        # Labeled completion line (not a bare success URL) + economics, and the URL is shown.
+        assert "iterate pass complete" in res.output
+        assert PR_URL in res.output
+        assert "franky: economics" in res.output
+        logs = list(Path("tasks").glob("*.log"))
+        assert logs and "economics" in logs[0].read_text()
+
+
+def test_iterate_invokes_auto_update_hint(monkeypatch):
+    seen = {"called": False}
+    monkeypatch.setattr(cli, "maybe_auto_update", lambda *a, **k: seen.update(called=True))
+    monkeypatch.setattr(cli.os, "environ", _iterate_env())
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: (0, "ok"))
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["iterate", PR_URL])
+    assert res.exit_code == 0, res.output
+    assert seen["called"] is True
+
+
+def test_iterate_engine_flag_selects_engine(monkeypatch):
+    env = {
+        "FRANKY_ALLOWED_REPOS": "me/repo",
+        "GH_TOKEN": "ghp_fake",
+        "CLAUDE_CODE_OAUTH_TOKEN": "oauth-fake",
+    }
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+
+    seen = {}
+
+    def fake_run(cfg, inner_argv, *a, **k):
+        seen["engine"] = cfg.engine.name
+        seen["argv0"] = inner_argv[0]
+        return 0, "ok"
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["iterate", PR_URL, "--engine", "claude"])
+    assert res.exit_code == 0, res.output
+    assert seen["engine"] == "claude"
+    assert seen["argv0"] == "claude"
+
+
+def test_iterate_off_allowlist_clean_error(monkeypatch):
+    monkeypatch.setattr(cli.os, "environ", _iterate_env())
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    ran = {"container": False}
+    monkeypatch.setattr(
+        cli, "run_in_container", lambda *a, **k: ran.update(container=True) or (0, "")
+    )
+
+    res = CliRunner().invoke(cli.main, ["iterate", "https://github.com/stranger/repo/pull/1"])
+    assert res.exit_code != 0
+    assert "allowlist" in res.output
+    assert ran["container"] is False  # gate refused before any container run
+
+
+def test_iterate_invalid_url_clean_error(monkeypatch):
+    monkeypatch.setattr(cli.os, "environ", _iterate_env())
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: (0, ""))
+
+    # An issue URL is not a PR URL.
+    res = CliRunner().invoke(cli.main, ["iterate", "https://github.com/me/repo/issues/1"])
+    assert res.exit_code != 0
+    assert "PR URL" in res.output
+
+
+def test_iterate_missing_creds_clean_error_no_secret_leak(monkeypatch):
+    env = {"FRANKY_ALLOWED_REPOS": "me/repo", "GH_TOKEN": "ghp_fake"}  # no provider key
+    monkeypatch.setattr(cli.os, "environ", env)
+
+    res = CliRunner().invoke(cli.main, ["iterate", PR_URL])
+    assert res.exit_code != 0
+    assert "ghp_fake" not in res.output  # no secret value on the error path
+
+
+def test_iterate_nonzero_exit_emits_economics_and_writes_log(monkeypatch):
+    # A non-zero agent exit raises, but economics is emitted + logged first, and no bare URL is
+    # presented as a fresh success artifact (the completion line is labeled).
+    agent_output = json.dumps({"type": "result", "usage": {"input_tokens": 10, "output_tokens": 5}})
+    monkeypatch.setattr(cli.os, "environ", _iterate_env())
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: (1, agent_output))
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["iterate", PR_URL])
+        assert res.exit_code != 0
+        assert "franky: economics" in res.output
+        logs = list(Path("tasks").glob("*.log"))
+        assert logs and "economics" in logs[0].read_text()
+
+
+def test_iterate_image_no_docker_clean_message(monkeypatch):
+    # iterate shares _ensure_images with build; confirm the image gate fires on the iterate
+    # path too (clean message, no container run).
+    monkeypatch.setattr(cli.os, "environ", _iterate_env())
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "ghcr.io/vietlabs-work/franky:0.1.0")
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (False, "no-docker"))
+    ran = {"container": False}
+    monkeypatch.setattr(
+        cli, "run_in_container", lambda *a, **k: ran.update(container=True) or (0, "")
+    )
+
+    res = CliRunner().invoke(cli.main, ["iterate", PR_URL])
+    assert res.exit_code != 0
+    assert "docker is not available" in res.output
+    assert ran["container"] is False

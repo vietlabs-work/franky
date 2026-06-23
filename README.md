@@ -9,6 +9,9 @@ franky build https://github.com/you/repo/issues/42
 franky build jira FOO-123 --repo you/repo
 franky build "add a --json flag to the export command" --repo you/repo
 franky build "fix the flaky retry test" --repo you/repo --engine claude
+
+# Got review comments or red CI on a Franky PR? Iterate on it with follow-up commits.
+franky iterate https://github.com/you/repo/pull/42
 ```
 
 The agent is autonomous inside the container. The safety gate is four layers:
@@ -105,6 +108,34 @@ written. The default stays autonomous - the sandbox plus PR review is the gate.
 prints a one-line hint if one exists - it never blocks the build. Silence it with
 `FRANKY_NO_UPDATE_CHECK=1`, or set `FRANKY_AUTO_UPDATE=1` to auto-install the new
 release for your next run. (Both are host-CLI only; neither reaches the container.)
+
+## Iterating on a PR
+
+Franky is no longer one-shot. When a PR it opened gets review comments or a red CI
+check, point it back at the PR and it responds with **additive follow-up commits** on
+the same branch:
+
+```
+franky iterate https://github.com/you/repo/pull/42 [--engine pi|claude|codex]
+```
+
+It runs the **same hardened, egress-controlled container** as `franky build`, but instead
+of starting fresh it checks out the PR's existing branch, reads the review comments and
+failing checks with `gh` (in-container, already allowlisted), addresses them, runs the
+tests green, and pushes. It **never force-pushes, never rewrites history, never opens a new
+PR, and never merges** - a human still reviews every change. The PR URL carries the repo, so
+there is no `--repo` flag, and the repo allowlist gates it exactly like `build`.
+
+Unlike `build` (which prints the new PR URL to stdout), `iterate` opens no new PR - on a
+clean run it writes only an economics summary and a labeled completion line to stderr, and
+nothing to stdout. Review the existing PR for the new commits. The redacted transcript still
+lands in `tasks/<timestamp>.log`.
+
+`iterate` is intended for Franky's **own** PRs. As a guardrail it is instructed to confirm
+the PR's head branch is a `franky/*` branch in the same repo (not a fork) before touching
+anything, and to stop otherwise. This is a prompt-level guard in the same register as the
+"never merge" rule (the agent is autonomous); the hard bounds remain the repo allowlist, the
+egress cage, and PR-not-merge. See the Security section.
 
 ## Security
 
@@ -213,6 +244,10 @@ v0 mitigations, still in force:
 2. **Scope your tokens narrowly.** Give `GH_TOKEN` only contents + pull_requests
    on the target repos. Prefer a low-spend or separate API key for `pi`.
 3. **PR, not merge.** Franky only opens PRs. You review before anything lands.
+   `franky iterate` follows the same rule: it only pushes additive commits to an
+   existing PR's branch (never force-push, never merge, never a new PR), and the
+   "act only on a `franky/*` branch in the same repo" check is prompt-level - so
+   point `iterate` only at PRs Franky itself opened, in an allowlisted repo.
 
 **GitHub Actions warning.** Opening a PR can trigger workflows. A PR built from an
 attacker-influenced issue could run attacker-influenced workflow code with your

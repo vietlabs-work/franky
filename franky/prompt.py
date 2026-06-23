@@ -93,6 +93,57 @@ def build_prompt(spec: TaskSpec) -> str:
     return f"{persona}\n\n{task_block}\n{conventions}"
 
 
+def build_iterate_prompt(spec: TaskSpec) -> str:
+    """Prompt for the `iterate` command: a FOLLOW-UP pass on an existing Franky PR.
+
+    Standalone on purpose - it does NOT reuse `_task_block`/`_slug_hint` (which key on
+    "issue"/"jira"/"prose"), so the new `source="pr"` never falls through to build-mode
+    behaviour and the build conventions (create a `franky/` branch, `gh pr create`) are not
+    inherited. The agent checks out the EXISTING branch and pushes ADDITIVE commits.
+
+    `spec.text` is the canonical PR URL (reconstructed in parse_pr_task). The own-PR guard
+    (head branch `franky/*` AND not cross-repository) is prompt-level - the same trust
+    register as build's "do not merge": the engine is autonomous and carries creds, so the
+    hard bounds are the repo allowlist + the egress cage + a human reviewing the PR. It
+    keeps `iterate` from acting on a fork PR or a non-Franky branch (issue #24 non-goal).
+    """
+    persona = load_persona()
+    url = spec.text
+    owner = spec.repo.split("/", 1)[0]
+
+    task_block = (
+        f"Repo: {spec.repo}\n"
+        f"Task: this is a FOLLOW-UP pass on a pull request you (Franky) already opened: {url}. "
+        "Address its open review feedback and any failing CI with additive follow-up commits.\n"
+    )
+
+    conventions = (
+        "Conventions (follow exactly):\n"
+        f"- FIRST confirm this is your own PR before changing anything: run "
+        f"`gh pr view {url} --json headRefName,isCrossRepository,headRepositoryOwner` and verify "
+        f"ALL of: the head branch name (`headRefName`) starts with `franky/`; the PR is NOT "
+        f"cross-repository (`isCrossRepository` is false); and the head repository owner "
+        f"(`headRepositoryOwner.login`) is `{owner}`. If ANY check fails, STOP - make no commits "
+        f"and no push.\n"
+        f"- Clone {spec.repo} and check out the PR's existing branch with `gh pr checkout {url}`. "
+        "Do NOT create a new branch.\n"
+        f"- Gather the feedback to address: read the review comments and requested changes with "
+        f"`gh pr view {url} --comments`, inspect failing checks with `gh pr checks {url}`, and "
+        f"review the current diff with `gh pr diff {url}`.\n"
+        "- Address that feedback with ADDITIVE follow-up commits on the same branch. Do NOT amend, "
+        "squash, rebase, or otherwise rewrite history.\n"
+        "- Run the repo's tests and make them pass BEFORE pushing. Do not push on red tests.\n"
+        "- Use conventional-commit messages: `<type>: <summary>` (e.g. `fix:`, `chore:`).\n"
+        "- Push the follow-up commits to the SAME branch with a normal `git push`. NEVER use "
+        "`git push --force` or `git push --force-with-lease`.\n"
+        "- Do NOT open a new PR (no `gh pr create`) and do NOT merge the PR (no `gh pr merge`) - "
+        "a human reviews every change.\n"
+        "- Keep commit messages and PR text professional; no persona flavor in the deliverables.\n"
+    )
+
+    return f"{persona}\n\n{task_block}\n{conventions}"
+
+
 def build_plan_prompt(spec: TaskSpec) -> str:
     """Prompt for the `--plan-first` planning pass: produce a plan, change NOTHING.
 
