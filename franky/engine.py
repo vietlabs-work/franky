@@ -199,6 +199,9 @@ class ClaudeEngine(Engine):
             prompt,
             "--output-format",
             "stream-json",
+            # claude rejects -p + stream-json without --verbose ("requires --verbose").
+            # We parse the JSONL stream for the PR URL, so stream-json is mandatory.
+            "--verbose",
             "--dangerously-skip-permissions",
         ]
         if model:
