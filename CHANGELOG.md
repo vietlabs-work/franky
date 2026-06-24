@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- `--engine claude` no longer exits 1 with "When using --print, --output-format=stream-json
+  requires --verbose". The claude CLI now requires `--verbose` alongside `-p` + `stream-json`
+  (which Franky needs to parse the JSONL stream for the PR URL), so the flag is added.
+
 ## [0.0.2] - 2026-06-23
 
 ### Added

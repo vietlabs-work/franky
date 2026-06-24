@@ -43,6 +43,7 @@ def test_claude_inner_argv_without_model():
         "do it",
         "--output-format",
         "stream-json",
+        "--verbose",
         "--dangerously-skip-permissions",
     ]
 
@@ -51,7 +52,7 @@ def test_claude_inner_argv_with_model():
     argv = ClaudeEngine().inner_argv("do it", "claude-x")
     assert argv[-2:] == ["--model", "claude-x"]
     assert "--dangerously-skip-permissions" in argv
-    assert "--verbose" not in argv
+    assert "--verbose" in argv
 
 
 def test_default_engine_is_pi():
