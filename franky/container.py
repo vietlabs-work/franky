@@ -316,6 +316,8 @@ def run_in_container(
     sleeper=time.sleep,
     proxy_image: str = PROXY_IMAGE,
     profile_bundle: str | None = None,
+    progress=None,
+    popen=subprocess.Popen,
 ) -> tuple[int, str]:
     """Run the inner engine in a hardened, egress-controlled container; return
     (returncode, redacted_output).
@@ -330,6 +332,11 @@ def run_in_container(
     resolve to real values inside the task without those values ever hitting the argv. The
     PROXY gets NO cred env. `runner`/`sleeper` are injectable so tests run fakes and never
     touch real docker. All returned output is scrubbed of secret values.
+
+    When `progress` is given, it is called with each redacted output line as it arrives so
+    the caller can stream live feedback to stderr. The returned output still contains the
+    full accumulated transcript (redacted) for end-of-run processing. `popen` is the
+    injectable Popen-compatible callable used by the streaming path (tests pass a fake).
     """
     net = f"franky-net-{uuid.uuid4().hex[:12]}"
     proxy = f"franky-proxy-{uuid.uuid4().hex[:12]}"
@@ -383,23 +390,66 @@ def run_in_container(
             proxy_url=proxy_url(proxy),
             profile_bundle=profile_bundle,
         )
-        try:
-            proc = runner(
-                argv,
-                capture_output=True,
-                text=True,
-                errors="replace",
-                timeout=timeout,
-                env=child_env,
-            )
-            task_launched = True
-            code = proc.returncode
-            output = (proc.stdout or "") + (proc.stderr or "")
-        except subprocess.TimeoutExpired:
-            task_launched = True
-            code, output = 1, f"franky: container timed out after {timeout}s"
-        except OSError as exc:
-            code, output = 1, f"franky: could not launch docker ({exc})"
+        if progress is not None:
+            # Streaming path: iterate stdout/stderr line by line, redact per line, call
+            # progress(), and accumulate raw lines for the end-of-run full-buffer redact.
+            # WHY raw accumulation: a secret that spans a line boundary (unlikely for JSONL
+            # but theoretically possible) is caught by the final redact() call below.
+            try:
+                proc = popen(
+                    argv,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    errors="replace",
+                    env=child_env,
+                )
+                task_launched = True
+                raw_lines: list[str] = []
+                t_start = time.monotonic()
+                timed_out = False
+                try:
+                    for line in proc.stdout:
+                        if time.monotonic() - t_start >= timeout:
+                            proc.kill()
+                            timed_out = True
+                            break
+                        progress(redact(line, secrets))
+                        raw_lines.append(line)
+                finally:
+                    proc.stdout.close()
+                    remaining = max(1.0, timeout - (time.monotonic() - t_start))
+                    try:
+                        proc.wait(timeout=remaining)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+                if timed_out:
+                    code, output = 1, f"franky: container timed out after {timeout}s"
+                else:
+                    code = proc.returncode
+                    output = "".join(raw_lines)
+            except OSError as exc:
+                code, output = 1, f"franky: could not launch docker ({exc})"
+        else:
+            # Blocking path (original): capture all output then return.
+            try:
+                proc = runner(
+                    argv,
+                    capture_output=True,
+                    text=True,
+                    errors="replace",
+                    timeout=timeout,
+                    env=child_env,
+                )
+                task_launched = True
+                code = proc.returncode
+                output = (proc.stdout or "") + (proc.stderr or "")
+            except subprocess.TimeoutExpired:
+                task_launched = True
+                code, output = 1, f"franky: container timed out after {timeout}s"
+            except OSError as exc:
+                code, output = 1, f"franky: could not launch docker ({exc})"
     except _AbortRun as abort:
         # A pre-task step failed. code/output set here; teardown still runs in `finally` and
         # its warnings append to THIS output, which the single return below surfaces.

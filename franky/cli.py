@@ -48,6 +48,7 @@ from .userconfig import (
 )
 
 TASKS_DIR = Path("tasks")
+FRANKY_VERBOSE_VAR = "FRANKY_VERBOSE"
 
 
 @click.group()
@@ -84,12 +85,21 @@ def main() -> None:
     help="Path to a profile.toml to inject skills/instructions/knowledge into the container. "
     "Auto-discovered from ~/.franky/profile.toml if present.",
 )
+@click.option(
+    "-v",
+    "--verbose",
+    "verbose",
+    is_flag=True,
+    default=False,
+    help="Stream raw agent output to stderr during the run (also: FRANKY_VERBOSE=1).",
+)
 def build(
     task_input: tuple[str, ...],
     repo: str | None,
     engine: str | None,
     plan_first: bool,
     profile_path_opt: str | None,
+    verbose: bool,
 ) -> None:
     """Build TASK_INPUT (a GitHub issue URL, a JIRA key, or a prose request) and open a PR.
 
@@ -140,12 +150,17 @@ def build(
     # overridden by --profile or FRANKY_PROFILE_PATH. Fails closed on detected credentials.
     bundle = _load_profile_bundle(profile_path_opt, os.environ, secrets)
 
+    # Verbose mode: raw passthrough of agent output to stderr. Falls back to distilled
+    # progress (the default) which shows compact milestones without the raw stream.
+    verbose = verbose or bool(os.environ.get(FRANKY_VERBOSE_VAR))
+    progress = _make_progress(cfg.engine, verbose)
+
     if plan_first:
         # PHASE 1: planning pass. Show the plan, then gate on explicit approval. A plan that
         # errored is not a plan to approve, so abort before the gate. No economics on this
         # pass - economics is build-pass only.
         code, output, _plan_dur = _run_pass(
-            cfg, build_plan_prompt(spec), franky_img, proxy_img, bundle
+            cfg, build_plan_prompt(spec), franky_img, proxy_img, bundle, progress=progress
         )
         _write_log(output, secrets)
         click.echo("franky: --- plan (read-only, nothing written yet) ---", err=True)
@@ -160,7 +175,9 @@ def build(
             return
 
     # PHASE 2 (or the only phase without --plan-first): build it and open the PR.
-    code, output, duration = _run_pass(cfg, build_prompt(spec), franky_img, proxy_img, bundle)
+    code, output, duration = _run_pass(
+        cfg, build_prompt(spec), franky_img, proxy_img, bundle, progress=progress
+    )
 
     # Emit economics before the PR-URL echo and before any ClickException so the summary is
     # always shown (even when the agent exits non-zero).
@@ -193,7 +210,15 @@ def build(
     type=click.Choice(sorted(ENGINES)),
     help="Engine override; else FRANKY_ENGINE, else pi.",
 )
-def iterate(pr_url: str, engine: str | None) -> None:
+@click.option(
+    "-v",
+    "--verbose",
+    "verbose",
+    is_flag=True,
+    default=False,
+    help="Stream raw agent output to stderr during the run (also: FRANKY_VERBOSE=1).",
+)
+def iterate(pr_url: str, engine: str | None, verbose: bool) -> None:
     """Address review feedback / failing CI on an existing Franky PR with follow-up commits.
 
     Example:
@@ -225,8 +250,10 @@ def iterate(pr_url: str, engine: str | None) -> None:
     franky_img, proxy_img = _ensure_images(os.environ)
 
     bundle = _load_profile_bundle(None, os.environ, secrets)
+    verbose = verbose or bool(os.environ.get(FRANKY_VERBOSE_VAR))
+    progress = _make_progress(cfg.engine, verbose)
     code, output, duration = _run_pass(
-        cfg, build_iterate_prompt(spec), franky_img, proxy_img, bundle
+        cfg, build_iterate_prompt(spec), franky_img, proxy_img, bundle, progress=progress
     )
 
     # Economics first (same as build) so spend is visible even when the agent exits non-zero.
@@ -286,6 +313,7 @@ def _run_pass(
     franky_img: str,
     proxy_img: str,
     profile_bundle: str | None = None,
+    progress=None,
 ) -> tuple[int, str, float]:
     """Run one container pass for `prompt` and return (exit_code, output, duration_secs).
 
@@ -296,7 +324,12 @@ def _run_pass(
     inner_argv = cfg.engine.inner_argv(prompt, model=None)
     t0 = time.monotonic()
     code, output = run_in_container(
-        cfg, inner_argv, image=franky_img, proxy_image=proxy_img, profile_bundle=profile_bundle
+        cfg,
+        inner_argv,
+        image=franky_img,
+        proxy_image=proxy_img,
+        profile_bundle=profile_bundle,
+        progress=progress,
     )
     duration = time.monotonic() - t0
     return code, output, duration
@@ -335,6 +368,30 @@ def _load_profile_bundle(
         return build_bundle(spec)
     except ValueError as exc:
         raise click.ClickException(redact(str(exc), secrets)) from exc
+
+
+def _make_progress(engine, verbose: bool):
+    """Return the per-line progress callback for a container pass.
+
+    verbose=True  -> Phase 1: raw passthrough; every redacted line is echoed to stderr as-is.
+    verbose=False -> Phase 2: distilled view; only engine-parsed milestones reach stderr.
+
+    In both cases stderr is the output channel so stdout remains PR-URL-only.
+    """
+    if verbose:
+
+        def raw_cb(line: str) -> None:
+            click.echo(line, err=True, nl=False)
+
+        return raw_cb
+    else:
+
+        def distilled_cb(line: str) -> None:
+            msg = engine.distill_line(line)
+            if msg:
+                click.echo(msg, err=True)
+
+        return distilled_cb
 
 
 def _economics_line(output: str, duration: float, secrets: list[str]) -> str:

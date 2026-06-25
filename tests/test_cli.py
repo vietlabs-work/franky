@@ -1007,3 +1007,156 @@ def test_build_load_config_file_malformed_gives_clean_error(tmp_path, monkeypatc
     # Should be a ClickException (clean message), not a raw traceback.
     assert "config file error" in res.output or "malformed" in res.output
     assert "Traceback" not in res.output
+
+
+# ---------------------------------------------------------------------------
+# --verbose / FRANKY_VERBOSE + progress callbacks
+# ---------------------------------------------------------------------------
+
+
+def _build_env():
+    return {
+        "FRANKY_ALLOWED_REPOS": "me/repo",
+        "GH_TOKEN": "ghp_fake",
+        "OPENROUTER_API_KEY": "sk-or-fake",
+    }
+
+
+def test_build_help_shows_verbose_flag():
+    res = CliRunner().invoke(cli.main, ["build", "--help"])
+    assert res.exit_code == 0
+    assert "--verbose" in res.output or "-v" in res.output
+
+
+def test_iterate_help_shows_verbose_flag():
+    res = CliRunner().invoke(cli.main, ["iterate", "--help"])
+    assert res.exit_code == 0
+    assert "--verbose" in res.output or "-v" in res.output
+
+
+def test_make_progress_verbose_echoes_raw_lines():
+    """In verbose mode, every line (including non-milestones) reaches the callback."""
+    from franky.engine import PiEngine
+
+    cb = cli._make_progress(PiEngine(), verbose=True)
+    seen = []
+    # Monkeypatch click.echo to capture stderr output.
+    original_echo = cli.click.echo
+    try:
+        cli.click.echo = lambda msg, err=False, nl=True: seen.append(msg) if err else None
+        cb("raw line no newline")
+        cb('{"type":"done"}')
+    finally:
+        cli.click.echo = original_echo
+    assert len(seen) == 2  # both lines surfaced
+
+
+def test_make_progress_distilled_suppresses_non_milestone_lines():
+    """Without verbose, non-milestone lines (e.g. intermediate token events) are dropped."""
+    from franky.engine import PiEngine
+
+    cb = cli._make_progress(PiEngine(), verbose=False)
+    seen = []
+    original_echo = cli.click.echo
+    try:
+        cli.click.echo = lambda msg, err=False, nl=True: seen.append(msg) if err else None
+        cb('{"type":"usage","tokens":99}')  # not a milestone -> suppressed
+        cb("not json")  # not JSON -> suppressed
+    finally:
+        cli.click.echo = original_echo
+    assert seen == []
+
+
+def test_make_progress_distilled_surfaces_milestones():
+    """Without verbose, milestone events are echoed to stderr."""
+    import json as _json
+    from franky.engine import PiEngine
+
+    cb = cli._make_progress(PiEngine(), verbose=False)
+    seen = []
+    original_echo = cli.click.echo
+    tool_line = _json.dumps({"type": "done"})
+    try:
+        cli.click.echo = lambda msg, err=False, nl=True: seen.append(msg) if err else None
+        cb(tool_line)
+    finally:
+        cli.click.echo = original_echo
+    assert len(seen) == 1
+    assert "agent complete" in seen[0]
+
+
+def test_build_verbose_flag_passes_progress_to_container(monkeypatch):
+    """--verbose causes a non-None progress callback to be passed to run_in_container."""
+    env = _build_env()
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+
+    received = {}
+
+    def fake_run(cfg, inner_argv, *a, **k):
+        received["progress"] = k.get("progress")
+        return 0, f"opened {PR_URL}"
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "--verbose", "do it", "--repo", "me/repo"])
+    assert res.exit_code == 0, res.output
+    assert received.get("progress") is not None
+
+
+def test_build_no_verbose_flag_still_passes_progress_to_container(monkeypatch):
+    """Without --verbose a distilled progress callback is still passed (Phase 2 is default)."""
+    env = _build_env()
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+
+    received = {}
+
+    def fake_run(cfg, inner_argv, *a, **k):
+        received["progress"] = k.get("progress")
+        return 0, f"opened {PR_URL}"
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo"])
+    assert res.exit_code == 0, res.output
+    assert received.get("progress") is not None
+
+
+def test_build_franky_verbose_env_activates_verbose(monkeypatch):
+    """FRANKY_VERBOSE=1 in env is equivalent to --verbose flag."""
+    env = {**_build_env(), cli.FRANKY_VERBOSE_VAR: "1"}
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+
+    received_cbs = []
+
+    def fake_run(cfg, inner_argv, *a, **k):
+        received_cbs.append(k.get("progress"))
+        return 0, f"opened {PR_URL}"
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo"])
+    assert res.exit_code == 0, res.output
+    assert received_cbs  # progress was passed
+    # With verbose active, raw lines must be echoed (nl=False distinguishes verbose from distilled)
+    lines_seen = []
+    original_echo = cli.click.echo
+    try:
+        cli.click.echo = lambda msg, err=False, nl=True: (
+            lines_seen.append((msg, nl)) if err else None
+        )
+        received_cbs[0]("a raw line")
+    finally:
+        cli.click.echo = original_echo
+    assert any(nl is False for _, nl in lines_seen), "verbose path should use nl=False"

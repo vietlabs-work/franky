@@ -608,3 +608,180 @@ def test_run_in_container_no_bundle_by_default():
     runner, _ = _orchestration_runner(task)
     run_in_container(_cfg(), ["pi"], runner=runner, env={}, sleeper=NOOP_SLEEP)
     assert PROFILE_BUNDLE_VAR not in " ".join(captured["argv"])
+
+
+# ---------------------------------------------------------------------------
+# Streaming path (progress + popen)
+# ---------------------------------------------------------------------------
+
+
+class _FakePopen:
+    """Fake subprocess.Popen for streaming tests: stdout yields the provided lines."""
+
+    def __init__(self, lines, returncode=0):
+        self.returncode = returncode
+        self._lines = list(lines)
+        self.stdout = self
+
+    def __iter__(self):
+        return iter(self._lines)
+
+    def close(self):
+        pass
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+    def kill(self):
+        pass
+
+
+def _fake_popen_factory(lines, returncode=0):
+    """Return a popen callable that produces a _FakePopen for the task container."""
+
+    def fake_popen(argv, **kwargs):
+        return _FakePopen(lines=lines, returncode=returncode)
+
+    return fake_popen
+
+
+def test_run_in_container_streaming_calls_progress_for_each_line():
+    """When progress is given, it is called once per line of output."""
+    lines = ["line one\n", "line two\n"]
+    seen = []
+
+    def task(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    runner, _ = _orchestration_runner(task)
+    run_in_container(
+        _cfg(),
+        ["pi"],
+        runner=runner,
+        env={},
+        sleeper=NOOP_SLEEP,
+        progress=seen.append,
+        popen=_fake_popen_factory(lines),
+    )
+    assert seen == lines
+
+
+def test_run_in_container_streaming_accumulates_output():
+    """The returned output is the full accumulated transcript (for log + economics)."""
+    lines = ["event one\n", "event two\n"]
+
+    def task(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    runner, _ = _orchestration_runner(task)
+    code, out = run_in_container(
+        _cfg(),
+        ["pi"],
+        runner=runner,
+        env={},
+        sleeper=NOOP_SLEEP,
+        progress=lambda _: None,
+        popen=_fake_popen_factory(lines),
+    )
+    assert code == 0
+    assert out == "event one\nevent two\n"
+
+
+def test_run_in_container_streaming_redacts_before_progress():
+    """The progress callback must receive per-line redacted output (never the raw secret)."""
+    lines = [f"token {SECRET}\n"]
+    seen = []
+
+    def task(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    runner, _ = _orchestration_runner(task)
+    run_in_container(
+        _cfg(),
+        ["pi"],
+        runner=runner,
+        env={},
+        sleeper=NOOP_SLEEP,
+        progress=seen.append,
+        popen=_fake_popen_factory(lines),
+    )
+    assert len(seen) == 1
+    assert SECRET not in seen[0]
+    assert "***REDACTED***" in seen[0]
+
+
+def test_run_in_container_streaming_full_output_redacted():
+    """The returned output (for log / PR-URL parsing) is also fully redacted."""
+    lines = [f"leaked {SECRET}\n"]
+
+    def task(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    runner, _ = _orchestration_runner(task)
+    code, out = run_in_container(
+        _cfg(),
+        ["pi"],
+        runner=runner,
+        env={},
+        sleeper=NOOP_SLEEP,
+        progress=lambda _: None,
+        popen=_fake_popen_factory(lines),
+    )
+    assert SECRET not in out
+    assert "***REDACTED***" in out
+
+
+def test_run_in_container_streaming_oserror_returns_nonzero():
+    """OSError from popen (docker not found) is handled the same as the blocking path."""
+
+    def failing_popen(argv, **kwargs):
+        raise OSError("docker not found")
+
+    def task(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    runner, _ = _orchestration_runner(task)
+    code, out = run_in_container(
+        _cfg(),
+        ["pi"],
+        runner=runner,
+        env={},
+        sleeper=NOOP_SLEEP,
+        progress=lambda _: None,
+        popen=failing_popen,
+    )
+    assert code != 0
+    assert "could not launch docker" in out
+
+
+def test_run_in_container_streaming_nonzero_returncode():
+    """If the container exits non-zero, run_in_container surfaces that return code."""
+
+    def task(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    runner, _ = _orchestration_runner(task)
+    code, out = run_in_container(
+        _cfg(),
+        ["pi"],
+        runner=runner,
+        env={},
+        sleeper=NOOP_SLEEP,
+        progress=lambda _: None,
+        popen=_fake_popen_factory(["done\n"], returncode=1),
+    )
+    assert code == 1
+
+
+def test_run_in_container_blocking_path_unchanged_when_no_progress():
+    """Without a progress callback the original blocking subprocess.run path is used."""
+    captured = {}
+
+    def task(argv, **kwargs):
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    runner, _ = _orchestration_runner(task)
+    run_in_container(_cfg(), ["pi"], runner=runner, env={}, sleeper=NOOP_SLEEP)
+    # capture_output=True is the blocking-path signature (popen path uses stdout=PIPE)
+    assert captured["kwargs"].get("capture_output") is True
