@@ -87,6 +87,28 @@ FRANKY_PROFILE_PATH=~/my-profiles/python.toml franky build ...
 franky config set FRANKY_PROFILE_PATH
 ```
 
+## CLI commands
+
+Instead of hand-writing the TOML, use the `franky profile` command group (mirrors
+`franky config`). Every command honors `FRANKY_PROFILE_PATH`.
+
+```bash
+franky profile init     # interactive wizard: scaffold ~/.franky/profile.toml
+                        #   (merges into an existing file, never clobbers it)
+franky profile check    # dry-run the build's gate: expand globs + secret-scan;
+                        #   prints what WOULD inject; nonzero exit + offending file on a hit
+franky profile show     # print the profile.toml + the glob-expanded file list
+franky profile path     # print the resolved profile path
+```
+
+`franky profile check` is the high-value one: it runs the **same** `load_profile` +
+`scan_for_secrets` path the build runs, so it catches a misconfigured profile (a missing
+file, or a credential that would trip the fail-closed gate) in under a second instead of
+aborting a multi-minute build. It names the offending file but never prints file contents.
+
+`franky config init` also offers to set up a profile at the end of the wizard, so the
+feature is discoverable during onboarding.
+
 ## Secret scan patterns
 
 The following patterns trigger a fail-closed refusal:

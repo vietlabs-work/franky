@@ -98,6 +98,14 @@ add an engine), so Codex, Cursor, pi, or Claude Code all start with the same con
    franky config list                  # view the file (secrets masked)
    franky config path                  # show where the file lives
    ```
+   To inject your own skills / instructions / knowledge into the container, set up an
+   operator profile (see [docs/profiles.md](docs/profiles.md)):
+   ```
+   franky profile init                 # interactive wizard -> ~/.franky/profile.toml
+   franky profile check                # dry-run: what would inject + secret scan
+   franky profile show                 # view the profile + expanded file list
+   franky profile path                 # show where the profile lives
+   ```
    At minimum you need:
    - `FRANKY_ALLOWED_REPOS` - the trusted-repo allowlist (see below).
    - `GH_TOKEN` - scoped to contents + pull_requests on those repos.

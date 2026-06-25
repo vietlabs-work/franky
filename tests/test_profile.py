@@ -16,8 +16,12 @@ from franky.profile import (
     ProfileSpec,
     build_bundle,
     load_profile,
+    profile_file_path,
     profile_path,
+    read_profile_raw,
     scan_for_secrets,
+    scan_profile_files,
+    write_profile,
 )
 
 
@@ -359,3 +363,170 @@ def test_build_bundle_unreadable_file_raises(tmp_path):
 
 def test_profile_bundle_var_constant():
     assert PROFILE_BUNDLE_VAR == "FRANKY_PROFILE_BUNDLE"
+
+
+# ---------------------------------------------------------------------------
+# profile_file_path (always returns a path, unlike profile_path)
+# ---------------------------------------------------------------------------
+
+
+def test_profile_file_path_default_when_absent(tmp_path, monkeypatch):
+    monkeypatch.delenv(PROFILE_PATH_VAR, raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    # The default path is returned even though it does not exist (unlike profile_path()).
+    assert profile_file_path({}) == tmp_path / ".franky" / "profile.toml"
+
+
+def test_profile_file_path_honors_override():
+    p = profile_file_path({PROFILE_PATH_VAR: "/somewhere/custom.toml"})
+    assert p == Path("/somewhere/custom.toml")
+
+
+# ---------------------------------------------------------------------------
+# read_profile_raw (raw declared lists, no glob expansion / existence check)
+# ---------------------------------------------------------------------------
+
+
+def test_read_profile_raw_absent_file_returns_empty(tmp_path):
+    assert read_profile_raw(tmp_path / "nope.toml") == {}
+
+
+def test_read_profile_raw_returns_unexpanded_strings(tmp_path):
+    p = tmp_path / "profile.toml"
+    p.write_text(
+        '[profile]\nskills = ["~/.claude/skills/*.md"]\ninstructions = ["~/.claude/CLAUDE.md"]\n',
+        encoding="utf-8",
+    )
+    raw = read_profile_raw(p)
+    # The glob is returned verbatim - not expanded and not existence-checked.
+    assert raw == {
+        "skills": ["~/.claude/skills/*.md"],
+        "instructions": ["~/.claude/CLAUDE.md"],
+    }
+
+
+def test_read_profile_raw_omits_empty_categories(tmp_path):
+    p = tmp_path / "profile.toml"
+    p.write_text("[profile]\nskills = []\n", encoding="utf-8")
+    assert read_profile_raw(p) == {}
+
+
+def test_read_profile_raw_malformed_toml_raises(tmp_path):
+    p = tmp_path / "profile.toml"
+    p.write_text("[profile\nskills = oops", encoding="utf-8")
+    with pytest.raises(ValueError, match="malformed TOML"):
+        read_profile_raw(p)
+
+
+def test_read_profile_raw_non_table_raises(tmp_path):
+    p = tmp_path / "profile.toml"
+    p.write_text('profile = "not a table"\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="must be a TOML table"):
+        read_profile_raw(p)
+
+
+def test_read_profile_raw_non_string_entry_raises(tmp_path):
+    p = tmp_path / "profile.toml"
+    p.write_text("[profile]\nskills = [1, 2]\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="must be strings"):
+        read_profile_raw(p)
+
+
+# ---------------------------------------------------------------------------
+# write_profile (deterministic [profile] array writer, round-trips with read_profile_raw)
+# ---------------------------------------------------------------------------
+
+
+def test_write_profile_round_trips(tmp_path):
+    p = tmp_path / "profile.toml"
+    table = {
+        "skills": ["~/.claude/skills/*.md", "~/extra.md"],
+        "instructions": ["~/.claude/CLAUDE.md"],
+    }
+    write_profile(p, table)
+    assert read_profile_raw(p) == table
+
+
+def test_write_profile_canonical_order_and_omits_empty(tmp_path):
+    p = tmp_path / "profile.toml"
+    # Insertion order deliberately reversed; output must be canonical (skills first).
+    write_profile(p, {"knowledge": ["~/k.md"], "skills": ["~/s.md"], "instructions": []})
+    text = p.read_text(encoding="utf-8")
+    assert text.index("skills") < text.index("knowledge")
+    assert "instructions" not in text  # empty category omitted
+
+
+def test_write_profile_mode_0644(tmp_path):
+    import stat
+
+    p = tmp_path / "profile.toml"
+    write_profile(p, {"skills": ["~/s.md"]})
+    assert stat.S_IMODE(p.stat().st_mode) == 0o644
+
+
+def test_write_profile_rejects_control_char(tmp_path):
+    p = tmp_path / "profile.toml"
+    with pytest.raises(ValueError, match="control character"):
+        write_profile(p, {"skills": ["bad\nentry"]})
+
+
+def test_write_profile_escapes_quotes_and_backslashes(tmp_path):
+    p = tmp_path / "profile.toml"
+    write_profile(p, {"skills": ['~/a"b\\c.md']})
+    assert read_profile_raw(p) == {"skills": ['~/a"b\\c.md']}
+
+
+# ---------------------------------------------------------------------------
+# scan_profile_files (dry-run twin of build_bundle's per-file loop)
+# ---------------------------------------------------------------------------
+
+
+def test_scan_profile_files_clean(tmp_path):
+    a = tmp_path / "a.md"
+    a.write_text("# clean skill\n", encoding="utf-8")
+    spec = ProfileSpec(skills=[a])
+    results = scan_profile_files(spec)
+    assert len(results) == 1
+    assert results[0].path == a
+    assert results[0].findings == []
+    assert results[0].error is None
+    assert results[0].size == len("# clean skill\n".encode("utf-8"))
+
+
+def test_scan_profile_files_flags_secret_and_names_file(tmp_path):
+    bad = tmp_path / "leak.md"
+    bad.write_text("ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890ab\n", encoding="utf-8")
+    spec = ProfileSpec(instructions=[bad])
+    results = scan_profile_files(spec)
+    assert results[0].path == bad
+    assert results[0].findings != []
+
+
+def test_scan_profile_files_captures_read_error(tmp_path):
+    bad = tmp_path / "noperm.md"
+    bad.write_text("x\n", encoding="utf-8")
+    bad.chmod(0o000)
+    spec = ProfileSpec(skills=[bad])
+    try:
+        results = scan_profile_files(spec)
+        assert results[0].error is not None
+        assert results[0].findings == []
+    finally:
+        bad.chmod(0o644)
+
+
+def test_scan_profile_files_and_build_bundle_agree(tmp_path):
+    """No-drift guard: a file scan_profile_files flags also makes build_bundle raise,
+    and a clean set passes both."""
+    bad = tmp_path / "leak.md"
+    bad.write_text("ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890ab\n", encoding="utf-8")
+    bad_spec = ProfileSpec(skills=[bad])
+    assert any(r.findings for r in scan_profile_files(bad_spec))
+    with pytest.raises(ValueError):
+        build_bundle(bad_spec)
+
+    good = tmp_path / "ok.md"
+    good.write_text("# fine\n", encoding="utf-8")
+    good_spec = ProfileSpec(skills=[good])
+    assert not any(r.findings for r in scan_profile_files(good_spec))
+    build_bundle(good_spec)  # must not raise
