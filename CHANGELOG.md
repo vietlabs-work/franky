@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.0.4] - 2026-06-25
 
+### Added
+- Operator profile injection: declare skill / instruction / knowledge files in
+  `~/.franky/profile.toml` and Franky secret-scans them host-side, then injects the bundle into
+  the task container so the in-container agent sees your curated context (skills, CLAUDE.md-style
+  instructions, knowledge docs) instead of only the generic persona. New `--profile` flag,
+  auto-discovery of `~/.franky/profile.toml`, and a `FRANKY_PROFILE_PATH` override. The bundle is
+  base64-passed by value (no bind mount, not a credential) and the run fails closed if any
+  credential pattern is detected in a listed file. Tier-1 (static prose) only; MCP servers are
+  out of scope (#23).
+- Live progress for `franky build` / `franky iterate`, ending the silent multi-minute run.
+  Distilled milestones (`franky: editing src/foo.py`, `franky: running: make test`, ...) print to
+  stderr by default; `--verbose` / `-v` (or `FRANKY_VERBOSE=1`) streams the raw engine output
+  instead. Output is redacted line-by-line and stdout still carries only the PR URL (#48).
+
 ## [0.0.3] - 2026-06-24
 
 ### Fixed
