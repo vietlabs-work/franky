@@ -116,6 +116,31 @@ def _scan_jsonl_for_pr_url(output: str, repo: str | None = None) -> str | None:
     return found or _fallback_pr_url(output, pattern)
 
 
+def _tool_use_summary(name: str, inp: dict) -> str:
+    """Return a compact `franky: <verb> <detail>` line for a tool-use event.
+
+    Shared by all engine distillers so the wording is consistent across engines.
+    """
+    if name in ("Edit", "MultiEdit"):
+        path = inp.get("file_path", "") or inp.get("path", "")
+        return f"franky: editing {path}" if path else "franky: editing file"
+    if name == "Write":
+        path = inp.get("file_path", "") or inp.get("path", "")
+        return f"franky: writing {path}" if path else "franky: writing file"
+    if name == "Read":
+        path = inp.get("file_path", "") or inp.get("path", "")
+        return f"franky: reading {path}" if path else "franky: reading file"
+    if name in ("Bash", "execute_bash"):
+        cmd = str(inp.get("command", "") or inp.get("cmd", "")).split("\n")[0][:60]
+        return f"franky: running: {cmd}" if cmd else "franky: running command"
+    if name in ("Glob", "GlobTool", "glob"):
+        pat = inp.get("pattern", "")
+        return f"franky: searching: {pat}" if pat else "franky: searching"
+    if name:
+        return f"franky: {name.lower()}"
+    return "franky: tool call"
+
+
 class Engine:
     """Base engine. Subclasses set `name` and implement the required behaviours."""
 
@@ -143,6 +168,16 @@ class Engine:
         `required_env` returns [] (no creds at all), so it answers "what should the operator
         set" rather than "which creds are usable now"."""
         raise NotImplementedError
+
+    def distill_line(self, line: str) -> str | None:
+        """Return a compact progress summary for one redacted output line, or None to skip.
+
+        Called for each streamed line in distilled-progress mode (the default, without
+        --verbose). Return None to suppress the line entirely; return a short string to
+        print it to stderr. The base implementation always returns None; subclasses override
+        for their specific JSONL event schemas.
+        """
+        return None
 
 
 class PiEngine(Engine):
@@ -188,6 +223,31 @@ class PiEngine(Engine):
         # pi is BYOK: any one of the provider vars is enough, so list them all.
         return f"set one of: {', '.join(PI_PROVIDER_VARS)}"
 
+    def distill_line(self, line: str) -> str | None:
+        line = line.strip()
+        if not line:
+            return None
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(event, dict):
+            return None
+        event_type = event.get("type")
+        # Top-level tool_use event (direct pi format)
+        if event_type == "tool_use":
+            return _tool_use_summary(
+                event.get("name", ""), event.get("input") or event.get("arguments") or {}
+            )
+        # Tool use nested in an assistant/message content block
+        if event_type == "message":
+            for item in event.get("content") or []:
+                if isinstance(item, dict) and item.get("type") == "tool_use":
+                    return _tool_use_summary(item.get("name", ""), item.get("input") or {})
+        if event_type == "done":
+            return "franky: agent complete"
+        return None
+
 
 class ClaudeEngine(Engine):
     name = "claude"
@@ -222,6 +282,28 @@ class ClaudeEngine(Engine):
 
     def cred_hint(self) -> str:
         return f"set {CLAUDE_TOKEN_VAR}"
+
+    def distill_line(self, line: str) -> str | None:
+        line = line.strip()
+        if not line:
+            return None
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(event, dict):
+            return None
+        event_type = event.get("type")
+        # Tool-use events arrive inside the assistant message content list
+        if event_type == "assistant":
+            msg = event.get("message")
+            if isinstance(msg, dict):
+                for item in msg.get("content") or []:
+                    if isinstance(item, dict) and item.get("type") == "tool_use":
+                        return _tool_use_summary(item.get("name", ""), item.get("input") or {})
+        if event_type == "result":
+            return "franky: agent complete"
+        return None
 
 
 class CodexEngine(Engine):
@@ -268,6 +350,34 @@ class CodexEngine(Engine):
     def cred_hint(self) -> str:
         # codex accepts either var; CODEX_API_KEY is the automation-recommended one.
         return f"set one of: {', '.join(CODEX_PROVIDER_VARS)}"
+
+    def distill_line(self, line: str) -> str | None:
+        line = line.strip()
+        if not line:
+            return None
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(event, dict):
+            return None
+        event_type = event.get("type")
+        if event_type == "action":
+            action = event.get("action") or {}
+            atype = action.get("type", "")
+            if atype == "exec":
+                cmd_obj = action.get("command") or {}
+                cmd = str(cmd_obj.get("cmd", "")).split("\n")[0][:60]
+                return f"franky: running: {cmd}" if cmd else "franky: running command"
+            if atype == "file_write":
+                path = action.get("path", "")
+                return f"franky: writing {path}" if path else "franky: writing file"
+            if atype == "file_read":
+                path = action.get("path", "")
+                return f"franky: reading {path}" if path else "franky: reading file"
+        if event_type == "result":
+            return "franky: agent complete"
+        return None
 
 
 ENGINES: dict[str, type[Engine]] = {

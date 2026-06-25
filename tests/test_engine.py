@@ -242,3 +242,154 @@ def test_codex_cred_hint_names_its_vars():
     # codex must NOT advertise the other engines' creds.
     assert "ANTHROPIC_API_KEY" not in hint
     assert CLAUDE_TOKEN_VAR not in hint
+
+
+# ---------------------------------------------------------------------------
+# distill_line: per-engine distilled progress renderers
+# ---------------------------------------------------------------------------
+
+
+def test_base_engine_distill_line_returns_none():
+    """Base Engine.distill_line always returns None (no distillation)."""
+    assert Engine().distill_line("anything") is None
+    assert Engine().distill_line('{"type":"result"}') is None
+
+
+def test_distill_line_non_json_returns_none():
+    for engine in (PiEngine(), ClaudeEngine(), CodexEngine()):
+        assert engine.distill_line("not json at all") is None
+        assert engine.distill_line("") is None
+        assert engine.distill_line("   ") is None
+
+
+def test_distill_line_unknown_event_returns_none():
+    line = json.dumps({"type": "usage", "tokens": 42})
+    for engine in (PiEngine(), ClaudeEngine(), CodexEngine()):
+        assert engine.distill_line(line) is None
+
+
+# --- ClaudeEngine distill_line ---
+
+
+def test_claude_distill_line_edit_tool():
+    event = {
+        "type": "assistant",
+        "message": {
+            "content": [{"type": "tool_use", "name": "Edit", "input": {"file_path": "src/app.py"}}]
+        },
+    }
+    result = ClaudeEngine().distill_line(json.dumps(event))
+    assert result == "franky: editing src/app.py"
+
+
+def test_claude_distill_line_bash_tool():
+    event = {
+        "type": "assistant",
+        "message": {
+            "content": [
+                {"type": "tool_use", "name": "Bash", "input": {"command": "make test\nextra"}}
+            ]
+        },
+    }
+    result = ClaudeEngine().distill_line(json.dumps(event))
+    assert result == "franky: running: make test"
+
+
+def test_claude_distill_line_write_tool():
+    event = {
+        "type": "assistant",
+        "message": {
+            "content": [{"type": "tool_use", "name": "Write", "input": {"file_path": "out.txt"}}]
+        },
+    }
+    result = ClaudeEngine().distill_line(json.dumps(event))
+    assert result == "franky: writing out.txt"
+
+
+def test_claude_distill_line_result_event():
+    event = {"type": "result"}
+    assert ClaudeEngine().distill_line(json.dumps(event)) == "franky: agent complete"
+
+
+def test_claude_distill_line_unknown_tool_uses_name():
+    event = {
+        "type": "assistant",
+        "message": {"content": [{"type": "tool_use", "name": "CustomTool", "input": {}}]},
+    }
+    result = ClaudeEngine().distill_line(json.dumps(event))
+    assert result == "franky: customtool"
+
+
+def test_claude_distill_line_assistant_text_no_tool_use():
+    event = {
+        "type": "assistant",
+        "message": {"content": [{"type": "text", "text": "I will now edit the file."}]},
+    }
+    assert ClaudeEngine().distill_line(json.dumps(event)) is None
+
+
+def test_claude_distill_line_no_message_key():
+    event = {"type": "assistant"}
+    assert ClaudeEngine().distill_line(json.dumps(event)) is None
+
+
+# --- PiEngine distill_line ---
+
+
+def test_pi_distill_line_top_level_tool_use():
+    event = {"type": "tool_use", "name": "Bash", "input": {"command": "pytest -q"}}
+    result = PiEngine().distill_line(json.dumps(event))
+    assert result == "franky: running: pytest -q"
+
+
+def test_pi_distill_line_message_with_tool_use():
+    event = {
+        "type": "message",
+        "content": [{"type": "tool_use", "name": "Edit", "input": {"file_path": "main.py"}}],
+    }
+    result = PiEngine().distill_line(json.dumps(event))
+    assert result == "franky: editing main.py"
+
+
+def test_pi_distill_line_done_event():
+    event = {"type": "done", "usage": {"prompt_tokens": 100, "completion_tokens": 50}}
+    assert PiEngine().distill_line(json.dumps(event)) == "franky: agent complete"
+
+
+def test_pi_distill_line_message_no_tool_use():
+    event = {"type": "message", "role": "assistant", "content": [{"type": "text", "text": "hi"}]}
+    assert PiEngine().distill_line(json.dumps(event)) is None
+
+
+# --- CodexEngine distill_line ---
+
+
+def test_codex_distill_line_exec_action():
+    event = {
+        "type": "action",
+        "action": {"type": "exec", "command": {"cmd": "git status\nmore"}},
+    }
+    result = CodexEngine().distill_line(json.dumps(event))
+    assert result == "franky: running: git status"
+
+
+def test_codex_distill_line_file_write_action():
+    event = {"type": "action", "action": {"type": "file_write", "path": "src/util.py"}}
+    result = CodexEngine().distill_line(json.dumps(event))
+    assert result == "franky: writing src/util.py"
+
+
+def test_codex_distill_line_file_read_action():
+    event = {"type": "action", "action": {"type": "file_read", "path": "README.md"}}
+    result = CodexEngine().distill_line(json.dumps(event))
+    assert result == "franky: reading README.md"
+
+
+def test_codex_distill_line_result_event():
+    event = {"type": "result", "output": {"type": "success"}}
+    assert CodexEngine().distill_line(json.dumps(event)) == "franky: agent complete"
+
+
+def test_codex_distill_line_unknown_action_type():
+    event = {"type": "action", "action": {"type": "something_new"}}
+    assert CodexEngine().distill_line(json.dumps(event)) is None
