@@ -327,6 +327,9 @@ def _auto_update(
     if _cache_fresh(entry, now()):
         tag = entry.get("latest_tag")
         status = entry.get("status")
+        # A cached "available" can outlive the upgrade that resolved it; re-check vs current.
+        if status == "available" and tag and not is_newer(tag, current):
+            status = "current"
     else:
         try:
             tag = fetch()

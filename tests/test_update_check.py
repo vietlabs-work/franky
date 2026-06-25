@@ -407,6 +407,18 @@ def test_auto_update_fresh_current_cache_is_silent(tmp_path):
     assert lines == []
 
 
+def test_auto_update_cached_available_suppressed_after_upgrade(tmp_path):
+    # Regression: cache says "available: v0.1.0" but current is now v0.1.0 (user just upgraded).
+    # The hint must not appear even though the cache entry is still fresh.
+    path = tmp_path / "c.json"
+    _write_cache(
+        path, {"checked_at": 1_000_000.0 - 10, "latest_tag": "v0.1.0", "status": "available"}
+    )
+    lines, out = _collect()
+    _au(current="0.1.0", cache_path=path, out=out)  # default fetch fails the test if called
+    assert lines == []
+
+
 def test_auto_update_stale_cache_refetches_and_hints(tmp_path):
     path = tmp_path / "c.json"
     lines, out = _collect()
