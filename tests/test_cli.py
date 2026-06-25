@@ -917,6 +917,7 @@ def test_config_init_full_wizard(tmp_path, monkeypatch):
         "OPENROUTER_API_KEY\n"  # provider var choice
         "sk-or-wiz\n"  # provider value
         "n\n"  # JIRA: no
+        "n\n"  # profile: no
     )
     res = runner.invoke(cli.main, ["config", "init"], input=wizard_input)
     assert res.exit_code == 0, res.output
@@ -940,6 +941,7 @@ def test_config_init_claude_wizard(tmp_path, monkeypatch):
         "ghp_wiz\n"  # GH_TOKEN
         "claude-tok\n"  # CLAUDE_CODE_OAUTH_TOKEN
         "n\n"  # JIRA: no
+        "n\n"  # profile: no
     )
     res = CliRunner().invoke(cli.main, ["config", "init"], input=wizard_input)
     assert res.exit_code == 0, res.output
@@ -960,6 +962,7 @@ def test_config_init_codex_wizard_with_codex_key(tmp_path, monkeypatch):
         "ghp_wiz\n"  # GH_TOKEN
         "codex-key\n"  # CODEX_API_KEY
         "n\n"  # JIRA: no
+        "n\n"  # profile: no
     )
     res = CliRunner().invoke(cli.main, ["config", "init"], input=wizard_input)
     assert res.exit_code == 0, res.output
@@ -981,6 +984,7 @@ def test_config_init_codex_wizard_falls_back_to_openai(tmp_path, monkeypatch):
         "\n"  # CODEX_API_KEY empty -> fall through to OPENAI_API_KEY
         "sk-openai\n"  # OPENAI_API_KEY
         "n\n"  # JIRA: no
+        "n\n"  # profile: no
     )
     res = CliRunner().invoke(cli.main, ["config", "init"], input=wizard_input)
     assert res.exit_code == 0, res.output
@@ -1462,3 +1466,165 @@ def test_iterate_json_error_object_off_allowlist(monkeypatch):
     assert data["error"]["kind"] == "task_rejected"
     assert len(res.stdout.strip().splitlines()) == 1  # exactly one JSON object on stdout
     assert ran["container"] is False
+
+
+# ---------------------------------------------------------------------------
+# `franky profile` subgroup (issue #49)
+# ---------------------------------------------------------------------------
+
+_GHP_FAKE = "ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890ab"
+
+
+def test_profile_path_prints_resolved_override(tmp_path, monkeypatch):
+    p = str(tmp_path / "custom.toml")
+    monkeypatch.setenv("FRANKY_PROFILE_PATH", p)
+    res = CliRunner().invoke(cli.main, ["profile", "path"])
+    assert res.exit_code == 0, res.output
+    assert p in res.output
+
+
+def test_profile_show_absent_returns_zero(tmp_path, monkeypatch):
+    monkeypatch.setenv("FRANKY_PROFILE_PATH", str(tmp_path / "nope.toml"))
+    res = CliRunner().invoke(cli.main, ["profile", "show"])
+    assert res.exit_code == 0
+    assert "not found" in res.output
+
+
+def test_profile_show_lists_expanded_files(tmp_path, monkeypatch):
+    skill = tmp_path / "skill.md"
+    skill.write_text("# my skill\n", encoding="utf-8")
+    prof = tmp_path / "profile.toml"
+    prof.write_text(f'[profile]\nskills = ["{skill}"]\n', encoding="utf-8")
+    monkeypatch.setenv("FRANKY_PROFILE_PATH", str(prof))
+    res = CliRunner().invoke(cli.main, ["profile", "show"])
+    assert res.exit_code == 0, res.output
+    assert str(skill) in res.output
+    assert "expanded files" in res.output
+    assert "[skills]" in res.output  # the expanded-files loop ran, not just the TOML echo
+
+
+def test_profile_show_empty_expansion(tmp_path, monkeypatch):
+    empty = tmp_path / "skills"
+    empty.mkdir()
+    prof = tmp_path / "profile.toml"
+    prof.write_text(f'[profile]\nskills = ["{empty}/*.md"]\n', encoding="utf-8")
+    monkeypatch.setenv("FRANKY_PROFILE_PATH", str(prof))
+    res = CliRunner().invoke(cli.main, ["profile", "show"])
+    assert res.exit_code == 0, res.output
+    assert "(none)" in res.output
+
+
+def test_profile_show_bad_toml_is_lenient(tmp_path, monkeypatch):
+    prof = tmp_path / "profile.toml"
+    prof.write_text("[profile\nskills = oops", encoding="utf-8")
+    monkeypatch.setenv("FRANKY_PROFILE_PATH", str(prof))
+    res = CliRunner().invoke(cli.main, ["profile", "show"])
+    # show is lenient: it prints the raw text + a warning, but does not hard-fail.
+    assert res.exit_code == 0, res.output
+    assert "could not expand profile" in res.output
+
+
+def test_profile_check_clean_exits_zero(tmp_path, monkeypatch):
+    skill = tmp_path / "skill.md"
+    skill.write_text("# clean\n", encoding="utf-8")
+    prof = tmp_path / "profile.toml"
+    prof.write_text(f'[profile]\nskills = ["{skill}"]\n', encoding="utf-8")
+    monkeypatch.setenv("FRANKY_PROFILE_PATH", str(prof))
+    res = CliRunner().invoke(cli.main, ["profile", "check"])
+    assert res.exit_code == 0, res.output
+    assert "OK:" in res.output
+
+
+def test_profile_check_secret_hit_nonzero_and_names_file_without_value(tmp_path, monkeypatch):
+    leak = tmp_path / "leak.md"
+    leak.write_text(f"token {_GHP_FAKE}\n", encoding="utf-8")
+    prof = tmp_path / "profile.toml"
+    prof.write_text(f'[profile]\ninstructions = ["{leak}"]\n', encoding="utf-8")
+    monkeypatch.setenv("FRANKY_PROFILE_PATH", str(prof))
+    res = CliRunner().invoke(cli.main, ["profile", "check"])
+    assert res.exit_code != 0
+    assert str(leak) in res.output  # offending file named (operator's own file)
+    assert _GHP_FAKE not in res.output  # but the secret value is never echoed
+
+
+def test_profile_check_absent_exits_zero(tmp_path, monkeypatch):
+    monkeypatch.setenv("FRANKY_PROFILE_PATH", str(tmp_path / "nope.toml"))
+    res = CliRunner().invoke(cli.main, ["profile", "check"])
+    assert res.exit_code == 0
+    assert "no profile configured" in res.output
+
+
+def test_profile_check_empty_expansion_shows_declared(tmp_path, monkeypatch):
+    empty = tmp_path / "skills"
+    empty.mkdir()
+    prof = tmp_path / "profile.toml"
+    prof.write_text(f'[profile]\nskills = ["{empty}/*.md"]\n', encoding="utf-8")
+    monkeypatch.setenv("FRANKY_PROFILE_PATH", str(prof))
+    res = CliRunner().invoke(cli.main, ["profile", "check"])
+    assert res.exit_code == 0, res.output
+    assert "no files to inject" in res.output
+    assert f"{empty}/*.md" in res.output  # the declared pattern is surfaced
+
+
+def test_profile_check_bad_toml_nonzero(tmp_path, monkeypatch):
+    prof = tmp_path / "profile.toml"
+    prof.write_text("[profile\nskills = oops", encoding="utf-8")
+    monkeypatch.setenv("FRANKY_PROFILE_PATH", str(prof))
+    res = CliRunner().invoke(cli.main, ["profile", "check"])
+    assert res.exit_code != 0
+
+
+def test_profile_init_writes_entered_globs(tmp_path, monkeypatch):
+    from franky.profile import read_profile_raw
+
+    prof = tmp_path / "profile.toml"
+    monkeypatch.setenv("FRANKY_PROFILE_PATH", str(prof))
+    # skills, instructions, knowledge prompts
+    wizard_input = "~/.claude/skills/*.md\n~/.claude/CLAUDE.md\n\n"
+    res = CliRunner().invoke(cli.main, ["profile", "init"], input=wizard_input)
+    assert res.exit_code == 0, res.output
+    raw = read_profile_raw(prof)
+    assert raw["skills"] == ["~/.claude/skills/*.md"]
+    assert raw["instructions"] == ["~/.claude/CLAUDE.md"]
+    assert "knowledge" not in raw
+
+
+def test_profile_init_merges_existing(tmp_path, monkeypatch):
+    from franky.profile import read_profile_raw
+
+    prof = tmp_path / "profile.toml"
+    prof.write_text('[profile]\nskills = ["~/existing.md"]\n', encoding="utf-8")
+    monkeypatch.setenv("FRANKY_PROFILE_PATH", str(prof))
+    wizard_input = "~/new.md\n\n\n"  # add a skill, skip instructions + knowledge
+    res = CliRunner().invoke(cli.main, ["profile", "init"], input=wizard_input)
+    assert res.exit_code == 0, res.output
+    assert read_profile_raw(prof)["skills"] == ["~/existing.md", "~/new.md"]
+
+
+def test_config_init_profile_prompt_yes_writes_both(tmp_path, monkeypatch):
+    from franky.profile import read_profile_raw
+    from franky.userconfig import read_config_file
+
+    cfg_path = tmp_path / "franky-config"
+    prof_path = tmp_path / "profile.toml"
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setenv("FRANKY_PROFILE_PATH", str(prof_path))
+    # config init now fails fast in a non-TTY (never-hang, #50); driving the wizard via
+    # CliRunner input simulates an interactive session, so mark stdin interactive.
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)
+    wizard_input = (
+        "pi\n"  # engine
+        "me/repo\n"  # repos
+        "ghp_wiz\n"  # GH_TOKEN
+        "OPENROUTER_API_KEY\n"  # provider choice
+        "sk-or-wiz\n"  # provider value
+        "n\n"  # JIRA: no
+        "y\n"  # profile: yes
+        "~/.claude/skills/*.md\n"  # skills
+        "~/.claude/CLAUDE.md\n"  # instructions
+        "\n"  # knowledge: empty
+    )
+    res = CliRunner().invoke(cli.main, ["config", "init"], input=wizard_input)
+    assert res.exit_code == 0, res.output
+    assert read_config_file(cfg_path)["FRANKY_ENGINE"] == "pi"
+    assert read_profile_raw(prof_path)["skills"] == ["~/.claude/skills/*.md"]

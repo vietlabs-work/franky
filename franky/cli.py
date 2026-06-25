@@ -36,7 +36,16 @@ from .container import (
 )
 from .engine import ENGINES, PI_PROVIDER_VARS, resolve_engine
 from .jira import JIRA_API_TOKEN_VAR, JIRA_EMAIL_VAR, fetch_jira_issue
-from .profile import build_bundle, load_profile, profile_path
+from .profile import (
+    PROFILE_CATEGORIES,
+    build_bundle,
+    load_profile,
+    profile_file_path,
+    profile_path,
+    read_profile_raw,
+    scan_profile_files,
+    write_profile,
+)
 from .prompt import build_iterate_prompt, build_plan_prompt, build_prompt
 from .result import (
     EXIT_AGENT,
@@ -952,6 +961,177 @@ def config_init() -> None:
 
     click.echo()
     click.echo(f"wrote config to {path}")
+
+    # Surface the operator-profile feature during onboarding (issue #49). Opt-in, so a
+    # plain `config init` is unchanged for users who do not want a profile.
+    click.echo()
+    if click.confirm("Set up an operator profile now?", default=False):
+        _profile_init_wizard(dict(os.environ))
+
+
+# ---------------------------------------------------------------------------
+# `franky profile` subgroup (issue #49)
+# ---------------------------------------------------------------------------
+# Mirrors the `config` subgroup: thin CLI wrappers over franky/profile.py. Like
+# `config`, the group callback does NOT load the profile, so the subcommands stay
+# usable even when ~/.franky/profile.toml is malformed (so `profile init` can fix it).
+
+
+def _profile_init_wizard(env: dict[str, str]) -> None:
+    """Interactive wizard: scaffold/merge ~/.franky/profile.toml.
+
+    Shared by `franky profile init` and the `config init` profile prompt. Prompts for
+    skills / instructions / knowledge globs with sensible defaults, then merge-not-clobbers
+    an existing file (union per category, order preserved). Honors FRANKY_PROFILE_PATH.
+    """
+    path = profile_file_path(env)
+    click.echo(f"franky profile init - writing to {path}", err=True)
+    click.echo(
+        "Enter comma-separated paths or globs per category (~ and *, ? globs allowed). "
+        "Defaults are globs that may match nothing on your machine - run `franky profile "
+        "check` afterwards to see what would actually inject.",
+        err=True,
+    )
+
+    def _prompt_list(label: str, default: str) -> list[str]:
+        raw = click.prompt(label, default=default, show_default=True)
+        return [item.strip() for item in raw.split(",") if item.strip()]
+
+    new_table: dict[str, list[str]] = {
+        "skills": _prompt_list("Skills", "~/.claude/skills/*.md"),
+        "instructions": _prompt_list("Instructions", "~/.claude/CLAUDE.md"),
+        "knowledge": _prompt_list("Knowledge", ""),
+    }
+
+    # Merge with the existing file so we never clobber entries the user already curated.
+    # A malformed existing file is treated as empty so the wizard can repair it.
+    existing: dict[str, list[str]] = {}
+    if path.exists():
+        try:
+            existing = read_profile_raw(path)
+        except ValueError:
+            existing = {}
+
+    merged: dict[str, list[str]] = {}
+    for category in PROFILE_CATEGORIES:
+        seen: list[str] = []
+        for entry in existing.get(category, []) + new_table.get(category, []):
+            if entry not in seen:
+                seen.append(entry)
+        if seen:
+            merged[category] = seen
+
+    if not merged:
+        click.echo("franky: no paths entered - nothing written.", err=True)
+        return
+
+    try:
+        write_profile(path, merged)
+    except ValueError as exc:
+        raise click.ClickException(f"could not write profile: {exc}") from exc
+    click.echo(f"wrote profile to {path}", err=True)
+
+
+@main.group("profile")
+def profile_group() -> None:
+    """Set up and inspect the operator profile (~/.franky/profile.toml)."""
+
+
+@profile_group.command("path")
+def profile_path_cmd() -> None:
+    """Print the resolved profile path (whether or not it exists)."""
+    click.echo(profile_file_path(dict(os.environ)))
+
+
+@profile_group.command("show")
+def profile_show() -> None:
+    """Print the profile.toml and the glob-expanded file list it would inject.
+
+    Lenient introspection: a load error (bad TOML / a listed file that does not exist yet)
+    is reported as a warning, not a hard failure - use `profile check` for the strict gate.
+    """
+    path = profile_file_path(dict(os.environ))
+    if not path.exists():
+        click.echo(f"profile not found: {path}", err=True)
+        return
+
+    # The raw TOML is the operator's own declared path list (never file contents), so
+    # echoing it cannot leak a fetched secret.
+    click.echo(f"# {path}")
+    click.echo(path.read_text(encoding="utf-8").rstrip("\n"))
+
+    try:
+        spec = load_profile(path)
+    except ValueError as exc:
+        click.echo(f"\nfranky: could not expand profile: {exc}", err=True)
+        return
+
+    click.echo("\nexpanded files:", err=True)
+    files = spec.all_files()
+    if not files:
+        click.echo("  (none)", err=True)
+        return
+    for category in PROFILE_CATEGORIES:
+        for fp in getattr(spec, category):
+            click.echo(f"  [{category}] {fp} ({fp.stat().st_size} bytes)", err=True)
+
+
+@profile_group.command("check")
+def profile_check() -> None:
+    """Dry-run the build's profile gate: expand globs + secret-scan, report what would inject.
+
+    Uses the SAME load_profile + scan_for_secrets path as the real build, so a profile that
+    passes here cannot fail the build's fail-closed secret gate. Exit code is a contract:
+    a credential hit (or unreadable file) exits nonzero and names the offending file; a clean
+    profile exits 0 with the inject manifest. Absent profile -> exit 0 (build treats it as no bundle).
+    """
+    path = profile_file_path(dict(os.environ))
+    if not path.exists():
+        click.echo(f"no profile configured at {path} - nothing would be injected", err=True)
+        return
+
+    try:
+        spec = load_profile(path)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    results = scan_profile_files(spec)
+    if not results:
+        # load_profile succeeded but every glob matched nothing (a valid but usually
+        # unintended state). Echo the declared patterns so the operator knows what to fix.
+        declared = read_profile_raw(path)
+        click.echo("profile has no files to inject - declared patterns matched nothing:", err=True)
+        for category in PROFILE_CATEGORIES:
+            for pattern in declared.get(category, []):
+                click.echo(f"  [{category}] {pattern}", err=True)
+        return
+
+    total = 0
+    problems: list[str] = []
+    for r in results:
+        if r.error is not None:
+            click.echo(f"  ERROR  {r.path}: {r.error}", err=True)
+            problems.append(f"{r.path} (unreadable)")
+            continue
+        total += r.size
+        if r.findings:
+            click.echo(f"  SECRET {r.path}: {', '.join(r.findings)}", err=True)
+            problems.append(f"{r.path} ({r.findings[0]})")
+        else:
+            click.echo(f"  ok     {r.path} ({r.size} bytes)", err=True)
+
+    if problems:
+        raise click.ClickException(
+            f"profile check failed - {len(problems)} file(s) cannot be injected: "
+            + "; ".join(problems)
+        )
+    click.echo(f"OK: {len(results)} file(s), {total} bytes would be injected", err=True)
+
+
+@profile_group.command("init")
+def profile_init() -> None:
+    """Interactive wizard to create or extend ~/.franky/profile.toml (merge-not-clobber)."""
+    _profile_init_wizard(dict(os.environ))
 
 
 if __name__ == "__main__":

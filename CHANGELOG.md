@@ -21,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `build -` reads the prose task from stdin.
   - Never-hang guarantee: every interactive prompt (`--plan-first` confirm, `config set` /
     `config init`, `build -`) fails fast with exit `2` in a non-TTY instead of blocking.
+- `franky profile` setup commands so a profile no longer has to be hand-written:
+  `profile init` (interactive wizard that scaffolds / merges `~/.franky/profile.toml`),
+  `profile check` (dry-run the build's gate - expand globs + secret-scan, report what would
+  inject, nonzero exit naming the offending file on a credential hit), `profile show`, and
+  `profile path`. `check` reuses the exact `load_profile` + `scan_for_secrets` path the build
+  runs, so a profile that passes `check` cannot fail the build's fail-closed secret gate. `franky
+  config init` now also offers to set up a profile so the feature is discoverable (#49).
 
 ### Changed
 - `franky build` now exits `7` (was `0`) when the agent finishes cleanly but produces no PR URL,
