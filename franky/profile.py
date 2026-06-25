@@ -47,6 +47,9 @@ PROFILE_PATH_VAR = "FRANKY_PROFILE_PATH"
 # Default profile location relative to the user home directory.
 _DEFAULT_PROFILE_RELATIVE = Path(".franky") / "profile.toml"
 
+# The categories a profile.toml [profile] table may declare, in canonical order.
+PROFILE_CATEGORIES = ("skills", "instructions", "knowledge")
+
 # Credential patterns to detect in profile files.  A match causes a fail-closed
 # refusal.  Patterns are deliberately conservative (high-confidence) to avoid
 # false positives on legitimate technical prose.
@@ -121,6 +124,24 @@ def profile_path(env: dict[str, str] | None = None) -> Path | None:
     return default if default.exists() else None
 
 
+def profile_file_path(env: dict[str, str] | None = None) -> Path:
+    """Return the resolved profile path, whether or not it exists.
+
+    Priority: FRANKY_PROFILE_PATH override > default ~/.franky/profile.toml.  Unlike
+    profile_path() (which returns None for an absent default so `build` treats it as
+    "no profile"), this ALWAYS returns a path - it is the path the `franky profile`
+    subcommands print and write, the same contract as userconfig.config_file_path().
+    """
+    if env is None:
+        import os
+
+        env = dict(os.environ)
+    override = env.get(PROFILE_PATH_VAR)
+    if override:
+        return Path(override)
+    return Path.home() / _DEFAULT_PROFILE_RELATIVE
+
+
 def _expand_glob(raw: str) -> list[Path]:
     """Expand a single path or glob pattern (after ~ expansion) into existing Paths."""
     import glob as _glob
@@ -160,7 +181,7 @@ def load_profile(path: Path) -> ProfileSpec:
         raise ValueError(f"[profile] in {path} must be a TOML table, not {type(table).__name__}")
 
     spec = ProfileSpec()
-    for category in ("skills", "instructions", "knowledge"):
+    for category in PROFILE_CATEGORIES:
         raw_list = table.get(category, [])
         if not isinstance(raw_list, list):
             raise ValueError(f"profile.{category} must be a list of strings in {path}")
@@ -180,6 +201,115 @@ def load_profile(path: Path) -> ProfileSpec:
     return spec
 
 
+def read_profile_raw(path: Path) -> dict[str, list[str]]:
+    """Return the RAW declared string lists from a profile.toml's [profile] table.
+
+    Unlike load_profile(), this performs NO glob expansion and NO existence check - it
+    returns exactly the strings the operator wrote, which is what `profile init` needs to
+    merge-not-clobber an existing file.  Absent file -> {} (not an error).  Raises
+    ValueError on malformed TOML, a non-table [profile], or a non-string-list category.
+    Empty categories are omitted from the returned dict.
+    """
+    if not path.exists():
+        return {}
+    try:
+        import tomllib  # type: ignore[import-not-found]
+    except ModuleNotFoundError:
+        import tomli as tomllib  # type: ignore[import-not-found,no-redef]
+
+    try:
+        data = tomllib.loads(path.read_bytes().decode("utf-8"))
+    except Exception as exc:
+        raise ValueError(f"malformed TOML in profile {path}: {exc}") from exc
+
+    table = data.get("profile", {})
+    if not isinstance(table, dict):
+        raise ValueError(f"[profile] in {path} must be a TOML table, not {type(table).__name__}")
+
+    raw: dict[str, list[str]] = {}
+    for category in PROFILE_CATEGORIES:
+        entries = table.get(category, [])
+        if not isinstance(entries, list):
+            raise ValueError(f"profile.{category} must be a list of strings in {path}")
+        for entry in entries:
+            if not isinstance(entry, str):
+                raise ValueError(
+                    f"profile.{category} entries must be strings, got {entry!r} in {path}"
+                )
+        if entries:
+            raw[category] = list(entries)
+    return raw
+
+
+def _toml_escape(value: str) -> str:
+    """Escape a string for a TOML basic (double-quoted) string: backslash and quote only.
+
+    Control characters are rejected by write_profile() before this is called.
+    """
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def write_profile(path: Path, table: dict[str, list[str]]) -> None:
+    """Atomically write `table` as a [profile] TOML table to `path`.
+
+    Mirrors userconfig.write_config_file but emits string ARRAYS (skills / instructions /
+    knowledge) in the canonical PROFILE_CATEGORIES order so output is deterministic.
+    Empty categories are omitted.  Rejects control chars in any entry (would corrupt the
+    file).  The file holds curated path lists, not credentials, so the final mode is 0644
+    (the parent ~/.franky is created 0700).
+    """
+    import os
+    import tempfile
+
+    for category, entries in table.items():
+        for entry in entries:
+            if any(ord(ch) < 32 or ord(ch) == 127 for ch in entry):
+                raise ValueError(
+                    f"profile entry {entry!r} in {category!r} contains a control character - "
+                    "refusing to write (would corrupt the file)"
+                )
+
+    parent = path.parent
+    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    lines = ["[profile]"]
+    for category in PROFILE_CATEGORIES:
+        entries = table.get(category)
+        if not entries:
+            continue
+        lines.append(f"{category} = [")
+        for entry in entries:
+            lines.append(f'    "{_toml_escape(entry)}",')
+        lines.append("]")
+    content = "\n".join(lines) + "\n"
+
+    # Write atomically: temp file in the same dir -> os.replace, so the file is never
+    # half-written for a concurrent reader.
+    fd, tmp_path_str = tempfile.mkstemp(dir=parent, prefix=".franky-profile-")
+    tmp_path = Path(tmp_path_str)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    path.chmod(0o644)
+
+
+def _read_profile_text(file_path: Path) -> str:
+    """Read a profile file as UTF-8 text (lossy on invalid bytes).
+
+    The single read path shared by build_bundle() (the real fail-closed gate) and
+    scan_profile_files() (the `franky profile check` dry-run), so the dry-run can never
+    read a file differently from the build and thus never diverge on what it scans.
+    """
+    return file_path.read_text(encoding="utf-8", errors="replace")
+
+
 def scan_for_secrets(text: str) -> list[str]:
     """Return a list of detection descriptions if `text` contains credential patterns.
 
@@ -192,6 +322,43 @@ def scan_for_secrets(text: str) -> list[str]:
         if pattern.search(text):
             findings.append(description)
     return findings
+
+
+@dataclass
+class FileScanResult:
+    """Per-file result of the `franky profile check` dry-run."""
+
+    path: Path
+    size: int  # byte length of the UTF-8-encoded text (0 when unreadable)
+    findings: list[str]  # scan_for_secrets descriptions; empty when clean
+    error: str | None  # read-error message, or None when the file was read
+
+
+def scan_profile_files(spec: ProfileSpec) -> list[FileScanResult]:
+    """Dry-run twin of build_bundle's per-file loop, for `franky profile check`.
+
+    Reads each file in `spec` via the SAME _read_profile_text() and scans it with the
+    SAME scan_for_secrets() that build_bundle uses, so a profile that scans clean here
+    cannot fail the build's fail-closed secret gate (and vice-versa).  Unlike build_bundle
+    it never raises: it accumulates per-file results (size, findings, read errors) so
+    `check` can report every problem in one pass instead of aborting on the first.
+    """
+    results: list[FileScanResult] = []
+    for file_path in spec.all_files():
+        try:
+            text = _read_profile_text(file_path)
+        except OSError as exc:
+            results.append(FileScanResult(path=file_path, size=0, findings=[], error=str(exc)))
+            continue
+        results.append(
+            FileScanResult(
+                path=file_path,
+                size=len(text.encode("utf-8")),
+                findings=scan_for_secrets(text),
+                error=None,
+            )
+        )
+    return results
 
 
 def build_bundle(spec: ProfileSpec) -> str:
@@ -219,7 +386,7 @@ def build_bundle(spec: ProfileSpec) -> str:
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:
         for file_path in files:
             try:
-                text = file_path.read_text(encoding="utf-8", errors="replace")
+                text = _read_profile_text(file_path)
             except OSError as exc:
                 raise ValueError(f"could not read profile file {file_path}: {exc}") from exc
 
