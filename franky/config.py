@@ -14,6 +14,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 
 from .engine import Engine, resolve_engine
+from .result import AuthError, ConfigError
 
 REDACT_TOKEN = "***REDACTED***"
 
@@ -83,7 +84,7 @@ def validate_allowlist_entry(entry: str) -> None:
     if entry == "*":
         return
     if not _ALLOWLIST_ENTRY_RE.match(entry):
-        raise ValueError(
+        raise ConfigError(
             f"invalid allowlist entry {entry!r}: expected 'owner/repo' or 'owner/*' "
             "or '*' (each segment: alphanumeric/dash/underscore/dot/asterisk, "
             "exactly one slash)"
@@ -100,12 +101,19 @@ def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
       3. engine creds missing -> refuse (pi: no provider var set; claude: token missing;
          codex: neither CODEX_API_KEY nor OPENAI_API_KEY set)
     """
-    engine = resolve_engine(flag_engine, env)
+    # resolve_engine raises a plain ValueError for an unknown FRANKY_ENGINE; rewrap as a
+    # ConfigError so it gets exit code 3 + a JSON error, keeping the message identical.
+    try:
+        engine = resolve_engine(flag_engine, env)
+    except ConfigError:
+        raise
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
 
     raw_allowed = env.get(ALLOWED_REPOS_VAR, "") or ""
     allowed = [r.strip() for r in raw_allowed.split(",") if r.strip()]
     if not allowed:
-        raise ValueError(
+        raise ConfigError(
             f"{ALLOWED_REPOS_VAR} is unset or empty - refusing (set a comma-separated "
             "owner/repo allowlist)"
         )
@@ -116,7 +124,7 @@ def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
 
     gh_token = env.get(GH_TOKEN_VAR)
     if not gh_token:
-        raise ValueError(
+        raise AuthError(
             f"{GH_TOKEN_VAR} is unset or empty - refusing (needed to clone + open the PR)"
         )
 
@@ -124,7 +132,7 @@ def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
     if not cred_vars:
         # The hint comes from the engine itself so the refusal names THIS engine's vars -
         # shared config stays engine-agnostic (no hardcoded pi vars).
-        raise ValueError(
+        raise AuthError(
             f"no creds present for engine '{engine.name}' - refusing ({engine.cred_hint()})"
         )
 
@@ -137,7 +145,7 @@ def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
             continue
         passthrough[var] = value
     if missing:
-        raise ValueError(
+        raise AuthError(
             f"engine '{engine.name}' requires {', '.join(missing)} but they are unset - refusing"
         )
 

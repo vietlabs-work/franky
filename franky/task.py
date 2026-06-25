@@ -15,6 +15,7 @@ import re
 from dataclasses import dataclass
 
 from .config import repo_allowed
+from .result import TaskRejected
 
 PROSE_MAX_CHARS = 4000
 
@@ -62,30 +63,30 @@ def parse_task(raw_input: str, repo_flag: str | None, allowed: list[str]) -> Tas
     if jira_match:
         token = jira_match.group(1)
         if not JIRA_KEY_RE.match(token):
-            raise ValueError(f"invalid JIRA key '{token}'")
+            raise TaskRejected(f"invalid JIRA key '{token}'")
         if not repo_flag:
-            raise ValueError("jira task needs --repo owner/repo (the JIRA key carries no repo)")
+            raise TaskRejected("jira task needs --repo owner/repo (the JIRA key carries no repo)")
         spec = TaskSpec(repo=repo_flag, text=token, source="jira")
     else:
         issue = GH_ISSUE_RE.search(text_in)
         if issue:
             repo = f"{issue.group('owner')}/{issue.group('repo')}"
             if repo_flag and repo_flag != repo:
-                raise ValueError(
+                raise TaskRejected(
                     f"--repo '{repo_flag}' conflicts with the issue URL repo '{repo}' - "
                     "drop --repo or fix the URL"
                 )
             spec = TaskSpec(repo=repo, text=text_in, source="issue")
         else:
             if not repo_flag:
-                raise ValueError(
+                raise TaskRejected(
                     "prose task needs --repo owner/repo (no repo could be inferred from the input)"
                 )
             text = text_in[:PROSE_MAX_CHARS].strip()
             spec = TaskSpec(repo=repo_flag, text=text, source="prose")
 
     if not repo_allowed(spec.repo, allowed):
-        raise ValueError(f"repo '{spec.repo}' is not in the allowlist - refusing")
+        raise TaskRejected(f"repo '{spec.repo}' is not in the allowlist - refusing")
     return spec
 
 
@@ -104,11 +105,11 @@ def parse_pr_task(raw_input: str, allowed: list[str]) -> TaskSpec:
     text_in = (raw_input or "").strip()
     m = GH_PR_RE.match(text_in)
     if not m:
-        raise ValueError(
+        raise TaskRejected(
             "iterate needs a GitHub PR URL like https://github.com/owner/repo/pull/123"
         )
     repo = f"{m.group('owner')}/{m.group('repo')}"
     if not repo_allowed(repo, allowed):
-        raise ValueError(f"repo '{repo}' is not in the allowlist - refusing")
+        raise TaskRejected(f"repo '{repo}' is not in the allowlist - refusing")
     canonical = f"https://github.com/{repo}/pull/{m.group('number')}"
     return TaskSpec(repo=repo, text=canonical, source="pr")

@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -280,6 +281,7 @@ def test_build_plan_first_declined_does_not_execute(monkeypatch):
     # Declining the gate: the planning pass runs ONCE, the plan is shown, and no build pass
     # or PR follows.
     monkeypatch.setattr(cli.os, "environ", _plan_first_env())
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)
     monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
     monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
 
@@ -306,6 +308,7 @@ def test_build_plan_first_declined_does_not_execute(monkeypatch):
 def test_build_plan_first_approved_executes_and_prs(monkeypatch):
     # Approving the gate: planning pass THEN build pass; the build pass's PR URL is reported.
     monkeypatch.setattr(cli.os, "environ", _plan_first_env())
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)
     monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
     monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
 
@@ -327,9 +330,10 @@ def test_build_plan_first_approved_executes_and_prs(monkeypatch):
 
 
 def test_build_plan_first_non_interactive_fails_closed(monkeypatch):
-    # No stdin to answer the gate (CI / piped) must fail closed: the planning pass runs, the
-    # gate aborts (no approval), and the build pass never runs.
+    # No TTY to answer the gate (CI / piped) must fail FAST: exit 2 BEFORE the planning pass
+    # runs at all (never-hang), and certainly no build pass or PR.
     monkeypatch.setattr(cli.os, "environ", _plan_first_env())
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: False)
     monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
     monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
 
@@ -344,14 +348,15 @@ def test_build_plan_first_non_interactive_fails_closed(monkeypatch):
     runner = CliRunner()
     with runner.isolated_filesystem():
         res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo", "--plan-first"])
-    assert res.exit_code != 0  # click aborts the confirm cleanly (no traceback)
-    assert calls["n"] == 1  # only the planning pass ran; no build
+    assert res.exit_code == 2  # fail fast, never-hang
+    assert calls["n"] == 0  # no container run at all
     assert PR_URL not in res.output
 
 
 def test_build_plan_first_planning_failure_aborts_before_gate(monkeypatch):
     # A planning pass that errors must NOT proceed to a build pass.
     monkeypatch.setattr(cli.os, "environ", _plan_first_env())
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)
     monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
     monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
 
@@ -589,6 +594,7 @@ def test_build_prints_economics_line_and_writes_to_log(monkeypatch):
 def test_build_plan_first_approved_emits_exactly_one_economics_line(monkeypatch):
     """--plan-first approved run emits exactly ONE economics line (build pass only)."""
     monkeypatch.setattr(cli.os, "environ", _build_env())
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)
     monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
     monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
 
@@ -881,6 +887,7 @@ def test_config_set_secret_refuses_positional_value(tmp_path, monkeypatch):
 def test_config_set_secret_via_hidden_prompt(tmp_path, monkeypatch):
     cfg_path = tmp_path / "franky-config"
     monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)
     runner = CliRunner()
     res = runner.invoke(cli.main, ["config", "set", "GH_TOKEN"], input="ghp_from_prompt\n")
     assert res.exit_code == 0, res.output
@@ -899,6 +906,7 @@ def test_config_set_unknown_key_rejected(tmp_path, monkeypatch):
 def test_config_init_full_wizard(tmp_path, monkeypatch):
     cfg_path = tmp_path / "franky-config"
     monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)
     runner = CliRunner()
     # Simulate: engine=pi, repos=me/repo, GH_TOKEN=ghp_wiz, provider=OPENROUTER,
     # key=sk-or-wiz, no JIRA
@@ -925,6 +933,7 @@ def test_config_init_full_wizard(tmp_path, monkeypatch):
 def test_config_init_claude_wizard(tmp_path, monkeypatch):
     cfg_path = tmp_path / "franky-config"
     monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)
     wizard_input = (
         "claude\n"  # engine
         "me/repo\n"  # FRANKY_ALLOWED_REPOS
@@ -944,6 +953,7 @@ def test_config_init_claude_wizard(tmp_path, monkeypatch):
 def test_config_init_codex_wizard_with_codex_key(tmp_path, monkeypatch):
     cfg_path = tmp_path / "franky-config"
     monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)
     wizard_input = (
         "codex\n"  # engine
         "me/repo\n"  # FRANKY_ALLOWED_REPOS
@@ -963,6 +973,7 @@ def test_config_init_codex_wizard_with_codex_key(tmp_path, monkeypatch):
 def test_config_init_codex_wizard_falls_back_to_openai(tmp_path, monkeypatch):
     cfg_path = tmp_path / "franky-config"
     monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)
     wizard_input = (
         "codex\n"  # engine
         "me/repo\n"  # FRANKY_ALLOWED_REPOS
@@ -1012,14 +1023,6 @@ def test_build_load_config_file_malformed_gives_clean_error(tmp_path, monkeypatc
 # ---------------------------------------------------------------------------
 # --verbose / FRANKY_VERBOSE + progress callbacks
 # ---------------------------------------------------------------------------
-
-
-def _build_env():
-    return {
-        "FRANKY_ALLOWED_REPOS": "me/repo",
-        "GH_TOKEN": "ghp_fake",
-        "OPENROUTER_API_KEY": "sk-or-fake",
-    }
 
 
 def test_build_help_shows_verbose_flag():
@@ -1160,3 +1163,302 @@ def test_build_franky_verbose_env_activates_verbose(monkeypatch):
     finally:
         cli.click.echo = original_echo
     assert any(nl is False for _, nl in lines_seen), "verbose path should use nl=False"
+
+
+# ---------------------------------------------------------------------------
+# Machine contract: --json results, exit-code taxonomy, --quiet, stdin, never-hang (#50)
+# ---------------------------------------------------------------------------
+
+
+def _mc_env():
+    return {
+        "FRANKY_ALLOWED_REPOS": "me/repo",
+        "GH_TOKEN": "ghp_fake",
+        "OPENROUTER_API_KEY": "sk-or-fake",
+    }
+
+
+def _mc_setup(monkeypatch, env=None, container=(0, None)):
+    """Wire a hermetic build/iterate: env, images present, container mocked. container is
+    (code, output); output=None -> a default `opened {PR_URL}` body."""
+    env = dict(env) if env is not None else _mc_env()
+    env.setdefault("FRANKY_CONFIG_FILE", os.environ["FRANKY_CONFIG_FILE"])
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    code, output = container
+    if output is None:
+        output = f"opened {PR_URL}"
+    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: (code, output))
+
+
+def test_build_json_success_stdout_is_one_object(monkeypatch):
+    _mc_setup(monkeypatch)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo", "--json"])
+    assert res.exit_code == 0, res.output
+    # stdout must be EXACTLY one JSON object (no prose econ line, no bare URL).
+    data = json.loads(res.stdout)
+    assert data["status"] == "pr_opened"
+    assert data["exit_code"] == 0
+    assert data["pr_url"] == PR_URL
+    assert data["repo"] == "me/repo"
+    assert data["engine"] == "pi"
+    assert set(data["economics"]) == {"tokens_in", "tokens_out", "cost_usd", "duration_s"}
+    # stdout purity: exactly one line, parseable as one object.
+    assert len(res.stdout.strip().splitlines()) == 1
+    assert "economics -" not in res.stdout  # no prose econ leaked onto stdout
+
+
+def test_build_json_no_pr_exits_7(monkeypatch):
+    _mc_setup(monkeypatch, container=(0, "did stuff, no url"))
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo", "--json"])
+    assert res.exit_code == 7
+    data = json.loads(res.stdout)
+    assert data["status"] == "no_pr"
+    assert data["exit_code"] == 7
+    assert data["pr_url"] is None
+
+
+def test_build_json_agent_error_exits_7(monkeypatch):
+    _mc_setup(monkeypatch, container=(1, "boom"))
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo", "--json"])
+    assert res.exit_code == 7
+    data = json.loads(res.stdout)
+    assert data["status"] == "agent_error"
+    assert data["exit_code"] == 7
+
+
+def test_build_default_no_pr_now_exits_7(monkeypatch):
+    # Behavior change: a clean agent exit that produced no PR URL now exits 7 (was 0).
+    _mc_setup(monkeypatch, container=(0, "no url here"))
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo"])
+    assert res.exit_code == 7
+    assert "no PR URL" in res.output
+
+
+def test_build_json_config_error_exits_3(monkeypatch):
+    env = {"GH_TOKEN": "ghp_fake", "OPENROUTER_API_KEY": "sk-or-fake"}  # no allowlist
+    _mc_setup(monkeypatch, env=env)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo", "--json"])
+    assert res.exit_code == 3
+    data = json.loads(res.stdout)
+    assert data["error"]["code"] == 3
+    assert data["error"]["kind"] == "config_error"
+
+
+def test_build_json_allowlist_rejection_exits_4(monkeypatch):
+    _mc_setup(monkeypatch)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "stranger/repo", "--json"])
+    assert res.exit_code == 4
+    data = json.loads(res.stdout)
+    assert data["error"]["code"] == 4
+    assert data["error"]["kind"] == "task_rejected"
+
+
+def test_build_json_missing_creds_exits_5(monkeypatch):
+    env = {"FRANKY_ALLOWED_REPOS": "me/repo", "GH_TOKEN": "ghp_fake"}  # no provider key
+    env["FRANKY_CONFIG_FILE"] = os.environ["FRANKY_CONFIG_FILE"]
+    monkeypatch.setattr(cli.os, "environ", env)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo", "--json"])
+    assert res.exit_code == 5
+    data = json.loads(res.stdout)
+    assert data["error"]["code"] == 5
+    assert data["error"]["kind"] == "auth_error"
+    assert "ghp_fake" not in res.output  # never leak a secret
+
+
+def test_build_json_docker_unavailable_exits_6(monkeypatch):
+    env = {**_mc_env(), "FRANKY_CONFIG_FILE": os.environ["FRANKY_CONFIG_FILE"]}
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "ghcr.io/x/franky:0.1.0")
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (False, "no-docker"))
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo", "--json"])
+    assert res.exit_code == 6
+    data = json.loads(res.stdout)
+    assert data["error"]["code"] == 6
+    assert data["error"]["kind"] == "docker_error"
+
+
+def test_build_json_redacts_secret_inside_object(monkeypatch):
+    # The agent output carries the fake secret value AND the PR URL; the JSON must scrub it.
+    leaky = f"using sk-or-fake to open {PR_URL}"
+    _mc_setup(monkeypatch, container=(0, leaky))
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo", "--json"])
+    assert res.exit_code == 0, res.output
+    assert "sk-or-fake" not in res.stdout
+    assert "sk-or-fake" not in res.output
+    # The PR URL still parses out fine (only the secret was masked).
+    data = json.loads(res.stdout)
+    assert data["pr_url"] == PR_URL
+
+
+def test_build_default_stdout_purity_is_bare_pr_url(monkeypatch):
+    _mc_setup(monkeypatch)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo"])
+    assert res.exit_code == 0, res.output
+    # stdout is EXACTLY the PR URL + newline (the econ line goes to stderr).
+    assert res.stdout == PR_URL + "\n"
+
+
+def test_build_quiet_suppresses_update_hint_and_progress(monkeypatch):
+    called = {"update": False, "progress_passed": None}
+    monkeypatch.setattr(cli, "maybe_auto_update", lambda *a, **k: called.update(update=True))
+    env = {**_mc_env(), "FRANKY_CONFIG_FILE": os.environ["FRANKY_CONFIG_FILE"]}
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+
+    def fake_run(cfg, inner_argv, *a, **k):
+        called["progress_passed"] = k.get("progress")
+        return 0, f"opened {PR_URL}"
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo", "--quiet"])
+    assert res.exit_code == 0, res.output
+    assert called["update"] is False  # no update hint under --quiet
+    assert called["progress_passed"] is None  # no progress callback under --quiet
+
+
+def test_build_json_implies_quiet_no_update_hint(monkeypatch):
+    called = {"update": False}
+    monkeypatch.setattr(cli, "maybe_auto_update", lambda *a, **k: called.update(update=True))
+    _mc_setup(monkeypatch)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo", "--json"])
+    assert res.exit_code == 0, res.output
+    assert called["update"] is False  # --json implies --quiet
+
+
+def test_build_yes_approves_plan_first_non_interactive(monkeypatch):
+    # --yes auto-approves the gate with no TTY: both passes run, the PR is reported, exit 0.
+    env = {**_mc_env(), "FRANKY_CONFIG_FILE": os.environ["FRANKY_CONFIG_FILE"]}
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: False)
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+
+    outputs = ["PLAN: do the thing", f"opened {PR_URL}"]
+
+    def fake_run(*a, **k):
+        return 0, outputs.pop(0)
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(
+            cli.main, ["build", "do it", "--repo", "me/repo", "--plan-first", "--yes"]
+        )
+    assert res.exit_code == 0, res.output
+    assert not outputs  # both passes ran
+    assert PR_URL in res.output
+
+
+def test_build_stdin_task_input(monkeypatch):
+    # `build - --repo me/repo` reads the prose task from stdin (non-TTY) and reaches the PR.
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: False)
+    _mc_setup(monkeypatch)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "-", "--repo", "me/repo"], input="add a flag\n")
+    assert res.exit_code == 0, res.output
+    assert PR_URL in res.output
+
+
+def test_build_stdin_dash_interactive_fails_fast(monkeypatch):
+    # `build -` with an interactive TTY would block forever; fail fast (exit 2).
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)
+    _mc_setup(monkeypatch)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "-", "--repo", "me/repo"])
+    assert res.exit_code == 2
+
+
+def test_config_set_non_secret_non_interactive_no_hang(monkeypatch, tmp_path):
+    # `config set KEY` with no value and no TTY must fail fast (exit 2), not block on prompt.
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", str(tmp_path / "franky-config"))
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: False)
+    res = CliRunner().invoke(cli.main, ["config", "set", "FRANKY_ALLOWED_REPOS"])
+    assert res.exit_code == 2
+
+
+def test_config_init_non_interactive_no_hang(monkeypatch, tmp_path):
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", str(tmp_path / "franky-config"))
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: False)
+    res = CliRunner().invoke(cli.main, ["config", "init"])
+    assert res.exit_code == 2
+    assert "interactive" in res.output  # failed for the right reason, not an unrelated error
+
+
+def test_iterate_json_complete(monkeypatch):
+    agent_output = json.dumps({"type": "result", "usage": {"input_tokens": 8, "output_tokens": 4}})
+    env = {**_iterate_env(), "FRANKY_CONFIG_FILE": os.environ["FRANKY_CONFIG_FILE"]}
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: (0, agent_output))
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["iterate", PR_URL, "--json"])
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.stdout)
+    assert data["status"] == "iterate_complete"
+    assert data["pr_url"] == PR_URL
+    assert data["branch"] is None
+    assert len(res.stdout.strip().splitlines()) == 1
+
+
+def test_iterate_json_agent_error_exits_7(monkeypatch):
+    env = {**_iterate_env(), "FRANKY_CONFIG_FILE": os.environ["FRANKY_CONFIG_FILE"]}
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: (1, "boom"))
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["iterate", PR_URL, "--json"])
+    assert res.exit_code == 7
+    data = json.loads(res.stdout)
+    assert data["status"] == "agent_error"
+    assert data["exit_code"] == 7
+
+
+def test_iterate_json_error_object_off_allowlist(monkeypatch):
+    # A pre-container failure under --json must emit the {"error": {...}} object (not prose)
+    # on stdout and exit with that code. Off-allowlist PR URL -> task rejection, exit 4.
+    env = {**_iterate_env(), "FRANKY_CONFIG_FILE": os.environ["FRANKY_CONFIG_FILE"]}
+    monkeypatch.setattr(cli.os, "environ", env)
+    ran = {"container": False}
+    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: ran.update(container=True))
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["iterate", "https://github.com/other/repo/pull/9", "--json"])
+    assert res.exit_code == 4
+    data = json.loads(res.stdout)
+    assert data["error"]["code"] == 4
+    assert data["error"]["kind"] == "task_rejected"
+    assert len(res.stdout.strip().splitlines()) == 1  # exactly one JSON object on stdout
+    assert ran["container"] is False
