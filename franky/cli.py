@@ -32,6 +32,7 @@ from .container import (
 )
 from .engine import ENGINES, PI_PROVIDER_VARS, resolve_engine
 from .jira import JIRA_API_TOKEN_VAR, JIRA_EMAIL_VAR, fetch_jira_issue
+from .profile import build_bundle, load_profile, profile_path
 from .prompt import build_iterate_prompt, build_plan_prompt, build_prompt
 from .task import PROSE_MAX_CHARS, parse_pr_task, parse_task
 from .update_check import force_update, maybe_auto_update
@@ -75,8 +76,20 @@ def main() -> None:
     is_flag=True,
     help="Run a read-only planning pass first, show the plan, and execute only after approval.",
 )
+@click.option(
+    "--profile",
+    "profile_path_opt",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False),
+    help="Path to a profile.toml to inject skills/instructions/knowledge into the container. "
+    "Auto-discovered from ~/.franky/profile.toml if present.",
+)
 def build(
-    task_input: tuple[str, ...], repo: str | None, engine: str | None, plan_first: bool
+    task_input: tuple[str, ...],
+    repo: str | None,
+    engine: str | None,
+    plan_first: bool,
+    profile_path_opt: str | None,
 ) -> None:
     """Build TASK_INPUT (a GitHub issue URL, a JIRA key, or a prose request) and open a PR.
 
@@ -123,11 +136,17 @@ def build(
     secrets = cfg.secret_values()
     franky_img, proxy_img = _ensure_images(os.environ)
 
+    # Build the profile bundle (optional). Auto-discovers ~/.franky/profile.toml unless
+    # overridden by --profile or FRANKY_PROFILE_PATH. Fails closed on detected credentials.
+    bundle = _load_profile_bundle(profile_path_opt, os.environ, secrets)
+
     if plan_first:
         # PHASE 1: planning pass. Show the plan, then gate on explicit approval. A plan that
         # errored is not a plan to approve, so abort before the gate. No economics on this
         # pass - economics is build-pass only.
-        code, output, _plan_dur = _run_pass(cfg, build_plan_prompt(spec), franky_img, proxy_img)
+        code, output, _plan_dur = _run_pass(
+            cfg, build_plan_prompt(spec), franky_img, proxy_img, bundle
+        )
         _write_log(output, secrets)
         click.echo("franky: --- plan (read-only, nothing written yet) ---", err=True)
         click.echo(output)
@@ -141,7 +160,7 @@ def build(
             return
 
     # PHASE 2 (or the only phase without --plan-first): build it and open the PR.
-    code, output, duration = _run_pass(cfg, build_prompt(spec), franky_img, proxy_img)
+    code, output, duration = _run_pass(cfg, build_prompt(spec), franky_img, proxy_img, bundle)
 
     # Emit economics before the PR-URL echo and before any ClickException so the summary is
     # always shown (even when the agent exits non-zero).
@@ -205,7 +224,10 @@ def iterate(pr_url: str, engine: str | None) -> None:
     secrets = cfg.secret_values()
     franky_img, proxy_img = _ensure_images(os.environ)
 
-    code, output, duration = _run_pass(cfg, build_iterate_prompt(spec), franky_img, proxy_img)
+    bundle = _load_profile_bundle(None, os.environ, secrets)
+    code, output, duration = _run_pass(
+        cfg, build_iterate_prompt(spec), franky_img, proxy_img, bundle
+    )
 
     # Economics first (same as build) so spend is visible even when the agent exits non-zero.
     econ = _economics_line(output, duration, secrets)
@@ -258,7 +280,13 @@ def _ensure_images(env: Mapping[str, str]) -> tuple[str, str]:
     return franky_img, proxy_img
 
 
-def _run_pass(cfg, prompt: str, franky_img: str, proxy_img: str) -> tuple[int, str, float]:
+def _run_pass(
+    cfg,
+    prompt: str,
+    franky_img: str,
+    proxy_img: str,
+    profile_bundle: str | None = None,
+) -> tuple[int, str, float]:
     """Run one container pass for `prompt` and return (exit_code, output, duration_secs).
 
     Duration is measured with time.monotonic() around run_in_container only. Logging and the
@@ -267,9 +295,46 @@ def _run_pass(cfg, prompt: str, franky_img: str, proxy_img: str) -> tuple[int, s
     """
     inner_argv = cfg.engine.inner_argv(prompt, model=None)
     t0 = time.monotonic()
-    code, output = run_in_container(cfg, inner_argv, image=franky_img, proxy_image=proxy_img)
+    code, output = run_in_container(
+        cfg, inner_argv, image=franky_img, proxy_image=proxy_img, profile_bundle=profile_bundle
+    )
     duration = time.monotonic() - t0
     return code, output, duration
+
+
+def _load_profile_bundle(
+    profile_path_opt: str | None,
+    env: dict,
+    secrets: list[str],
+) -> str | None:
+    """Load, scan, and pack the operator profile bundle; return None if no profile is found.
+
+    Resolution order: --profile flag path > FRANKY_PROFILE_PATH env var > auto-discovered
+    ~/.franky/profile.toml.  Fails closed (ClickException) on a detected credential.
+    An absent or empty profile is not an error; the caller treats None as "no bundle".
+    """
+    from pathlib import Path
+
+    if profile_path_opt:
+        ppath = Path(profile_path_opt)
+    else:
+        ppath = profile_path(env)
+
+    if ppath is None:
+        return None
+
+    try:
+        spec = load_profile(ppath)
+    except ValueError as exc:
+        raise click.ClickException(redact(str(exc), secrets)) from exc
+
+    if not spec.all_files():
+        return None
+
+    try:
+        return build_bundle(spec)
+    except ValueError as exc:
+        raise click.ClickException(redact(str(exc), secrets)) from exc
 
 
 def _economics_line(output: str, duration: float, secrets: list[str]) -> str:

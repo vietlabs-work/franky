@@ -25,6 +25,7 @@ import uuid
 
 from . import egress, franky_version
 from .config import redact
+from .profile import PROFILE_BUNDLE_VAR
 
 # Long agent runs: a full clone-build-test-PR cycle can take many minutes. 30 min cap.
 FALLBACK_TIMEOUT_SECS = 1800
@@ -147,6 +148,7 @@ def build_docker_argv(
     name: str | None = None,
     network: str | None = None,
     proxy_url: str | None = None,
+    profile_bundle: str | None = None,
 ) -> list[str]:
     """Build the full `docker run` argv. Pure - no docker invoked.
 
@@ -160,6 +162,13 @@ def build_docker_argv(
     `--dns 127.0.0.1`: the container's own DNS is dead, so a hostile agent cannot DNS-exfil
     or resolve an off-allowlist host directly; proxied clients still work because Squid does
     the DNS resolution on their behalf. Existing call sites pass neither and are unchanged.
+
+    When `profile_bundle` is given (a base64-encoded gzip tar of curated prose files), it
+    is passed BY VALUE as FRANKY_PROFILE_BUNDLE.  This is correct and does not weaken the
+    secret-by-name discipline: the bundle is NOT a credential - it is curated, secret-scrubbed
+    operator content (Tier-1: static markdown/text only).  The entrypoint decodes and extracts
+    it into HOME before exec-ing the engine.  No bind mount is added; the hardening flags are
+    unchanged.
     """
     container_name = name or f"franky-run-{uuid.uuid4().hex[:12]}"
     argv = ["docker", "run", *_HARDENING, "--name", container_name]
@@ -185,6 +194,11 @@ def build_docker_argv(
             "--dns",
             "127.0.0.1",
         ]
+    if profile_bundle:
+        # By-value (non-secret): curated prose, already secret-scrubbed on the host.
+        # The entrypoint unpacks this before exec-ing the engine; see profile.py and
+        # franky-dind-entrypoint.sh.
+        argv += ["-e", f"{PROFILE_BUNDLE_VAR}={profile_bundle}"]
     for key in passthrough_env:
         argv += ["-e", key]
     argv += [image, *inner_argv]
@@ -301,6 +315,7 @@ def run_in_container(
     env: dict[str, str] | None = None,
     sleeper=time.sleep,
     proxy_image: str = PROXY_IMAGE,
+    profile_bundle: str | None = None,
 ) -> tuple[int, str]:
     """Run the inner engine in a hardened, egress-controlled container; return
     (returncode, redacted_output).
@@ -366,6 +381,7 @@ def run_in_container(
             name=task,
             network=net,
             proxy_url=proxy_url(proxy),
+            profile_bundle=profile_bundle,
         )
         try:
             proc = runner(
