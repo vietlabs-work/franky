@@ -58,4 +58,16 @@ if [ "${ready}" != 1 ]; then
          "build/test steps will fail (see /tmp/dockerd.log inside the container)." >&2
 fi
 
+# Unpack operator profile bundle (skills/instructions/knowledge) into HOME if provided.
+# The bundle is a gzip-compressed tar of curated, secret-scrubbed prose files packed
+# with paths relative to HOME.  It is extracted here - before exec-ing the engine - so
+# the in-container agent finds the operator's skills/instructions as it would locally.
+# The var is unset after extraction so it does not leak into the agent environment.
+# WHY safe: the bundle is assembled host-side from an explicit allowlist and refused
+# (fail-closed) by the host if any credential pattern is detected (see franky/profile.py).
+if [ -n "${FRANKY_PROFILE_BUNDLE:-}" ]; then
+    printf '%s' "${FRANKY_PROFILE_BUNDLE}" | base64 -d | tar -xz -C "${HOME}"
+    unset FRANKY_PROFILE_BUNDLE
+fi
+
 exec "$@"

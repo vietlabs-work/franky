@@ -83,6 +83,7 @@ _NON_SECRET_SETTABLE_KEYS: frozenset[str] = frozenset(
         "FRANKY_GHCR_REPO",
         "FRANKY_NO_UPDATE_CHECK",
         "FRANKY_AUTO_UPDATE",
+        "FRANKY_PROFILE_PATH",
     }
 )
 

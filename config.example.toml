@@ -67,6 +67,16 @@ OPENROUTER_API_KEY = "sk-or-your_key_here"
 # JIRA_EMAIL = "you@your-org.com"
 # JIRA_API_TOKEN = "your_jira_api_token_here"
 
+# --- Operator profile (OPTIONAL) -----------------------------------------------
+# Path to a profile.toml that lists skills/instructions/knowledge files to inject
+# into the container so the in-container agent sees your curated expertise.
+# Auto-discovered from ~/.franky/profile.toml when that file exists.
+# Override only if the profile lives elsewhere.
+# Files are secret-scanned before injection; the run is refused (fail-closed) if
+# any credential pattern is detected in a listed file.
+# Tier-1 only: static prose (markdown, text). No MCP config, no secret-bearing files.
+# FRANKY_PROFILE_PATH = "~/.franky/profile.toml"
+
 # --- Image overrides (dev only) -----------------------------------------------
 # FRANKY_IMAGE = "franky"
 # FRANKY_PROXY_IMAGE = "franky-proxy"

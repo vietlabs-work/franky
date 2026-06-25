@@ -16,6 +16,7 @@ from franky.container import (
     run_in_container,
 )
 from franky.engine import PiEngine
+from franky.profile import PROFILE_BUNDLE_VAR
 
 SECRET = "sk-or-very-secret-9999"
 PR_URL = "https://github.com/me/repo/pull/3"
@@ -549,3 +550,61 @@ def test_run_in_container_threads_proxy_image():
     )
     assert len(proxy_run_calls) == 1
     assert "my-proxy:1.0" in proxy_run_calls[0]
+
+
+# ---------------------------------------------------------------------------
+# profile bundle injection
+# ---------------------------------------------------------------------------
+
+
+def test_build_docker_argv_profile_bundle_injected_by_value():
+    bundle = "SGVsbG8gV29ybGQ="  # base64("Hello World")
+    argv = build_docker_argv("franky", {"GH_TOKEN": "x"}, ["pi"], profile_bundle=bundle)
+    assert f"{PROFILE_BUNDLE_VAR}={bundle}" in argv
+
+
+def test_build_docker_argv_no_profile_bundle_when_none():
+    argv = build_docker_argv("franky", {"GH_TOKEN": "x"}, ["pi"])
+    assert PROFILE_BUNDLE_VAR not in " ".join(argv)
+
+
+def test_build_docker_argv_profile_bundle_before_passthrough_env():
+    """Profile bundle must appear before the passthrough name-only -e flags."""
+    bundle = "SGVsbG8="
+    argv = build_docker_argv(
+        "franky", {"GH_TOKEN": "x", "OPENROUTER_API_KEY": "y"}, ["pi"], profile_bundle=bundle
+    )
+    bundle_idx = argv.index(f"{PROFILE_BUNDLE_VAR}={bundle}")
+    # Name-only -e flags come after the by-value bundle
+    name_only_idxs = [i for i, a in enumerate(argv) if a in ("GH_TOKEN", "OPENROUTER_API_KEY")]
+    assert name_only_idxs, "passthrough env not found"
+    assert all(bundle_idx < idx for idx in name_only_idxs)
+
+
+def test_run_in_container_threads_profile_bundle():
+    """run_in_container forwards profile_bundle to build_docker_argv."""
+    captured = {}
+
+    def task(argv, **kwargs):
+        captured["argv"] = argv
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    runner, _ = _orchestration_runner(task)
+    bundle = "dGVzdA=="
+    run_in_container(
+        _cfg(), ["pi"], runner=runner, env={}, sleeper=NOOP_SLEEP, profile_bundle=bundle
+    )
+    assert f"{PROFILE_BUNDLE_VAR}={bundle}" in captured["argv"]
+
+
+def test_run_in_container_no_bundle_by_default():
+    """Without profile_bundle, FRANKY_PROFILE_BUNDLE must not appear in the task argv."""
+    captured = {}
+
+    def task(argv, **kwargs):
+        captured["argv"] = argv
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    runner, _ = _orchestration_runner(task)
+    run_in_container(_cfg(), ["pi"], runner=runner, env={}, sleeper=NOOP_SLEEP)
+    assert PROFILE_BUNDLE_VAR not in " ".join(captured["argv"])
