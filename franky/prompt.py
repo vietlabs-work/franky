@@ -19,18 +19,46 @@ def load_persona() -> str:
     return _PERSONA_PATH.read_text(encoding="utf-8").strip()
 
 
-def _slug_hint(spec: TaskSpec) -> str:
-    """A short hint the agent turns into the branch slug. Kept loose on purpose - the agent
-    derives the real slug; we only anchor the `franky/` prefix and give it source material.
-    Non-alphanumerics (incl. the `/` in owner/repo) split into separate words so an issue
-    task hints from the repo name rather than collapsing to the empty default.
+def task_slug(spec: TaskSpec) -> str:
+    """A DETERMINISTIC, task-distinguishing slug for the `franky/<slug>` branch name.
 
-    issue -> slug from repo name (owner/repo has no useful text).
-    prose/jira -> slug from text (jira text begins "[FOO-123] ..." -> readable slug).
+    WHY deterministic: the host computes this BEFORE the run so the idempotency pre-check can
+    look up an open PR on exactly the branch the agent will push (issue #50 retry-safety). A
+    loose hint the agent reinterprets would break that lookup, so the prompt now PINS this slug
+    rather than handing the agent latitude.
+
+    Computed on the spec as it stands at parse_task return time (issue text = the URL; jira text
+    = the bare KEY like "FOO-123"; prose text = the prose - the JIRA body has not been fetched in
+    yet, and that is fine, the slug keys on the stable identifier):
+
+    - issue -> "issue-<n>" from the URL's issue number; falls back to the old repo-token
+      tokenization if no number matches (a directly-built spec with unparseable text).
+    - jira  -> the bare key lowercased (e.g. "foo-123"). spec.text IS the key here.
+    - prose -> up to 5 leading tokens of the prose, or "task" if empty.
+
+    Free-text-derived slugs (prose, the issue repo-fallback, a jira key) are length-bounded:
+    a degenerate input (e.g. one 4000-char no-separator prose token) would otherwise yield an
+    unrealizable git ref the agent cannot create, silently diverging from the host-predicted
+    branch and defeating the idempotency lookup on the next retry.
     """
-    basis = spec.repo if spec.source == "issue" else spec.text
-    words = [w for w in re.split(r"[^a-z0-9]+", basis.lower()) if w][:5]
-    return "-".join(words) or "task"
+    if spec.source == "issue":
+        m = GH_ISSUE_RE.search(spec.text)
+        if m:
+            return f"issue-{m.group('number')}"
+        words = [w for w in re.split(r"[^a-z0-9]+", spec.repo.lower()) if w][:5]
+        return _bound_slug("-".join(words))
+    if spec.source == "jira":
+        return _bound_slug(spec.text.lower())
+    words = [w for w in re.split(r"[^a-z0-9]+", spec.text.lower()) if w][:5]
+    return _bound_slug("-".join(words))
+
+
+_SLUG_MAX_CHARS = 60
+
+
+def _bound_slug(slug: str) -> str:
+    """Trim a free-text slug to a realizable git-ref length, or "task" if empty."""
+    return slug[:_SLUG_MAX_CHARS].rstrip("-") or "task"
 
 
 def _task_block(spec: TaskSpec, *, plan: bool) -> tuple[str, str]:
@@ -71,15 +99,22 @@ def _task_block(spec: TaskSpec, *, plan: bool) -> tuple[str, str]:
     return task_block, close_line
 
 
-def build_prompt(spec: TaskSpec) -> str:
+def build_prompt(spec: TaskSpec, *, branch: str | None = None) -> str:
+    """Compose the build prompt, pinning the branch the agent must use.
+
+    `branch` is the host-computed branch name (`franky/<slug>`). The CLI passes it so the
+    branch the agent pushes matches the one the idempotency pre-check looked up (issue #50);
+    when omitted (standalone callers / tests) it is computed here from `task_slug`. Either way
+    the prompt pins EXACTLY this branch - the agent is given no slug latitude.
+    """
     persona = load_persona()
 
     task_block, close_line = _task_block(spec, plan=False)
+    branch = branch or f"franky/{task_slug(spec)}"
 
     conventions = (
         "Conventions (follow exactly):\n"
-        f"- Clone {spec.repo} and work on a new branch named `franky/{_slug_hint(spec)}` "
-        "(the `franky/` prefix is required; pick a short descriptive slug after it).\n"
+        f"- Clone {spec.repo} and work on a new branch named exactly `{branch}`.\n"
         "- Run the repo's tests and make them pass BEFORE opening the PR. Do not open a PR on red tests.\n"
         "- Use conventional-commit messages: `<type>: <summary>` (e.g. `feat:`, `fix:`, `chore:`).\n"
         "- PR title uses the same conventional format: `<type>: <summary>`.\n"

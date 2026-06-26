@@ -1,4 +1,10 @@
-from franky.prompt import build_iterate_prompt, build_plan_prompt, build_prompt, load_persona
+from franky.prompt import (
+    build_iterate_prompt,
+    build_plan_prompt,
+    build_prompt,
+    load_persona,
+    task_slug,
+)
 from franky.task import TaskSpec
 
 
@@ -58,14 +64,30 @@ def test_build_prompt_issue_without_parseable_url_degrades_gracefully():
     assert "Closes #" not in p
 
 
-def test_issue_branch_hint_uses_repo_name_not_empty_default():
-    # Regression: owner/repo has a slash, so a naive isalnum() filter collapsed every
-    # issue branch hint to `franky/task`. The hint must reflect the repo.
+def test_issue_branch_slug_uses_issue_number():
+    # The branch slug is now deterministic and task-distinguishing: an issue keys on its
+    # number (`issue-42`) so a retry resolves to the same branch for the idempotency check.
     spec = TaskSpec(
         repo="octocat/hello", text="https://github.com/octocat/hello/issues/42", source="issue"
     )
     p = build_prompt(spec)
-    assert "franky/octocat-hello" in p
+    assert "franky/issue-42" in p
+
+
+def test_issue_slug_without_parseable_number_falls_back_to_repo_tokens():
+    # A directly-built issue spec whose text has no issue number degrades to the old
+    # repo-token tokenization rather than crashing.
+    spec = TaskSpec(repo="octocat/hello", text="not-a-url", source="issue")
+    assert task_slug(spec) == "octocat-hello"
+
+
+def test_build_prompt_pins_explicit_branch_and_drops_slug_latitude():
+    # When the CLI passes a branch, the prompt pins EXACTLY it (host-predicted == prompt-pinned
+    # for the idempotency contract) and no longer hands the agent slug latitude.
+    spec = TaskSpec(repo="me/repo", text="add a --json flag", source="prose")
+    p = build_prompt(spec, branch="franky/x")
+    assert "named exactly `franky/x`" in p
+    assert "pick a short descriptive slug" not in p
 
 
 # ---------------------------------------------------------------------------
@@ -123,12 +145,13 @@ def test_build_prompt_jira_label_says_from_jira():
     assert "JIRA" in p
 
 
-def test_build_prompt_jira_slug_uses_text():
-    # JIRA text starts with "[FOO-123] ..." so the slug should include those tokens.
-    spec = TaskSpec(repo="me/repo", text="[FOO-123] fix the thing", source="jira")
+def test_build_prompt_jira_slug_uses_bare_key():
+    # At parse_task return time a jira spec.text IS the bare key (e.g. "FOO-123"); the slug is
+    # that key lowercased, so the predicted branch is deterministic for the idempotency check.
+    spec = TaskSpec(repo="me/repo", text="FOO-123", source="jira")
+    assert task_slug(spec) == "foo-123"
     p = build_prompt(spec)
-    # The slug is derived from the text, not the repo name.
-    assert "franky/foo" in p.lower() or "franky/fix" in p.lower()
+    assert "franky/foo-123" in p
 
 
 # ---------------------------------------------------------------------------

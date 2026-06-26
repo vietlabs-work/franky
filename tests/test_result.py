@@ -1,14 +1,17 @@
 """Unit tests for the pure machine-contract module (franky/result.py)."""
 
+from franky import result as result_mod
 from franky.economics import Usage
 from franky.result import (
     EXIT_AGENT,
     EXIT_AUTH,
+    EXIT_CODES,
     EXIT_CONFIG,
     EXIT_DOCKER,
     EXIT_NETWORK,
     EXIT_SUCCESS,
     EXIT_TASK_REJECTED,
+    EXIT_TIMEOUT,
     EXIT_USAGE,
     AuthError,
     ConfigError,
@@ -31,6 +34,19 @@ def test_exit_code_values_are_stable():
     assert EXIT_DOCKER == 6
     assert EXIT_AGENT == 7
     assert EXIT_NETWORK == 8
+    assert EXIT_TIMEOUT == 9
+
+
+def test_exit_codes_map_covers_every_exit_constant():
+    # EXIT_CODES is the single source of truth for exit-code docs; every EXIT_* constant must
+    # have a string meaning (discovered via reflection so a new code can't slip through).
+    exit_values = [
+        v for k, v in vars(result_mod).items() if k.startswith("EXIT_") and k != "EXIT_CODES"
+    ]
+    for code in exit_values:
+        assert isinstance(code, int)
+        assert code in EXIT_CODES
+        assert isinstance(EXIT_CODES[code], str) and EXIT_CODES[code]
 
 
 def test_franky_error_is_value_error():

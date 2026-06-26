@@ -25,3 +25,16 @@ def _hermetic_config_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     """
     fake_path = tmp_path / "test-franky-config"
     monkeypatch.setenv("FRANKY_CONFIG_FILE", str(fake_path))
+
+
+@pytest.fixture(autouse=True)
+def _no_idempotency_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub the idempotency pre-check to "no open PR" for every test (no real network).
+
+    `franky build` calls find_open_pr (issue #50) against the GitHub REST API. Default it to
+    None so the existing build tests never hit the network and proceed to the container path;
+    tests that exercise the already_open short-circuit override this symbol explicitly.
+    """
+    import franky.cli as cli
+
+    monkeypatch.setattr(cli, "find_open_pr", lambda *a, **k: None)

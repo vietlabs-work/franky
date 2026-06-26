@@ -30,6 +30,21 @@ EXIT_AUTH = 5  # auth/creds missing (GH_TOKEN, engine creds, JIRA creds, JIRA 40
 EXIT_DOCKER = 6  # docker / image unavailable
 EXIT_AGENT = 7  # agent ran but exited nonzero / produced no PR
 EXIT_NETWORK = 8  # network/timeout (JIRA reach/HTTP/parse)
+EXIT_TIMEOUT = 9  # run exceeded --max-duration; distinct from 8 network/JIRA-timeout
+
+# Single source of truth for exit-code docs (consumed by `franky schema` -> exit_codes). Every
+# EXIT_* constant above MUST have an entry here (a test enforces this via reflection).
+EXIT_CODES: dict[int, str] = {
+    EXIT_SUCCESS: "success",
+    EXIT_USAGE: "usage/flag error, or interactive input required in a non-TTY (never-hang)",
+    EXIT_CONFIG: "bad config file, allowlist unset/empty/malformed, or unknown engine",
+    EXIT_TASK_REJECTED: "task rejected: off-allowlist repo, missing --repo, or bad URL/key",
+    EXIT_AUTH: "missing creds (GH_TOKEN, engine creds, JIRA creds) or JIRA 401/403",
+    EXIT_DOCKER: "docker or image unavailable",
+    EXIT_AGENT: "agent ran but exited nonzero or produced no PR",
+    EXIT_NETWORK: "network/timeout reaching JIRA, HTTP error, or unparseable response",
+    EXIT_TIMEOUT: "run exceeded --max-duration (the container was killed)",
+}
 
 
 class FrankyError(ValueError):
@@ -104,9 +119,14 @@ def build_result(
 ) -> dict:
     """Shape the success/agent-result object emitted on stdout under `--json`.
 
-    Pure dict shaping only - the caller redacts the serialized string. `branch` is reserved
-    (always null this version; not reliably derivable host-side). `usage` is an
+    Pure dict shaping only - the caller redacts the serialized string. `branch` is the
+    PREDICTED branch name (`franky/<slug>`) the host computed before the run; it MAY differ
+    from the branch the agent actually created (the agent is autonomous), so treat it as a
+    hint, not a guarantee. `iterate` passes null (no host-predicted branch). `usage` is an
     economics.Usage (input_tokens/output_tokens/cost_usd, each int|None / float|None).
+
+    For the `already_open` status (idempotency short-circuit, no container ran) the caller
+    passes the sentinels `duration=0.0` and `log_path=""` - there is no run to time or log.
     """
     return {
         "status": status,

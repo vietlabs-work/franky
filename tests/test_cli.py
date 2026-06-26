@@ -378,6 +378,33 @@ def test_build_plan_first_planning_failure_aborts_before_gate(monkeypatch):
     assert "planning pass" in res.output
 
 
+def test_build_plan_first_timeout_maps_to_exit_9(monkeypatch):
+    # A timed-out planning pass (124 sentinel) maps to the dedicated timeout contract
+    # (EXIT_TIMEOUT=9), not the generic agent_error (7), and never reaches the build pass.
+    monkeypatch.setattr(cli.os, "environ", _plan_first_env())
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+
+    calls = {"n": 0}
+
+    def fake_run(*a, **k):
+        calls["n"] += 1
+        return cli.CONTAINER_TIMEOUT_CODE, "franky: container timed out after 1s"
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(
+            cli.main,
+            ["build", "do it", "--repo", "me/repo", "--plan-first", "--max-duration", "1"],
+            input="y\n",
+        )
+    assert res.exit_code == 9
+    assert calls["n"] == 1  # never reached the build pass
+
+
 def test_build_off_allowlist_clean_error(monkeypatch):
     env = {
         "FRANKY_ALLOWED_REPOS": "me/repo",
@@ -1628,3 +1655,185 @@ def test_config_init_profile_prompt_yes_writes_both(tmp_path, monkeypatch):
     assert res.exit_code == 0, res.output
     assert read_config_file(cfg_path)["FRANKY_ENGINE"] == "pi"
     assert read_profile_raw(prof_path)["skills"] == ["~/.claude/skills/*.md"]
+
+
+# ---------------------------------------------------------------------------
+# --max-duration timeout (issue #50): a timed-out run maps to status=timeout, exit 9
+# ---------------------------------------------------------------------------
+
+
+def test_build_max_duration_help_shown():
+    res = CliRunner().invoke(cli.main, ["build", "--help"])
+    assert res.exit_code == 0
+    assert "--max-duration" in res.output
+
+
+def test_build_timeout_maps_to_status_timeout_exit_9(monkeypatch):
+    # The container returns the 124 sentinel; build must map it to status=timeout / exit 9,
+    # distinct from the generic agent_error (7).
+    monkeypatch.setattr(cli.os, "environ", _build_env())
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    monkeypatch.setattr(
+        cli, "run_in_container", lambda *a, **k: (124, "franky: container timed out after 1s")
+    )
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(
+            cli.main, ["build", "do it", "--repo", "me/repo", "--max-duration", "1", "--json"]
+        )
+    assert res.exit_code == 9, res.output
+    data = json.loads(res.output)
+    assert data["status"] == "timeout"
+    assert data["exit_code"] == 9
+
+
+def test_build_max_duration_threaded_to_container(monkeypatch):
+    monkeypatch.setattr(cli.os, "environ", _build_env())
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    seen = {}
+
+    def fake_run(cfg, inner_argv, *a, **k):
+        seen["timeout"] = k.get("timeout")
+        return 0, f"opened {PR_URL}"
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(
+            cli.main, ["build", "do it", "--repo", "me/repo", "--max-duration", "42"]
+        )
+    assert res.exit_code == 0, res.output
+    assert seen["timeout"] == 42
+
+
+def test_build_without_max_duration_uses_container_default(monkeypatch):
+    # No --max-duration -> the timeout kwarg is NOT forwarded (run_in_container keeps its own
+    # default), so the fake sees no override.
+    monkeypatch.setattr(cli.os, "environ", _build_env())
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    seen = {}
+
+    def fake_run(cfg, inner_argv, *a, **k):
+        seen["has_timeout"] = "timeout" in k
+        return 0, f"opened {PR_URL}"
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo"])
+    assert res.exit_code == 0, res.output
+    assert seen["has_timeout"] is False
+
+
+def test_iterate_timeout_maps_to_status_timeout_exit_9(monkeypatch):
+    monkeypatch.setattr(cli.os, "environ", _iterate_env())
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    monkeypatch.setattr(
+        cli, "run_in_container", lambda *a, **k: (124, "franky: container timed out after 1s")
+    )
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["iterate", PR_URL, "--max-duration", "1", "--json"])
+    assert res.exit_code == 9, res.output
+    data = json.loads(res.output)
+    assert data["status"] == "timeout"
+
+
+# ---------------------------------------------------------------------------
+# schema command (issue #50)
+# ---------------------------------------------------------------------------
+
+
+def test_schema_command_emits_json():
+    res = CliRunner().invoke(cli.main, ["schema"])
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.output)
+    assert "commands" in data
+    assert "exit_codes" in data
+
+
+# ---------------------------------------------------------------------------
+# idempotency pre-check (issue #50): already_open short-circuit + --force bypass
+# ---------------------------------------------------------------------------
+
+
+def test_build_already_open_short_circuits(monkeypatch):
+    # A Franky PR already open on the predicted branch -> report it, exit 0, NO container run.
+    existing = "https://github.com/me/repo/pull/99"
+    monkeypatch.setattr(cli.os, "environ", _build_env())
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    monkeypatch.setattr(cli, "find_open_pr", lambda *a, **k: existing)
+
+    ran = {"container": False}
+    monkeypatch.setattr(
+        cli, "run_in_container", lambda *a, **k: ran.update(container=True) or (0, "")
+    )
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo"])
+    assert res.exit_code == 0, res.output
+    assert existing in res.output  # the existing PR URL is echoed on stdout
+    assert ran["container"] is False  # no build launched
+
+
+def test_build_already_open_json_carries_url(monkeypatch):
+    existing = "https://github.com/me/repo/pull/99"
+    monkeypatch.setattr(cli.os, "environ", _build_env())
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    monkeypatch.setattr(cli, "find_open_pr", lambda *a, **k: existing)
+    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: (0, ""))
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo", "--json"])
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.output)
+    assert data["status"] == "already_open"
+    assert data["pr_url"] == existing
+    assert data["branch"]  # the predicted branch is populated
+
+
+def test_build_force_bypasses_idempotency_check(monkeypatch):
+    # --force must skip find_open_pr entirely and run the build even if a PR is "open".
+    monkeypatch.setattr(cli.os, "environ", _build_env())
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+
+    checked = {"n": 0}
+
+    def boom(*a, **k):
+        checked["n"] += 1
+        return "https://github.com/me/repo/pull/99"
+
+    monkeypatch.setattr(cli, "find_open_pr", boom)
+    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: (0, f"opened {PR_URL}"))
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo", "--force"])
+    assert res.exit_code == 0, res.output
+    assert PR_URL in res.output  # the build ran normally
+    assert checked["n"] == 0  # the idempotency check was never consulted
+
+
+def test_build_normal_result_populates_predicted_branch(monkeypatch):
+    monkeypatch.setattr(cli.os, "environ", _build_env())
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: (0, f"opened {PR_URL}"))
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo", "--json"])
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.output)
+    assert data["branch"] == "franky/do-it"
