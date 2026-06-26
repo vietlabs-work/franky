@@ -17,6 +17,8 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping
 
+from .result import AuthError, NetworkError
+
 JIRA_BASE_URL_VAR = "JIRA_BASE_URL"
 JIRA_EMAIL_VAR = "JIRA_EMAIL"
 JIRA_API_TOKEN_VAR = "JIRA_API_TOKEN"
@@ -102,14 +104,14 @@ def fetch_jira_issue(
         if not val
     ]
     if missing:
-        raise ValueError(f"missing JIRA creds: {', '.join(missing)}")
+        raise AuthError(f"missing JIRA creds: {', '.join(missing)}")
 
     # SSRF guard (fail-closed): only https:// with a real netloc is accepted.
     # Without this, Basic-auth creds could travel over cleartext http or a
     # non-http scheme (file://, ftp://, etc.).
     parsed = urllib.parse.urlparse(base)
     if parsed.scheme != "https" or not parsed.netloc:
-        raise ValueError(
+        raise NetworkError(
             f"{JIRA_BASE_URL_VAR} must be an https:// URL (got scheme={parsed.scheme!r})"
         )
 
@@ -140,26 +142,26 @@ def fetch_jira_issue(
     except urllib.error.HTTPError as exc:
         code = exc.code
         if code == 404:
-            raise ValueError(f"JIRA issue {key} not found") from exc
+            raise NetworkError(f"JIRA issue {key} not found") from exc
         if code in (401, 403):
-            raise ValueError(
+            raise AuthError(
                 f"JIRA auth failed (HTTP {code}) - check {JIRA_EMAIL_VAR} / {JIRA_API_TOKEN_VAR}"
             ) from exc
-        raise ValueError(f"JIRA fetch failed (HTTP {code}) for {key}") from exc
+        raise NetworkError(f"JIRA fetch failed (HTTP {code}) for {key}") from exc
     except (urllib.error.URLError, OSError, TimeoutError) as exc:
-        raise ValueError(f"could not reach JIRA at {host} ({exc})") from exc
+        raise NetworkError(f"could not reach JIRA at {host} ({exc})") from exc
 
     try:
         data = json.loads(raw)
     except ValueError as exc:
-        raise ValueError(f"JIRA returned unparseable JSON for {key}") from exc
+        raise NetworkError(f"JIRA returned unparseable JSON for {key}") from exc
 
     # A valid-JSON response can still lack the expected shape (a restricted issue, an API
     # change). Guard so it surfaces as a ValueError (clean ClickException) rather than a
     # KeyError/TypeError traceback - KeyError/TypeError are not caught by the CLI's handler.
     fields = data.get("fields") if isinstance(data, dict) else None
     if not isinstance(fields, dict) or not fields.get("summary"):
-        raise ValueError(f"JIRA response for {key} is missing fields.summary")
+        raise NetworkError(f"JIRA response for {key} is missing fields.summary")
     summary: str = fields["summary"]
     description = fields.get("description")
 

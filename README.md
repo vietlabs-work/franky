@@ -116,10 +116,12 @@ add an engine), so Codex, Cursor, pi, or Claude Code all start with the same con
      never forwarded into the container).
 4. Run:
    ```
-   franky build <gh-issue-url | jira KEY | "prose"> [--repo owner/repo] [--engine pi|claude|codex] [--plan-first]
+   franky build <gh-issue-url | jira KEY | "prose" | -> [--repo owner/repo] [--engine pi|claude|codex] [--plan-first] [--json] [-q] [-y]
    ```
 
 Each run writes a redacted log to `tasks/<timestamp>.log` and prints the PR URL.
+Pass `-` as the task to read the prose task from stdin. For scripting / agent callers,
+see [Machine / scripting interface](#machine--scripting-interface) (`--json`, exit codes).
 
 `--plan-first` adds an opt-in approval gate for sensitive targets: Franky runs a
 read-only planning pass, prints the plan, and waits for explicit confirmation
@@ -158,6 +160,69 @@ the PR's head branch is a `franky/*` branch in the same repo (not a fork) before
 anything, and to stop otherwise. This is a prompt-level guard in the same register as the
 "never merge" rule (the agent is autonomous); the hard bounds remain the repo allowlist, the
 egress cage, and PR-not-merge. See the Security section.
+
+## Machine / scripting interface
+
+`franky build` / `iterate` are built to be driven by a script or an LLM/agent without
+parsing prose. Three guarantees:
+
+**1. `--json` - one machine-readable object on stdout.**
+
+Success / agent result:
+
+```json
+{ "status": "pr_opened|no_pr|agent_error|iterate_complete",
+  "pr_url": "https://github.com/you/repo/pull/42",
+  "branch": null,
+  "reason": "PR opened",
+  "exit_code": 0,
+  "economics": {"tokens_in": 1200, "tokens_out": 340, "cost_usd": 0.0123, "duration_s": 47.5},
+  "log_path": "tasks/20260625-101500.log",
+  "engine": "pi",
+  "repo": "you/repo" }
+```
+
+Failure:
+
+```json
+{ "error": {"code": 5, "kind": "auth_error", "message": "...", "hint": "..."} }
+```
+
+`--json` implies `--quiet`, so stdout carries **exactly one** JSON object and nothing else
+(progress + the update hint are suppressed). The object is fully redacted - a secret value
+never appears, even nested in a field. `branch` is reserved and always `null` this version
+(not reliably derivable host-side).
+
+**2. Exit-code taxonomy (a SemVer contract).** The process exit code always equals the
+failure's `code`:
+
+| code | meaning |
+|---|---|
+| 0 | success (PR opened / iterate pass complete) |
+| 2 | usage/flag error; interactive input required in a non-TTY |
+| 3 | config error (bad config file, allowlist unset/empty/malformed, bad engine) |
+| 4 | allowlist / task rejection |
+| 5 | auth/creds missing (`GH_TOKEN`, engine creds, JIRA creds, JIRA 401/403) |
+| 6 | docker / image unavailable |
+| 7 | agent ran but exited nonzero or produced no PR |
+| 8 | network/timeout (JIRA reach/HTTP/parse) |
+
+Note `build` exits **7** (not 0) when the agent finishes cleanly but opens no PR, so success
+is distinguishable from a no-PR outcome by exit code alone.
+
+**3. Never-hang.** Every interactive prompt fails fast with exit `2` in a non-TTY instead of
+blocking forever:
+
+- `--plan-first` without a TTY needs `--yes` to auto-approve, else it exits 2 **before**
+  running the planning pass.
+- `franky build -` reads the task from stdin; on an interactive TTY (no piped input) it
+  exits 2 rather than block waiting for a human to type the task - pipe the task in instead.
+- `franky config set <KEY>` (no value) and `franky config init` exit 2 without a TTY rather
+  than waiting on a prompt.
+
+Other flags: `-q/--quiet` suppresses progress and the update hint (stdout stays exactly the
+bare PR URL); `-y/--yes` auto-approves `--plan-first`. Without `--json`, errors print a single
+`franky: <message>` line to stderr and use the same exit code.
 
 ## Security
 

@@ -1,9 +1,12 @@
 """Franky CLI: wire config -> task -> prompt -> container -> PR-URL.
 
-WHY config/task errors surface as click.ClickException: they are operator errors (bad
-allowlist, off-list repo, missing creds), so a clean non-zero exit with a stderr message
-beats a traceback. Every printed or logged string is redacted first - a secret value must
-never reach the terminal or the on-disk log.
+The primary caller is an LLM/agent, so the machine contract is load-bearing: `build` and
+`iterate` raise typed FrankyError subclasses (config/task/jira/docker), each carrying a stable
+exit code, and a single outer handler emits either a `--json` error object (stdout) or a prose
+line (stderr) and exits with that code. Successful runs emit a `--json` result object or a bare
+PR URL. Every printed or logged string is redacted first - a secret value must never reach the
+terminal or the on-disk log. Interactive prompts (plan-first confirm, config wizard, `build -`
+stdin) fail fast in a non-TTY rather than hang.
 """
 
 from __future__ import annotations
@@ -11,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import time
 from collections.abc import Mapping
 from dataclasses import replace as dc_replace
@@ -43,6 +47,17 @@ from .profile import (
     write_profile,
 )
 from .prompt import build_iterate_prompt, build_plan_prompt, build_prompt
+from .result import (
+    EXIT_AGENT,
+    EXIT_SUCCESS,
+    EXIT_USAGE,
+    ConfigError,
+    DockerError,
+    FrankyError,
+    NetworkError,
+    build_error,
+    build_result,
+)
 from .task import PROSE_MAX_CHARS, parse_pr_task, parse_task
 from .update_check import force_update, maybe_auto_update
 from .userconfig import (
@@ -58,6 +73,66 @@ from .userconfig import (
 
 TASKS_DIR = Path("tasks")
 FRANKY_VERBOSE_VAR = "FRANKY_VERBOSE"
+
+
+def _stdin_is_interactive() -> bool:
+    """True when stdin is a TTY (a human can answer a prompt).
+
+    Wrapped in a module function so tests can monkeypatch it without touching sys.stdin.
+    Every blocking prompt (plan-first confirm, `config set`/`init` wizard, `build -` stdin)
+    guards on this so a non-TTY run fails fast (exit 2) instead of hanging - the never-hang
+    guarantee.
+    """
+    return sys.stdin.isatty()
+
+
+def _emit_error(exc: FrankyError, as_json: bool, secrets: list[str]) -> None:
+    """Render a typed error: a JSON error object on stdout (--json) or prose on stderr.
+
+    Redacts the message (and, under --json, the whole serialized object) so a secret VALUE
+    can never reach the terminal even if a future error message interpolates env. The
+    host-side JIRA token/email never reach `cfg.secret_values()`, so union in
+    cfg_secrets_safe() too - defense-in-depth for the typed JIRA error path.
+    """
+    all_secrets = secrets + cfg_secrets_safe()
+    if as_json:
+        payload = build_error(exc.code, exc.kind, str(exc), exc.hint)
+        click.echo(redact(json.dumps(payload), all_secrets))
+    else:
+        click.echo("franky: " + redact(str(exc), all_secrets), err=True)
+
+
+def _emit_result(
+    result: dict,
+    as_json: bool,
+    secrets: list[str],
+    *,
+    pr_url: str | None,
+    status: str,
+    quiet: bool,
+) -> None:
+    """Emit the result: one JSON object on stdout (--json) or the existing prose.
+
+    --json: redact the serialized object and print it to stdout (the only stdout line).
+    Non-json: keep stdout pure - the bare PR URL on stdout for a build pr_opened, the
+    "no PR URL"/iterate-completion lines to stderr, never a secret value.
+    """
+    if as_json:
+        click.echo(redact(json.dumps(result), secrets))
+        return
+    if status == "pr_opened" and pr_url:
+        click.echo(pr_url)
+    elif status == "no_pr":
+        click.echo(
+            "franky: no PR URL found in agent output - see the redacted log in tasks/", err=True
+        )
+    elif status == "iterate_complete" and not quiet:
+        # iterate opens no new PR; report a labeled completion line (never a bare success URL)
+        # on stderr so stdout stays pure. Suppressed under --quiet.
+        click.echo(
+            f"franky: iterate pass complete for {pr_url} - review the PR for the new commits",
+            err=True,
+        )
 
 
 @click.group()
@@ -102,13 +177,31 @@ def main() -> None:
     default=False,
     help="Stream raw agent output to stderr during the run (also: FRANKY_VERBOSE=1).",
 )
+@click.option(
+    "--json", "as_json", is_flag=True, help="Emit a single JSON result/error object on stdout."
+)
+@click.option(
+    "-q",
+    "--quiet",
+    "quiet",
+    is_flag=True,
+    help="Suppress progress + the update hint (implied by --json).",
+)
+@click.option(
+    "-y", "--yes", "yes", is_flag=True, help="Auto-approve --plan-first (non-interactive)."
+)
+@click.pass_context
 def build(
+    ctx: click.Context,
     task_input: tuple[str, ...],
     repo: str | None,
     engine: str | None,
     plan_first: bool,
     profile_path_opt: str | None,
     verbose: bool,
+    as_json: bool,
+    quiet: bool,
+    yes: bool,
 ) -> None:
     """Build TASK_INPUT (a GitHub issue URL, a JIRA key, or a prose request) and open a PR.
 
@@ -116,97 +209,153 @@ def build(
       franky build https://github.com/you/repo/issues/42
       franky build jira FOO-123 --repo you/repo
       franky build "add a --json flag" --repo you/repo
+      franky build - --repo you/repo          (read the prose task from stdin)
 
     With --plan-first, Franky first runs the engine in a read-only planning pass, prints the
-    plan, and waits for explicit approval; nothing is built or PR'd until you confirm. The
+    plan, and waits for explicit approval; nothing is built or PR'd until you confirm
+    (--yes auto-approves; a non-interactive run without --yes fails fast, exit 2). The
     approval gate is the hard guarantee (the planning container is still autonomous), so a
     declined or non-interactive run writes nothing.
+
+    --json emits one machine-readable result/error object on stdout; exit codes follow the
+    documented taxonomy (0 ok, 2 usage, 3 config, 4 task, 5 auth, 6 docker, 7 agent, 8 net).
     """
-    task_input_str = " ".join(task_input)
-
-    # Best-effort, hint-only update check (never blocks/raises; ~1s budget, cached). Prints
-    # a one-line stderr hint if a newer release exists. Silenced by FRANKY_NO_UPDATE_CHECK=1.
-    maybe_auto_update()
-
-    # Inject user config file values into os.environ via setdefault (process env wins).
-    # WHY here and not in the group callback or `version`: the `config` subgroup must
-    # remain usable even when the config file is malformed (so the user can `config set`
-    # to fix it), and `version` is intentionally lightweight.  A malformed file raises
-    # ValueError here -> caught below -> clean ClickException, no traceback.
+    # --json implies --quiet: the JSON object is the only thing stdout/stderr should carry.
+    quiet = quiet or as_json
+    # Best-effort secret list for any error raised before cfg exists.
+    secrets = cfg_secrets_safe()
     try:
-        load_config_file(os.environ)
-    except ValueError as exc:
-        raise click.ClickException(f"config file error: {exc}") from exc
+        # stdin task input: `build - --repo ...`. A TTY on `-` would block forever, so fail
+        # fast (never-hang); otherwise read the prose task from stdin.
+        if task_input == ("-",):
+            if _stdin_is_interactive():
+                raise FrankyError(
+                    "`build -` reads the task from stdin, but stdin is a TTY - pipe the task in "
+                    "or pass it as an argument",
+                    code=EXIT_USAGE,
+                    kind="interactive_input_required",
+                    hint="pipe a task into stdin or pass it as an argument",
+                )
+            task_input_str = sys.stdin.read().strip()
+        else:
+            task_input_str = " ".join(task_input)
 
-    # Config + task parse are operator-error surfaces -> clean ClickException, no traceback.
-    try:
-        cfg = load_config(engine, os.environ)
-        spec = parse_task(task_input_str, repo, cfg.allowed_repos)
-        if spec.source == "jira":
-            # Fetch the JIRA issue host-side (the container has no JIRA creds or egress).
-            # A fetch failure raises ValueError, caught by the same handler below.
-            body = fetch_jira_issue(spec.text, os.environ)
-            spec = dc_replace(spec, text=body[:PROSE_MAX_CHARS].strip())
-    except ValueError as exc:
-        # load_config/parse_task/fetch_jira_issue never put a secret value in their
-        # messages, but redact defensively in case a future message ever interpolates env.
-        raise click.ClickException(redact(str(exc), cfg_secrets_safe())) from exc
+        # Best-effort, hint-only update check (never blocks/raises; ~1s budget, cached). Skip
+        # under --quiet/--json so stderr stays clean. Silenced too by FRANKY_NO_UPDATE_CHECK=1.
+        if not quiet:
+            maybe_auto_update()
 
-    secrets = cfg.secret_values()
-    franky_img, proxy_img = _ensure_images(os.environ)
+        # Inject user config file values into os.environ via setdefault (process env wins). A
+        # malformed file -> ConfigError (exit 3) so --json gets the right code + JSON error.
+        try:
+            load_config_file(os.environ)
+        except FrankyError:
+            raise
+        except ValueError as exc:
+            raise ConfigError(f"config file error: {exc}") from exc
 
-    # Build the profile bundle (optional). Auto-discovers ~/.franky/profile.toml unless
-    # overridden by --profile or FRANKY_PROFILE_PATH. Fails closed on detected credentials.
-    bundle = _load_profile_bundle(profile_path_opt, os.environ, secrets)
+        # Config + task parse + JIRA fetch are typed-error surfaces. Each already raises the
+        # right FrankyError subclass (ConfigError/AuthError/TaskRejected/NetworkError); re-raise
+        # those untouched and only wrap a residual plain ValueError defensively.
+        try:
+            cfg = load_config(engine, os.environ)
+            secrets = cfg.secret_values()
+            spec = parse_task(task_input_str, repo, cfg.allowed_repos)
+            if spec.source == "jira":
+                # Fetch the JIRA issue host-side (the container has no JIRA creds or egress).
+                body = fetch_jira_issue(spec.text, os.environ)
+                spec = dc_replace(spec, text=body[:PROSE_MAX_CHARS].strip())
+        except FrankyError:
+            raise
+        except ValueError as exc:
+            raise NetworkError(redact(str(exc), cfg_secrets_safe())) from exc
 
-    # Verbose mode: raw passthrough of agent output to stderr. Falls back to distilled
-    # progress (the default) which shows compact milestones without the raw stream.
-    verbose = verbose or bool(os.environ.get(FRANKY_VERBOSE_VAR))
-    progress = _make_progress(cfg.engine, verbose)
+        franky_img, proxy_img = _ensure_images(os.environ)
 
-    if plan_first:
-        # PHASE 1: planning pass. Show the plan, then gate on explicit approval. A plan that
-        # errored is not a plan to approve, so abort before the gate. No economics on this
-        # pass - economics is build-pass only.
-        code, output, _plan_dur = _run_pass(
-            cfg, build_plan_prompt(spec), franky_img, proxy_img, bundle, progress=progress
-        )
-        _write_log(output, secrets)
-        click.echo("franky: --- plan (read-only, nothing written yet) ---", err=True)
-        click.echo(output)
-        if code != 0:
-            raise click.ClickException(
-                f"planning pass exited non-zero ({code}) - see the redacted log in tasks/"
+        # Build the profile bundle (optional). Auto-discovers ~/.franky/profile.toml unless
+        # overridden by --profile or FRANKY_PROFILE_PATH. Fails closed on detected credentials.
+        bundle = _load_profile_bundle(profile_path_opt, os.environ, secrets)
+
+        # Verbose mode: raw passthrough of agent output to stderr. Quiet (or --json) -> no
+        # progress callback at all. Else distilled milestones (the default).
+        verbose = verbose or bool(os.environ.get(FRANKY_VERBOSE_VAR))
+        progress = None if (quiet and not verbose) else _make_progress(cfg.engine, verbose)
+
+        if plan_first:
+            # Never-hang: an unattended run that cannot answer the approval gate must fail
+            # fast BEFORE the planning container even starts (exit 2), not run-then-abort.
+            if not yes and not _stdin_is_interactive():
+                raise FrankyError(
+                    "--plan-first needs interactive approval - pass --yes (or run in a TTY)",
+                    code=EXIT_USAGE,
+                    kind="interactive_input_required",
+                    hint="pass --yes to auto-approve",
+                )
+            # PHASE 1: planning pass. Show the plan (to stderr - stdout stays pure), then gate.
+            # A plan that errored is not a plan to approve. No economics on this pass.
+            code, output, _plan_dur = _run_pass(
+                cfg, build_plan_prompt(spec), franky_img, proxy_img, bundle, progress=progress
             )
-        # default=False and non-interactive abort both fail closed: no approval -> no build.
-        if not click.confirm("franky: proceed to execute this plan?", default=False):
-            click.echo("franky: plan-first aborted - nothing was built or opened.", err=True)
-            return
+            _write_log(output, secrets)
+            if not quiet:
+                click.echo("franky: --- plan (read-only, nothing written yet) ---", err=True)
+                click.echo(output, err=True)
+            if code != 0:
+                raise FrankyError(
+                    f"planning pass exited non-zero ({code}) - see the redacted log in tasks/",
+                    code=EXIT_AGENT,
+                    kind="agent_error",
+                )
+            # --yes auto-approves; else gate on the interactive confirm (fail-closed default).
+            # Prompt to stderr (err=True) so stdout stays pure under --json even in a TTY.
+            if not yes and not click.confirm(
+                "franky: proceed to execute this plan?", default=False, err=True
+            ):
+                if not quiet:
+                    click.echo(
+                        "franky: plan-first aborted - nothing was built or opened.", err=True
+                    )
+                ctx.exit(EXIT_SUCCESS)
 
-    # PHASE 2 (or the only phase without --plan-first): build it and open the PR.
-    code, output, duration = _run_pass(
-        cfg, build_prompt(spec), franky_img, proxy_img, bundle, progress=progress
-    )
-
-    # Emit economics before the PR-URL echo and before any ClickException so the summary is
-    # always shown (even when the agent exits non-zero).
-    econ = _economics_line(output, duration, secrets)
-    click.echo(econ, err=True)
-    _write_log(output, secrets, footer=econ)
-
-    # Scope PR-URL detection to the task's own repo so a hostile issue body cannot make
-    # Franky report a PR URL for some other (attacker) repo.
-    pr_url = cfg.engine.parse_pr_url(output, repo=spec.repo)
-    if pr_url:
-        click.echo(pr_url)
-    else:
-        click.echo(
-            "franky: no PR URL found in agent output - see the redacted log in tasks/", err=True
+        # PHASE 2 (or the only phase without --plan-first): build it and open the PR.
+        code, output, duration = _run_pass(
+            cfg, build_prompt(spec), franky_img, proxy_img, bundle, progress=progress
         )
-    if code != 0:
-        raise click.ClickException(
-            f"agent exited non-zero ({code}) - see the redacted log in tasks/"
+
+        # Parse usage ONCE; both the prose econ line and the JSON economics block come from it.
+        usage = _parse_usage_safe(output)
+        econ = _economics_line(usage, duration, secrets)
+        # Non-json: emit the prose econ line before everything so spend is always visible.
+        if not as_json:
+            click.echo(econ, err=True)
+        log_path = _write_log(output, secrets, footer=econ)
+
+        # Scope PR-URL detection to the task's own repo so a hostile issue body cannot make
+        # Franky report a PR URL for some other (attacker) repo.
+        pr_url = cfg.engine.parse_pr_url(output, repo=spec.repo)
+        if code != 0:
+            status, reason, exit_code = "agent_error", f"agent exited {code}", EXIT_AGENT
+        elif pr_url:
+            status, reason, exit_code = "pr_opened", "PR opened", EXIT_SUCCESS
+        else:
+            status, reason, exit_code = "no_pr", "agent produced no PR URL", EXIT_AGENT
+
+        result = build_result(
+            status=status,
+            pr_url=pr_url,
+            reason=reason,
+            exit_code=exit_code,
+            usage=usage,
+            duration=duration,
+            log_path=str(log_path),
+            engine=cfg.engine.name,
+            repo=spec.repo,
         )
+        _emit_result(result, as_json, secrets, pr_url=pr_url, status=status, quiet=quiet)
+        ctx.exit(exit_code)
+    except FrankyError as exc:
+        _emit_error(exc, as_json, secrets)
+        ctx.exit(exc.code)
 
 
 @main.command()
@@ -227,7 +376,20 @@ def build(
     default=False,
     help="Stream raw agent output to stderr during the run (also: FRANKY_VERBOSE=1).",
 )
-def iterate(pr_url: str, engine: str | None, verbose: bool) -> None:
+@click.option(
+    "--json", "as_json", is_flag=True, help="Emit a single JSON result/error object on stdout."
+)
+@click.option(
+    "-q",
+    "--quiet",
+    "quiet",
+    is_flag=True,
+    help="Suppress progress + the update hint (implied by --json).",
+)
+@click.pass_context
+def iterate(
+    ctx: click.Context, pr_url: str, engine: str | None, verbose: bool, as_json: bool, quiet: bool
+) -> None:
     """Address review feedback / failing CI on an existing Franky PR with follow-up commits.
 
     Example:
@@ -238,58 +400,82 @@ def iterate(pr_url: str, engine: str | None, verbose: bool) -> None:
     failing checks via `gh`, and pushes ADDITIVE follow-up commits to that branch. It never
     force-pushes, never merges, and never opens a new PR - a human still reviews every change.
     The PR URL is authoritative (it carries owner/repo), so there is no --repo flag.
+
+    --json emits one machine-readable result/error object on stdout (status iterate_complete
+    on exit 0; the input PR URL is echoed back as pr_url).
     """
-    # Best-effort, hint-only update check - same as build (never blocks/raises).
-    maybe_auto_update()
-
-    # Same config-file injection as `build` (see that command's WHY comment).
+    quiet = quiet or as_json
+    secrets = cfg_secrets_safe()
     try:
-        load_config_file(os.environ)
-    except ValueError as exc:
-        raise click.ClickException(f"config file error: {exc}") from exc
+        if not quiet:
+            maybe_auto_update()
 
-    # Config + PR-URL parse are operator-error surfaces -> clean ClickException, no traceback.
-    try:
-        cfg = load_config(engine, os.environ)
-        spec = parse_pr_task(pr_url, cfg.allowed_repos)
-    except ValueError as exc:
-        raise click.ClickException(redact(str(exc), cfg_secrets_safe())) from exc
+        # Same config-file injection as `build` (see that command's WHY comment).
+        try:
+            load_config_file(os.environ)
+        except FrankyError:
+            raise
+        except ValueError as exc:
+            raise ConfigError(f"config file error: {exc}") from exc
 
-    secrets = cfg.secret_values()
-    franky_img, proxy_img = _ensure_images(os.environ)
+        try:
+            cfg = load_config(engine, os.environ)
+            secrets = cfg.secret_values()
+            spec = parse_pr_task(pr_url, cfg.allowed_repos)
+        except FrankyError:
+            raise
+        except ValueError as exc:
+            raise NetworkError(redact(str(exc), cfg_secrets_safe())) from exc
 
-    bundle = _load_profile_bundle(None, os.environ, secrets)
-    verbose = verbose or bool(os.environ.get(FRANKY_VERBOSE_VAR))
-    progress = _make_progress(cfg.engine, verbose)
-    code, output, duration = _run_pass(
-        cfg, build_iterate_prompt(spec), franky_img, proxy_img, bundle, progress=progress
-    )
+        franky_img, proxy_img = _ensure_images(os.environ)
 
-    # Economics first (same as build) so spend is visible even when the agent exits non-zero.
-    econ = _economics_line(output, duration, secrets)
-    click.echo(econ, err=True)
-    _write_log(output, secrets, footer=econ)
-
-    # iterate produces NO new PR; the existing PR gains commits. Report a labeled line rather
-    # than a bare URL on stdout - exit 0 means the pass ran, NOT that a push necessarily landed
-    # (the agent correctly pushes nothing on red tests or a failed own-PR check), so we never
-    # present the URL as a fresh success artifact.
-    click.echo(
-        f"franky: iterate pass complete for {spec.text} - review the PR for the new commits",
-        err=True,
-    )
-    if code != 0:
-        raise click.ClickException(
-            f"agent exited non-zero ({code}) - see the redacted log in tasks/"
+        bundle = _load_profile_bundle(None, os.environ, secrets)
+        verbose = verbose or bool(os.environ.get(FRANKY_VERBOSE_VAR))
+        progress = None if (quiet and not verbose) else _make_progress(cfg.engine, verbose)
+        code, output, duration = _run_pass(
+            cfg, build_iterate_prompt(spec), franky_img, proxy_img, bundle, progress=progress
         )
+
+        usage = _parse_usage_safe(output)
+        econ = _economics_line(usage, duration, secrets)
+        if not as_json:
+            click.echo(econ, err=True)
+        log_path = _write_log(output, secrets, footer=econ)
+
+        # iterate produces NO new PR; the existing PR gains commits. The PR URL is reported as
+        # the input PR (not a fresh success artifact) - exit 0 means the pass ran, not that a
+        # push necessarily landed (the agent pushes nothing on red tests or a failed own-PR
+        # check). status is iterate_complete on a clean exit, agent_error otherwise.
+        if code != 0:
+            status, reason, exit_code = "agent_error", f"agent exited {code}", EXIT_AGENT
+        else:
+            status, reason, exit_code = "iterate_complete", "iterate pass complete", EXIT_SUCCESS
+
+        result = build_result(
+            status=status,
+            pr_url=spec.text,
+            reason=reason,
+            exit_code=exit_code,
+            usage=usage,
+            duration=duration,
+            log_path=str(log_path),
+            engine=cfg.engine.name,
+            repo=spec.repo,
+        )
+        _emit_result(result, as_json, secrets, pr_url=spec.text, status=status, quiet=quiet)
+        ctx.exit(exit_code)
+    except FrankyError as exc:
+        _emit_error(exc, as_json, secrets)
+        ctx.exit(exc.code)
 
 
 def _ensure_images(env: Mapping[str, str]) -> tuple[str, str]:
     """Resolve + ensure the franky and franky-proxy images are available locally.
 
-    Returns (franky_image, proxy_image). Raises a clean ClickException (no traceback) for the
-    operator-facing failure modes: docker absent, auth needed, or pull failed. Shared by
-    `build` and `iterate` - the only difference between them is the prompt, not the plumbing.
+    Returns (franky_image, proxy_image). Raises DockerError (exit 6, a clean message, no
+    traceback) for the operator-facing failure modes: docker absent, auth needed, or pull
+    failed - typed so the outer FrankyError handler emits the right code + JSON error too.
+    Shared by `build` and `iterate` - the only difference between them is the prompt.
     """
     franky_img = resolve_image(env, FRANKY_IMAGE_VAR, "franky")
     proxy_img = resolve_image(env, FRANKY_PROXY_IMAGE_VAR, "franky-proxy")
@@ -300,16 +486,16 @@ def _ensure_images(env: Mapping[str, str]) -> tuple[str, str]:
         ok, reason = ensure_image_available(img)
         if not ok:
             if reason == "no-docker":
-                raise click.ClickException(
+                raise DockerError(
                     "docker is not available - is the daemon running and `docker` on PATH?"
                 )
             if reason == "auth":
-                raise click.ClickException(
+                raise DockerError(
                     f"{label} image '{img}' needs auth to pull - run `docker login ghcr.io` "
                     f"(a PAT with read:packages), or for local dev `{dev_build}` "
                     f"and set {dev_var}=<local-tag>."
                 )
-            raise click.ClickException(
+            raise DockerError(
                 f"{label} image '{img}' not found locally and could not be pulled. "
                 f"For local dev: `{dev_build}` and set {dev_var}=<local-tag>."
             )
@@ -352,7 +538,9 @@ def _load_profile_bundle(
     """Load, scan, and pack the operator profile bundle; return None if no profile is found.
 
     Resolution order: --profile flag path > FRANKY_PROFILE_PATH env var > auto-discovered
-    ~/.franky/profile.toml.  Fails closed (ClickException) on a detected credential.
+    ~/.franky/profile.toml.  Fails closed (ConfigError, exit 3) on a detected credential or a
+    malformed profile, so the failure stays inside the machine contract (right exit code + a
+    JSON error object under --json) instead of a bare exit-1 ClickException.
     An absent or empty profile is not an error; the caller treats None as "no bundle".
     """
     from pathlib import Path
@@ -368,7 +556,7 @@ def _load_profile_bundle(
     try:
         spec = load_profile(ppath)
     except ValueError as exc:
-        raise click.ClickException(redact(str(exc), secrets)) from exc
+        raise ConfigError(redact(str(exc), secrets)) from exc
 
     if not spec.all_files():
         return None
@@ -376,7 +564,7 @@ def _load_profile_bundle(
     try:
         return build_bundle(spec)
     except ValueError as exc:
-        raise click.ClickException(redact(str(exc), secrets)) from exc
+        raise ConfigError(redact(str(exc), secrets)) from exc
 
 
 def _make_progress(engine, verbose: bool):
@@ -403,11 +591,23 @@ def _make_progress(engine, verbose: bool):
         return distilled_cb
 
 
-def _economics_line(output: str, duration: float, secrets: list[str]) -> str:
-    """The redacted one-line economics summary for a pass. Degrades to all-unknown on any
-    parse/format error so economics can never fail a run. Shared by build and iterate."""
+def _parse_usage_safe(output: str) -> Usage:
+    """parse_usage(output), degrading to an all-unknown Usage on any error.
+
+    Parsed ONCE per pass; both the prose economics line (non-json) and the JSON economics
+    block are derived from this single Usage so they can never disagree.
+    """
     try:
-        return redact(format_economics(parse_usage(output), duration), secrets)
+        return parse_usage(output)
+    except Exception:
+        return Usage()
+
+
+def _economics_line(usage: Usage, duration: float, secrets: list[str]) -> str:
+    """The redacted one-line economics summary for a pass. Degrades to all-unknown on any
+    format error so economics can never fail a run. Shared by build and iterate."""
+    try:
+        return redact(format_economics(usage, duration), secrets)
     except Exception:
         return redact(format_economics(Usage(), duration), secrets)
 
@@ -424,18 +624,21 @@ def cfg_secrets_safe() -> list[str]:
     return [v for v in (os.environ.get(JIRA_API_TOKEN_VAR), os.environ.get(JIRA_EMAIL_VAR)) if v]
 
 
-def _write_log(output: str, secrets: list[str], footer: str | None = None) -> None:
-    """Write the REDACTED agent output to tasks/<timestamp>.log.
+def _write_log(output: str, secrets: list[str], footer: str | None = None) -> Path:
+    """Write the REDACTED agent output to tasks/<timestamp>.log and return its Path.
 
     When `footer` is given, it is appended after the transcript (also redacted) separated
-    by a newline so the economics summary lands in the same timestamped file.
+    by a newline so the economics summary lands in the same timestamped file. The returned
+    Path is surfaced as `log_path` in the JSON result.
     """
     TASKS_DIR.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     body = redact(output, secrets) + "\n"
     if footer is not None:
         body += redact(footer, secrets) + "\n"
-    (TASKS_DIR / f"{stamp}.log").write_text(body, encoding="utf-8")
+    path = TASKS_DIR / f"{stamp}.log"
+    path.write_text(body, encoding="utf-8")
+    return path
 
 
 def _engine_binary_version(
@@ -622,10 +825,21 @@ def config_set(key: str, value: str | None) -> None:
                 f"{key} is a secret; run `franky config set {key}` and enter it at "
                 "the prompt - a value on the command line leaks into shell history"
             )
+        # A hidden prompt would block forever with no TTY - fail fast instead (never-hang).
+        if not _stdin_is_interactive():
+            raise click.UsageError(
+                f"{key} is a secret and needs an interactive prompt, but stdin is not a TTY. "
+                f"Run `franky config set {key}` in a terminal, or edit the config file directly."
+            )
         # Hidden prompt - value never echoed to the terminal.
         value = click.prompt(key, hide_input=True)
     else:
         if value is None:
+            if not _stdin_is_interactive():
+                raise click.UsageError(
+                    f"no value given for {key} and stdin is not a TTY. "
+                    f"Pass it as `franky config set {key} <value>` or run in a terminal."
+                )
             value = click.prompt(key)
 
     path = config_file_path(dict(os.environ))
@@ -643,6 +857,13 @@ def config_init() -> None:
     Walks through engine selection, repo allowlist, GitHub token,
     engine creds, and optional JIRA settings.
     """
+    # The wizard is entirely interactive prompts; with no TTY it would block forever, so
+    # fail fast (never-hang) before printing anything.
+    if not _stdin_is_interactive():
+        raise click.UsageError(
+            "config init is interactive; with no TTY use `franky config set <KEY> <VALUE>` "
+            "or edit the config file directly."
+        )
     path = config_file_path(dict(os.environ))
     click.echo(f"franky config init - writing to {path}")
     click.echo(

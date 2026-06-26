@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Machine-friendly CLI for agent callers (#50). `franky build` / `iterate` gain:
+  - `--json`: a single result object on stdout - `{status, pr_url, branch, reason, exit_code,
+    economics{tokens_in, tokens_out, cost_usd, duration_s}, log_path, engine, repo}` - or a
+    `{"error": {code, kind, message, hint}}` object on failure. Always fully redacted.
+  - A stable exit-code taxonomy (SemVer contract): `0` success, `2` usage / interactive-input-
+    required, `3` config, `4` task rejection, `5` auth/creds, `6` docker, `7` agent (nonzero or
+    no PR), `8` network/JIRA. The process exit code always equals the failure's code.
+  - `-q/--quiet` (implied by `--json`): suppresses progress output and the update hint; stdout
+    stays pure (exactly the bare PR URL, or exactly one JSON object).
+  - `-y/--yes`: auto-approve `--plan-first` for unattended runs.
+  - `build -` reads the prose task from stdin.
+  - Never-hang guarantee: every interactive prompt (`--plan-first` confirm, `config set` /
+    `config init`, `build -`) fails fast with exit `2` in a non-TTY instead of blocking.
 - `franky profile` setup commands so a profile no longer has to be hand-written:
   `profile init` (interactive wizard that scaffolds / merges `~/.franky/profile.toml`),
   `profile check` (dry-run the build's gate - expand globs + secret-scan, report what would
@@ -15,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `profile path`. `check` reuses the exact `load_profile` + `scan_for_secrets` path the build
   runs, so a profile that passes `check` cannot fail the build's fail-closed secret gate. `franky
   config init` now also offers to set up a profile so the feature is discoverable (#49).
+
+### Changed
+- `franky build` now exits `7` (was `0`) when the agent finishes cleanly but produces no PR URL,
+  so a no-PR outcome is distinguishable from success by exit code alone (#50). `branch` in the
+  JSON result is reserved and always null this version (not reliably derivable host-side).
 
 ## [0.0.4] - 2026-06-25
 
