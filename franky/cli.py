@@ -28,6 +28,7 @@ from ._install import detect_install
 from .config import load_config, redact
 from .economics import Usage, format_economics, parse_usage
 from .container import (
+    CONTAINER_TIMEOUT_CODE,
     FRANKY_IMAGE_VAR,
     FRANKY_PROXY_IMAGE_VAR,
     ensure_image_available,
@@ -35,6 +36,7 @@ from .container import (
     run_in_container,
 )
 from .engine import ENGINES, PI_PROVIDER_VARS, resolve_engine
+from .idempotency import find_open_pr
 from .jira import JIRA_API_TOKEN_VAR, JIRA_EMAIL_VAR, fetch_jira_issue
 from .profile import (
     PROFILE_CATEGORIES,
@@ -46,10 +48,11 @@ from .profile import (
     scan_profile_files,
     write_profile,
 )
-from .prompt import build_iterate_prompt, build_plan_prompt, build_prompt
+from .prompt import build_iterate_prompt, build_plan_prompt, build_prompt, task_slug
 from .result import (
     EXIT_AGENT,
     EXIT_SUCCESS,
+    EXIT_TIMEOUT,
     EXIT_USAGE,
     ConfigError,
     DockerError,
@@ -58,6 +61,7 @@ from .result import (
     build_error,
     build_result,
 )
+from .schema import build_schema
 from .task import PROSE_MAX_CHARS, parse_pr_task, parse_task
 from .update_check import force_update, maybe_auto_update
 from .userconfig import (
@@ -120,7 +124,9 @@ def _emit_result(
     if as_json:
         click.echo(redact(json.dumps(result), secrets))
         return
-    if status == "pr_opened" and pr_url:
+    # already_open echoes the EXISTING PR URL on stdout (it IS a PR URL, like pr_opened) so an
+    # agent scraping stdout for the URL still gets one on an idempotent short-circuit.
+    if status in ("pr_opened", "already_open") and pr_url:
         click.echo(pr_url)
     elif status == "no_pr":
         click.echo(
@@ -190,6 +196,19 @@ def main() -> None:
 @click.option(
     "-y", "--yes", "yes", is_flag=True, help="Auto-approve --plan-first (non-interactive)."
 )
+@click.option(
+    "--max-duration",
+    "max_duration",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Abort the run after N seconds (default 1800).",
+)
+@click.option(
+    "--force",
+    "force",
+    is_flag=True,
+    help="Skip the idempotency pre-check and build even if a Franky PR is already open.",
+)
 @click.pass_context
 def build(
     ctx: click.Context,
@@ -202,6 +221,8 @@ def build(
     as_json: bool,
     quiet: bool,
     yes: bool,
+    max_duration: int | None,
+    force: bool,
 ) -> None:
     """Build TASK_INPUT (a GitHub issue URL, a JIRA key, or a prose request) and open a PR.
 
@@ -218,7 +239,8 @@ def build(
     declined or non-interactive run writes nothing.
 
     --json emits one machine-readable result/error object on stdout; exit codes follow the
-    documented taxonomy (0 ok, 2 usage, 3 config, 4 task, 5 auth, 6 docker, 7 agent, 8 net).
+    documented taxonomy (0 ok, 2 usage, 3 config, 4 task, 5 auth, 6 docker, 7 agent, 8 net,
+    9 timeout).
     """
     # --json implies --quiet: the JSON object is the only thing stdout/stderr should carry.
     quiet = quiet or as_json
@@ -261,6 +283,11 @@ def build(
             cfg = load_config(engine, os.environ)
             secrets = cfg.secret_values()
             spec = parse_task(task_input_str, repo, cfg.allowed_repos)
+            # Compute the predicted branch HERE, before the JIRA fetch mutates spec.text: for a
+            # jira spec the slug keys on the bare KEY (stable), not the fetched body, so the
+            # host-predicted branch matches what build_prompt pins below and what the
+            # idempotency pre-check looks up.
+            branch = f"franky/{task_slug(spec)}"
             if spec.source == "jira":
                 # Fetch the JIRA issue host-side (the container has no JIRA creds or egress).
                 body = fetch_jira_issue(spec.text, os.environ)
@@ -269,6 +296,30 @@ def build(
             raise
         except ValueError as exc:
             raise NetworkError(redact(str(exc), cfg_secrets_safe())) from exc
+
+        # Idempotency pre-check (issue #50): if a Franky PR is already open on the predicted
+        # branch, a retry must NOT open a second one. Report the existing PR and stop without
+        # launching the container. Best-effort - find_open_pr returns None on any error, so a
+        # flaky check never blocks a build. --force skips the check entirely.
+        if not force:
+            existing = find_open_pr(spec.repo, branch, os.environ)
+            if existing:
+                result = build_result(
+                    status="already_open",
+                    pr_url=existing,
+                    reason="a Franky PR is already open for this task",
+                    exit_code=EXIT_SUCCESS,
+                    usage=Usage(),
+                    duration=0.0,
+                    log_path="",
+                    engine=cfg.engine.name,
+                    repo=spec.repo,
+                    branch=branch,
+                )
+                _emit_result(
+                    result, as_json, secrets, pr_url=existing, status="already_open", quiet=quiet
+                )
+                ctx.exit(EXIT_SUCCESS)
 
         franky_img, proxy_img = _ensure_images(os.environ)
 
@@ -294,12 +345,26 @@ def build(
             # PHASE 1: planning pass. Show the plan (to stderr - stdout stays pure), then gate.
             # A plan that errored is not a plan to approve. No economics on this pass.
             code, output, _plan_dur = _run_pass(
-                cfg, build_plan_prompt(spec), franky_img, proxy_img, bundle, progress=progress
+                cfg,
+                build_plan_prompt(spec),
+                franky_img,
+                proxy_img,
+                bundle,
+                progress=progress,
+                timeout=max_duration,
             )
             _write_log(output, secrets)
             if not quiet:
                 click.echo("franky: --- plan (read-only, nothing written yet) ---", err=True)
                 click.echo(output, err=True)
+            # A timed-out planning pass returns the 124 sentinel; map it to the dedicated
+            # timeout contract (exit 9) rather than the generic agent_error, same as PHASE 2.
+            if code == CONTAINER_TIMEOUT_CODE:
+                raise FrankyError(
+                    "planning pass exceeded max-duration",
+                    code=EXIT_TIMEOUT,
+                    kind="timeout",
+                )
             if code != 0:
                 raise FrankyError(
                     f"planning pass exited non-zero ({code}) - see the redacted log in tasks/",
@@ -317,9 +382,16 @@ def build(
                     )
                 ctx.exit(EXIT_SUCCESS)
 
-        # PHASE 2 (or the only phase without --plan-first): build it and open the PR.
+        # PHASE 2 (or the only phase without --plan-first): build it and open the PR. Pin the
+        # host-predicted branch so it matches the idempotency pre-check above.
         code, output, duration = _run_pass(
-            cfg, build_prompt(spec), franky_img, proxy_img, bundle, progress=progress
+            cfg,
+            build_prompt(spec, branch=branch),
+            franky_img,
+            proxy_img,
+            bundle,
+            progress=progress,
+            timeout=max_duration,
         )
 
         # Parse usage ONCE; both the prose econ line and the JSON economics block come from it.
@@ -333,7 +405,12 @@ def build(
         # Scope PR-URL detection to the task's own repo so a hostile issue body cannot make
         # Franky report a PR URL for some other (attacker) repo.
         pr_url = cfg.engine.parse_pr_url(output, repo=spec.repo)
-        if code != 0:
+        # Timeout is checked FIRST: a timed-out run returns the CONTAINER_TIMEOUT_CODE sentinel
+        # (124), which is nonzero, so it must be distinguished before the generic agent_error
+        # branch and mapped to the dedicated timeout status / EXIT_TIMEOUT.
+        if code == CONTAINER_TIMEOUT_CODE:
+            status, reason, exit_code = "timeout", "exceeded max-duration", EXIT_TIMEOUT
+        elif code != 0:
             status, reason, exit_code = "agent_error", f"agent exited {code}", EXIT_AGENT
         elif pr_url:
             status, reason, exit_code = "pr_opened", "PR opened", EXIT_SUCCESS
@@ -350,6 +427,7 @@ def build(
             log_path=str(log_path),
             engine=cfg.engine.name,
             repo=spec.repo,
+            branch=branch,
         )
         _emit_result(result, as_json, secrets, pr_url=pr_url, status=status, quiet=quiet)
         ctx.exit(exit_code)
@@ -386,9 +464,22 @@ def build(
     is_flag=True,
     help="Suppress progress + the update hint (implied by --json).",
 )
+@click.option(
+    "--max-duration",
+    "max_duration",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Abort the run after N seconds (default 1800).",
+)
 @click.pass_context
 def iterate(
-    ctx: click.Context, pr_url: str, engine: str | None, verbose: bool, as_json: bool, quiet: bool
+    ctx: click.Context,
+    pr_url: str,
+    engine: str | None,
+    verbose: bool,
+    as_json: bool,
+    quiet: bool,
+    max_duration: int | None,
 ) -> None:
     """Address review feedback / failing CI on an existing Franky PR with follow-up commits.
 
@@ -402,7 +493,8 @@ def iterate(
     The PR URL is authoritative (it carries owner/repo), so there is no --repo flag.
 
     --json emits one machine-readable result/error object on stdout (status iterate_complete
-    on exit 0; the input PR URL is echoed back as pr_url).
+    on exit 0; the input PR URL is echoed back as pr_url). Exit codes follow the documented
+    taxonomy (0 ok, 2 usage, 3 config, 4 task, 5 auth, 6 docker, 7 agent, 8 net, 9 timeout).
     """
     quiet = quiet or as_json
     secrets = cfg_secrets_safe()
@@ -433,7 +525,13 @@ def iterate(
         verbose = verbose or bool(os.environ.get(FRANKY_VERBOSE_VAR))
         progress = None if (quiet and not verbose) else _make_progress(cfg.engine, verbose)
         code, output, duration = _run_pass(
-            cfg, build_iterate_prompt(spec), franky_img, proxy_img, bundle, progress=progress
+            cfg,
+            build_iterate_prompt(spec),
+            franky_img,
+            proxy_img,
+            bundle,
+            progress=progress,
+            timeout=max_duration,
         )
 
         usage = _parse_usage_safe(output)
@@ -446,7 +544,10 @@ def iterate(
         # the input PR (not a fresh success artifact) - exit 0 means the pass ran, not that a
         # push necessarily landed (the agent pushes nothing on red tests or a failed own-PR
         # check). status is iterate_complete on a clean exit, agent_error otherwise.
-        if code != 0:
+        # Timeout first (124 is nonzero) -> dedicated timeout status, before generic agent_error.
+        if code == CONTAINER_TIMEOUT_CODE:
+            status, reason, exit_code = "timeout", "exceeded max-duration", EXIT_TIMEOUT
+        elif code != 0:
             status, reason, exit_code = "agent_error", f"agent exited {code}", EXIT_AGENT
         else:
             status, reason, exit_code = "iterate_complete", "iterate pass complete", EXIT_SUCCESS
@@ -509,14 +610,19 @@ def _run_pass(
     proxy_img: str,
     profile_bundle: str | None = None,
     progress=None,
+    timeout: int | None = None,
 ) -> tuple[int, str, float]:
     """Run one container pass for `prompt` and return (exit_code, output, duration_secs).
 
     Duration is measured with time.monotonic() around run_in_container only. Logging and the
     economics summary are the CALLER's responsibility (the planning pass logs without an
     economics footer; the build and iterate passes attach one). Shared by build and iterate.
+
+    `timeout` is the --max-duration budget in seconds; None preserves run_in_container's own
+    default (FALLBACK_TIMEOUT_SECS), so the kwarg is only forwarded when explicitly set.
     """
     inner_argv = cfg.engine.inner_argv(prompt, model=None)
+    extra = {} if timeout is None else {"timeout": timeout}
     t0 = time.monotonic()
     code, output = run_in_container(
         cfg,
@@ -525,6 +631,7 @@ def _run_pass(
         proxy_image=proxy_img,
         profile_bundle=profile_bundle,
         progress=progress,
+        **extra,
     )
     duration = time.monotonic() - t0
     return code, output, duration
@@ -743,6 +850,16 @@ def version(as_json: bool) -> None:
     else:
         click.echo(f"  engine:     {eng['name']}")
     click.echo(f"  image:      {img}")
+
+
+@main.command()
+def schema() -> None:
+    """Emit a machine-readable JSON description of Franky's commands, flags, result/error
+    shapes, and exit-code taxonomy (the agent-facing capability contract).
+
+    Always JSON - no --json flag - and the single JSON object is the only thing on stdout.
+    """
+    click.echo(json.dumps(build_schema(main)))
 
 
 @main.command()

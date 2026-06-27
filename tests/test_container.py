@@ -202,7 +202,8 @@ def test_run_in_container_timeout_returns_nonzero():
     code, out = run_in_container(
         _cfg(), ["pi"], timeout=5, runner=runner, env={}, sleeper=NOOP_SLEEP
     )
-    assert code != 0
+    # 124 is the Franky-set timeout sentinel (GNU `timeout(1)` convention), still nonzero.
+    assert code == 124
     assert "timed out" in out
     # reaper fired (task + proxy reaped, net removed)
     assert any(a[:3] == ["docker", "rm", "-f"] for a in calls)
@@ -398,7 +399,7 @@ def test_run_in_container_timeout_reaps_task_proxy_net():
     code, out = run_in_container(
         _cfg(), ["pi"], timeout=5, runner=runner, env={}, sleeper=NOOP_SLEEP
     )
-    assert code != 0
+    assert code == 124  # Franky-set timeout sentinel
     # finally guarantees all three are reaped
     assert any(
         a[:3] == ["docker", "rm", "-f"] and any("franky-run-" in x for x in a) for a in calls

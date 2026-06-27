@@ -21,6 +21,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `build -` reads the prose task from stdin.
   - Never-hang guarantee: every interactive prompt (`--plan-first` confirm, `config set` /
     `config init`, `build -`) fails fast with exit `2` in a non-TTY instead of blocking.
+- Agent-friendly P2 additions (#50):
+  - `--max-duration SECONDS` (on `build` and `iterate`): abort a runaway run. The container is
+    killed and the result is `status: timeout` / exit `9` (a new, additive taxonomy code). A
+    token/cost cap is out of scope (token usage is only known after the run).
+  - Idempotency / retry-safety: `build` computes a deterministic branch (`franky/issue-<n>`,
+    `franky/<jira-key>`, or `franky/<prose-slug>`) and pre-checks GitHub for an open Franky PR
+    on it. If one exists it reports `status: already_open` with the existing `pr_url` at exit
+    `0` and opens no duplicate; `--force` skips the check. Best-effort (any error proceeds with
+    the build). `branch` is now populated in the result as the predicted branch.
+  - `franky schema`: a read-only command that prints one JSON object describing every command +
+    flags, the result/error shapes, and the exit-code table - machine introspection so an agent
+    discovers the contract instead of parsing `--help`.
 - `franky profile` setup commands so a profile no longer has to be hand-written:
   `profile init` (interactive wizard that scaffolds / merges `~/.franky/profile.toml`),
   `profile check` (dry-run the build's gate - expand globs + secret-scan, report what would
@@ -31,8 +43,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 - `franky build` now exits `7` (was `0`) when the agent finishes cleanly but produces no PR URL,
-  so a no-PR outcome is distinguishable from success by exit code alone (#50). `branch` in the
-  JSON result is reserved and always null this version (not reliably derivable host-side).
+  so a no-PR outcome is distinguishable from success by exit code alone (#50).
+- The branch the build prompt pins is now deterministic and task-distinguishing
+  (`franky/issue-<n>` / `franky/<jira-key>` / `franky/<prose-slug>`, replacing the loose
+  repo-name hint) so the host can predict it for the idempotency pre-check; `branch` in the
+  JSON result carries that predicted value (was always null) (#50).
 
 ## [0.0.4] - 2026-06-25
 

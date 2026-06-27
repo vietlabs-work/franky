@@ -171,9 +171,9 @@ parsing prose. Three guarantees:
 Success / agent result:
 
 ```json
-{ "status": "pr_opened|no_pr|agent_error|iterate_complete",
+{ "status": "pr_opened|already_open|no_pr|agent_error|timeout|iterate_complete",
   "pr_url": "https://github.com/you/repo/pull/42",
-  "branch": null,
+  "branch": "franky/issue-42",
   "reason": "PR opened",
   "exit_code": 0,
   "economics": {"tokens_in": 1200, "tokens_out": 340, "cost_usd": 0.0123, "duration_s": 47.5},
@@ -190,8 +190,9 @@ Failure:
 
 `--json` implies `--quiet`, so stdout carries **exactly one** JSON object and nothing else
 (progress + the update hint are suppressed). The object is fully redacted - a secret value
-never appears, even nested in a field. `branch` is reserved and always `null` this version
-(not reliably derivable host-side).
+never appears, even nested in a field. `branch` is the **predicted** branch name
+(`franky/<slug>`) the host computed before the run; the agent may deviate, so treat it as a
+hint, not a guarantee (`iterate` reports `null`).
 
 **2. Exit-code taxonomy (a SemVer contract).** The process exit code always equals the
 failure's `code`:
@@ -206,9 +207,11 @@ failure's `code`:
 | 6 | docker / image unavailable |
 | 7 | agent ran but exited nonzero or produced no PR |
 | 8 | network/timeout (JIRA reach/HTTP/parse) |
+| 9 | run exceeded `--max-duration` (the container was aborted) |
 
 Note `build` exits **7** (not 0) when the agent finishes cleanly but opens no PR, so success
-is distinguishable from a no-PR outcome by exit code alone.
+is distinguishable from a no-PR outcome by exit code alone. The taxonomy is append-only -
+new codes may be added, but existing values never change meaning.
 
 **3. Never-hang.** Every interactive prompt fails fast with exit `2` in a non-TTY instead of
 blocking forever:
@@ -223,6 +226,21 @@ blocking forever:
 Other flags: `-q/--quiet` suppresses progress and the update hint (stdout stays exactly the
 bare PR URL); `-y/--yes` auto-approves `--plan-first`. Without `--json`, errors print a single
 `franky: <message>` line to stderr and use the same exit code.
+
+**4. Budget guardrail.** `--max-duration SECONDS` (on `build` and `iterate`) aborts a runaway
+run; the container is killed and the result is `status: timeout` / exit `9`. The default
+budget is 1800s. (A token/cost cap is out of scope - token usage is only known after the run.)
+
+**5. Idempotency (retry-safety).** Before launching, `build` computes a deterministic branch
+(`franky/issue-42`, `franky/<jira-key>`, or `franky/<prose-slug>`) and asks GitHub whether an
+open Franky PR already uses it. If so it reports `status: already_open` with the existing
+`pr_url` at exit `0` and does **not** open a duplicate - so an agent that retries the same task
+converges instead of stacking PRs. The check is best-effort (any error just proceeds with the
+build) and `--force` skips it.
+
+**6. `franky schema`.** Prints one JSON object describing every command + its flags, the
+result/error object shapes, and the exit-code table - machine introspection so an agent can
+discover the contract instead of parsing `--help`.
 
 ## Security
 

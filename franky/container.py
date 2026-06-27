@@ -30,6 +30,12 @@ from .profile import PROFILE_BUNDLE_VAR
 # Long agent runs: a full clone-build-test-PR cycle can take many minutes. 30 min cap.
 FALLBACK_TIMEOUT_SECS = 1800
 
+# On a timeout Franky kills the container, so the agent's OWN exit code is never observed.
+# We therefore return a Franky-set sentinel (124, the GNU `timeout(1)` convention) rather than
+# the generic agent-error 1, so the CLI can map it to status="timeout" instead of agent_error.
+CONTAINER_TIMEOUT_CODE = 124
+CONTAINER_TIMEOUT_MSG = "franky: container timed out after {timeout}s"
+
 # The non-root user baked into the image (Dockerfile: useradd --uid 1001 franky). The writable
 # tmpfs mounts are owned by this uid/gid so the agent can actually clone, commit, and write its
 # HOME config under a --read-only root. (The --tmpfs PATH:opts short form silently ignores
@@ -425,7 +431,10 @@ def run_in_container(
                         proc.kill()
                         proc.wait()
                 if timed_out:
-                    code, output = 1, f"franky: container timed out after {timeout}s"
+                    code, output = (
+                        CONTAINER_TIMEOUT_CODE,
+                        CONTAINER_TIMEOUT_MSG.format(timeout=timeout),
+                    )
                 else:
                     code = proc.returncode
                     output = "".join(raw_lines)
@@ -447,7 +456,10 @@ def run_in_container(
                 output = (proc.stdout or "") + (proc.stderr or "")
             except subprocess.TimeoutExpired:
                 task_launched = True
-                code, output = 1, f"franky: container timed out after {timeout}s"
+                code, output = (
+                    CONTAINER_TIMEOUT_CODE,
+                    CONTAINER_TIMEOUT_MSG.format(timeout=timeout),
+                )
             except OSError as exc:
                 code, output = 1, f"franky: could not launch docker ({exc})"
     except _AbortRun as abort:
