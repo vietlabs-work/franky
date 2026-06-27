@@ -37,7 +37,7 @@ def test_schema_exit_codes_cover_every_exit_constant():
 def test_schema_lists_core_commands_with_flags():
     schema = build_schema(cli.main)
     cmds = schema["commands"]
-    for name in ("build", "iterate", "schema"):
+    for name in ("build", "iterate", "plan", "schema"):
         assert name in cmds
 
     build_flag_names = {f["name"] for f in cmds["build"]["flags"]}
@@ -77,6 +77,20 @@ def test_result_schema_documents_fields_and_predicted_branch():
     assert "predicted" in rs["branch"].lower()
     for econ_field in ("tokens_in", "tokens_out", "cost_usd", "duration_s"):
         assert econ_field in rs["economics"]
+
+
+def test_plan_result_schema_is_distinct_envelope():
+    schema = build_schema(cli.main)
+    assert "plan_result_schema" in schema
+    prs = schema["plan_result_schema"]
+    for field in ("fits_one_pr", "subtasks", "rationale", "engine", "repo", "exit_code"):
+        assert field in prs
+    # subtasks is a list of {title, summary, suggested_repo}.
+    assert isinstance(prs["subtasks"], list)
+    for field in ("title", "summary", "suggested_repo"):
+        assert field in prs["subtasks"][0]
+    # It is NOT merged into result_schema (a separate top-level envelope).
+    assert "fits_one_pr" not in schema["result_schema"]
 
 
 def test_error_schema_shape():

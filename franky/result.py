@@ -28,7 +28,7 @@ EXIT_CONFIG = 3  # bad config file, allowlist unset/empty/malformed, bad engine
 EXIT_TASK_REJECTED = 4  # allowlist / task rejection
 EXIT_AUTH = 5  # auth/creds missing (GH_TOKEN, engine creds, JIRA creds, JIRA 401/403)
 EXIT_DOCKER = 6  # docker / image unavailable
-EXIT_AGENT = 7  # agent ran but exited nonzero / produced no PR
+EXIT_AGENT = 7  # agent ran but exited nonzero / produced no PR / (plan) no parseable plan
 EXIT_NETWORK = 8  # network/timeout (JIRA reach/HTTP/parse)
 EXIT_TIMEOUT = 9  # run exceeded --max-duration; distinct from 8 network/JIRA-timeout
 
@@ -41,7 +41,7 @@ EXIT_CODES: dict[int, str] = {
     EXIT_TASK_REJECTED: "task rejected: off-allowlist repo, missing --repo, or bad URL/key",
     EXIT_AUTH: "missing creds (GH_TOKEN, engine creds, JIRA creds) or JIRA 401/403",
     EXIT_DOCKER: "docker or image unavailable",
-    EXIT_AGENT: "agent ran but exited nonzero or produced no PR",
+    EXIT_AGENT: "agent ran but exited nonzero, produced no PR, or (plan) emitted no parseable plan",
     EXIT_NETWORK: "network/timeout reaching JIRA, HTTP error, or unparseable response",
     EXIT_TIMEOUT: "run exceeded --max-duration (the container was killed)",
 }

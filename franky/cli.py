@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import subprocess
 import sys
 import time
@@ -25,7 +26,8 @@ import click
 
 from . import franky_version
 from ._install import detect_install
-from .config import load_config, redact
+from .config import Config, load_config, redact
+from .decompose import build_plan_result, parse_decomposition
 from .economics import Usage, format_economics, parse_usage
 from .container import (
     CONTAINER_TIMEOUT_CODE,
@@ -48,7 +50,13 @@ from .profile import (
     scan_profile_files,
     write_profile,
 )
-from .prompt import build_iterate_prompt, build_plan_prompt, build_prompt, task_slug
+from .prompt import (
+    build_decompose_prompt,
+    build_iterate_prompt,
+    build_plan_prompt,
+    build_prompt,
+    task_slug,
+)
 from .result import (
     EXIT_AGENT,
     EXIT_SUCCESS,
@@ -62,7 +70,7 @@ from .result import (
     build_result,
 )
 from .schema import build_schema
-from .task import PROSE_MAX_CHARS, parse_pr_task, parse_task
+from .task import PROSE_MAX_CHARS, TaskSpec, parse_pr_task, parse_task
 from .update_check import force_update, maybe_auto_update
 from .userconfig import (
     SECRET_KEYS,
@@ -88,6 +96,69 @@ def _stdin_is_interactive() -> bool:
     guarantee.
     """
     return sys.stdin.isatty()
+
+
+def _read_task_input(task_input: tuple[str, ...]) -> str:
+    """Resolve the positional task argument, handling the `-` stdin convention.
+
+    `<cmd> - --repo ...` reads the prose task from stdin. A TTY on `-` would block forever,
+    so fail fast (never-hang, exit 2) rather than hang. Shared by `build` and `plan` so the
+    stdin contract is identical across both.
+    """
+    if task_input == ("-",):
+        if _stdin_is_interactive():
+            raise FrankyError(
+                "this command reads the task from stdin, but stdin is a TTY - pipe the task "
+                "in or pass it as an argument",
+                code=EXIT_USAGE,
+                kind="interactive_input_required",
+                hint="pipe a task into stdin or pass it as an argument",
+            )
+        return sys.stdin.read().strip()
+    return " ".join(task_input)
+
+
+def _resolve_task_spec(
+    task_input_str: str,
+    repo: str | None,
+    engine: str | None,
+    env: dict,
+) -> tuple[Config, TaskSpec, str, list[str]]:
+    """Run the shared config + task-parse + JIRA-fetch preamble; return (cfg, spec, branch, secrets).
+
+    Factors out the body `build` and `plan` share so the allowlist gate, fail-closed config,
+    JIRA fetch, and host-predicted branch are identical across both commands. Each underlying
+    call already raises the right typed FrankyError (ConfigError/AuthError/TaskRejected/
+    NetworkError); those re-raise untouched and only a residual plain ValueError is wrapped.
+
+    The branch is computed BEFORE the JIRA fetch mutates spec.text on purpose: for a jira
+    spec the slug keys on the bare KEY (stable), not the fetched body, so the host-predicted
+    branch matches what build_prompt pins and what the idempotency pre-check looks up. `plan`
+    ignores the branch (it builds nothing).
+    """
+    # Inject user config file values into env via setdefault (process env wins). A malformed
+    # file -> ConfigError (exit 3) so --json gets the right code + JSON error.
+    try:
+        load_config_file(env)
+    except FrankyError:
+        raise
+    except ValueError as exc:
+        raise ConfigError(f"config file error: {exc}") from exc
+
+    try:
+        cfg = load_config(engine, env)
+        secrets = cfg.secret_values()
+        spec = parse_task(task_input_str, repo, cfg.allowed_repos)
+        branch = f"franky/{task_slug(spec)}"
+        if spec.source == "jira":
+            # Fetch the JIRA issue host-side (the container has no JIRA creds or egress).
+            body = fetch_jira_issue(spec.text, env)
+            spec = dc_replace(spec, text=body[:PROSE_MAX_CHARS].strip())
+    except FrankyError:
+        raise
+    except ValueError as exc:
+        raise NetworkError(redact(str(exc), cfg_secrets_safe())) from exc
+    return cfg, spec, branch, secrets
 
 
 def _emit_error(exc: FrankyError, as_json: bool, secrets: list[str]) -> None:
@@ -226,6 +297,9 @@ def build(
 ) -> None:
     """Build TASK_INPUT (a GitHub issue URL, a JIRA key, or a prose request) and open a PR.
 
+    Big task? Run `franky plan <task>` first to split it into PR-sized sub-tasks - one franky
+    run is meant to be one focused PR.
+
     Examples:
       franky build https://github.com/you/repo/issues/42
       franky build jira FOO-123 --repo you/repo
@@ -249,53 +323,16 @@ def build(
     try:
         # stdin task input: `build - --repo ...`. A TTY on `-` would block forever, so fail
         # fast (never-hang); otherwise read the prose task from stdin.
-        if task_input == ("-",):
-            if _stdin_is_interactive():
-                raise FrankyError(
-                    "`build -` reads the task from stdin, but stdin is a TTY - pipe the task in "
-                    "or pass it as an argument",
-                    code=EXIT_USAGE,
-                    kind="interactive_input_required",
-                    hint="pipe a task into stdin or pass it as an argument",
-                )
-            task_input_str = sys.stdin.read().strip()
-        else:
-            task_input_str = " ".join(task_input)
+        task_input_str = _read_task_input(task_input)
 
         # Best-effort, hint-only update check (never blocks/raises; ~1s budget, cached). Skip
         # under --quiet/--json so stderr stays clean. Silenced too by FRANKY_NO_UPDATE_CHECK=1.
         if not quiet:
             maybe_auto_update()
 
-        # Inject user config file values into os.environ via setdefault (process env wins). A
-        # malformed file -> ConfigError (exit 3) so --json gets the right code + JSON error.
-        try:
-            load_config_file(os.environ)
-        except FrankyError:
-            raise
-        except ValueError as exc:
-            raise ConfigError(f"config file error: {exc}") from exc
-
-        # Config + task parse + JIRA fetch are typed-error surfaces. Each already raises the
-        # right FrankyError subclass (ConfigError/AuthError/TaskRejected/NetworkError); re-raise
-        # those untouched and only wrap a residual plain ValueError defensively.
-        try:
-            cfg = load_config(engine, os.environ)
-            secrets = cfg.secret_values()
-            spec = parse_task(task_input_str, repo, cfg.allowed_repos)
-            # Compute the predicted branch HERE, before the JIRA fetch mutates spec.text: for a
-            # jira spec the slug keys on the bare KEY (stable), not the fetched body, so the
-            # host-predicted branch matches what build_prompt pins below and what the
-            # idempotency pre-check looks up.
-            branch = f"franky/{task_slug(spec)}"
-            if spec.source == "jira":
-                # Fetch the JIRA issue host-side (the container has no JIRA creds or egress).
-                body = fetch_jira_issue(spec.text, os.environ)
-                spec = dc_replace(spec, text=body[:PROSE_MAX_CHARS].strip())
-        except FrankyError:
-            raise
-        except ValueError as exc:
-            raise NetworkError(redact(str(exc), cfg_secrets_safe())) from exc
+        # Shared config + task-parse + JIRA-fetch preamble (also computes the host-predicted
+        # branch before the JIRA fetch mutates spec.text - see _resolve_task_spec).
+        cfg, spec, branch, secrets = _resolve_task_spec(task_input_str, repo, engine, os.environ)
 
         # Idempotency pre-check (issue #50): if a Franky PR is already open on the predicted
         # branch, a retry must NOT open a second one. Report the existing PR and stop without
@@ -570,6 +607,185 @@ def iterate(
         ctx.exit(exc.code)
 
 
+@main.command()
+@click.argument("task_input", nargs=-1, required=True)
+@click.option(
+    "--repo", "repo", default=None, help="Target repo owner/repo (required for prose/jira tasks)."
+)
+@click.option(
+    "--engine",
+    "engine",
+    default=None,
+    # Same registry-derived choice as `build` (see that command's note).
+    type=click.Choice(sorted(ENGINES)),
+    help="Engine override; else FRANKY_ENGINE, else pi.",
+)
+@click.option(
+    "--profile",
+    "profile_path_opt",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False),
+    help="Path to a profile.toml to inject skills/instructions/knowledge into the container. "
+    "Auto-discovered from ~/.franky/profile.toml if present.",
+)
+@click.option(
+    "--json", "as_json", is_flag=True, help="Emit a single JSON result/error object on stdout."
+)
+@click.option(
+    "-q",
+    "--quiet",
+    "quiet",
+    is_flag=True,
+    help="Suppress progress + the update hint (implied by --json).",
+)
+@click.option(
+    "--max-duration",
+    "max_duration",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Abort the run after N seconds (default 1800).",
+)
+@click.pass_context
+def plan(
+    ctx: click.Context,
+    task_input: tuple[str, ...],
+    repo: str | None,
+    engine: str | None,
+    profile_path_opt: str | None,
+    as_json: bool,
+    quiet: bool,
+    max_duration: int | None,
+) -> None:
+    """Assess scope and decompose TASK_INPUT into PR-sized sub-tasks - READ-ONLY, builds nothing.
+
+    Accepts the SAME task forms as `build` (a GitHub issue URL, a JIRA key, or a prose
+    request, plus `plan - --repo ...` to read prose from stdin). Runs one read-only container
+    pass that inspects the repo/issue, decides whether the task fits one focused PR or needs
+    splitting, and emits a decomposition. It creates no branch, opens no PR, and writes
+    nothing to the target repo - the caller orchestrates what to do with the sub-tasks.
+
+    --json emits one machine-readable object on stdout: a decomposition
+    `{fits_one_pr, subtasks:[{title, summary, suggested_repo}], rationale, engine, repo,
+    exit_code}` on success (a DISTINCT envelope from build/iterate), or the shared
+    `{"error":{...}}` object on failure. Exit codes follow the documented taxonomy (0 ok,
+    2 usage, 3 config, 4 task, 5 auth, 6 docker, 7 agent/no-plan, 8 net, 9 timeout).
+    """
+    # --json implies --quiet: the JSON object is the only thing stdout/stderr should carry.
+    quiet = quiet or as_json
+    secrets = cfg_secrets_safe()
+    try:
+        # stdin task input mirrors `build -` (never-hang on a TTY).
+        task_input_str = _read_task_input(task_input)
+
+        if not quiet:
+            maybe_auto_update()
+
+        # Shared config + task-parse + JIRA-fetch preamble (branch is unused - plan builds
+        # nothing).
+        cfg, spec, _branch, secrets = _resolve_task_spec(task_input_str, repo, engine, os.environ)
+
+        franky_img, proxy_img = _ensure_images(os.environ)
+        bundle = _load_profile_bundle(profile_path_opt, os.environ, secrets)
+        progress = None if quiet else _make_progress(cfg.engine, False)
+
+        # Per-run nonce fenced into the prompt + parser: a hostile issue body / repo file
+        # cannot plant a fixed sentinel to hijack the decomposition Franky reports (same
+        # spirit as the repo-scoped PR-URL guard). Threaded into BOTH halves. Generated via
+        # the module-level `secrets` (not the local secret-list var, which shadows it here).
+        nonce = _make_nonce()
+        code, output, duration = _run_pass(
+            cfg,
+            build_decompose_prompt(spec, nonce),
+            franky_img,
+            proxy_img,
+            bundle,
+            progress=progress,
+            timeout=max_duration,
+        )
+
+        usage = _parse_usage_safe(output)
+        econ = _economics_line(usage, duration, secrets)
+        if not as_json:
+            click.echo(econ, err=True)
+        _write_log(output, secrets, footer=econ)
+
+        # Timeout first (124 is nonzero) -> dedicated timeout contract, before generic agent.
+        if code == CONTAINER_TIMEOUT_CODE:
+            raise FrankyError(
+                "plan pass exceeded max-duration",
+                code=EXIT_TIMEOUT,
+                kind="timeout",
+            )
+        if code != 0:
+            raise FrankyError(
+                f"plan pass exited {code} - see the redacted log in tasks/",
+                code=EXIT_AGENT,
+                kind="agent_error",
+            )
+
+        # parse_decomposition is best-effort; guard the call so ANY unexpected raise (e.g. a
+        # RecursionError on a pathologically nested transcript) degrades to "no parseable plan"
+        # and the shared error envelope, never a traceback that bypasses the --json contract.
+        try:
+            parsed = parse_decomposition(output, nonce)
+        except Exception:
+            parsed = None
+        if parsed is None:
+            # No partial object - route through the shared error envelope (exit 7).
+            raise FrankyError(
+                "agent produced no parseable plan - see the redacted log in tasks/",
+                code=EXIT_AGENT,
+                kind="no_plan",
+            )
+
+        result = build_plan_result(parsed, engine=cfg.engine.name, repo=spec.repo)
+        if as_json:
+            # The ONLY stdout line under --json.
+            click.echo(redact(json.dumps(result), secrets))
+        else:
+            for line in _format_plan_summary(result):
+                click.echo(redact(line, secrets))
+        ctx.exit(EXIT_SUCCESS)
+    except FrankyError as exc:
+        _emit_error(exc, as_json, secrets)
+        ctx.exit(exc.code)
+
+
+def _make_nonce() -> str:
+    """A per-run hex nonce for the `plan` sentinel fence.
+
+    Wrapped so it reads `secrets.token_hex` off the MODULE (the `plan` body rebinds `secrets`
+    to a secret-VALUE list, which would shadow the module), and so tests can monkeypatch
+    `cli.secrets.token_hex` to a fixed value for a deterministic sentinel.
+    """
+    return secrets.token_hex(8)
+
+
+def _format_plan_summary(result: dict) -> list[str]:
+    """Render the human-readable (non-json) plan summary lines for stdout.
+
+    Returns a list of lines the caller redacts and echoes: the fits-one-PR verdict, the
+    numbered sub-tasks (`N. <title> [suggested_repo]` + their summaries), and the rationale.
+    """
+    lines: list[str] = []
+    if result["fits_one_pr"]:
+        lines.append("This task fits ONE focused PR.")
+    else:
+        lines.append("This task should be split into PR-sized sub-tasks.")
+    subtasks = result["subtasks"]
+    if subtasks:
+        lines.append("")
+        lines.append("Sub-tasks:")
+        for i, st in enumerate(subtasks, start=1):
+            lines.append(f"{i}. {st['title']} [{st['suggested_repo']}]")
+            if st["summary"]:
+                lines.append(f"   {st['summary']}")
+    if result["rationale"]:
+        lines.append("")
+        lines.append(f"Rationale: {result['rationale']}")
+    return lines
+
+
 def _ensure_images(env: Mapping[str, str]) -> tuple[str, str]:
     """Resolve + ensure the franky and franky-proxy images are available locally.
 
@@ -616,7 +832,7 @@ def _run_pass(
 
     Duration is measured with time.monotonic() around run_in_container only. Logging and the
     economics summary are the CALLER's responsibility (the planning pass logs without an
-    economics footer; the build and iterate passes attach one). Shared by build and iterate.
+    economics footer; the build and iterate passes attach one). Shared by build, iterate, and plan.
 
     `timeout` is the --max-duration budget in seconds; None preserves run_in_container's own
     default (FALLBACK_TIMEOUT_SECS), so the kwarg is only forwarded when explicitly set.

@@ -201,3 +201,50 @@ def build_plan_prompt(spec: TaskSpec) -> str:
     )
 
     return f"{persona}\n\n{task_block}\n{plan_conventions}"
+
+
+def build_decompose_prompt(spec: TaskSpec, nonce: str) -> str:
+    """Prompt for the `franky plan` command: read-only scope-assessment + decomposition.
+
+    The agent inspects the repo/issue (read-only), decides whether the task fits ONE focused
+    PR or needs splitting into PR-sized sub-tasks, and ends its response with EXACTLY ONE
+    machine-readable sentinel block carrying the decomposition JSON.
+
+    `nonce` is a per-run token (the CLI generates `secrets.token_hex`) fenced into the
+    sentinel so a hostile issue body / repo file cannot plant a fixed sentinel to hijack the
+    payload Franky reports - the same trust register as the repo-scoped PR-URL guard. The
+    parser keys on this exact token, so the literal must survive into the prompt. Same
+    read-only register as build_plan_prompt: the container is autonomous, but plan builds and
+    opens NOTHING, so these instructions keep the agent from wasting the pass on edits it
+    cannot persist (the container is ephemeral) and from creating a branch or PR.
+    """
+    persona = load_persona()
+    task_block, _ = _task_block(spec, plan=True)
+
+    begin = f"FRANKY_PLAN_{nonce}_BEGIN"
+    end = f"FRANKY_PLAN_{nonce}_END"
+
+    decompose_conventions = (
+        "PLAN MODE - this is a read-only scope-assessment and decomposition pass, NOT "
+        "execution:\n"
+        "- Inspect the issue and the repo as needed (read-only) to understand the work.\n"
+        "- Assess whether the task fits ONE focused pull request or should be split into "
+        "several PR-sized sub-tasks. Each sub-task must be sized to roughly one PR.\n"
+        "- Do NOT modify any files, commit, push, create a branch, or open a pull request. "
+        "Assess, decompose, and stop.\n"
+        "- END your response with EXACTLY ONE machine-readable block and NO text after it, "
+        "in this exact form (a single line, compact JSON, no surrounding code fence):\n"
+        # The middle segment carries LITERAL braces, so it cannot be an f-string; the explicit
+        # `+` concatenation around it is intentional (not a typo).
+        f"  {begin}" + "{<compact ONE-LINE JSON>}" + f"{end}\n"
+        "  where the JSON is exactly this shape:\n"
+        '  {"fits_one_pr": <bool>, "subtasks": [{"title": "...", "summary": "...", '
+        '"suggested_repo": "owner/repo"}], "rationale": "..."}\n'
+        "- If the task fits one PR, set `fits_one_pr` true; `subtasks` may then be a single "
+        "entry or empty, and `rationale` explains why it fits. Otherwise set it false and "
+        "list one entry per PR-sized sub-task.\n"
+        f"- Output ONLY the sentinel block as the FINAL content of your response; add no text "
+        f"after `{end}`.\n"
+    )
+
+    return f"{persona}\n\n{task_block}\n{decompose_conventions}"

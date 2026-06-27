@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `franky plan <task>` (#52): a read-only scope-assessment + decomposition command. Runs ONE
+  read-only container pass that inspects the repo/issue and decides whether the task fits one
+  focused PR or should be split, then emits a decomposition `{fits_one_pr, subtasks:[{title,
+  summary, suggested_repo}], rationale}` (a DISTINCT `--json` envelope from build/iterate;
+  errors share the `{"error":{...}}` envelope and exit-code taxonomy, with `kind: no_plan` /
+  exit `7` when the agent produces no parseable plan). It accepts the same task forms as
+  `build` (issue URL / JIRA key / prose / `-` stdin), the same repo allowlist gate, and the
+  same `--engine` / `--profile` / `--max-duration` / `--json` / `-q` flags. It builds nothing
+  (no branch, commits, or PR) - the caller orchestrates per sub-task. A per-run nonce fences
+  the machine-readable block so a hostile issue body / repo file cannot plant a fixed sentinel
+  to hijack the reported decomposition. `build --help` gains a static advisory pointing at it
+  ("one franky run = one focused PR").
 - Machine-friendly CLI for agent callers (#50). `franky build` / `iterate` gain:
   - `--json`: a single result object on stdout - `{status, pr_url, branch, reason, exit_code,
     economics{tokens_in, tokens_out, cost_usd, duration_s}, log_path, engine, repo}` - or a

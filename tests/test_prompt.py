@@ -1,4 +1,5 @@
 from franky.prompt import (
+    build_decompose_prompt,
     build_iterate_prompt,
     build_plan_prompt,
     build_prompt,
@@ -115,6 +116,35 @@ def test_plan_prompt_issue_still_fetches_but_does_not_close():
     assert "gh issue view" in p
     # No PR is opened in a planning pass, so no closing keyword either.
     assert "Closes #" not in p
+
+
+# ---------------------------------------------------------------------------
+# build_decompose_prompt (the `franky plan` read-only decomposition pass)
+# ---------------------------------------------------------------------------
+
+
+def test_decompose_prompt_is_read_only_and_names_repo():
+    spec = TaskSpec(repo="me/repo", text="add a big feature", source="prose")
+    p = build_decompose_prompt(spec, "abc123")
+    assert "me/repo" in p
+    assert "add a big feature" in p
+    # Read-only: must forbid mutating actions and must not instruct opening a PR.
+    assert "do NOT" in p or "Do NOT" in p
+    assert "gh pr create" not in p
+
+
+def test_decompose_prompt_has_nonce_fenced_sentinel_and_schema():
+    spec = TaskSpec(repo="me/repo", text="add a big feature", source="prose")
+    p = build_decompose_prompt(spec, "abc123")
+    assert "FRANKY_PLAN_abc123_BEGIN" in p
+    assert "FRANKY_PLAN_abc123_END" in p
+    # The decomposition schema keys must appear so the agent emits the right shape.
+    assert "fits_one_pr" in p
+    assert "subtasks" in p
+    assert "rationale" in p
+    assert "suggested_repo" in p
+    # Must instruct: no text after the closing sentinel.
+    assert "no text after" in p.lower()
 
 
 # ---------------------------------------------------------------------------
