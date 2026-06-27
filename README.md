@@ -161,9 +161,43 @@ anything, and to stop otherwise. This is a prompt-level guard in the same regist
 "never merge" rule (the agent is autonomous); the hard bounds remain the repo allowlist, the
 egress cage, and PR-not-merge. See the Security section.
 
+## Planning a big task
+
+**One franky run = one focused PR.** A run is meant to produce a single, reviewable pull
+request, not a sprawling multi-concern changeset. If a task is too big for one PR, split it
+first with `franky plan`:
+
+```
+franky plan "rework auth + add SSO + migrate the user table" --repo you/repo [--json]
+franky plan https://github.com/you/repo/issues/42 --json
+franky plan - --repo you/repo          (read the prose task from stdin)
+```
+
+`plan` runs **one read-only container pass** that inspects the repo/issue, decides whether the
+task fits one PR or needs splitting, and emits a decomposition. It **builds nothing** - no
+branch, no commits, no PR. It accepts the same task forms as `build` (issue URL / JIRA key /
+prose / `-` stdin), gates on the same repo allowlist, and threads `--engine`, `--profile`, and
+`--max-duration` the same way. The caller orchestrates what to do with the sub-tasks (e.g. run
+`franky build` per sub-task). `build --help` carries a static pointer to this command.
+
+Under `--json`, `plan` emits a **distinct** envelope (NOT the build/iterate `result_schema`):
+
+```json
+{ "fits_one_pr": false,
+  "subtasks": [
+    {"title": "split out SSO", "summary": "add the SSO provider hooks", "suggested_repo": "you/repo"},
+    {"title": "migrate user table", "summary": "the schema change + backfill", "suggested_repo": "you/repo"}
+  ],
+  "rationale": "three independent concerns; each is its own reviewable PR",
+  "engine": "pi", "repo": "you/repo", "exit_code": 0 }
+```
+
+Errors share the same `{"error":{...}}` envelope and exit-code taxonomy as `build`/`iterate`
+(a parseable plan that the agent never produced is exit `7`, `kind: no_plan`).
+
 ## Machine / scripting interface
 
-`franky build` / `iterate` are built to be driven by a script or an LLM/agent without
+`franky build` / `iterate` / `plan` are built to be driven by a script or an LLM/agent without
 parsing prose. Three guarantees:
 
 **1. `--json` - one machine-readable object on stdout.**
@@ -218,8 +252,9 @@ blocking forever:
 
 - `--plan-first` without a TTY needs `--yes` to auto-approve, else it exits 2 **before**
   running the planning pass.
-- `franky build -` reads the task from stdin; on an interactive TTY (no piped input) it
-  exits 2 rather than block waiting for a human to type the task - pipe the task in instead.
+- `franky build -` (and `franky plan -`) reads the task from stdin; on an interactive TTY (no
+  piped input) it exits 2 rather than block waiting for a human to type the task - pipe the
+  task in instead.
 - `franky config set <KEY>` (no value) and `franky config init` exit 2 without a TTY rather
   than waiting on a prompt.
 
@@ -227,9 +262,10 @@ Other flags: `-q/--quiet` suppresses progress and the update hint (stdout stays 
 bare PR URL); `-y/--yes` auto-approves `--plan-first`. Without `--json`, errors print a single
 `franky: <message>` line to stderr and use the same exit code.
 
-**4. Budget guardrail.** `--max-duration SECONDS` (on `build` and `iterate`) aborts a runaway
-run; the container is killed and the result is `status: timeout` / exit `9`. The default
-budget is 1800s. (A token/cost cap is out of scope - token usage is only known after the run.)
+**4. Budget guardrail.** `--max-duration SECONDS` (on `build`, `iterate`, and `plan`) aborts a
+runaway run; the container is killed and the result is `status: timeout` / exit `9` (`plan`
+raises the timeout error). The default budget is 1800s. (A token/cost cap is out of scope -
+token usage is only known after the run.)
 
 **5. Idempotency (retry-safety).** Before launching, `build` computes a deterministic branch
 (`franky/issue-42`, `franky/<jira-key>`, or `franky/<prose-slug>`) and asks GitHub whether an
@@ -239,8 +275,9 @@ converges instead of stacking PRs. The check is best-effort (any error just proc
 build) and `--force` skips it.
 
 **6. `franky schema`.** Prints one JSON object describing every command + its flags, the
-result/error object shapes, and the exit-code table - machine introspection so an agent can
-discover the contract instead of parsing `--help`.
+result/error object shapes (including the distinct `plan_result_schema`), and the exit-code
+table - machine introspection so an agent can discover the contract instead of parsing
+`--help`.
 
 ## Security
 

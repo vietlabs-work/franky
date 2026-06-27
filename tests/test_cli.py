@@ -1837,3 +1837,241 @@ def test_build_normal_result_populates_predicted_branch(monkeypatch):
     assert res.exit_code == 0, res.output
     data = json.loads(res.output)
     assert data["branch"] == "franky/do-it"
+
+
+# ---------------------------------------------------------------------------
+# `franky plan` - read-only scope-assessment + decomposition (#52)
+# ---------------------------------------------------------------------------
+
+PLAN_NONCE = "feedfacecafe0001"
+
+
+def _plan_block(payload, nonce=PLAN_NONCE):
+    import json as _json
+
+    return f"FRANKY_PLAN_{nonce}_BEGIN{_json.dumps(payload)}FRANKY_PLAN_{nonce}_END"
+
+
+def _fix_plan_nonce(monkeypatch):
+    """Pin the per-run nonce so a fake container can echo a matching sentinel block."""
+    monkeypatch.setattr(cli.secrets, "token_hex", lambda *a, **k: PLAN_NONCE)
+
+
+def test_plan_help_shows_command():
+    res = CliRunner().invoke(cli.main, ["plan", "--help"])
+    assert res.exit_code == 0
+    assert "--engine" in res.output
+    assert "read-only" in res.output.lower()
+
+
+def test_plan_json_emits_one_decomposition_object(monkeypatch):
+    _fix_plan_nonce(monkeypatch)
+    # Pin the engine so the envelope assertion is deterministic regardless of any host
+    # ~/.franky/config (the replaced cli.os.environ does not carry FRANKY_CONFIG_FILE).
+    monkeypatch.setattr(cli.os, "environ", {**_build_env(), "FRANKY_ENGINE": "pi"})
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+
+    payload = {
+        "fits_one_pr": False,
+        "subtasks": [
+            {"title": "part one", "summary": "do A", "suggested_repo": "me/repo"},
+            {"title": "part two", "summary": "do B", "suggested_repo": "me/repo"},
+        ],
+        "rationale": "two concerns",
+    }
+    seen = {}
+
+    def fake_run(cfg, inner_argv, *a, **k):
+        # The prompt is the LAST positional/kw - capture it via the engine argv tail; here we
+        # assert the decompose prompt reached the container by checking the inner argv carries
+        # the nonce-fenced sentinel instruction.
+        seen["argv"] = inner_argv
+        return 0, _plan_block(payload)
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["plan", "add a big feature", "--repo", "me/repo", "--json"])
+    assert res.exit_code == 0, res.output
+    # Exactly one JSON object on stdout, nothing else.
+    data = json.loads(res.output)
+    assert data["fits_one_pr"] is False
+    assert [s["title"] for s in data["subtasks"]] == ["part one", "part two"]
+    assert data["rationale"] == "two concerns"
+    # The envelope fields build_plan_result adds are present and correct.
+    assert data["engine"] == "pi"
+    assert data["repo"] == "me/repo"
+    assert data["exit_code"] == 0
+    # The decompose prompt (carrying the nonce sentinel) reached the container, read-only.
+    assert any(f"FRANKY_PLAN_{PLAN_NONCE}_BEGIN" in str(a) for a in seen["argv"])
+    assert not any("gh pr create" in str(a) for a in seen["argv"])
+
+
+def test_plan_non_json_prints_prose_summary(monkeypatch):
+    _fix_plan_nonce(monkeypatch)
+    monkeypatch.setattr(cli.os, "environ", _build_env())
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+
+    payload = {
+        "fits_one_pr": False,
+        "subtasks": [{"title": "split this", "summary": "the detail", "suggested_repo": "me/repo"}],
+        "rationale": "too big",
+    }
+    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: (0, _plan_block(payload)))
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["plan", "add a big feature", "--repo", "me/repo"])
+    assert res.exit_code == 0, res.output
+    assert "split this" in res.output
+    assert "[me/repo]" in res.output
+    assert "too big" in res.output
+    # Not JSON on stdout.
+    assert "fits_one_pr" not in res.output
+
+
+def test_plan_json_fits_one_pr_true_happy_path(monkeypatch):
+    # The canonical agent-caller path: a task that already fits one PR.
+    _fix_plan_nonce(monkeypatch)
+    monkeypatch.setattr(cli.os, "environ", {**_build_env(), "FRANKY_ENGINE": "pi"})
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+
+    payload = {
+        "fits_one_pr": True,
+        "subtasks": [
+            {"title": "the whole thing", "summary": "one change", "suggested_repo": "me/repo"}
+        ],
+        "rationale": "small and focused",
+    }
+    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: (0, _plan_block(payload)))
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["plan", "tiny fix", "--repo", "me/repo", "--json"])
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.output)
+    assert data["fits_one_pr"] is True
+    assert [s["title"] for s in data["subtasks"]] == ["the whole thing"]
+    assert data["exit_code"] == 0
+
+
+def test_plan_non_json_fits_one_pr_true_prose(monkeypatch):
+    # Covers the fits-one-PR verdict line in _format_plan_summary.
+    _fix_plan_nonce(monkeypatch)
+    monkeypatch.setattr(cli.os, "environ", _build_env())
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+
+    payload = {"fits_one_pr": True, "subtasks": [], "rationale": "one logical change"}
+    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: (0, _plan_block(payload)))
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["plan", "tiny fix", "--repo", "me/repo"])
+    assert res.exit_code == 0, res.output
+    assert "fits ONE focused PR" in res.output
+    assert "one logical change" in res.output
+
+
+def test_plan_no_parseable_plan_exits_7_with_error_object(monkeypatch):
+    _fix_plan_nonce(monkeypatch)
+    monkeypatch.setattr(cli.os, "environ", _build_env())
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: (0, "no sentinel here at all"))
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["plan", "do it", "--repo", "me/repo", "--json"])
+    assert res.exit_code == 7, res.output
+    data = json.loads(res.output)
+    # The shared error envelope, NOT a partial decomposition.
+    assert "error" in data
+    assert "fits_one_pr" not in data
+    assert data["error"]["kind"] == "no_plan"
+
+
+def test_plan_agent_error_exits_7(monkeypatch):
+    # A nonzero (non-timeout) container exit maps to exit 7 agent_error, NOT no_plan.
+    _fix_plan_nonce(monkeypatch)
+    monkeypatch.setattr(cli.os, "environ", _build_env())
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: (3, "the agent crashed"))
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["plan", "do it", "--repo", "me/repo", "--json"])
+    assert res.exit_code == 7, res.output
+    data = json.loads(res.output)
+    assert "error" in data
+    assert data["error"]["kind"] == "agent_error"
+
+
+def test_plan_timeout_maps_to_exit_9(monkeypatch):
+    _fix_plan_nonce(monkeypatch)
+    monkeypatch.setattr(cli.os, "environ", _build_env())
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    monkeypatch.setattr(
+        cli, "run_in_container", lambda *a, **k: (cli.CONTAINER_TIMEOUT_CODE, "timed out")
+    )
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["plan", "do it", "--repo", "me/repo", "--max-duration", "1"])
+    assert res.exit_code == 9, res.output
+
+
+def test_plan_off_allowlist_exits_4(monkeypatch):
+    monkeypatch.setattr(cli.os, "environ", _build_env())
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: (0, "x"))
+
+    res = CliRunner().invoke(cli.main, ["plan", "do it", "--repo", "stranger/repo"])
+    assert res.exit_code == 4, res.output
+    assert "allowlist" in res.output
+
+
+def test_plan_stdin_reads_task(monkeypatch):
+    _fix_plan_nonce(monkeypatch)
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: False)
+    monkeypatch.setattr(cli.os, "environ", _build_env())
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+
+    payload = {"fits_one_pr": True, "subtasks": [], "rationale": "fits"}
+    seen = {}
+
+    def fake_run(cfg, inner_argv, *a, **k):
+        seen["argv"] = inner_argv
+        return 0, _plan_block(payload)
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(
+            cli.main, ["plan", "-", "--repo", "me/repo", "--json"], input="split this big thing\n"
+        )
+    assert res.exit_code == 0, res.output
+    assert any("split this big thing" in str(a) for a in seen["argv"])
+
+
+def test_plan_stdin_dash_interactive_fails_fast(monkeypatch):
+    # A TTY on `plan -` would block forever - fail fast (exit 2), never hang.
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)
+    monkeypatch.setattr(cli.os, "environ", _build_env())
+    res = CliRunner().invoke(cli.main, ["plan", "-", "--repo", "me/repo"])
+    assert res.exit_code == 2, res.output
+
+
+def test_build_help_shows_plan_advisory():
+    res = CliRunner().invoke(cli.main, ["build", "--help"])
+    assert res.exit_code == 0
+    assert "franky plan" in res.output

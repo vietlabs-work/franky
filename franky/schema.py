@@ -40,6 +40,25 @@ _RESULT_SCHEMA: dict = {
     "repo": "the target owner/repo",
 }
 
+# Static description of the `franky plan` success object (the dict build_plan_result shapes).
+# This is a SEPARATE top-level envelope from result_schema: `plan` is a read-only
+# scope-assessment that emits a decomposition, NOT a build/iterate run result. Errors from
+# `plan` still use the shared error_schema below; only its success object differs.
+_PLAN_RESULT_SCHEMA: dict = {
+    "fits_one_pr": "bool: true if the task fits one focused PR, false if it should be split",
+    "subtasks": [
+        {
+            "title": "short title of one PR-sized sub-task",
+            "summary": "what this sub-task entails",
+            "suggested_repo": "owner/repo for this sub-task (defaults to the plan's repo)",
+        }
+    ],
+    "rationale": "why the task fits one PR or how it was split",
+    "engine": "the resolved engine name (e.g. pi | claude | codex)",
+    "repo": "the target owner/repo",
+    "exit_code": "the process exit code this result corresponds to (0 on success)",
+}
+
 # Static description of the error object (the dict build_error shapes), emitted on stdout
 # under --json on any failure. exit_code == error.code.
 _ERROR_SCHEMA: dict = {
@@ -104,6 +123,7 @@ def build_schema(group: click.Group) -> dict:
     return {
         "commands": _walk(group),
         "result_schema": _RESULT_SCHEMA,
+        "plan_result_schema": _PLAN_RESULT_SCHEMA,
         "error_schema": _ERROR_SCHEMA,
         # JSON object keys are strings; stringify the int exit codes for a valid JSON map.
         "exit_codes": {str(code): meaning for code, meaning in result.EXIT_CODES.items()},
