@@ -12,8 +12,13 @@ golden task set run N times - "succeeds on >= X%", never "worked once". Comparis
 same set under two configs (engine A vs B today; persona/model later) and reports the delta, so
 a persona/model/profile change can be judged instead of guessed.
 
-The harness logic is pure and takes an INJECTABLE runner so it is unit-testable without docker;
-only `main()` wires in the real subprocess runner. Stdlib-only.
+The harness logic is pure and takes an INJECTABLE runner and inspector so it is unit-testable
+without docker or a live `gh`; only `main()` wires in the real subprocess runner and
+`_gh_inspector`. Stdlib-only.
+
+Richer artifact checkers (`diff_touches_files`, `change_present`) are implemented and work
+against the live PR via `gh pr view` / `gh pr diff`. They require `gh` installed and
+authenticated for a real run; in tests inject a fake inspector.
 
 Run:  python3 scripts/eval.py [--tasks evals/tasks.json] [-n RUNS] [--engine E] [--compare-engine E2]
 """
@@ -40,10 +45,63 @@ Runner = Callable[[Sequence[str]], "tuple[int, str]"]
 DEFAULT_TASKS = Path(__file__).resolve().parents[1] / "evals" / "tasks.json"
 
 
+# --- PR artifact fetching ---------------------------------------------------
+
+
+@dataclass
+class PRArtifacts:
+    """Artifacts fetched from a live PR via `gh`."""
+
+    changed_files: list[str]
+    diff: str
+
+
+# Inspector: given a PR URL, returns PRArtifacts. The real impl calls `gh`; tests inject a fake.
+Inspector = Callable[[str], PRArtifacts]
+
+
+def _gh_inspector(pr_url: str) -> PRArtifacts:
+    """Fetch PR artifacts (changed files + diff) via `gh`. Warns to stderr on failure."""
+    # Changed files: gh emits one path per line when -q selects .files[].path.
+    files_proc = subprocess.run(
+        ["gh", "pr", "view", pr_url, "--json", "files", "-q", ".files[].path"],
+        capture_output=True,
+        text=True,
+    )
+    if files_proc.returncode != 0:
+        # gh is unavailable / unauthenticated / the PR is not visible: warn once and skip the
+        # second gh call - both artifact checks fail on empty artifacts anyway, and a single
+        # warning keeps the root cause clear (vs. two warnings for one underlying failure).
+        print(
+            f"eval: gh pr view failed for {pr_url} (rc={files_proc.returncode});"
+            " artifact checks will fail",
+            file=sys.stderr,
+        )
+        return PRArtifacts(changed_files=[], diff="")
+    changed_files = [line for line in files_proc.stdout.splitlines() if line.strip()]
+
+    # Diff text.
+    diff_proc = subprocess.run(
+        ["gh", "pr", "diff", pr_url],
+        capture_output=True,
+        text=True,
+    )
+    if diff_proc.returncode == 0:
+        diff = diff_proc.stdout
+    else:
+        diff = ""
+        print(
+            f"eval: gh pr diff failed for {pr_url} (rc={diff_proc.returncode});"
+            " artifact checks will fail",
+            file=sys.stderr,
+        )
+
+    return PRArtifacts(changed_files=changed_files, diff=diff)
+
+
 # --- success checkers -------------------------------------------------------
-# Each checker is pure over the subprocess RESULT (returncode, stdout) - no extra network, so
-# the harness needs nothing beyond what `franky build` already prints. MVP keeps two; richer
-# checks (diff touches files, specific change present) need `gh` + a live PR and come later.
+# Output checkers are pure over the subprocess RESULT (returncode, stdout) - no extra network.
+# Artifact checkers operate on PRArtifacts fetched via `gh` and are therefore richer but slower.
 
 
 def _check_pr_opened(returncode: int, stdout: str) -> bool:
@@ -63,6 +121,46 @@ CHECKERS: dict[str, Callable[[int, str], bool]] = {
 }
 
 
+def _check_diff_touches_files(artifacts: PRArtifacts, task: "EvalTask") -> bool:
+    """True iff task.files is non-empty and EVERY declared path matches some changed file.
+
+    Matching semantics: a declared path `d` matches a changed path `c` iff `d` is non-empty
+    AND (`c == d` OR `c.endswith("/" + d)`). The suffix-match lets callers declare bare
+    filenames (e.g. "cli.py") that resolve correctly regardless of directory depth. An empty
+    declared string never matches (guards against accidentally matching any nested path via
+    `endswith("/")`)."""
+    if not task.files or not artifacts.changed_files:
+        return False
+    for declared in task.files:
+        if not declared:
+            return False
+        if not any(
+            changed == declared or changed.endswith("/" + declared)
+            for changed in artifacts.changed_files
+        ):
+            return False
+    return True
+
+
+def _check_change_present(artifacts: PRArtifacts, task: "EvalTask") -> bool:
+    """True iff task.contains is non-empty and EVERY substring in task.contains appears in the
+    diff (plain `in` substring test, NOT regex). Returns False when the diff is empty."""
+    if not task.contains or not artifacts.diff:
+        return False
+    return all(substring in artifacts.diff for substring in task.contains)
+
+
+ARTIFACT_CHECKERS: dict[str, Callable[[PRArtifacts, "EvalTask"], bool]] = {
+    "diff_touches_files": _check_diff_touches_files,
+    "change_present": _check_change_present,
+}
+
+# The two registries must stay disjoint: run_once dispatches each expected name to whichever
+# registry holds it, so an overlapping name would be checked twice (and load_tasks, which
+# validates against the union, would silently accept it).
+assert not (set(CHECKERS) & set(ARTIFACT_CHECKERS)), "checker name collision across registries"
+
+
 # --- task model -------------------------------------------------------------
 
 
@@ -75,6 +173,10 @@ class EvalTask:
     # The checker names ALL of which must pass for the run to count as a success. Tuple so it
     # is hashable/immutable; defaults to pr_opened (the baseline "did Franky do its job").
     expect: tuple[str, ...] = ("pr_opened",)
+    # For diff_touches_files: paths (bare filename or full path) the PR diff must touch.
+    files: tuple[str, ...] = ()
+    # For change_present: substrings that must all appear in the PR diff.
+    contains: tuple[str, ...] = ()
 
 
 @dataclass
@@ -113,18 +215,33 @@ def _placeholder_in(task: EvalTask) -> str | None:
 
 def load_tasks(path: str | Path) -> list[EvalTask]:
     """Parse the golden task set (JSON list). JSON not TOML: stdlib `tomllib` is 3.11+, and
-    Franky targets >=3.10. Validates each `expect` name against CHECKERS so a typo'd criterion
-    fails loudly at load time, not silently as a never-passing run."""
+    Franky targets >=3.10. Validates each `expect` name against CHECKERS + ARTIFACT_CHECKERS
+    so a typo'd criterion fails loudly at load time, not silently as a never-passing run.
+    Also loud-fails if an artifact checker is declared without its required data field."""
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    all_known = set(CHECKERS) | set(ARTIFACT_CHECKERS)
     tasks: list[EvalTask] = []
     for entry in raw:
         expect = tuple(entry.get("expect", ["pr_opened"]))
         for name in expect:
-            if name not in CHECKERS:
+            if name not in all_known:
                 raise ValueError(
                     f"task '{entry.get('id')}' names unknown checker '{name}' "
-                    f"(known: {', '.join(sorted(CHECKERS))})"
+                    f"(known: {', '.join(sorted(all_known))})"
                 )
+        files = tuple(entry.get("files", ()))
+        contains = tuple(entry.get("contains", ()))
+        task_id = entry.get("id")
+        if "diff_touches_files" in expect and not files:
+            raise ValueError(
+                f"task '{task_id}' expects 'diff_touches_files' but 'files' is empty - "
+                f"add a 'files' list to this task"
+            )
+        if "change_present" in expect and not contains:
+            raise ValueError(
+                f"task '{task_id}' expects 'change_present' but 'contains' is empty - "
+                f"add a 'contains' list to this task"
+            )
         tasks.append(
             EvalTask(
                 id=entry["id"],
@@ -132,6 +249,8 @@ def load_tasks(path: str | Path) -> list[EvalTask]:
                 repo=entry["repo"],
                 engine=entry.get("engine"),
                 expect=expect,
+                files=files,
+                contains=contains,
             )
         )
     return tasks
@@ -154,8 +273,17 @@ def build_argv(task: EvalTask, engine_override: str | None = None) -> list[str]:
     return argv
 
 
-def run_once(task: EvalTask, runner: Runner, engine_override: str | None = None) -> bool:
-    """One real `franky build` for `task`; True iff ALL of `task.expect` pass."""
+def run_once(
+    task: EvalTask,
+    runner: Runner,
+    engine_override: str | None = None,
+    inspector: Inspector = _gh_inspector,
+) -> bool:
+    """One real `franky build` for `task`; True iff ALL of `task.expect` pass.
+
+    Output checkers (pr_opened, exit_zero) run over the subprocess result. Artifact checkers
+    (diff_touches_files, change_present) additionally call the inspector to fetch PR artifacts
+    via `gh`. The inspector is called at most once per run, and only when needed."""
     placeholder = _placeholder_in(task)
     if placeholder is not None:
         raise ValueError(
@@ -163,21 +291,49 @@ def run_once(task: EvalTask, runner: Runner, engine_override: str | None = None)
             f"point at your own throwaway sandbox repo before running the eval."
         )
     returncode, stdout = runner(build_argv(task, engine_override))
-    return all(CHECKERS[name](returncode, stdout) for name in task.expect)
+
+    artifact_names = [name for name in task.expect if name in ARTIFACT_CHECKERS]
+    output_names = [name for name in task.expect if name in CHECKERS]
+
+    # Run output checkers first; short-circuit if any fail.
+    for name in output_names:
+        if not CHECKERS[name](returncode, stdout):
+            return False
+
+    if not artifact_names:
+        return True
+
+    # Fetch artifacts once for all artifact checkers.
+    url_match = PR_URL_RE.search(stdout)
+    if url_match:
+        artifacts = inspector(url_match.group(0))
+    else:
+        # No PR URL in stdout - artifact checks cannot pass (nothing to inspect).
+        artifacts = PRArtifacts(changed_files=[], diff="")
+
+    return all(ARTIFACT_CHECKERS[name](artifacts, task) for name in artifact_names)
 
 
 def run_task(
-    task: EvalTask, n: int, runner: Runner, engine_override: str | None = None
+    task: EvalTask,
+    n: int,
+    runner: Runner,
+    engine_override: str | None = None,
+    inspector: Inspector = _gh_inspector,
 ) -> TaskResult:
     """Run `task` n times (non-determinism => need a sample) and tally passes."""
-    passes = sum(1 for _ in range(n) if run_once(task, runner, engine_override))
+    passes = sum(1 for _ in range(n) if run_once(task, runner, engine_override, inspector))
     return TaskResult(task_id=task.id, runs=n, passes=passes)
 
 
 def run_set(
-    tasks: Sequence[EvalTask], n: int, runner: Runner, engine_override: str | None = None
+    tasks: Sequence[EvalTask],
+    n: int,
+    runner: Runner,
+    engine_override: str | None = None,
+    inspector: Inspector = _gh_inspector,
 ) -> list[TaskResult]:
-    return [run_task(t, n, runner, engine_override) for t in tasks]
+    return [run_task(t, n, runner, engine_override, inspector) for t in tasks]
 
 
 # --- scoring ----------------------------------------------------------------
@@ -252,7 +408,11 @@ def _subprocess_runner(argv: Sequence[str]) -> tuple[int, str]:
     return proc.returncode, proc.stdout
 
 
-def main(argv: Sequence[str] | None = None, runner: Runner = _subprocess_runner) -> int:
+def main(
+    argv: Sequence[str] | None = None,
+    runner: Runner = _subprocess_runner,
+    inspector: Inspector = _gh_inspector,
+) -> int:
     p = argparse.ArgumentParser(description="Run the Franky eval golden-task set (out-of-band).")
     p.add_argument("--tasks", default=str(DEFAULT_TASKS), help="path to the golden task JSON.")
     p.add_argument("-n", "--runs", type=int, default=1, help="runs per task (non-determinism).")
@@ -274,11 +434,17 @@ def main(argv: Sequence[str] | None = None, runner: Runner = _subprocess_runner)
 
         if args.compare_engine:
             base_label = args.engine or "default"
-            results_a = run_set(tasks, args.runs, runner, engine_override=args.engine)
-            results_b = run_set(tasks, args.runs, runner, engine_override=args.compare_engine)
+            results_a = run_set(
+                tasks, args.runs, runner, engine_override=args.engine, inspector=inspector
+            )
+            results_b = run_set(
+                tasks, args.runs, runner, engine_override=args.compare_engine, inspector=inspector
+            )
             print(format_comparison(results_a, results_b, base_label, args.compare_engine))
         else:
-            results = run_set(tasks, args.runs, runner, engine_override=args.engine)
+            results = run_set(
+                tasks, args.runs, runner, engine_override=args.engine, inspector=inspector
+            )
             print(format_report(results, label=args.engine))
     except (ValueError, FileNotFoundError) as exc:
         print(f"eval: {exc}", file=sys.stderr)

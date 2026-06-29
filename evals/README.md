@@ -32,13 +32,42 @@ Edit [`tasks.json`](tasks.json) and replace every `<your-sandbox-repo>` with you
 | `engine` | *(optional)* engine for this task; overridden by `--engine` / comparison mode |
 | `expect` | list of success checkers, **all** of which must pass for a run to count |
 
-Checkers (MVP - both derived from the `franky build` result, no extra network):
+Checkers (all must pass for a run to count as a success):
+
+Output checkers - derived from the `franky build` result, no extra network needed:
 
 - `pr_opened` - a PR URL was printed to stdout (the baseline "Franky did its job").
 - `exit_zero` - the build exited 0.
 
-Richer checks (diff touches the right files, a specific change is present) need `gh` + the live
-PR and are a deliberate future extension.
+Artifact checkers - fetch the live PR via `gh pr view` / `gh pr diff`; require `gh` installed
+and authenticated. They warn to stderr and fail gracefully if `gh` is unavailable:
+
+- `diff_touches_files` - every path in the task's `files` list was touched by the PR diff.
+  Matching is suffix-based: a declared path `"cli.py"` matches a changed path `"franky/cli.py"`.
+  Full paths also match exactly. Requires `files` to be non-empty (load-time error if missing).
+- `change_present` - every string in the task's `contains` list appears as a substring of the
+  PR diff. Plain substring test, not regex. Requires `contains` to be non-empty (load-time
+  error if missing).
+
+### Artifact checker task fields
+
+Add `files` and/or `contains` alongside `expect`:
+
+```json
+{
+  "id": "add-flag",
+  "input": "Add a --verbose flag to the CLI.",
+  "repo": "me/sandbox",
+  "expect": ["pr_opened", "exit_zero", "diff_touches_files", "change_present"],
+  "files": ["cli.py"],
+  "contains": ["--verbose"]
+}
+```
+
+`files` matching semantics: `"cli.py"` matches `"franky/cli.py"` (suffix match) and
+`"franky/cli.py"` (exact match), but NOT `"other/xcli.py"` (not a path-component suffix).
+
+`contains` matching semantics: plain Python `in` substring test against the full diff text.
 
 ## Run
 

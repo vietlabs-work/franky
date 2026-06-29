@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Richer eval success checkers (#25): `diff_touches_files` (every declared file path was touched
+  by the PR diff, using suffix-match semantics) and `change_present` (every declared substring
+  appears in the PR diff). Both fetch PR artifacts via `gh pr view` / `gh pr diff` and are
+  injectable for unit testing; tasks declare required data via new `files` / `contains` fields.
 - `franky plan <task>` (#52): a read-only scope-assessment + decomposition command. Runs ONE
   read-only container pass that inspects the repo/issue and decides whether the task fits one
   focused PR or should be split, then emits a decomposition `{fits_one_pr, subtasks:[{title,
