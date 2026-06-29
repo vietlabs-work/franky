@@ -256,3 +256,211 @@ def test_main_empty_task_set_exits_2(tmp_path, capsys):
     p = _write_tasks(tmp_path, [])
     rc = ev.main(["--tasks", str(p)], runner=make_runner((0, PR_URL)))
     assert rc == 2
+
+
+# --- artifact checkers: _check_diff_touches_files ---------------------------
+
+
+def _artifacts(changed_files=None, diff=""):
+    return ev.PRArtifacts(changed_files=changed_files or [], diff=diff)
+
+
+def test_diff_touches_files_suffix_match():
+    # "cli.py" is a suffix of "franky/cli.py"
+    arts = _artifacts(changed_files=["franky/cli.py"])
+    task = _task(files=("cli.py",), expect=("diff_touches_files",))
+    assert ev._check_diff_touches_files(arts, task) is True
+
+
+def test_diff_touches_files_no_suffix_match():
+    # "xcli.py" ends with "cli.py" as a string but "other/xcli.py" does NOT end with "/cli.py"
+    arts = _artifacts(changed_files=["other/xcli.py"])
+    task = _task(files=("cli.py",), expect=("diff_touches_files",))
+    assert ev._check_diff_touches_files(arts, task) is False
+
+
+def test_diff_touches_files_exact_full_path():
+    arts = _artifacts(changed_files=["franky/cli.py"])
+    task = _task(files=("franky/cli.py",), expect=("diff_touches_files",))
+    assert ev._check_diff_touches_files(arts, task) is True
+
+
+def test_diff_touches_files_missing_file():
+    arts = _artifacts(changed_files=["franky/engine.py"])
+    task = _task(files=("cli.py",), expect=("diff_touches_files",))
+    assert ev._check_diff_touches_files(arts, task) is False
+
+
+def test_diff_touches_files_empty_changed_files():
+    arts = _artifacts(changed_files=[])
+    task = _task(files=("cli.py",), expect=("diff_touches_files",))
+    assert ev._check_diff_touches_files(arts, task) is False
+
+
+def test_diff_touches_files_empty_declared_string_no_match():
+    # An empty declared string must not match any path (guards endswith("/") wildcard).
+    arts = _artifacts(changed_files=["franky/cli.py"])
+    task = _task(files=("",), expect=("diff_touches_files",))
+    assert ev._check_diff_touches_files(arts, task) is False
+
+
+# --- artifact checkers: _check_change_present -------------------------------
+
+
+def test_change_present_all_substrings_present():
+    arts = _artifacts(diff="+    parser.add_argument('--verbose')\n")
+    task = _task(contains=("--verbose",), expect=("change_present",))
+    assert ev._check_change_present(arts, task) is True
+
+
+def test_change_present_one_missing():
+    arts = _artifacts(diff="+    parser.add_argument('--verbose')\n")
+    task = _task(contains=("--verbose", "--debug"), expect=("change_present",))
+    assert ev._check_change_present(arts, task) is False
+
+
+def test_change_present_empty_diff():
+    arts = _artifacts(diff="")
+    task = _task(contains=("--verbose",), expect=("change_present",))
+    assert ev._check_change_present(arts, task) is False
+
+
+# --- load_tasks: artifact checker validation --------------------------------
+
+
+def test_load_tasks_diff_touches_files_without_files_raises(tmp_path):
+    p = _write_tasks(
+        tmp_path,
+        [{"id": "a", "input": "x", "repo": "me/r", "expect": ["diff_touches_files"]}],
+    )
+    with pytest.raises(ValueError, match="diff_touches_files|files"):
+        ev.load_tasks(p)
+
+
+def test_load_tasks_change_present_without_contains_raises(tmp_path):
+    p = _write_tasks(
+        tmp_path,
+        [{"id": "a", "input": "x", "repo": "me/r", "expect": ["change_present"]}],
+    )
+    with pytest.raises(ValueError, match="change_present|contains"):
+        ev.load_tasks(p)
+
+
+def test_load_tasks_valid_artifact_task(tmp_path):
+    p = _write_tasks(
+        tmp_path,
+        [
+            {
+                "id": "a",
+                "input": "x",
+                "repo": "me/r",
+                "expect": ["pr_opened", "diff_touches_files", "change_present"],
+                "files": ["cli.py"],
+                "contains": ["--verbose"],
+            }
+        ],
+    )
+    tasks = ev.load_tasks(p)
+    assert tasks[0].files == ("cli.py",)
+    assert tasks[0].contains == ("--verbose",)
+
+
+def test_load_tasks_unknown_checker_lists_artifact_checkers(tmp_path):
+    p = _write_tasks(
+        tmp_path,
+        [{"id": "a", "input": "x", "repo": "me/r", "expect": ["bogus"]}],
+    )
+    with pytest.raises(ValueError) as exc_info:
+        ev.load_tasks(p)
+    msg = str(exc_info.value)
+    # Both artifact checker names must appear in the known: list.
+    assert "diff_touches_files" in msg
+    assert "change_present" in msg
+
+
+# --- run_once with injected inspector ---------------------------------------
+
+
+def make_inspector(artifacts):
+    """Fake inspector that returns the given PRArtifacts and records calls."""
+    calls = []
+
+    def inspector(pr_url):
+        calls.append(pr_url)
+        return artifacts
+
+    inspector.calls = calls
+    return inspector
+
+
+def test_run_once_artifact_checker_passes_with_matching_artifacts():
+    runner = make_runner((0, f"opened {PR_URL}"))
+    arts = _artifacts(diff="+    --verbose\n")
+    insp = make_inspector(arts)
+    task = _task(expect=("change_present",), contains=("--verbose",))
+    assert ev.run_once(task, runner, inspector=insp) is True
+    assert insp.calls == [PR_URL]
+
+
+def test_run_once_artifact_checker_fails_when_not_matching():
+    runner = make_runner((0, f"opened {PR_URL}"))
+    arts = _artifacts(diff="+    something else\n")
+    insp = make_inspector(arts)
+    task = _task(expect=("change_present",), contains=("--verbose",))
+    assert ev.run_once(task, runner, inspector=insp) is False
+
+
+def test_run_once_inspector_not_called_for_output_only_checkers():
+    # When only output checkers (pr_opened, exit_zero) are expected, inspector must not be called.
+    runner = make_runner((0, f"opened {PR_URL}"))
+    insp = make_inspector(_artifacts())
+    task = _task(expect=("pr_opened", "exit_zero"))
+    ev.run_once(task, runner, inspector=insp)
+    assert insp.calls == []
+
+
+def test_run_once_artifact_only_checker_with_pr_url_in_stdout():
+    # Task with ONLY diff_touches_files and a PR URL in stdout -> inspector is called, result
+    # depends on artifacts.
+    runner = make_runner((0, f"result: {PR_URL}"))
+    arts = _artifacts(changed_files=["franky/cli.py"])
+    insp = make_inspector(arts)
+    task = _task(expect=("diff_touches_files",), files=("cli.py",))
+    assert ev.run_once(task, runner, inspector=insp) is True
+    assert len(insp.calls) == 1
+
+
+def test_run_once_artifact_checker_no_pr_url_fails_without_raising():
+    # No PR URL in stdout -> PRArtifacts is empty -> artifact check fails, no exception.
+    runner = make_runner((0, "no url here"))
+    insp = make_inspector(_artifacts(changed_files=["franky/cli.py"]))
+    task = _task(expect=("diff_touches_files",), files=("cli.py",))
+    result = ev.run_once(task, runner, inspector=insp)
+    assert result is False
+    # Inspector must NOT be called when there is no PR URL to inspect.
+    assert insp.calls == []
+
+
+# --- main() end-to-end with inspector ---------------------------------------
+
+
+def test_main_with_artifact_inspector(tmp_path, capsys):
+    p = _write_tasks(
+        tmp_path,
+        [
+            {
+                "id": "a",
+                "input": "x",
+                "repo": "me/r",
+                "expect": ["pr_opened", "change_present"],
+                "contains": ["--verbose"],
+            }
+        ],
+    )
+    runner = make_runner((0, f"opened {PR_URL}"))
+    arts = _artifacts(diff="+    --verbose\n")
+    insp = make_inspector(arts)
+    rc = ev.main(["--tasks", str(p)], runner=runner, inspector=insp)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "a" in out and "OVERALL" in out

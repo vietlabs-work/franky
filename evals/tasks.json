@@ -3,7 +3,8 @@
     "id": "add-flag",
     "input": "Add a --verbose flag to the CLI that prints debug output, with a test.",
     "repo": "<your-sandbox-repo>",
-    "expect": ["pr_opened", "exit_zero"]
+    "expect": ["pr_opened", "exit_zero", "change_present"],
+    "contains": ["--verbose"]
   },
   {
     "id": "fix-readme-typo",
