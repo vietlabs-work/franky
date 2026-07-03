@@ -80,7 +80,22 @@ python3 scripts/eval.py --tasks evals/tasks.json -n 3 --engine pi
 
 # Comparison mode: run the set under two engines and report the per-task + overall delta.
 python3 scripts/eval.py -n 3 --engine pi --compare-engine codex
+
+# Profile comparison: does an operator profile (#23) make Franky better? Run the set with the
+# profile OFF vs ON and report the delta. `franky build --profile P` injects that profile; an
+# empty [profile] injects nothing, so it is the "off" side.
+printf '[profile]\n' > /tmp/empty-profile.toml
+python3 scripts/eval.py -n 3 --profile /tmp/empty-profile.toml --compare-profile ~/.franky/profile.toml
 ```
+
+Two comparison axes are wired: `--compare-engine` (varies engine, holds `--profile` constant)
+and `--compare-profile` (varies profile, holds `--engine` constant). They are mutually exclusive
+- a single delta report varies one axis, so passing both is an error.
+
+**Why the empty baseline:** with no `--profile`, `franky build` auto-discovers
+`~/.franky/profile.toml`, so an unset baseline is NOT truly "off" (it would compare the profile
+against itself). Pass an empty `[profile]` file as `--profile` for a genuine off-vs-on run; side
+A then injects no bundle and side B injects the real profile.
 
 Reading the report: `passes/runs` and a pass-rate per task, plus a pooled `OVERALL`. Comparison
 mode shows `rate_a -> rate_b (+/- pts)` per task. A change is "better" when it moves the overall
@@ -89,6 +104,7 @@ pass-rate up without regressing individual tasks - that is the signal #23 (profi
 
 ## Scope (MVP)
 
-In: the golden set, the opt-in runner, pass-rate + engine-vs-engine comparison. Out (for now):
-CI integration (needs creds + spend), a large benchmark suite, model/persona levers on the
-build CLI (`franky build` has no `--model` flag yet), and LLM-as-judge for fuzzy criteria.
+In: the golden set, the opt-in runner, pass-rate + comparison along two axes (engine and
+profile). Out (for now): CI integration (needs creds + spend), a large benchmark suite,
+model/persona levers on the build CLI (`franky build` has no `--model` flag or persona selector
+yet), and LLM-as-judge for fuzzy criteria.

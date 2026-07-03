@@ -9,8 +9,9 @@ shipped CLI surface and out of the wheel.
 
 WHAT it measures: agent QUALITY, which is non-deterministic. So the metric is pass-RATE over a
 golden task set run N times - "succeeds on >= X%", never "worked once". Comparison mode runs the
-same set under two configs (engine A vs B today; persona/model later) and reports the delta, so
-a persona/model/profile change can be judged instead of guessed.
+same set under two configs and reports the delta, so a config change can be judged instead of
+guessed. Two axes are wired today - engine (--compare-engine) and profile (--compare-profile);
+model/persona are not levers yet (`franky build` has no --model flag or persona selector).
 
 The harness logic is pure and takes an INJECTABLE runner and inspector so it is unit-testable
 without docker or a live `gh`; only `main()` wires in the real subprocess runner and
@@ -21,6 +22,7 @@ against the live PR via `gh pr view` / `gh pr diff`. They require `gh` installed
 authenticated for a real run; in tests inject a fake inspector.
 
 Run:  python3 scripts/eval.py [--tasks evals/tasks.json] [-n RUNS] [--engine E] [--compare-engine E2]
+      [--profile P] [--compare-profile P2]
 """
 
 from __future__ import annotations
@@ -259,10 +261,16 @@ def load_tasks(path: str | Path) -> list[EvalTask]:
 # --- running ----------------------------------------------------------------
 
 
-def build_argv(task: EvalTask, engine_override: str | None = None) -> list[str]:
-    """The `franky build` argv for a task. NOTE: only --engine is passed - `franky build` has
-    no --model flag today, so model/persona are not eval levers yet (engine is). engine_override
-    (comparison mode) wins over the task's own engine."""
+def build_argv(
+    task: EvalTask,
+    engine_override: str | None = None,
+    profile_override: str | None = None,
+) -> list[str]:
+    """The `franky build` argv for a task. Two eval levers are wired: --engine and --profile
+    (`franky build --profile PATH` injects an operator profile). engine_override /
+    profile_override (comparison mode) win over the task's own engine; a None profile_override
+    means "pass no --profile" so `franky build` keeps its own auto-discovery. NOTE: --model and
+    persona are NOT levers yet - `franky build` has no --model flag and no persona selector."""
     # --plan-first is deliberately NOT passed: it sends the read-only plan pass to stdout
     # (cli.py click.echo(output)), which would let pr_opened match a PR URL mentioned in the
     # plan and fake a pass. The eval always runs the build pass.
@@ -270,6 +278,8 @@ def build_argv(task: EvalTask, engine_override: str | None = None) -> list[str]:
     engine = engine_override or task.engine
     if engine:
         argv += ["--engine", engine]
+    if profile_override:
+        argv += ["--profile", profile_override]
     return argv
 
 
@@ -278,6 +288,7 @@ def run_once(
     runner: Runner,
     engine_override: str | None = None,
     inspector: Inspector = _gh_inspector,
+    profile_override: str | None = None,
 ) -> bool:
     """One real `franky build` for `task`; True iff ALL of `task.expect` pass.
 
@@ -290,7 +301,7 @@ def run_once(
             f"task '{task.id}' has a placeholder {placeholder} - edit evals/tasks.json to "
             f"point at your own throwaway sandbox repo before running the eval."
         )
-    returncode, stdout = runner(build_argv(task, engine_override))
+    returncode, stdout = runner(build_argv(task, engine_override, profile_override))
 
     artifact_names = [name for name in task.expect if name in ARTIFACT_CHECKERS]
     output_names = [name for name in task.expect if name in CHECKERS]
@@ -320,9 +331,12 @@ def run_task(
     runner: Runner,
     engine_override: str | None = None,
     inspector: Inspector = _gh_inspector,
+    profile_override: str | None = None,
 ) -> TaskResult:
     """Run `task` n times (non-determinism => need a sample) and tally passes."""
-    passes = sum(1 for _ in range(n) if run_once(task, runner, engine_override, inspector))
+    passes = sum(
+        1 for _ in range(n) if run_once(task, runner, engine_override, inspector, profile_override)
+    )
     return TaskResult(task_id=task.id, runs=n, passes=passes)
 
 
@@ -332,8 +346,9 @@ def run_set(
     runner: Runner,
     engine_override: str | None = None,
     inspector: Inspector = _gh_inspector,
+    profile_override: str | None = None,
 ) -> list[TaskResult]:
-    return [run_task(t, n, runner, engine_override, inspector) for t in tasks]
+    return [run_task(t, n, runner, engine_override, inspector, profile_override) for t in tasks]
 
 
 # --- scoring ----------------------------------------------------------------
@@ -422,7 +437,29 @@ def main(
         default=None,
         help="if set, run the set under --engine AND this engine, and report the delta.",
     )
+    p.add_argument(
+        "--profile",
+        default=None,
+        help="profile.toml path for the (baseline) run; omit to let `franky build` "
+        "auto-discover its default.",
+    )
+    p.add_argument(
+        "--compare-profile",
+        default=None,
+        help="if set, run the set under --profile AND this profile, and report the delta "
+        "(for profile-off-vs-on, pass an empty [profile] file as --profile).",
+    )
     args = p.parse_args(argv)
+
+    # A single delta report varies ONE axis; comparing engine and profile at once would need a
+    # 2-D grid the report cannot express. Reject up front rather than silently ignoring one.
+    if args.compare_engine and args.compare_profile:
+        print(
+            "eval: choose one comparison axis - pass --compare-engine OR --compare-profile, "
+            "not both",
+            file=sys.stderr,
+        )
+        return 2
 
     # load + placeholder errors are operator setup mistakes - surface them as a clean one-liner,
     # not a traceback (the run loop raises ValueError on an unedited placeholder repo).
@@ -433,17 +470,53 @@ def main(
             return 2
 
         if args.compare_engine:
+            # Vary engine; hold the profile constant at --profile on both sides.
             base_label = args.engine or "default"
             results_a = run_set(
-                tasks, args.runs, runner, engine_override=args.engine, inspector=inspector
+                tasks,
+                args.runs,
+                runner,
+                engine_override=args.engine,
+                inspector=inspector,
+                profile_override=args.profile,
             )
             results_b = run_set(
-                tasks, args.runs, runner, engine_override=args.compare_engine, inspector=inspector
+                tasks,
+                args.runs,
+                runner,
+                engine_override=args.compare_engine,
+                inspector=inspector,
+                profile_override=args.profile,
             )
             print(format_comparison(results_a, results_b, base_label, args.compare_engine))
+        elif args.compare_profile:
+            # Vary profile; hold the engine constant at --engine on both sides.
+            base_label = args.profile or "default-profile"
+            results_a = run_set(
+                tasks,
+                args.runs,
+                runner,
+                engine_override=args.engine,
+                inspector=inspector,
+                profile_override=args.profile,
+            )
+            results_b = run_set(
+                tasks,
+                args.runs,
+                runner,
+                engine_override=args.engine,
+                inspector=inspector,
+                profile_override=args.compare_profile,
+            )
+            print(format_comparison(results_a, results_b, base_label, args.compare_profile))
         else:
             results = run_set(
-                tasks, args.runs, runner, engine_override=args.engine, inspector=inspector
+                tasks,
+                args.runs,
+                runner,
+                engine_override=args.engine,
+                inspector=inspector,
+                profile_override=args.profile,
             )
             print(format_report(results, label=args.engine))
     except (ValueError, FileNotFoundError) as exc:

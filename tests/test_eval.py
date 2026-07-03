@@ -91,6 +91,22 @@ def test_build_argv_engine_override_wins():
     assert argv[-2:] == ["--engine", "claude"]
 
 
+def test_build_argv_includes_profile_when_override_set():
+    argv = ev.build_argv(_task(), profile_override="/tmp/prof.toml")
+    assert argv[-2:] == ["--profile", "/tmp/prof.toml"]
+
+
+def test_build_argv_omits_profile_when_none():
+    argv = ev.build_argv(_task(engine="pi"))
+    assert "--profile" not in argv
+
+
+def test_build_argv_engine_and_profile_together():
+    argv = ev.build_argv(_task(), engine_override="codex", profile_override="/tmp/p.toml")
+    assert "--engine" in argv and "codex" in argv
+    assert argv[-2:] == ["--profile", "/tmp/p.toml"]
+
+
 # --- run_once / run_task ----------------------------------------------------
 
 
@@ -124,6 +140,12 @@ def test_run_task_passes_engine_override_into_argv():
     runner = make_runner((0, PR_URL))
     ev.run_task(_task(engine="pi"), n=1, runner=runner, engine_override="codex")
     assert runner.calls[0][-2:] == ["--engine", "codex"]
+
+
+def test_run_task_passes_profile_override_into_argv():
+    runner = make_runner((0, PR_URL))
+    ev.run_task(_task(), n=1, runner=runner, profile_override="/tmp/prof.toml")
+    assert runner.calls[0][-2:] == ["--profile", "/tmp/prof.toml"]
 
 
 def test_placeholder_repo_raises():
@@ -243,6 +265,40 @@ def test_main_compare_path(tmp_path, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "pi" in out and "codex" in out
+
+
+def test_main_compare_profile_path(tmp_path, capsys):
+    p = _write_tasks(tmp_path, [{"id": "a", "input": "x", "repo": "me/r"}])
+    rc = ev.main(
+        ["--tasks", str(p), "--profile", "/tmp/off.toml", "--compare-profile", "/tmp/on.toml"],
+        runner=make_runner((0, PR_URL)),
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    # both profile labels appear in the comparison header
+    assert "off.toml" in out and "on.toml" in out
+
+
+def test_main_compare_profile_threads_profiles_into_argv(tmp_path):
+    p = _write_tasks(tmp_path, [{"id": "a", "input": "x", "repo": "me/r"}])
+    runner = make_runner((0, PR_URL))
+    ev.main(
+        ["--tasks", str(p), "--compare-profile", "/tmp/on.toml"],
+        runner=runner,
+    )
+    # baseline run (no --profile) then comparison run (--profile /tmp/on.toml)
+    assert "--profile" not in runner.calls[0]
+    assert runner.calls[1][-2:] == ["--profile", "/tmp/on.toml"]
+
+
+def test_main_rejects_both_compare_axes(tmp_path, capsys):
+    p = _write_tasks(tmp_path, [{"id": "a", "input": "x", "repo": "me/r"}])
+    rc = ev.main(
+        ["--tasks", str(p), "--compare-engine", "codex", "--compare-profile", "/tmp/p.toml"],
+        runner=make_runner((0, PR_URL)),
+    )
+    assert rc == 2
+    assert "one comparison axis" in capsys.readouterr().err.lower()
 
 
 def test_main_placeholder_exits_2(tmp_path, capsys):
