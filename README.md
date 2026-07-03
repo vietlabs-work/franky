@@ -423,7 +423,7 @@ checkers.
 
 ## Status
 
-v0.0.4. Real end-to-end runs need live engine credentials, supplied out-of-band by
+v0.0.5. Real end-to-end runs need live engine credentials, supplied out-of-band by
 the operator. The pieces under test here are the container hardening, the egress
 allowlist + proxy orchestration, the secret redaction, the trusted-repo allowlist,
 and the engine abstraction.

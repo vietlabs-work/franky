@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.5] - 2026-07-03
+
 ### Added
 - Richer eval success checkers (#25): `diff_touches_files` (every declared file path was touched
   by the PR diff, using suffix-match semantics) and `change_present` (every declared substring
