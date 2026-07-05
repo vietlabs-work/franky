@@ -1,5 +1,7 @@
 from franky.prompt import (
+    DIAGNOSE_TRANSCRIPT_TAIL_CHARS,
     build_decompose_prompt,
+    build_diagnose_prompt,
     build_iterate_prompt,
     build_plan_prompt,
     build_prompt,
@@ -232,3 +234,63 @@ def test_iterate_prompt_own_pr_guard_and_test_before_push():
     assert "BEFORE pushing" in p
     assert "professional" in p.lower()
     assert "Closes #" not in p
+
+
+# ---------------------------------------------------------------------------
+# build_prompt prior_failures (issue #64 #5) + build_diagnose_prompt (#4)
+# ---------------------------------------------------------------------------
+
+
+def test_build_prompt_no_prior_failures_is_byte_identical():
+    # The retry learning-signal must not perturb a normal (non-retry) build prompt at all.
+    spec = TaskSpec(source="prose", text="add a flag", repo="me/repo")
+    assert build_prompt(spec, prior_failures=()) == build_prompt(spec)
+
+
+def test_build_prompt_injects_prior_failures():
+    spec = TaskSpec(source="prose", text="add a flag", repo="me/repo")
+    p = build_prompt(spec, prior_failures=["avoid the DinD race", "do not touch the proxy"])
+    assert "earlier automated attempts" in p.lower()
+    assert "1. avoid the DinD race" in p
+    assert "2. do not touch the proxy" in p
+    # The conventions still follow the injected block.
+    assert "Conventions (follow exactly)" in p
+
+
+def _diag_record(**over):
+    rec = {
+        "command": "build",
+        "repo": "me/repo",
+        "engine": "pi",
+        "status": "no_pr",
+        "exit_code": 7,
+        "task": "add a flag",
+    }
+    rec.update(over)
+    return rec
+
+
+def test_diagnose_prompt_has_nonce_block_and_is_read_only():
+    p = build_diagnose_prompt(_diag_record(), "some transcript text", "d1ag")
+    assert "FRANKY_DIAG_d1ag_BEGIN" in p and "FRANKY_DIAG_d1ag_END" in p
+    assert "DIAGNOSE MODE" in p
+    assert "do NOT clone" in p.lower() or "do not clone" in p.lower()
+    # The record metadata + transcript are injected.
+    assert "me/repo" in p and "no_pr" in p and "some transcript text" in p
+    # The required JSON keys are named for the agent.
+    for key in ("root_cause", "category", "retryable", "retry_hint", "confidence"):
+        assert key in p
+
+
+def test_diagnose_prompt_tail_caps_a_long_transcript():
+    marker_head = "HEAD_UNIQUE_MARKER"
+    long = marker_head + ("x" * (DIAGNOSE_TRANSCRIPT_TAIL_CHARS + 5000)) + "TAIL_UNIQUE_MARKER"
+    p = build_diagnose_prompt(_diag_record(), long, "d2")
+    assert "TAIL_UNIQUE_MARKER" in p  # the tail (where failures live) is kept
+    assert marker_head not in p  # the head is dropped
+    assert "earlier output omitted" in p
+
+
+def test_diagnose_prompt_short_transcript_not_truncated():
+    p = build_diagnose_prompt(_diag_record(), "short", "d3")
+    assert "earlier output omitted" not in p

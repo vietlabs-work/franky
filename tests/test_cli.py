@@ -4,6 +4,7 @@ import subprocess
 from pathlib import Path
 
 import franky.cli as cli
+import franky.jobs as jobs
 from click.testing import CliRunner
 
 from franky import __version__
@@ -2104,3 +2105,240 @@ def test_build_help_shows_plan_advisory():
     res = CliRunner().invoke(cli.main, ["build", "--help"])
     assert res.exit_code == 0
     assert "franky plan" in res.output
+
+
+# ---------------------------------------------------------------------------
+# build --retry (issue #64 #5) + job diagnose (#4)
+# ---------------------------------------------------------------------------
+
+
+def _retry_env(monkeypatch, container_results, diagnose_result):
+    """Wire a build --retry test: creds env, images present, a queue of (code, output) results
+    for the build passes, and a stubbed _diagnose (so diagnose never calls run_in_container)."""
+    monkeypatch.setattr(cli.os, "environ", _build_env())
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    results = list(container_results)
+    calls = {"n": 0}
+
+    def fake_run(*a, **k):
+        calls["n"] += 1
+        return results.pop(0)
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+    monkeypatch.setattr(cli, "_diagnose", lambda *a, **k: diagnose_result)
+    return calls
+
+
+def test_build_retry_zero_omits_attempts_field(monkeypatch):
+    # --retry 0 (the default) must emit the exact same keys as before - no `attempts`.
+    monkeypatch.setattr(cli.os, "environ", _build_env())
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: (0, f"opened {PR_URL}"))
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo", "--json"])
+    assert res.exit_code == 0, res.output
+    assert "attempts" not in json.loads(res.stdout)
+
+
+def test_build_retry_succeeds_on_second_attempt(monkeypatch):
+    calls = _retry_env(
+        monkeypatch,
+        container_results=[(0, "no pr here"), (0, f"opened {PR_URL}")],
+        diagnose_result=({"retryable": True, "retry_hint": "run the tests first"}, 0),
+    )
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(
+            cli.main, ["build", "do it", "--repo", "me/repo", "--retry", "2", "--json"]
+        )
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.stdout)
+    assert data["status"] == "pr_opened" and data["pr_url"] == PR_URL
+    assert len(data["attempts"]) == 2
+    assert data["attempts"][0]["status"] == "no_pr"
+    assert data["attempts"][0]["retry_hint"] == "run the tests first"
+    assert data["attempts"][1]["status"] == "pr_opened"
+    assert calls["n"] == 2  # two build passes; diagnose is stubbed (no container call)
+
+
+def test_build_retry_stops_when_diagnosis_not_retryable(monkeypatch):
+    calls = _retry_env(
+        monkeypatch,
+        container_results=[(0, "no pr")],  # only ONE build pass should run
+        diagnose_result=({"retryable": False}, 0),
+    )
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(
+            cli.main, ["build", "do it", "--repo", "me/repo", "--retry", "3", "--json"]
+        )
+    assert res.exit_code == 7, res.output
+    data = json.loads(res.stdout)
+    assert data["status"] == "no_pr" and len(data["attempts"]) == 1
+    assert calls["n"] == 1  # no retry after a non-retryable diagnosis
+
+
+def test_build_retry_stops_when_diagnose_fails(monkeypatch):
+    # A diagnose pass that itself fails/unparses (returns None) must STOP - never blind-restart.
+    calls = _retry_env(
+        monkeypatch,
+        container_results=[(0, "no pr")],
+        diagnose_result=(None, 7),
+    )
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(
+            cli.main, ["build", "do it", "--repo", "me/repo", "--retry", "3", "--json"]
+        )
+    assert res.exit_code == 7, res.output
+    assert calls["n"] == 1
+
+
+def test_build_retry_rechecks_idempotency_before_retry(monkeypatch):
+    # A "failed" attempt may actually have opened a PR; the pre-retry re-check must catch it and
+    # stop (already_open) rather than open a second PR.
+    calls = _retry_env(
+        monkeypatch,
+        container_results=[(0, "no pr")],  # attempt 2 must NOT run
+        diagnose_result=({"retryable": True, "retry_hint": "x"}, 0),
+    )
+    seq = [None, "https://github.com/me/repo/pull/99"]  # pre-loop None, then open at attempt 2
+    monkeypatch.setattr(cli, "find_open_pr", lambda *a, **k: seq.pop(0) if seq else None)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(
+            cli.main, ["build", "do it", "--repo", "me/repo", "--retry", "2", "--json"]
+        )
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.stdout)
+    assert data["status"] == "already_open"
+    assert data["pr_url"] == "https://github.com/me/repo/pull/99"
+    assert calls["n"] == 1  # only the first build pass ran
+
+
+def test_build_retry_rejects_out_of_range(monkeypatch):
+    monkeypatch.setattr(cli.os, "environ", _build_env())
+    res = CliRunner().invoke(cli.main, ["build", "do it", "--repo", "me/repo", "--retry", "99"])
+    assert res.exit_code == 2  # IntRange(max=5) rejects it
+
+
+def _diag_setup(monkeypatch, tmp_path, container_result, nonce="fixednonce"):
+    env = _build_env()
+    env["FRANKY_RUNS_DIR"] = str(tmp_path / "runs")
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: container_result)
+    monkeypatch.setattr(cli, "_make_nonce", lambda: nonce)
+    return env
+
+
+def _write_failed_run(env, tmp_path, job_id="abcd12"):
+    log = tmp_path / f"{job_id}.log"
+    log.write_text("the agent failed: tests were red\n", encoding="utf-8")
+    rec = jobs.new_record(
+        job_id=job_id,
+        command="build",
+        repo="me/repo",
+        engine="pi",
+        task="do it",
+        container="c",
+        network="n",
+        proxy="p",
+        branch="b",
+        started_at="2026-07-05T10:00:00+00:00",
+    )
+    rec["status"] = "no_pr"
+    rec["log_path"] = str(log)
+    jobs.write_record(rec, env)
+    return job_id
+
+
+def test_job_diagnose_emits_diagnosis(monkeypatch, tmp_path):
+    nonce = "fixednonce"
+    diag = (
+        '{"root_cause": "tests were red", "category": "test_failure", "retryable": true, '
+        '"retry_hint": "make the tests pass first", "confidence": "high"}'
+    )
+    output = f"analysis...\nFRANKY_DIAG_{nonce}_BEGIN{diag}FRANKY_DIAG_{nonce}_END"
+    env = _diag_setup(monkeypatch, tmp_path, (0, output), nonce)
+    job_id = _write_failed_run(env, tmp_path)
+    res = CliRunner().invoke(cli.main, ["job", "diagnose", job_id, "--json"])
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.stdout)
+    assert data["root_cause"] == "tests were red"
+    assert data["category"] == "test_failure" and data["retryable"] is True
+    assert data["job_id"] == job_id
+
+
+def test_job_diagnose_not_found_exits_2(monkeypatch, tmp_path):
+    env = _build_env()
+    env["FRANKY_RUNS_DIR"] = str(tmp_path / "runs")
+    monkeypatch.setattr(cli.os, "environ", env)
+    res = CliRunner().invoke(cli.main, ["job", "diagnose", "abcdef"])
+    assert res.exit_code == 2
+    assert "no run found" in res.stderr
+
+
+def test_job_diagnose_no_transcript_exits_2(monkeypatch, tmp_path):
+    env = _build_env()
+    env["FRANKY_RUNS_DIR"] = str(tmp_path / "runs")
+    monkeypatch.setattr(cli.os, "environ", env)
+    rec = jobs.new_record(
+        job_id="beef01",
+        command="build",
+        repo="me/repo",
+        engine="pi",
+        task="t",
+        container="c",
+        network="n",
+        proxy="p",
+        branch="b",
+        started_at="2026-07-05T10:00:00+00:00",
+    )  # status running, log_path "" -> no transcript
+    jobs.write_record(rec, env)
+    res = CliRunner().invoke(cli.main, ["job", "diagnose", "beef01"])
+    assert res.exit_code == 2
+    assert "no transcript" in res.stderr
+
+
+def test_job_diagnose_unparseable_exits_7(monkeypatch, tmp_path):
+    env = _diag_setup(monkeypatch, tmp_path, (0, "blah blah no sentinel"))
+    job_id = _write_failed_run(env, tmp_path, job_id="c0de01")
+    res = CliRunner().invoke(cli.main, ["job", "diagnose", job_id, "--json"])
+    assert res.exit_code == 7, res.output
+    assert json.loads(res.stdout)["error"]["kind"] == "no_diagnosis"
+
+
+def test_build_retry_exhausts_budget(monkeypatch):
+    # Both attempts fail retryably and the loop ends on the budget guard (not a non-retryable
+    # diagnosis): the final failure is reported and no third build/diagnose runs.
+    calls = _retry_env(
+        monkeypatch,
+        container_results=[(0, "no pr"), (0, "still no pr")],
+        diagnose_result=({"retryable": True, "retry_hint": "try harder"}, 0),
+    )
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(
+            cli.main, ["build", "do it", "--repo", "me/repo", "--retry", "1", "--json"]
+        )
+    assert res.exit_code == 7, res.output  # last failure = no_pr = EXIT_AGENT
+    data = json.loads(res.stdout)
+    assert data["status"] == "no_pr"
+    assert len(data["attempts"]) == 2  # both attempts ran; budget exhausted
+    assert data["attempts"][0]["retry_hint"] == "try harder"
+    assert data["attempts"][1]["retry_hint"] == ""  # last attempt is never diagnosed
+    assert calls["n"] == 2  # exactly two build passes, no third
+
+
+def test_job_diagnose_timeout_exits_9(monkeypatch, tmp_path):
+    # A diagnose pass that itself times out -> exit 9 (the documented timeout path).
+    env = _diag_setup(monkeypatch, tmp_path, (cli.CONTAINER_TIMEOUT_CODE, ""))
+    job_id = _write_failed_run(env, tmp_path, job_id="d00d01")
+    res = CliRunner().invoke(cli.main, ["job", "diagnose", job_id, "--json"])
+    assert res.exit_code == 9, res.output
+    assert json.loads(res.stdout)["error"]["kind"] == "timeout"

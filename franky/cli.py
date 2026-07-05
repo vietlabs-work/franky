@@ -28,6 +28,7 @@ from . import franky_version
 from ._install import detect_install
 from .config import GH_TOKEN_VAR, Config, load_config, redact
 from .decompose import build_plan_result, parse_decomposition
+from .diagnosis import build_diagnosis_result, parse_diagnosis
 from .economics import Usage, format_economics, parse_usage
 from .container import (
     CONTAINER_TIMEOUT_CODE,
@@ -55,6 +56,7 @@ from .profile import (
 )
 from .prompt import (
     build_decompose_prompt,
+    build_diagnose_prompt,
     build_iterate_prompt,
     build_plan_prompt,
     build_prompt,
@@ -98,6 +100,15 @@ _GH_DEFAULT_TIMEOUT = 120.0
 # Cap on the redacted task summary stored in a run record (issue #63) - a handle for `jobs`,
 # not the full prompt. Redact runs on the FULL string before this truncation.
 _JOB_TASK_SUMMARY_MAX = 200
+
+# Build statuses a `--retry` build may retry (issue #64 #5). pr_opened is success; config/auth/
+# docker/task failures raise a FrankyError BEFORE the attempt loop, so they never reach here.
+_RETRYABLE_STATUSES = frozenset({"timeout", "agent_error", "no_pr"})
+
+# Default time budget for a `job diagnose` pass (seconds). Diagnosis is a read-only summarization
+# of an existing transcript, not agentic work, and `--retry` fires it automatically, so it caps
+# far below build's 1800s default. `--max-duration` overrides it on the standalone command.
+_DIAGNOSE_DEFAULT_TIMEOUT = 300
 
 
 def _stdin_is_interactive() -> bool:
@@ -293,6 +304,14 @@ def main() -> None:
     is_flag=True,
     help="Skip the idempotency pre-check and build even if a Franky PR is already open.",
 )
+@click.option(
+    "--retry",
+    "retry",
+    type=click.IntRange(min=0, max=5),
+    default=0,
+    help="On a retryable failure (timeout/agent-error/no-PR), diagnose it and retry up to N "
+    "times, feeding the root-cause back in (issue #64). Default 0 = no retry.",
+)
 @click.pass_context
 def build(
     ctx: click.Context,
@@ -307,6 +326,7 @@ def build(
     yes: bool,
     max_duration: int | None,
     force: bool,
+    retry: int,
 ) -> None:
     """Build TASK_INPUT (a GitHub issue URL, a JIRA key, or a prose request) and open a PR.
 
@@ -432,73 +452,112 @@ def build(
                     )
                 ctx.exit(EXIT_SUCCESS)
 
-        # PHASE 2 (or the only phase without --plan-first): build it and open the PR. Pin the
-        # host-predicted branch so it matches the idempotency pre-check above.
-        # Register the run BEFORE it starts (issue #63): a status=running record + the container
-        # names, so a second shell can `franky jobs` / `job status` / `job kill` an in-flight
-        # (or hung) run. run_id pins the container names to this handle. Best-effort throughout.
-        job_id = jobs.new_job_id()
-        _record_run_start(job_id, command="build", cfg=cfg, spec=spec, branch=branch)
-        if not quiet:
-            click.echo(f"franky: job {job_id} started", err=True)
-        code, output, duration = _run_pass(
-            cfg,
-            build_prompt(spec, branch=branch),
-            franky_img,
-            proxy_img,
-            bundle,
-            progress=progress,
-            timeout=max_duration,
-            run_id=job_id,
-        )
+        # PHASE 2 (or the only phase without --plan-first): build it and open the PR, with up to
+        # `retry` diagnose-and-retry rounds (issue #64 #5). Each attempt is its own registered run
+        # (issue #63); `--retry 0` runs the loop body exactly once, identical to before.
+        prior_failures: list[str] = []
+        attempts: list[dict] = []
+        final: dict | None = None
+        total_attempts = 1 + retry
+        for attempt_no in range(1, total_attempts + 1):
+            # Per-retry idempotency re-check (issue #50 + #64 review): an attempt classified as
+            # failed may actually have opened a PR (e.g. a timeout AFTER `gh pr create`, or a
+            # no_pr from truncated output). Re-check before spending another attempt so a retry
+            # never opens a SECOND PR. --force skips it, matching the pre-loop pre-check.
+            if attempt_no > 1 and not force:
+                existing = find_open_pr(spec.repo, branch, os.environ)
+                if existing:
+                    final = {
+                        "job_id": attempts[-1]["job_id"],
+                        "status": "already_open",
+                        "reason": "a Franky PR is already open (opened by an earlier attempt)",
+                        "exit_code": EXIT_SUCCESS,
+                        "pr_url": existing,
+                        "usage": Usage(),
+                        "duration": 0.0,
+                        "log_path": "",
+                    }
+                    break
 
-        # Parse usage ONCE; both the prose econ line and the JSON economics block come from it.
-        usage = _parse_usage_safe(output)
-        econ = _economics_line(usage, duration, secrets)
-        # Non-json: emit the prose econ line before everything so spend is always visible.
-        if not as_json:
-            click.echo(econ, err=True)
-        log_path = _write_log(output, secrets, footer=econ)
+            final = _build_once(
+                cfg,
+                spec,
+                branch=branch,
+                franky_img=franky_img,
+                proxy_img=proxy_img,
+                bundle=bundle,
+                progress=progress,
+                timeout=max_duration,
+                secrets=secrets,
+                as_json=as_json,
+                quiet=quiet,
+                prior_failures=prior_failures,
+                env=os.environ,
+            )
+            attempts.append(
+                {"job_id": final["job_id"], "status": final["status"], "retry_hint": ""}
+            )
+            if final["status"] == "pr_opened":
+                break
+            if attempt_no >= total_attempts or final["status"] not in _RETRYABLE_STATUSES:
+                break
 
-        # Scope PR-URL detection to the task's own repo so a hostile issue body cannot make
-        # Franky report a PR URL for some other (attacker) repo.
-        pr_url = cfg.engine.parse_pr_url(output, repo=spec.repo)
-        # Timeout is checked FIRST: a timed-out run returns the CONTAINER_TIMEOUT_CODE sentinel
-        # (124), which is nonzero, so it must be distinguished before the generic agent_error
-        # branch and mapped to the dedicated timeout status / EXIT_TIMEOUT.
-        if code == CONTAINER_TIMEOUT_CODE:
-            status, reason, exit_code = "timeout", "exceeded max-duration", EXIT_TIMEOUT
-        elif code != 0:
-            status, reason, exit_code = "agent_error", f"agent exited {code}", EXIT_AGENT
-        elif pr_url:
-            status, reason, exit_code = "pr_opened", "PR opened", EXIT_SUCCESS
-        else:
-            status, reason, exit_code = "no_pr", "agent produced no PR URL", EXIT_AGENT
+            # Interstitial diagnosis: analyze THIS failure and feed the hint into the next
+            # attempt. A diagnose that fails, times out, or reports retryable=false STOPS the
+            # loop - never a blind restart (issue #64 review).
+            attempt_record = {
+                "command": "build",
+                "repo": spec.repo,
+                "engine": cfg.engine.name,
+                "status": final["status"],
+                "exit_code": final["exit_code"],
+                "task": redact(spec.text, secrets)[:_JOB_TASK_SUMMARY_MAX],
+            }
+            diagnosis, _diag_code = _diagnose(
+                cfg,
+                diagnosed_job_id=final["job_id"],
+                repo=spec.repo,
+                record=attempt_record,
+                transcript=final["output"],
+                franky_img=franky_img,
+                proxy_img=proxy_img,
+                progress=progress,
+                secrets=secrets,
+                as_json=as_json,
+                quiet=quiet,
+                timeout=_DIAGNOSE_DEFAULT_TIMEOUT,
+                env=os.environ,
+            )
+            if diagnosis is None or not diagnosis.get("retryable"):
+                break
+            hint = (
+                diagnosis.get("retry_hint")
+                or diagnosis.get("root_cause")
+                or "the previous attempt failed"
+            )
+            attempts[-1]["retry_hint"] = hint
+            prior_failures.append(hint)
 
-        _record_run_end(
-            job_id,
-            status=status,
-            pr_url=pr_url,
-            usage=usage,
-            duration=duration,
-            exit_code=exit_code,
-            log_path=log_path,
-        )
+        # `attempts` is included ONLY when retries were requested, so a plain `build` (--retry 0)
+        # emits the exact same keys as before (the review's byte-identical concern).
         result = build_result(
-            status=status,
-            pr_url=pr_url,
-            reason=reason,
-            exit_code=exit_code,
-            usage=usage,
-            duration=duration,
-            log_path=str(log_path),
+            status=final["status"],
+            pr_url=final["pr_url"],
+            reason=final["reason"],
+            exit_code=final["exit_code"],
+            usage=final["usage"],
+            duration=final["duration"],
+            log_path=str(final["log_path"]),
             engine=cfg.engine.name,
             repo=spec.repo,
             branch=branch,
-            job_id=job_id,
+            job_id=final["job_id"],
+            attempts=attempts if retry > 0 else None,
         )
-        _emit_result(result, as_json, secrets, pr_url=pr_url, status=status, quiet=quiet)
-        ctx.exit(exit_code)
+        _emit_result(
+            result, as_json, secrets, pr_url=final["pr_url"], status=final["status"], quiet=quiet
+        )
+        ctx.exit(final["exit_code"])
     except FrankyError as exc:
         _emit_error(exc, as_json, secrets)
         ctx.exit(exc.code)
@@ -595,7 +654,9 @@ def iterate(
         # Register the run before it starts (issue #63), same as build - iterate has no
         # host-predicted branch, so branch is None in the record.
         job_id = jobs.new_job_id()
-        _record_run_start(job_id, command="iterate", cfg=cfg, spec=spec, branch=None)
+        _record_run_start(
+            job_id, command="iterate", cfg=cfg, repo=spec.repo, summary=spec.text, branch=None
+        )
         if not quiet:
             click.echo(f"franky: job {job_id} started", err=True)
         code, output, duration = _run_pass(
@@ -999,23 +1060,25 @@ def cfg_secrets_safe() -> list[str]:
     return [v for v in (os.environ.get(JIRA_API_TOKEN_VAR), os.environ.get(JIRA_EMAIL_VAR)) if v]
 
 
-def _record_run_start(job_id, *, command, cfg, spec, branch, env=None) -> None:
-    """Write a status=running registry record before the container pass (issue #63).
+def _record_run_start(job_id, *, command, cfg, repo, summary, branch=None, env=None) -> None:
+    """Write a status=running registry record before the container pass (issues #63, #64).
 
-    Best-effort: any failure is swallowed so a registry hiccup can never block a build (mirrors
-    economics' "never raises into a run"). The task summary is REDACTED first, THEN truncated -
-    redacting the full string first so a secret can't be sliced in half and dodge the pattern.
+    Best-effort: any failure is swallowed so a registry hiccup can never block a run (mirrors
+    economics' "never raises into a run"). `summary` is REDACTED first, THEN truncated - redacting
+    the full string first so a secret can't be sliced in half and dodge the pattern. Takes `repo`
+    + `summary` directly (not a TaskSpec) so build/iterate AND the specless `diagnose` pass can
+    all register through this one helper.
     """
     env = os.environ if env is None else env
     try:
         net, proxy, task = run_names(job_id)
-        summary = redact(spec.text, cfg.secret_values())[:_JOB_TASK_SUMMARY_MAX]
+        redacted = redact(summary, cfg.secret_values())[:_JOB_TASK_SUMMARY_MAX]
         record = jobs.new_record(
             job_id=job_id,
             command=command,
-            repo=spec.repo,
+            repo=repo,
             engine=cfg.engine.name,
-            task=summary,
+            task=redacted,
             container=task,
             network=net,
             proxy=proxy,
@@ -1054,6 +1117,196 @@ def _record_run_end(
         )
     except Exception:
         pass
+
+
+def _build_once(
+    cfg,
+    spec,
+    *,
+    branch,
+    franky_img,
+    proxy_img,
+    bundle,
+    progress,
+    timeout,
+    secrets,
+    as_json,
+    quiet,
+    prior_failures,
+    env,
+) -> dict:
+    """Run ONE build attempt end to end and return its outcome (issue #64 #5).
+
+    Registers a fresh run (issue #63), runs the container pass with the branch pinned and any
+    `prior_failures` learning-signal injected, writes the redacted log, classifies the result,
+    and finalizes the record. Returns a dict the `build` retry loop consumes:
+    {job_id, status, reason, exit_code, pr_url, output, log_path, usage, duration}. The
+    classification (timeout > nonzero > pr_opened > no_pr) is identical to the pre-retry code.
+    """
+    job_id = jobs.new_job_id()
+    _record_run_start(
+        job_id, command="build", cfg=cfg, repo=spec.repo, summary=spec.text, branch=branch, env=env
+    )
+    if not quiet:
+        click.echo(f"franky: job {job_id} started", err=True)
+    code, output, duration = _run_pass(
+        cfg,
+        build_prompt(spec, branch=branch, prior_failures=prior_failures),
+        franky_img,
+        proxy_img,
+        bundle,
+        progress=progress,
+        timeout=timeout,
+        run_id=job_id,
+    )
+
+    # Parse usage ONCE; both the prose econ line and the JSON economics block come from it.
+    usage = _parse_usage_safe(output)
+    econ = _economics_line(usage, duration, secrets)
+    if not as_json:
+        click.echo(econ, err=True)
+    log_path = _write_log(output, secrets, footer=econ)
+
+    # Scope PR-URL detection to the task's own repo so a hostile issue body cannot make Franky
+    # report a PR URL for some other (attacker) repo. Timeout is checked FIRST: a timed-out run
+    # returns the CONTAINER_TIMEOUT_CODE sentinel (124, nonzero), so it must be distinguished
+    # before the generic agent_error branch and mapped to the dedicated timeout status.
+    pr_url = cfg.engine.parse_pr_url(output, repo=spec.repo)
+    if code == CONTAINER_TIMEOUT_CODE:
+        status, reason, exit_code = "timeout", "exceeded max-duration", EXIT_TIMEOUT
+    elif code != 0:
+        status, reason, exit_code = "agent_error", f"agent exited {code}", EXIT_AGENT
+    elif pr_url:
+        status, reason, exit_code = "pr_opened", "PR opened", EXIT_SUCCESS
+    else:
+        status, reason, exit_code = "no_pr", "agent produced no PR URL", EXIT_AGENT
+
+    _record_run_end(
+        job_id,
+        status=status,
+        pr_url=pr_url,
+        usage=usage,
+        duration=duration,
+        exit_code=exit_code,
+        log_path=log_path,
+        env=env,
+    )
+    return {
+        "job_id": job_id,
+        "status": status,
+        "reason": reason,
+        "exit_code": exit_code,
+        "pr_url": pr_url,
+        "output": output,
+        "log_path": log_path,
+        "usage": usage,
+        "duration": duration,
+    }
+
+
+def _diagnose(
+    cfg,
+    *,
+    diagnosed_job_id,
+    repo,
+    record,
+    transcript,
+    franky_img,
+    proxy_img,
+    progress,
+    secrets,
+    as_json,
+    quiet,
+    timeout,
+    env,
+) -> tuple[dict | None, int]:
+    """Run ONE read-only diagnose pass over a failed run's transcript (issue #64 #4).
+
+    Returns (diagnosis, exit_code): the build_diagnosis_result dict + EXIT_SUCCESS on success, or
+    (None, EXIT_TIMEOUT / EXIT_AGENT) on a timeout / nonzero-or-unparseable pass. Registers its
+    own run (command="diagnose") so its cost shows in `franky jobs` / `jobs --stats`; the diagnose
+    statuses (`diagnosed` / `diagnose_failed`) are outside compute_stats' success/failed sets, so
+    they never skew build pass-rate. Shared by the standalone `job diagnose` command and the
+    `build --retry` loop; never raises into either caller.
+    """
+    job_id = jobs.new_job_id()
+    _record_run_start(
+        job_id,
+        command="diagnose",
+        cfg=cfg,
+        repo=repo,
+        summary=f"diagnose {diagnosed_job_id}",
+        branch=None,
+        env=env,
+    )
+    if not quiet:
+        click.echo(f"franky: diagnosing job {diagnosed_job_id} (job {job_id})", err=True)
+
+    nonce = _make_nonce()
+    code, output, duration = _run_pass(
+        cfg,
+        build_diagnose_prompt(record, transcript, nonce),
+        franky_img,
+        proxy_img,
+        None,
+        progress=progress,
+        timeout=timeout,
+        run_id=job_id,
+    )
+    usage = _parse_usage_safe(output)
+    econ = _economics_line(usage, duration, secrets)
+    if not as_json:
+        click.echo(econ, err=True)
+    log_path = _write_log(output, secrets, footer=econ)
+
+    def _finish(status: str, exit_code: int) -> None:
+        _record_run_end(
+            job_id,
+            status=status,
+            pr_url=None,
+            usage=usage,
+            duration=duration,
+            exit_code=exit_code,
+            log_path=log_path,
+            env=env,
+        )
+
+    if code == CONTAINER_TIMEOUT_CODE:
+        _finish("diagnose_failed", EXIT_TIMEOUT)
+        return None, EXIT_TIMEOUT
+    if code != 0:
+        _finish("diagnose_failed", EXIT_AGENT)
+        return None, EXIT_AGENT
+    try:
+        parsed = parse_diagnosis(output, nonce)
+    except Exception:
+        parsed = None
+    if parsed is None:
+        _finish("diagnose_failed", EXIT_AGENT)
+        return None, EXIT_AGENT
+    _finish("diagnosed", EXIT_SUCCESS)
+    return build_diagnosis_result(
+        parsed, job_id=diagnosed_job_id, engine=cfg.engine.name
+    ), EXIT_SUCCESS
+
+
+def _format_diagnosis(d: dict) -> list[str]:
+    """Render the human-readable (non-json) `job diagnose` report lines for stdout."""
+    lines = [
+        f"diagnosis for job {d['job_id']} (confidence: {d['confidence']})",
+        f"category:     {d['category']}",
+        f"retryable:    {d['retryable']}",
+        "",
+        f"root cause:   {d['root_cause']}",
+        f"proposed fix: {d['proposed_fix']}",
+    ]
+    if d.get("retry_hint"):
+        lines.append(f"retry hint:   {d['retry_hint']}")
+    if d.get("evidence"):
+        lines.append("")
+        lines.append("evidence:")
+        lines.extend(f"  - {item}" for item in d["evidence"])
+    return lines
 
 
 def _write_log(output: str, secrets: list[str], footer: str | None = None) -> Path:
@@ -1571,6 +1824,114 @@ def job_export(ctx: click.Context, job_id: str, output: str | None, as_json: boo
             )
     except FrankyError as exc:
         _emit_error(exc, as_json, [])
+        ctx.exit(exc.code)
+
+
+@job_group.command("diagnose")
+@click.argument("job_id")
+@click.option(
+    "--engine",
+    "engine",
+    default=None,
+    type=click.Choice(sorted(ENGINES)),
+    help="Engine override; else FRANKY_ENGINE, else pi.",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit the diagnosis as a single JSON object.")
+@click.option(
+    "-v", "--verbose", "verbose", is_flag=True, default=False, help="Stream raw agent output."
+)
+@click.option("-q", "--quiet", "quiet", is_flag=True, help="Suppress progress (implied by --json).")
+@click.option(
+    "--max-duration",
+    "max_duration",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Abort the diagnose pass after N seconds (default 300).",
+)
+@click.pass_context
+def job_diagnose(
+    ctx: click.Context,
+    job_id: str,
+    engine: str | None,
+    as_json: bool,
+    verbose: bool,
+    quiet: bool,
+    max_duration: int | None,
+) -> None:
+    """Diagnose WHY a recorded run failed - a read-only meta-agent over its transcript (issue #64).
+
+    Dispatches the engine in a read-only container pass over the run's persisted transcript +
+    metadata (it clones nothing, edits nothing, opens no PR) and emits a structured root-cause,
+    proposed fix, and a `retryable`/`retry_hint` learning signal - the same signal `franky build
+    --retry` feeds back into a fresh attempt. Unknown/corrupt id -> exit 2; a run with no
+    transcript yet -> exit 2; the pass timing out -> exit 9; no parseable diagnosis -> exit 7.
+
+    --json emits one machine-readable diagnosis object (a DISTINCT envelope from build/iterate);
+    see `franky schema` -> diagnosis_result_schema.
+    """
+    quiet = quiet or as_json
+    secrets = cfg_secrets_safe()
+    try:
+        record = _require_record(job_id)
+        log_path = record.get("log_path") or ""
+        if not log_path or not Path(log_path).exists():
+            raise FrankyError(
+                f"cannot diagnose job {job_id} - it has no transcript yet (still running?)",
+                code=EXIT_USAGE,
+                kind="log_unavailable",
+                hint="the transcript is written when the pass finishes; see `franky job status`",
+            )
+        transcript = Path(log_path).read_text(encoding="utf-8")
+
+        # Same config-file merge as build (a config-file token/engine must work here too).
+        try:
+            load_config_file(os.environ)
+        except FrankyError:
+            raise
+        except ValueError as exc:
+            raise ConfigError(f"config file error: {exc}") from exc
+        cfg = load_config(engine, os.environ)
+        secrets = cfg.secret_values()
+
+        franky_img, proxy_img = _ensure_images(os.environ)
+        verbose = verbose or bool(os.environ.get(FRANKY_VERBOSE_VAR))
+        progress = None if (quiet and not verbose) else _make_progress(cfg.engine, verbose)
+        timeout = max_duration if max_duration is not None else _DIAGNOSE_DEFAULT_TIMEOUT
+
+        diagnosis, code = _diagnose(
+            cfg,
+            diagnosed_job_id=job_id,
+            repo=record.get("repo") or "?",
+            record=record,
+            transcript=transcript,
+            franky_img=franky_img,
+            proxy_img=proxy_img,
+            progress=progress,
+            secrets=secrets,
+            as_json=as_json,
+            quiet=quiet,
+            timeout=timeout,
+            env=os.environ,
+        )
+        if diagnosis is None:
+            if code == EXIT_TIMEOUT:
+                raise FrankyError(
+                    "diagnose pass exceeded its time budget", code=EXIT_TIMEOUT, kind="timeout"
+                )
+            raise FrankyError(
+                "agent produced no parseable diagnosis - see the redacted log in tasks/",
+                code=EXIT_AGENT,
+                kind="no_diagnosis",
+            )
+
+        if as_json:
+            click.echo(redact(json.dumps(diagnosis), secrets))
+        else:
+            for line in _format_diagnosis(diagnosis):
+                click.echo(redact(line, secrets))
+        ctx.exit(EXIT_SUCCESS)
+    except FrankyError as exc:
+        _emit_error(exc, as_json, secrets)
         ctx.exit(exc.code)
 
 

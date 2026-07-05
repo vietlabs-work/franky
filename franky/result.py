@@ -117,6 +117,7 @@ def build_result(
     repo: str,
     branch: str | None = None,
     job_id: str | None = None,
+    attempts: list | None = None,
 ) -> dict:
     """Shape the success/agent-result object emitted on stdout under `--json`.
 
@@ -128,8 +129,12 @@ def build_result(
 
     For the `already_open` status (idempotency short-circuit, no container ran) the caller
     passes the sentinels `duration=0.0` and `log_path=""` - there is no run to time or log.
+
+    `attempts` (issue #64 #5) is the per-attempt trail from a `--retry` build; it is included
+    ONLY when not None, so a plain (no-retry) build emits the exact same keys as before - the
+    `attempts` key simply does not appear.
     """
-    return {
+    result = {
         "status": status,
         "pr_url": pr_url,
         "branch": branch,
@@ -146,6 +151,9 @@ def build_result(
         "repo": repo,
         "job_id": job_id,
     }
+    if attempts is not None:
+        result["attempts"] = attempts
+    return result
 
 
 def build_error(code: int, kind: str, message: str, hint: str = "") -> dict:

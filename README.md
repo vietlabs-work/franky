@@ -213,6 +213,7 @@ franky job status <job_id>     # one run's record + whether its container is sti
 franky job logs <job_id>       # print the run's redacted transcript
 franky job kill <job_id>       # force-remove a stuck run's container + reap its proxy/network
 franky job export <job_id>     # bundle a run's record + transcript into a portable .tar.gz
+franky job diagnose <job_id>   # dispatch a read-only agent to explain WHY a run failed
 ```
 
 This is what turns the half-day silent hang into a 30-second `job status` -> `job kill`. The
@@ -232,12 +233,32 @@ a failed run offline. Both members are secret-free by construction (the record c
 value; the transcript was redacted when written), so the bundle exposes nothing new, and its tar
 members carry no host uid/username/timestamp.
 
+### Diagnose and auto-retry a failed run
+
+`franky job diagnose <id>` dispatches a **read-only meta-agent** at a failed run's transcript +
+metadata: it clones nothing and changes nothing, and emits a structured root-cause, a proposed
+fix, and a `retryable`/`retry_hint` learning signal (`--json` for the machine object; see
+`franky schema` -> `diagnosis_result_schema`). It answers "why did job X hang / produce no PR"
+with an agent that actually reads the evidence.
+
+`franky build --retry N` closes the loop (bounded, `N` <= 5): on a **retryable** failure
+(timeout / agent-error / no-PR) it diagnoses the attempt, then retries with the root-cause fed
+back into the prompt ("last attempt failed on X - avoid it"). It stops early when the diagnosis
+says the failure is not retryable (never a blind restart), re-checks idempotency before each
+retry so it can never open a second PR, and each attempt is its own tracked job. The `--json`
+result then carries an `attempts` trail; a plain `build` (no `--retry`) is unchanged.
+
+> **Retry caveat.** A retry is most effective for failures where nothing was pushed (an early
+> timeout, agent-error, or no-PR). If an attempt already pushed the branch, a fresh retry may not
+> be able to advance it (Franky never force-pushes - safe, but it may not progress); the
+> diagnosis will usually flag that case as not retryable.
+
 > **Note on in-flight runs.** `franky build` still **blocks** the shell it runs in, so to
 > observe or kill a run *while it is going* you need a second shell/channel to run `franky
 > jobs` / `job kill` from (exactly the case where a dispatching agent left the build running).
 > `job logs` shows the transcript once the run finishes (it is written at the end); for a live
 > view during a run use `franky build -v`. A `--detach` launch mode, `job shell` (exec into a
-> running container), `logs -f`, and `job diagnose` are tracked as follow-ups.
+> running container), and `logs -f` are tracked as follow-ups.
 
 ## Planning a big task
 

@@ -99,13 +99,39 @@ def _task_block(spec: TaskSpec, *, plan: bool) -> tuple[str, str]:
     return task_block, close_line
 
 
-def build_prompt(spec: TaskSpec, *, branch: str | None = None) -> str:
+def _prior_failures_block(prior_failures: tuple[str, ...] | list[str]) -> str:
+    """Render the 'earlier attempts failed, avoid repeating' block for a retry (issue #64 #5).
+
+    Empty -> "" so a non-retry build prompt is byte-identical to before (guarded by tests). Each
+    hint comes from a prior attempt's diagnosis `retry_hint`; the numbered list gives the fresh
+    attempt a concrete learning signal instead of a blind restart.
+    """
+    if not prior_failures:
+        return ""
+    lines = "\n".join(f"  {i}. {hint}" for i, hint in enumerate(prior_failures, 1))
+    return (
+        "IMPORTANT - earlier automated attempts at THIS task already failed. Learn from them "
+        "and do NOT repeat these mistakes:\n"
+        f"{lines}\n\n"
+    )
+
+
+def build_prompt(
+    spec: TaskSpec,
+    *,
+    branch: str | None = None,
+    prior_failures: tuple[str, ...] | list[str] = (),
+) -> str:
     """Compose the build prompt, pinning the branch the agent must use.
 
     `branch` is the host-computed branch name (`franky/<slug>`). The CLI passes it so the
     branch the agent pushes matches the one the idempotency pre-check looked up (issue #50);
     when omitted (standalone callers / tests) it is computed here from `task_slug`. Either way
     the prompt pins EXACTLY this branch - the agent is given no slug latitude.
+
+    `prior_failures` (issue #64 #5) is the list of diagnosis `retry_hint`s from earlier failed
+    attempts; when non-empty a learning-signal block is injected. Empty (the default) yields a
+    byte-identical prompt to the pre-retry build.
     """
     persona = load_persona()
 
@@ -125,7 +151,7 @@ def build_prompt(spec: TaskSpec, *, branch: str | None = None) -> str:
         "- Keep commit messages and PR text professional; no persona flavor in the deliverables.\n"
     )
 
-    return f"{persona}\n\n{task_block}\n{conventions}"
+    return f"{persona}\n\n{task_block}\n{_prior_failures_block(prior_failures)}{conventions}"
 
 
 def build_iterate_prompt(spec: TaskSpec) -> str:
@@ -248,3 +274,74 @@ def build_decompose_prompt(spec: TaskSpec, nonce: str) -> str:
     )
 
     return f"{persona}\n\n{task_block}\n{decompose_conventions}"
+
+
+# Cap the transcript injected into a diagnose prompt. The failure signal is almost always at the
+# END of a run, so we keep the tail; an uncapped transcript could blow the engine's context.
+DIAGNOSE_TRANSCRIPT_TAIL_CHARS = 20000
+
+
+def build_diagnose_prompt(record: dict, transcript: str, nonce: str) -> str:
+    """Prompt for `franky job diagnose` / the `build --retry` interstitial pass (issue #64).
+
+    Read-only failure analysis: the agent is handed a FAILED run's metadata + (tail-capped)
+    transcript and must emit EXACTLY ONE `FRANKY_DIAG_<nonce>` sentinel block with a structured
+    root-cause + proposed fix + a `retryable`/`retry_hint` learning signal. It clones nothing,
+    edits nothing, and opens no PR - like `build_decompose_prompt`, the read-only register is
+    enforced here (the container is autonomous but this pass persists nothing anyway).
+
+    `transcript` is ALREADY redacted (run_in_container scrubs its output; the standalone command
+    reads the redacted tasks/*.log), so injecting it adds no secret surface. `nonce` is the
+    anti-injection token the parser keys on, so the literal must survive into the prompt.
+    """
+    persona = load_persona()
+
+    if len(transcript) > DIAGNOSE_TRANSCRIPT_TAIL_CHARS:
+        tail = transcript[-DIAGNOSE_TRANSCRIPT_TAIL_CHARS:]
+        note = f" (last {DIAGNOSE_TRANSCRIPT_TAIL_CHARS} chars; earlier output omitted)"
+    else:
+        tail = transcript
+        note = ""
+
+    failure_block = (
+        "A previous Franky run FAILED. Diagnose why.\n\n"
+        "Run metadata:\n"
+        f"- command: {record.get('command')}\n"
+        f"- repo: {record.get('repo')}\n"
+        f"- engine: {record.get('engine')}\n"
+        f"- status: {record.get('status')}\n"
+        f"- exit_code: {record.get('exit_code')}\n"
+        f"- task: {record.get('task')}\n\n"
+        f"Run transcript{note}:\n"
+        "-----BEGIN TRANSCRIPT-----\n"
+        f"{tail}\n"
+        "-----END TRANSCRIPT-----\n"
+    )
+
+    begin = f"FRANKY_DIAG_{nonce}_BEGIN"
+    end = f"FRANKY_DIAG_{nonce}_END"
+
+    diagnose_conventions = (
+        "DIAGNOSE MODE - this is a read-only failure analysis, NOT execution:\n"
+        "- Analyze the transcript + metadata above and determine WHY the run failed.\n"
+        "- Do NOT clone, modify files, commit, push, or open a pull request. Analyze and stop.\n"
+        "- END your response with EXACTLY ONE machine-readable block and NO text after it, in "
+        "this exact form (a single line, compact JSON, no surrounding code fence):\n"
+        # The middle segment carries LITERAL braces, so it cannot be an f-string; the explicit
+        # `+` concatenation around it is intentional (not a typo).
+        f"  {begin}" + "{<compact ONE-LINE JSON>}" + f"{end}\n"
+        "  where the JSON is exactly this shape:\n"
+        '  {"root_cause": "...", "category": "<one of: dind_daemon|egress_denied|test_failure|'
+        'build_error|timeout|auth|no_pr|agent_confusion|rate_limit|unknown>", '
+        '"evidence": ["a quoted line or concrete fact from the transcript", "..."], '
+        '"proposed_fix": "...", "retryable": <bool>, '
+        '"retry_hint": "one concise instruction a fresh attempt should follow to avoid this '
+        'failure", "confidence": "<low|medium|high>"}\n'
+        "- Set `retryable` true ONLY if a fresh attempt following your `retry_hint` could "
+        "plausibly succeed; set it false for a deterministic failure (missing creds, an "
+        "impossible task, a repo that cannot build regardless of approach).\n"
+        f"- Output ONLY the sentinel block as the FINAL content of your response; add no text "
+        f"after `{end}`.\n"
+    )
+
+    return f"{persona}\n\n{failure_block}\n{diagnose_conventions}"
