@@ -38,6 +38,8 @@ _RESULT_SCHEMA: dict = {
     "(no run)",
     "engine": "the resolved engine name (e.g. pi | claude | codex)",
     "repo": "the target owner/repo",
+    "job_id": "the run handle (issue #63); use with `franky job status|logs|kill`. null when no "
+    "container ran (e.g. already_open).",
 }
 
 # Static description of the `franky plan` success object (the dict build_plan_result shapes).

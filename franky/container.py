@@ -248,6 +248,47 @@ def proxy_url(proxy_name: str) -> str:
     return f"http://{proxy_name}:{PROXY_PORT}"
 
 
+def run_names(run_id: str) -> tuple[str, str, str]:
+    """Derive the (network, proxy, task) container names from a run id.
+
+    Deterministic so the CLI can generate one job id up front, record these names in the run
+    registry (issue #63), and later target the SAME container/net/proxy for `job status`/`kill`
+    - the run id IS the handle. The `franky-net-`/`franky-proxy-`/`franky-run-` prefixes are the
+    stable contract other tooling (and the tests) match on.
+    """
+    return (f"franky-net-{run_id}", f"franky-proxy-{run_id}", f"franky-run-{run_id}")
+
+
+def container_running(name: str, runner=subprocess.run) -> bool:
+    """True iff a container named `name` exists AND is currently running (`docker inspect`).
+
+    For `job status`: distinguishes a still-alive (possibly stuck) run from one that is gone.
+    Never raises - a docker error or a missing container reads as not-running."""
+    try:
+        proc = runner(
+            ["docker", "inspect", "-f", "{{.State.Running}}", name],
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return False
+    return (getattr(proc, "stdout", "") or "").strip() == "true"
+
+
+def reap_run(run_id: str, runner=subprocess.run) -> bool:
+    """Force-remove a run's task container and reap its proxy sidecar + internal network.
+
+    For `franky job kill`: tears down the whole run topology by id, in the same task -> proxy
+    -> net order as run_in_container's own teardown. Returns True iff the task container (the
+    one holding the injected creds) was removed; proxy/net are lower-severity resource leaks.
+    Never raises."""
+    net, proxy, task = run_names(run_id)
+    task_reaped = _reap(task, runner)
+    _reap(proxy, runner)
+    _reap_network(net, runner)
+    return task_reaped
+
+
 def _reap(name: str, runner) -> bool:
     """Best-effort `docker rm -f` so a container does not linger after a timeout/error.
     Returns True iff the reap succeeded. Never raises - the reaper must not mask the
@@ -324,6 +365,7 @@ def run_in_container(
     profile_bundle: str | None = None,
     progress=None,
     popen=subprocess.Popen,
+    run_id: str | None = None,
 ) -> tuple[int, str]:
     """Run the inner engine in a hardened, egress-controlled container; return
     (returncode, redacted_output).
@@ -344,9 +386,10 @@ def run_in_container(
     full accumulated transcript (redacted) for end-of-run processing. `popen` is the
     injectable Popen-compatible callable used by the streaming path (tests pass a fake).
     """
-    net = f"franky-net-{uuid.uuid4().hex[:12]}"
-    proxy = f"franky-proxy-{uuid.uuid4().hex[:12]}"
-    task = f"franky-run-{uuid.uuid4().hex[:12]}"
+    # Names derive from run_id so the CLI can register them up front and later target the same
+    # container/net/proxy for `job status`/`kill` (issue #63). None -> a fresh id (unchanged
+    # behavior for callers that do not track a job).
+    net, proxy, task = run_names(run_id or uuid.uuid4().hex[:12])
 
     allowed = egress.build_allowlist(cfg.engine, cfg.passthrough_env, cfg.extra_allowed_domains)
 

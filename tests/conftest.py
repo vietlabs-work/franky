@@ -9,9 +9,32 @@ WHY autouse for FRANKY_CONFIG_FILE:
   developer's real home config.
 """
 
+import os
 from pathlib import Path
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_runs_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never let a test write run records to the developer's real ~/.franky/runs (issue #63).
+
+    `build`/`iterate` call jobs.write_record via _record_run_start, which defaults to os.environ;
+    a test that replaces cli.os.environ with a dict lacking FRANKY_RUNS_DIR would otherwise fall
+    back to the real home dir. Redirect jobs.runs_dir to a tmp path so no test can pollute home,
+    while still honoring an explicit FRANKY_RUNS_DIR (the test_jobs.py tests that pass their own
+    env dict keep working). Mirrors the FRANKY_CONFIG_FILE guarantee below.
+    """
+    import franky.jobs as jobs
+
+    default = tmp_path / "test-franky-runs"
+
+    def _safe_runs_dir(env=None):
+        source = os.environ if env is None else env
+        override = source.get("FRANKY_RUNS_DIR")
+        return Path(override) if override else default
+
+    monkeypatch.setattr(jobs, "runs_dir", _safe_runs_dir)
 
 
 @pytest.fixture(autouse=True)

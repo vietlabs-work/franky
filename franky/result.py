@@ -116,6 +116,7 @@ def build_result(
     engine: str,
     repo: str,
     branch: str | None = None,
+    job_id: str | None = None,
 ) -> dict:
     """Shape the success/agent-result object emitted on stdout under `--json`.
 
@@ -143,6 +144,7 @@ def build_result(
         "log_path": log_path,
         "engine": engine,
         "repo": repo,
+        "job_id": job_id,
     }
 
 

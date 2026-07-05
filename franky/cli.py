@@ -37,6 +37,8 @@ from .container import (
     resolve_image,
     run_in_container,
 )
+from . import jobs
+from .container import container_running, reap_run, run_names
 from .engine import ENGINES, PI_PROVIDER_VARS, resolve_engine
 from .github import run_gh
 from .idempotency import find_open_pr
@@ -93,6 +95,9 @@ FRANKY_VERBOSE_VAR = "FRANKY_VERBOSE"
 # commands. This is a safety watchdog, not a capability limit - full gh power is unchanged.
 FRANKY_GH_TIMEOUT_VAR = "FRANKY_GH_TIMEOUT"
 _GH_DEFAULT_TIMEOUT = 120.0
+# Cap on the redacted task summary stored in a run record (issue #63) - a handle for `jobs`,
+# not the full prompt. Redact runs on the FULL string before this truncation.
+_JOB_TASK_SUMMARY_MAX = 200
 
 
 def _stdin_is_interactive() -> bool:
@@ -429,6 +434,13 @@ def build(
 
         # PHASE 2 (or the only phase without --plan-first): build it and open the PR. Pin the
         # host-predicted branch so it matches the idempotency pre-check above.
+        # Register the run BEFORE it starts (issue #63): a status=running record + the container
+        # names, so a second shell can `franky jobs` / `job status` / `job kill` an in-flight
+        # (or hung) run. run_id pins the container names to this handle. Best-effort throughout.
+        job_id = jobs.new_job_id()
+        _record_run_start(job_id, command="build", cfg=cfg, spec=spec, branch=branch)
+        if not quiet:
+            click.echo(f"franky: job {job_id} started", err=True)
         code, output, duration = _run_pass(
             cfg,
             build_prompt(spec, branch=branch),
@@ -437,6 +449,7 @@ def build(
             bundle,
             progress=progress,
             timeout=max_duration,
+            run_id=job_id,
         )
 
         # Parse usage ONCE; both the prose econ line and the JSON economics block come from it.
@@ -462,6 +475,15 @@ def build(
         else:
             status, reason, exit_code = "no_pr", "agent produced no PR URL", EXIT_AGENT
 
+        _record_run_end(
+            job_id,
+            status=status,
+            pr_url=pr_url,
+            usage=usage,
+            duration=duration,
+            exit_code=exit_code,
+            log_path=log_path,
+        )
         result = build_result(
             status=status,
             pr_url=pr_url,
@@ -473,6 +495,7 @@ def build(
             engine=cfg.engine.name,
             repo=spec.repo,
             branch=branch,
+            job_id=job_id,
         )
         _emit_result(result, as_json, secrets, pr_url=pr_url, status=status, quiet=quiet)
         ctx.exit(exit_code)
@@ -569,6 +592,12 @@ def iterate(
         bundle = _load_profile_bundle(None, os.environ, secrets)
         verbose = verbose or bool(os.environ.get(FRANKY_VERBOSE_VAR))
         progress = None if (quiet and not verbose) else _make_progress(cfg.engine, verbose)
+        # Register the run before it starts (issue #63), same as build - iterate has no
+        # host-predicted branch, so branch is None in the record.
+        job_id = jobs.new_job_id()
+        _record_run_start(job_id, command="iterate", cfg=cfg, spec=spec, branch=None)
+        if not quiet:
+            click.echo(f"franky: job {job_id} started", err=True)
         code, output, duration = _run_pass(
             cfg,
             build_iterate_prompt(spec),
@@ -577,6 +606,7 @@ def iterate(
             bundle,
             progress=progress,
             timeout=max_duration,
+            run_id=job_id,
         )
 
         usage = _parse_usage_safe(output)
@@ -597,6 +627,15 @@ def iterate(
         else:
             status, reason, exit_code = "iterate_complete", "iterate pass complete", EXIT_SUCCESS
 
+        _record_run_end(
+            job_id,
+            status=status,
+            pr_url=spec.text,
+            usage=usage,
+            duration=duration,
+            exit_code=exit_code,
+            log_path=log_path,
+        )
         result = build_result(
             status=status,
             pr_url=spec.text,
@@ -607,6 +646,7 @@ def iterate(
             log_path=str(log_path),
             engine=cfg.engine.name,
             repo=spec.repo,
+            job_id=job_id,
         )
         _emit_result(result, as_json, secrets, pr_url=spec.text, status=status, quiet=quiet)
         ctx.exit(exit_code)
@@ -835,6 +875,7 @@ def _run_pass(
     profile_bundle: str | None = None,
     progress=None,
     timeout: int | None = None,
+    run_id: str | None = None,
 ) -> tuple[int, str, float]:
     """Run one container pass for `prompt` and return (exit_code, output, duration_secs).
 
@@ -844,6 +885,8 @@ def _run_pass(
 
     `timeout` is the --max-duration budget in seconds; None preserves run_in_container's own
     default (FALLBACK_TIMEOUT_SECS), so the kwarg is only forwarded when explicitly set.
+    `run_id` pins the container/net/proxy names to a job handle so the run registry can record
+    them and `job status`/`kill` can target the SAME containers (issue #63); None -> a fresh id.
     """
     inner_argv = cfg.engine.inner_argv(prompt, model=None)
     extra = {} if timeout is None else {"timeout": timeout}
@@ -855,6 +898,7 @@ def _run_pass(
         proxy_image=proxy_img,
         profile_bundle=profile_bundle,
         progress=progress,
+        run_id=run_id,
         **extra,
     )
     duration = time.monotonic() - t0
@@ -953,6 +997,63 @@ def cfg_secrets_safe() -> list[str]:
     so this is a defensive backstop.
     """
     return [v for v in (os.environ.get(JIRA_API_TOKEN_VAR), os.environ.get(JIRA_EMAIL_VAR)) if v]
+
+
+def _record_run_start(job_id, *, command, cfg, spec, branch, env=None) -> None:
+    """Write a status=running registry record before the container pass (issue #63).
+
+    Best-effort: any failure is swallowed so a registry hiccup can never block a build (mirrors
+    economics' "never raises into a run"). The task summary is REDACTED first, THEN truncated -
+    redacting the full string first so a secret can't be sliced in half and dodge the pattern.
+    """
+    env = os.environ if env is None else env
+    try:
+        net, proxy, task = run_names(job_id)
+        summary = redact(spec.text, cfg.secret_values())[:_JOB_TASK_SUMMARY_MAX]
+        record = jobs.new_record(
+            job_id=job_id,
+            command=command,
+            repo=spec.repo,
+            engine=cfg.engine.name,
+            task=summary,
+            container=task,
+            network=net,
+            proxy=proxy,
+            branch=branch,
+            started_at=jobs.now_iso(),
+        )
+        jobs.write_record(record, env)
+        jobs.prune(env)  # only on the write path; never a side effect of a read
+    except Exception:
+        pass
+
+
+def _record_run_end(
+    job_id, *, status, pr_url, usage, duration, exit_code, log_path, env=None
+) -> None:
+    """Update the run record once the pass finishes. Best-effort - never raises into a build."""
+    env = os.environ if env is None else env
+    try:
+        economics = {
+            "tokens_in": usage.input_tokens,
+            "tokens_out": usage.output_tokens,
+            "cost_usd": usage.cost_usd,
+            "duration_s": round(duration, 3),
+        }
+        jobs.update_record(
+            job_id,
+            {
+                "status": status,
+                "ended_at": jobs.now_iso(),
+                "pr_url": pr_url,
+                "economics": economics,
+                "exit_code": exit_code,
+                "log_path": str(log_path),
+            },
+            env,
+        )
+    except Exception:
+        pass
 
 
 def _write_log(output: str, secrets: list[str], footer: str | None = None) -> Path:
@@ -1199,6 +1300,168 @@ def update(ctx: click.Context, force: bool) -> None:
     Dev checkout -> git hint, no-op. Undetectable installer -> manual hint, nonzero exit.
     """
     ctx.exit(force_update(force=force, out=click.echo))
+
+
+# ---------------------------------------------------------------------------
+# `franky jobs` (list) + `franky job` subgroup (status / logs / kill) - issue #63
+# ---------------------------------------------------------------------------
+# The run registry (~/.franky/runs) records every build/iterate run so a second shell can see
+# and control an in-flight (or hung) run: `franky jobs` lists, `job status` shows live state,
+# `job logs` prints the transcript, `job kill` reaps a stuck container + its proxy/network.
+
+
+def _job_age(started_at: str | None) -> str:
+    """Compact age from an ISO started_at (e.g. `45s`, `12m`, `3h`, `2d`); `?` if unparseable."""
+    if not started_at:
+        return "?"
+    try:
+        start = datetime.fromisoformat(started_at)
+    except ValueError:
+        return "?"
+    secs = max(0, int((datetime.now(start.tzinfo) - start).total_seconds()))
+    if secs < 60:
+        return f"{secs}s"
+    if secs < 3600:
+        return f"{secs // 60}m"
+    if secs < 86400:
+        return f"{secs // 3600}h"
+    return f"{secs // 86400}d"
+
+
+def _require_record(job_id: str) -> dict:
+    """Read a run record or raise a clean job_not_found error (exit 2) - never a traceback.
+
+    A missing OR malformed/unreadable record both surface here as "no run found" (fail-closed),
+    so a corrupt registry file is reported cleanly rather than crashing.
+    """
+    record = jobs.read_record(job_id, os.environ)
+    if record is None:
+        raise FrankyError(
+            f"no run found for job id {job_id!r} (see `franky jobs`)",
+            code=EXIT_USAGE,
+            kind="job_not_found",
+            hint="run `franky jobs` to list known job ids",
+        )
+    return record
+
+
+@main.command("jobs")
+@click.option("--json", "as_json", is_flag=True, help="Emit the run list as a JSON array.")
+@click.option(
+    "-n", "--limit", type=click.IntRange(min=1), default=20, help="Max runs to show (default 20)."
+)
+def jobs_list(as_json: bool, limit: int) -> None:
+    """List recent Franky runs (newest first): id, command, status, age, repo.
+
+    Reads the run registry (~/.franky/runs) - a pure read, never mutates. Use `franky job
+    status <id>` for one run's live state, `job logs <id>` for its transcript, and `job kill
+    <id>` to reap a stuck run.
+    """
+    records = jobs.list_records(os.environ)[:limit]
+    if as_json:
+        click.echo(json.dumps(records))
+        return
+    if not records:
+        click.echo("franky: no runs recorded yet", err=True)
+        return
+    for record in records:
+        click.echo(
+            f"{record.get('job_id', '?'):<12}  {record.get('command', '?'):<7}  "
+            f"{record.get('status', '?'):<15}  {_job_age(record.get('started_at')):>4}  "
+            f"{record.get('repo', '?')}"
+        )
+
+
+@main.group("job")
+def job_group() -> None:
+    """Inspect and control a single Franky run by its job id (see `franky jobs`)."""
+
+
+@job_group.command("status")
+@click.argument("job_id")
+@click.option("--json", "as_json", is_flag=True, help="Emit the run record as a JSON object.")
+@click.pass_context
+def job_status(ctx: click.Context, job_id: str, as_json: bool) -> None:
+    """Show one run's record plus whether its container is still alive.
+
+    `container_running` is a live `docker inspect` on the recorded container name - it
+    distinguishes a still-running (possibly stuck) run from one that has finished or been reaped.
+    """
+    try:
+        record = _require_record(job_id)
+        alive = container_running(record.get("container", ""))
+        if as_json:
+            click.echo(json.dumps({**record, "container_running": alive}))
+        else:
+            live = "running" if alive else "not running (container gone)"
+            click.echo(f"job:        {record.get('job_id')}")
+            click.echo(f"command:    {record.get('command')}")
+            click.echo(f"repo:       {record.get('repo')}")
+            click.echo(f"engine:     {record.get('engine')}")
+            click.echo(f"status:     {record.get('status')}")
+            click.echo(f"container:  {record.get('container')} ({live})")
+            click.echo(f"started:    {record.get('started_at')}")
+            click.echo(f"ended:      {record.get('ended_at')}")
+            click.echo(f"pr_url:     {record.get('pr_url')}")
+            click.echo(f"log_path:   {record.get('log_path')}")
+    except FrankyError as exc:
+        _emit_error(exc, as_json, [])
+        ctx.exit(exc.code)
+
+
+@job_group.command("logs")
+@click.argument("job_id")
+@click.pass_context
+def job_logs(ctx: click.Context, job_id: str) -> None:
+    """Print a run's redacted transcript (the tasks/<ts>.log written when the pass finishes).
+
+    The transcript is written at the END of a run, so a still-running job has no log yet - that
+    is reported cleanly, not as a file-not-found trace. For a live view use `franky build -v`.
+    """
+    try:
+        record = _require_record(job_id)
+        log_path = record.get("log_path") or ""
+        if not log_path or not Path(log_path).exists():
+            raise FrankyError(
+                f"no log available yet for job {job_id} - the run may still be in progress",
+                code=EXIT_USAGE,
+                kind="log_unavailable",
+                hint="the transcript is written when the pass finishes; see `franky job status`",
+            )
+        # The on-disk log was written via _write_log and is ALREADY redacted; print verbatim.
+        click.echo(Path(log_path).read_text(encoding="utf-8"), nl=False)
+    except FrankyError as exc:
+        _emit_error(exc, False, [])
+        ctx.exit(exc.code)
+
+
+@job_group.command("kill")
+@click.argument("job_id")
+@click.option("--json", "as_json", is_flag=True, help="Emit the kill result as a JSON object.")
+@click.pass_context
+def job_kill(ctx: click.Context, job_id: str, as_json: bool) -> None:
+    """Force-remove a run's container and reap its proxy sidecar + network (stop a stuck run).
+
+    Reaps in the same task -> proxy -> net order as a normal teardown. The record is marked
+    `killed` only if the run was still running or a container was actually reaped, so killing an
+    already-finished job never rewrites its real outcome.
+    """
+    try:
+        record = _require_record(job_id)
+        reaped = reap_run(job_id)
+        if record.get("status") == "running" or reaped:
+            jobs.update_record(job_id, {"status": "killed", "ended_at": jobs.now_iso()}, os.environ)
+        if as_json:
+            click.echo(
+                json.dumps({"job_id": job_id, "status": "killed", "container_reaped": reaped})
+            )
+        elif reaped:
+            click.echo(f"franky: killed job {job_id} (container reaped)")
+        else:
+            click.echo(f"franky: job {job_id} had no running container to reap", err=True)
+    except FrankyError as exc:
+        _emit_error(exc, as_json, [])
+        ctx.exit(exc.code)
 
 
 # ---------------------------------------------------------------------------
