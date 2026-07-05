@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `franky gh <args>` (#62): a host-side passthrough to the real `gh` CLI using Franky's own
+  GitHub token, so an agent caller (whose sandbox has no `gh`/token) can query and act on
+  GitHub - confirm a PR landed, read CI checks, comment, `merge`, `api`, etc. - without a
+  second credential. FULL power, bounded only by the token's scopes: no read-only gate and no
+  repo allowlist on this surface (scope the token to limit it; the `build`/`iterate` allowlist
+  is unaffected). The token value never leaks - it reaches `gh` via the environment (never on
+  the argv) and `gh`'s output is redacted before printing. Stdout/stderr stay separated so
+  `franky gh pr list --json` yields clean JSON on stdout; `gh`'s own exit code is passed
+  through (missing token -> exit 5, `gh` not installed on the host -> exit 6). Non-interactive
+  by design (output is captured then redacted).
+
 ## [0.0.5] - 2026-07-03
 
 ### Added
