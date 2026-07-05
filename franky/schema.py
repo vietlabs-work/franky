@@ -40,6 +40,26 @@ _RESULT_SCHEMA: dict = {
     "repo": "the target owner/repo",
     "job_id": "the run handle (issue #63); use with `franky job status|logs|kill`. null when no "
     "container ran (e.g. already_open).",
+    "attempts": "present ONLY for a `build --retry` run (issue #64): an array of "
+    "{job_id, status, retry_hint} - one entry per attempt, in order. Absent on a plain build.",
+}
+
+# Static description of the `franky job diagnose` success object (build_diagnosis_result). A
+# read-only meta-agent pass over a failed run's transcript (issue #64); DISTINCT envelope from
+# build/iterate. Errors use the shared error_schema below.
+_DIAGNOSIS_RESULT_SCHEMA: dict = {
+    "job_id": "the diagnosed run's handle",
+    "root_cause": "the agent's root-cause explanation of why the run failed",
+    "category": "failure class: dind_daemon | egress_denied | test_failure | build_error | "
+    "timeout | auth | no_pr | agent_confusion | rate_limit | unknown",
+    "evidence": "array of quoted lines / concrete facts from the transcript supporting the cause",
+    "proposed_fix": "the agent's suggested fix",
+    "retryable": "bool: whether a fresh attempt following retry_hint could plausibly succeed "
+    "(false for a deterministic failure). `build --retry` stops when this is false.",
+    "retry_hint": "one concise instruction fed into a retry attempt (issue #64 #5)",
+    "confidence": "the agent's confidence: low | medium | high",
+    "engine": "the resolved engine name",
+    "exit_code": "the process exit code this result corresponds to (0 on success)",
 }
 
 # Static description of the `franky plan` success object (the dict build_plan_result shapes).
@@ -126,6 +146,7 @@ def build_schema(group: click.Group) -> dict:
         "commands": _walk(group),
         "result_schema": _RESULT_SCHEMA,
         "plan_result_schema": _PLAN_RESULT_SCHEMA,
+        "diagnosis_result_schema": _DIAGNOSIS_RESULT_SCHEMA,
         "error_schema": _ERROR_SCHEMA,
         # JSON object keys are strings; stringify the int exit codes for a valid JSON map.
         "exit_codes": {str(code): meaning for code, meaning in result.EXIT_CODES.items()},

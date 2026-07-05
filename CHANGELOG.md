@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Self-diagnosis + auto-retry (#64): `franky job diagnose <id>` dispatches a read-only meta-agent
+  at a failed run's transcript + metadata (it clones/changes nothing) and emits a structured
+  root-cause, proposed fix, and a `retryable`/`retry_hint` learning signal (`--json` object; see
+  `franky schema` -> `diagnosis_result_schema`). `franky build --retry N` (bounded, N <= 5) closes
+  the loop: on a retryable failure (timeout/agent-error/no-PR) it diagnoses the attempt and
+  retries with the root-cause fed into the prompt, stops early when the diagnosis is not
+  retryable (never a blind restart), re-checks idempotency before each retry (never a second PR),
+  and records each attempt as its own job; the `--json` result then carries an `attempts` trail
+  (a plain build without `--retry` is unchanged). Diagnose runs are registered as `command`
+  `diagnose` runs so their cost shows in `franky jobs` / `jobs --stats`. The nonce-fenced
+  structured-output scanner is now shared (`franky/sentinel.py`) between `plan` and `diagnose`.
 - Job forensics on top of the run registry (#64): `franky jobs --stats` aggregates cross-run
   health over ALL recorded runs (success rate, a hang count = timeout runs + stale `running`
   orphans, median duration, total cost, broken down `by engine` / `by repo`; `--json` emits the

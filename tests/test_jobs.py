@@ -182,7 +182,13 @@ def test_record_start_redacts_task_summary(tmp_path):
     env = _env(tmp_path)
     spec = _Spec("investigate gho_supersecret leaking " + "x" * 500)
     cli._record_run_start(
-        "5ec123", command="build", cfg=_FakeCfg(), spec=spec, branch=None, env=env
+        "5ec123",
+        command="build",
+        cfg=_FakeCfg(),
+        repo=spec.repo,
+        summary=spec.text,
+        branch=None,
+        env=env,
     )
     record = jobs.read_record("5ec123", env)
     assert record is not None
@@ -195,7 +201,7 @@ def test_record_run_end_updates(tmp_path):
 
     env = _env(tmp_path)
     cli._record_run_start(
-        "aced01", command="build", cfg=_FakeCfg(), spec=_Spec("t"), branch=None, env=env
+        "aced01", command="build", cfg=_FakeCfg(), repo="o/r", summary="t", branch=None, env=env
     )
     cli._record_run_end(
         "aced01",
@@ -227,7 +233,13 @@ def test_record_helpers_swallow_errors(tmp_path, monkeypatch):
     monkeypatch.setattr(jobs, "update_record", boom)
     # Neither call raises despite the underlying registry ops blowing up.
     cli._record_run_start(
-        "bad001", command="build", cfg=_FakeCfg(), spec=_Spec("t"), branch=None, env=_env(tmp_path)
+        "bad001",
+        command="build",
+        cfg=_FakeCfg(),
+        repo="o/r",
+        summary="t",
+        branch=None,
+        env=_env(tmp_path),
     )
     cli._record_run_end(
         "bad001",
@@ -246,7 +258,13 @@ def test_record_run_start_prunes(tmp_path, monkeypatch):
     called = {}
     monkeypatch.setattr(jobs, "prune", lambda env=None, **k: called.setdefault("yes", True))
     cli._record_run_start(
-        "cafe01", command="build", cfg=_FakeCfg(), spec=_Spec("t"), branch=None, env=_env(tmp_path)
+        "cafe01",
+        command="build",
+        cfg=_FakeCfg(),
+        repo="o/r",
+        summary="t",
+        branch=None,
+        env=_env(tmp_path),
     )
     assert called.get("yes") is True
 
