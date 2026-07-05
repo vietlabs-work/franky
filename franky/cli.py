@@ -1345,19 +1345,83 @@ def _require_record(job_id: str) -> dict:
     return record
 
 
+def _format_stats(stats: dict) -> list[str]:
+    """Render the compact human-readable `jobs --stats` report (issue #64).
+
+    A percentage/duration/cost that is None (no terminal runs / no economics) prints as `n/a`
+    so the report never crashes on a sparse registry. The by-engine / by-repo blocks are
+    omitted when empty (a zero-run registry shows only the `runs: 0` line).
+    """
+
+    def _pct(rate: float | None) -> str:
+        return f"{rate * 100:.0f}%" if rate is not None else "n/a"
+
+    def _dur(secs: float | None) -> str:
+        return f"{secs:.0f}s" if secs is not None else "n/a"
+
+    def _usd(cost: float | None) -> str:
+        return f"${cost:.2f}" if cost is not None else "n/a"
+
+    lines = [f"runs:          {stats['total']}"]
+    if stats["total"] == 0:
+        return lines
+    lines += [
+        f"success:       {stats['success']}  ({_pct(stats['success_rate'])})",
+        f"failed:        {stats['failed']}",
+        f"running:       {stats['running_fresh']}",
+        f"hangs:         {stats['hangs']}  (timeout + stale-running)",
+        f"median dur:    {_dur(stats['median_duration_s'])}",
+        f"total cost:    {_usd(stats['total_cost_usd'])}",
+    ]
+    for title, key in (("engine", "by_engine"), ("repo", "by_repo")):
+        groups = stats[key]
+        if not groups:
+            continue
+        lines.append("")
+        lines.append(f"by {title}:")
+        for name, g in groups.items():
+            lines.append(
+                f"  {name:<24} n={g['n']:<3} ok={_pct(g['success_rate']):<5} "
+                f"dur={_dur(g['median_duration_s']):<6} {_usd(g['total_cost_usd'])}"
+            )
+    return lines
+
+
 @main.command("jobs")
-@click.option("--json", "as_json", is_flag=True, help="Emit the run list as a JSON array.")
+@click.option(
+    "--stats",
+    "as_stats",
+    is_flag=True,
+    help="Show cross-run aggregate stats (success/hang rate, median duration & cost, by "
+    "engine/repo) instead of the list. Covers ALL recorded runs; ignores -n.",
+)
+@click.option(
+    "--json",
+    "as_json",
+    is_flag=True,
+    help="Emit as JSON: the run-list array, or the stats object with --stats.",
+)
 @click.option(
     "-n", "--limit", type=click.IntRange(min=1), default=20, help="Max runs to show (default 20)."
 )
-def jobs_list(as_json: bool, limit: int) -> None:
+def jobs_list(as_stats: bool, as_json: bool, limit: int) -> None:
     """List recent Franky runs (newest first): id, command, status, age, repo.
 
     Reads the run registry (~/.franky/runs) - a pure read, never mutates. Use `franky job
-    status <id>` for one run's live state, `job logs <id>` for its transcript, and `job kill
-    <id>` to reap a stuck run.
+    status <id>` for one run's live state, `job logs <id>` for its transcript, `job kill <id>`
+    to reap a stuck run, and `job export <id>` to bundle one for offline forensics. With
+    --stats, prints cross-run aggregate health (over ALL runs, not just the -n most recent).
     """
-    records = jobs.list_records(os.environ)[:limit]
+    records = jobs.list_records(os.environ)
+    if as_stats:
+        stats = jobs.compute_stats(records)
+        if as_json:
+            click.echo(json.dumps(stats))
+        else:
+            for line in _format_stats(stats):
+                click.echo(line)
+        return
+    records = records[:limit]
     if as_json:
         click.echo(json.dumps(records))
         return
@@ -1459,6 +1523,52 @@ def job_kill(ctx: click.Context, job_id: str, as_json: bool) -> None:
             click.echo(f"franky: killed job {job_id} (container reaped)")
         else:
             click.echo(f"franky: job {job_id} had no running container to reap", err=True)
+    except FrankyError as exc:
+        _emit_error(exc, as_json, [])
+        ctx.exit(exc.code)
+
+
+@job_group.command("export")
+@click.argument("job_id")
+@click.option(
+    "-o",
+    "--output",
+    "output",
+    default=None,
+    type=click.Path(dir_okay=False),
+    help="Write the bundle here (default ./franky-job-<id>.tar.gz).",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit the export result as a JSON object.")
+@click.pass_context
+def job_export(ctx: click.Context, job_id: str, output: str | None, as_json: bool) -> None:
+    """Bundle a run's record + redacted transcript into a portable .tar.gz for offline forensics.
+
+    The archive holds `record.json` (the secret-free run record) and, when the transcript still
+    exists, `transcript.log` (the already-redacted task log). Hand it to a human or another agent
+    to inspect a failed or stuck run without access to this machine - both members are secret-free
+    by construction, so nothing new is exposed. Unknown/corrupt job id -> exit 2.
+    """
+    try:
+        record = _require_record(job_id)
+        dest = Path(output) if output else Path.cwd() / f"franky-job-{job_id}.tar.gz"
+        try:
+            summary = jobs.export_bundle(record, dest)
+        except OSError as exc:
+            # No dedicated filesystem exit code in the taxonomy; reuse EXIT_USAGE (2), the same
+            # code job_logs uses for its log_unavailable state error, with a clean typed message.
+            raise FrankyError(
+                f"could not write export bundle to {dest}: {exc}",
+                code=EXIT_USAGE,
+                kind="export_failed",
+                hint="pass a writable path with --output",
+            ) from exc
+        if as_json:
+            click.echo(json.dumps({"job_id": job_id, **summary}))
+        else:
+            click.echo(
+                f"franky: exported job {job_id} -> {summary['output_path']} "
+                f"({len(summary['included'])} files, {summary['bytes']} bytes)"
+            )
     except FrankyError as exc:
         _emit_error(exc, as_json, [])
         ctx.exit(exc.code)

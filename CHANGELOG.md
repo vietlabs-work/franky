@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Job forensics on top of the run registry (#64): `franky jobs --stats` aggregates cross-run
+  health over ALL recorded runs (success rate, a hang count = timeout runs + stale `running`
+  orphans, median duration, total cost, broken down `by engine` / `by repo`; `--json` emits the
+  object), so a rising hang rate on a repo/engine is visible at a glance. `franky job export
+  <id>` writes a portable `.tar.gz` (default `./franky-job-<id>.tar.gz`, `-o` to override)
+  holding `record.json` + the redacted `transcript.log` to hand a failed run to a human or agent
+  for offline inspection. Both are pure over the existing registry (no docker, no build-path
+  change); the bundle exposes nothing new (record is secret-free, transcript already redacted)
+  and its tar members carry no host uid/username/timestamp. Unknown/corrupt id -> exit 2.
 - Run registry + `franky jobs` / `franky job status|logs|kill` (#63): every `build`/`iterate`
   run is recorded under `~/.franky/runs/<job_id>.json` and prints its `job_id` at start (also a
   `job_id` field in `--json` output), so a run can be listed, inspected, its transcript read, or

@@ -208,15 +208,29 @@ prints its `job_id` at start (and it appears as `job_id` in `--json` output).
 
 ```
 franky jobs                    # recent runs, newest first: id, command, status, age, repo
+franky jobs --stats            # cross-run health: success/hang rate, median dur & cost, by engine/repo
 franky job status <job_id>     # one run's record + whether its container is still alive
 franky job logs <job_id>       # print the run's redacted transcript
 franky job kill <job_id>       # force-remove a stuck run's container + reap its proxy/network
+franky job export <job_id>     # bundle a run's record + transcript into a portable .tar.gz
 ```
 
 This is what turns the half-day silent hang into a 30-second `job status` -> `job kill`. The
 records store **no secret values** (only names, paths, status, timings, and a redacted task
 summary), the runs dir is bounded (old finished records are pruned; a `running` record is never
 pruned), and an unknown/corrupt job id is a clean error (exit 2), never a traceback.
+
+`franky jobs --stats` aggregates over **all** recorded runs (not just the `-n` most recent):
+success rate, a **hang count** (timeout runs + stale `running` orphans that never finished),
+median duration, total cost, and the same broken down `by engine` / `by repo` - so a rising
+hang rate on a repo or engine is visible at a glance. `--stats --json` emits the numbers as one
+object.
+
+`franky job export <id>` writes a `.tar.gz` (default `./franky-job-<id>.tar.gz`, override with
+`-o`) holding `record.json` + `transcript.log` - hand it to a human or another agent to inspect
+a failed run offline. Both members are secret-free by construction (the record carries no secret
+value; the transcript was redacted when written), so the bundle exposes nothing new, and its tar
+members carry no host uid/username/timestamp.
 
 > **Note on in-flight runs.** `franky build` still **blocks** the shell it runs in, so to
 > observe or kill a run *while it is going* you need a second shell/channel to run `franky
