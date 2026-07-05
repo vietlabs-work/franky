@@ -20,10 +20,13 @@ FRANKY_RUNS_DIR for hermetic tests, mirroring userconfig's FRANKY_CONFIG_FILE.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
 import stat
+import statistics
+import tarfile
 import tempfile
 import uuid
 from collections.abc import Mapping
@@ -45,6 +48,12 @@ DEFAULT_KEEP = 200
 # real run never lasts anywhere near this long (the --max-duration default is 30 min), so a
 # "running" record older than this is a crash orphan and becomes eligible for pruning.
 STALE_RUNNING_SECS = 24 * 3600
+
+# Terminal-status classification for `compute_stats` (issue #64). `running` is non-terminal (it
+# is neither, and is reported separately as running_fresh / hangs). `already_open` never reaches
+# the registry (it short-circuits before a record is written), so it is intentionally absent.
+_SUCCESS_STATUSES = frozenset({"pr_opened", "iterate_complete"})
+_FAILURE_STATUSES = frozenset({"no_pr", "agent_error", "timeout", "killed"})
 
 
 def runs_dir(env: Mapping[str, str] | None = None) -> Path:
@@ -232,3 +241,135 @@ def prune(env: Mapping[str, str] | None = None, keep: int = DEFAULT_KEEP) -> int
         except OSError:
             pass
     return removed
+
+
+# ---------------------------------------------------------------------------
+# Cross-run analytics + forensic export (issue #64, items #6/#7) - both pure over the registry
+# records / on-disk artifacts above; no docker, stdlib-only, so they stay in the fast suite.
+# ---------------------------------------------------------------------------
+
+
+def _median_or_none(values: list[float]) -> float | None:
+    """Median of `values` (rounded), or None when empty - median([]) would raise."""
+    return round(statistics.median(values), 3) if values else None
+
+
+def _group_stats(records: list[dict]) -> dict:
+    """The metric block shared by the overall / by_engine / by_repo views.
+
+    success/failed classify each record by its terminal status (running records count as
+    neither); success_rate is over terminal runs only (None when there are none). Durations
+    and costs come from the economics block and skip records that lack a numeric value, so a
+    still-running or economics-less record never skews the medians/totals.
+    """
+    success = failed = 0
+    durations: list[float] = []
+    costs: list[float] = []
+    for record in records:
+        status = record.get("status")
+        if status in _SUCCESS_STATUSES:
+            success += 1
+        elif status in _FAILURE_STATUSES:
+            failed += 1
+        econ = record.get("economics") or {}
+        dur = econ.get("duration_s")
+        if isinstance(dur, (int, float)):
+            durations.append(dur)
+        cost = econ.get("cost_usd")
+        if isinstance(cost, (int, float)):
+            costs.append(cost)
+    terminal = success + failed
+    return {
+        "n": len(records),
+        "success": success,
+        "failed": failed,
+        "success_rate": round(success / terminal, 3) if terminal else None,
+        "median_duration_s": _median_or_none(durations),
+        "total_cost_usd": round(sum(costs), 6) if costs else None,
+    }
+
+
+def compute_stats(records: list[dict]) -> dict:
+    """Aggregate cross-run health over `records` (issue #64 item #7). Pure - no I/O.
+
+    Returns overall counts + rates + a by_engine / by_repo breakdown. `running_fresh` is the
+    count of genuinely in-flight runs (see `_is_fresh_running`); `hangs` is timeout runs PLUS
+    stale `running` records (crash orphans that never finished) - note this deliberately mixes a
+    terminal status (timeout) with a non-terminal one (stale running), so `hangs` is NOT a subset
+    of `by_status`. Everything degrades cleanly on an empty list (rates/medians/total_cost ->
+    None, counts -> 0).
+    """
+    by_status: dict[str, int] = {}
+    for record in records:
+        status = record.get("status") or "unknown"
+        by_status[status] = by_status.get(status, 0) + 1
+
+    overall = _group_stats(records)
+    running_fresh = sum(1 for record in records if _is_fresh_running(record))
+    stale_running = by_status.get("running", 0) - running_fresh
+    hangs = by_status.get("timeout", 0) + stale_running
+
+    def _breakdown(key: str) -> dict:
+        names = sorted({(record.get(key) or "?") for record in records})
+        return {
+            name: _group_stats([r for r in records if (r.get(key) or "?") == name])
+            for name in names
+        }
+
+    return {
+        "total": len(records),
+        "by_status": by_status,
+        "success": overall["success"],
+        "failed": overall["failed"],
+        "running_fresh": running_fresh,
+        "hangs": hangs,
+        "success_rate": overall["success_rate"],
+        "median_duration_s": overall["median_duration_s"],
+        "total_cost_usd": overall["total_cost_usd"],
+        "by_engine": _breakdown("engine"),
+        "by_repo": _breakdown("repo"),
+    }
+
+
+def _add_bytes(tar: tarfile.TarFile, name: str, data: bytes) -> None:
+    """Add `data` to `tar` as `name` with fixed, host-free metadata.
+
+    mode 0600, mtime 0, uid/gid 0, empty uname/gname so the bundle's tar members are
+    deterministic and leak no host username/timestamps (the gzip wrapper still stamps its own
+    header time, but the archived files carry nothing host-specific).
+    """
+    info = tarfile.TarInfo(name=name)
+    info.size = len(data)
+    info.mode = 0o600
+    info.mtime = 0
+    info.uid = info.gid = 0
+    info.uname = info.gname = ""
+    tar.addfile(info, io.BytesIO(data))
+
+
+def export_bundle(record: dict, dest: Path) -> dict:
+    """Write a portable forensic .tar.gz for `record` to `dest` (issue #64 item #6).
+
+    The bundle holds `record.json` (the secret-free run record) and, when the run's transcript
+    still exists on disk, `transcript.log` (the ALREADY-redacted task log). Both are secret-free
+    by construction, so this adds no new redaction surface. Returns
+    {output_path, bytes, included}. Raises OSError on a write failure (the caller maps it to a
+    clean typed error); a transcript that has since been deleted is simply omitted, not fatal.
+    """
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    included: list[str] = []
+    with tarfile.open(dest, "w:gz") as tar:
+        record_bytes = (json.dumps(record, indent=2, sort_keys=True) + "\n").encode("utf-8")
+        _add_bytes(tar, "record.json", record_bytes)
+        included.append("record.json")
+        log_path = record.get("log_path") or ""
+        if log_path and Path(log_path).exists():
+            try:
+                log_bytes = Path(log_path).read_bytes()
+            except OSError:
+                log_bytes = None
+            if log_bytes is not None:
+                _add_bytes(tar, "transcript.log", log_bytes)
+                included.append("transcript.log")
+    return {"output_path": str(dest), "bytes": dest.stat().st_size, "included": included}
