@@ -161,6 +161,45 @@ anything, and to stop otherwise. This is a prompt-level guard in the same regist
 "never merge" rule (the agent is autonomous); the hard bounds remain the repo allowlist, the
 egress cage, and PR-not-merge. See the Security section.
 
+## Querying GitHub with Franky's token (`franky gh`)
+
+Franky's caller is usually an agent in a sandbox with **no `gh` CLI and no GitHub token** - so
+after it dispatches a build it can't even confirm the PR landed or read CI on its own. Franky
+already holds a scoped token. `franky gh` lends it to the real `gh` CLI:
+
+```
+franky gh pr list --repo you/repo
+franky gh pr checks 42 --repo you/repo
+franky gh pr merge 42 --repo you/repo --squash
+franky gh api /repos/you/repo/pulls
+```
+
+**Full power, bounded only by the token.** It is a straight passthrough to `gh` - read AND
+write (comment, label, `merge`, `api`, workflow dispatch, ...), whatever the token's scopes
+allow. Franky imposes **no** capability ceiling here: no read-only gate and no repo allowlist on
+this surface. If you want to limit what Franky can touch, scope the token (a fine-grained PAT) -
+the credential is the control lever. (The `build`/`iterate` repo allowlist is unaffected; it
+still gates the autonomous, content-driven build path.)
+
+The one guarantee kept: **the token value never leaks.** It reaches `gh` via the environment,
+never on the argv (so it is not visible in `ps`), and `gh`'s output is redacted before printing.
+`gh`'s own exit code is passed through; a missing token exits 5, a missing `gh` binary exits 6.
+
+Runs **host-side** (like Franky's own PR-idempotency check), not in the container - a `franky gh`
+call is a deterministic operator/agent command, not the autonomous engine. It is **non-interactive
+by design**: output is captured then redacted, so pass `gh`'s own flags rather than relying on its
+prompts. Long-lived/streaming subcommands (e.g. `gh run watch`) buffer until completion rather than
+streaming live. A watchdog caps each call at `FRANKY_GH_TIMEOUT` seconds (default 120, exit 9 on
+hit) so a stalled call can't wedge an autonomous caller; set `FRANKY_GH_TIMEOUT=0` for no cap.
+Requires the `gh` CLI on the host.
+
+> **Scope the token deliberately.** Because there is no allowlist on this surface, `franky gh` is
+> exactly as powerful as the token you give Franky: a prompt-injected agent that can invoke it can
+> `merge`, `gh api -X DELETE`, dispatch workflows, or read Actions secrets on any repo the token
+> reaches - and `gh` can print GitHub-side secrets (e.g. `gh api .../actions/secrets`) that
+> Franky's redaction does not know about. Use a **fine-grained PAT** scoped to the repos and
+> permissions you actually want Franky to have. The credential is the limit.
+
 ## Planning a big task
 
 **One franky run = one focused PR.** A run is meant to produce a single, reviewable pull
@@ -238,7 +277,7 @@ failure's `code`:
 | 3 | config error (bad config file, allowlist unset/empty/malformed, bad engine) |
 | 4 | allowlist / task rejection |
 | 5 | auth/creds missing (`GH_TOKEN`, engine creds, JIRA creds, JIRA 401/403) |
-| 6 | docker / image unavailable |
+| 6 | docker / image unavailable, or a required host tool (e.g. `gh`) is missing |
 | 7 | agent ran but exited nonzero or produced no PR |
 | 8 | network/timeout (JIRA reach/HTTP/parse) |
 | 9 | run exceeded `--max-duration` (the container was aborted) |

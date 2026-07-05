@@ -26,7 +26,7 @@ import click
 
 from . import franky_version
 from ._install import detect_install
-from .config import Config, load_config, redact
+from .config import GH_TOKEN_VAR, Config, load_config, redact
 from .decompose import build_plan_result, parse_decomposition
 from .economics import Usage, format_economics, parse_usage
 from .container import (
@@ -38,6 +38,7 @@ from .container import (
     run_in_container,
 )
 from .engine import ENGINES, PI_PROVIDER_VARS, resolve_engine
+from .github import run_gh
 from .idempotency import find_open_pr
 from .jira import JIRA_API_TOKEN_VAR, JIRA_EMAIL_VAR, fetch_jira_issue
 from .profile import (
@@ -62,6 +63,7 @@ from .result import (
     EXIT_SUCCESS,
     EXIT_TIMEOUT,
     EXIT_USAGE,
+    AuthError,
     ConfigError,
     DockerError,
     FrankyError,
@@ -85,6 +87,12 @@ from .userconfig import (
 
 TASKS_DIR = Path("tasks")
 FRANKY_VERBOSE_VAR = "FRANKY_VERBOSE"
+# `franky gh` subprocess watchdog. A default cap honors the never-hang guarantee for the
+# autonomous agent caller (a stalled `gh api` or a `gh run watch` must not wedge the caller
+# forever); FRANKY_GH_TIMEOUT overrides it and 0 disables the cap for deliberately long-lived
+# commands. This is a safety watchdog, not a capability limit - full gh power is unchanged.
+FRANKY_GH_TIMEOUT_VAR = "FRANKY_GH_TIMEOUT"
+_GH_DEFAULT_TIMEOUT = 120.0
 
 
 def _stdin_is_interactive() -> bool:
@@ -1076,6 +1084,110 @@ def schema() -> None:
     Always JSON - no --json flag - and the single JSON object is the only thing on stdout.
     """
     click.echo(json.dumps(build_schema(main)))
+
+
+def _resolve_gh_timeout(env: Mapping[str, str]) -> float | None:
+    """Seconds for the `franky gh` subprocess, from FRANKY_GH_TIMEOUT (default 120).
+
+    A value of 0 (or negative) means no cap - for deliberately long-lived commands like
+    `gh run watch`. An unset or unparseable value falls back to the default so a typo never
+    silently removes the watchdog.
+    """
+    raw = env.get(FRANKY_GH_TIMEOUT_VAR)
+    if not raw:
+        return _GH_DEFAULT_TIMEOUT
+    try:
+        val = float(raw)
+    except ValueError:
+        return _GH_DEFAULT_TIMEOUT
+    return val if val > 0 else None
+
+
+@main.command(
+    "gh",
+    # Pass EVERYTHING through to gh: unknown flags are not Franky's, and no Franky --help is
+    # added (so `franky gh --help` shows gh's own help - this command is a pure passthrough).
+    context_settings={"ignore_unknown_options": True},
+    add_help_option=False,
+)
+@click.argument("args", nargs=-1, type=click.UNPROCESSED)
+@click.pass_context
+def gh(ctx: click.Context, args: tuple[str, ...]) -> None:
+    """Run `gh ARGS...` with Franky's GitHub token (full gh surface, non-interactive).
+
+    Franky's caller usually has no gh CLI or token; Franky does. `franky gh` lends Franky's
+    GH_TOKEN to the real gh CLI so the caller can query and act on GitHub (pr status/checks,
+    comment, merge, api, ...) without its own credential. FULL power: bounded only by the
+    token's scopes, not by Franky - there is no read-only gate and no repo allowlist on this
+    surface (scope the token to limit it). The token value is never leaked - it reaches gh via
+    the environment (never on argv) and gh's output is redacted. gh's own exit code is passed
+    through; a missing token -> exit 5, gh not installed on the host -> exit 6.
+
+    Non-interactive by design: output is captured then redacted, so pass gh's own flags rather
+    than relying on its interactive prompts. `franky gh --help` shows gh's help. A watchdog caps
+    the run at FRANKY_GH_TIMEOUT seconds (default 120, exit 9 on hit); set it to 0 for no cap
+    (e.g. a long-lived `gh run watch`).
+
+    Examples:
+      franky gh pr list --repo you/repo
+      franky gh pr checks 62 --repo you/repo
+      franky gh api /repos/you/repo/pulls
+    """
+    env = dict(os.environ)
+    # A gh error message could echo a token from the env; redact every known secret value.
+    secrets = [env[k] for k in SECRET_KEYS if env.get(k)]
+    try:
+        # Merge ~/.franky/config into env (process env wins) so a token stored there works,
+        # exactly like build. A malformed file -> ConfigError (exit 3).
+        try:
+            load_config_file(env)
+        except FrankyError:
+            raise
+        except ValueError as exc:
+            raise ConfigError(f"config file error: {exc}") from exc
+        # Re-read after the merge so a config-file token is included in the redaction set.
+        secrets = [env[k] for k in SECRET_KEYS if env.get(k)]
+
+        if not env.get(GH_TOKEN_VAR):
+            raise AuthError(
+                f"{GH_TOKEN_VAR} is unset or empty - refusing (franky gh lends Franky's "
+                "GitHub token to gh)",
+                hint=f"set {GH_TOKEN_VAR} in the env or via `franky config set {GH_TOKEN_VAR}`",
+            )
+
+        try:
+            code, out, err = run_gh(args, env, timeout=_resolve_gh_timeout(env))
+        except subprocess.TimeoutExpired as exc:
+            # Never-hang: a stalled or long-lived gh command hit the watchdog. Distinct exit 9
+            # (timeout), same as a build that exceeds --max-duration.
+            raise FrankyError(
+                f"gh command exceeded {int(exc.timeout)}s ({FRANKY_GH_TIMEOUT_VAR}) - set "
+                f"{FRANKY_GH_TIMEOUT_VAR}=0 for no cap (e.g. long-lived `gh run watch`)",
+                code=EXIT_TIMEOUT,
+                kind="timeout",
+                hint=f"raise or unset {FRANKY_GH_TIMEOUT_VAR} (0 = no cap)",
+            ) from exc
+        except OSError as exc:
+            # gh missing (FileNotFoundError) or present-but-not-executable (PermissionError) -
+            # both are OSError; surface a clean operator error, not a traceback.
+            raise DockerError(
+                "the `gh` CLI is not installed or not executable on the host - `franky gh` "
+                "runs gh host-side",
+                hint="install the GitHub CLI: https://cli.github.com",
+            ) from exc
+
+        # Preserve stdout purity: gh's stdout -> our stdout, gh's stderr -> our stderr, each
+        # redacted. nl=False keeps gh's own trailing newline (no doubled newline). Then pass
+        # gh's exit code through as our own.
+        if out:
+            click.echo(redact(out, secrets), nl=False)
+        if err:
+            click.echo(redact(err, secrets), nl=False, err=True)
+        ctx.exit(code)
+    except FrankyError as exc:
+        # Raw passthrough (not a --json command): prose to stderr + the typed exit code.
+        click.echo("franky: " + redact(str(exc), secrets), err=True)
+        ctx.exit(exc.code)
 
 
 @main.command()
