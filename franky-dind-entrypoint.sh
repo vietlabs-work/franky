@@ -50,7 +50,12 @@ for _ in $(seq 1 30); do
     sleep 1
 done
 
-if [ "${ready}" != 1 ]; then
+if [ "${ready}" = 1 ]; then
+    # Positive marker (issue #69): host-side diagnostics capture asserts DinD readiness from
+    # this exact string rather than only inferring it from the ABSENCE of the failure warning
+    # below - a positive signal beats an "I didn't see a complaint" one.
+    echo "franky: rootless dockerd ready" >&2
+else
     # Non-fatal on purpose: tasks that do not need Docker must still run. Emit a loud,
     # redaction-safe marker so the operator log distinguishes "infra did not come up" from an
     # agent bug; docker-dependent build/test steps will then fail inside the task.

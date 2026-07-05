@@ -93,6 +93,17 @@ def test_plan_result_schema_is_distinct_envelope():
     assert "fits_one_pr" not in schema["result_schema"]
 
 
+def test_job_record_schema_documents_diagnostics():
+    schema = build_schema(cli.main)
+    assert "job_record_schema" in schema
+    jrs = schema["job_record_schema"]
+    for field in ("job_id", "command", "repo", "engine", "status", "diagnostics"):
+        assert field in jrs
+    # diagnostics is issue #69's addition; assert its sub-fields are named in the description.
+    for sub_field in ("task_exit_code", "oom_killed", "dind_ready", "tmpfs_full", "egress_denied"):
+        assert sub_field in jrs["diagnostics"]
+
+
 def test_error_schema_shape():
     schema = build_schema(cli.main)
     err = schema["error_schema"]["error"]
