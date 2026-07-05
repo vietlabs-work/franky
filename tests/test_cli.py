@@ -1242,6 +1242,35 @@ def test_build_json_success_stdout_is_one_object(monkeypatch):
     assert "economics -" not in res.stdout  # no prose econ leaked onto stdout
 
 
+def test_build_json_includes_job_id(monkeypatch):
+    """The run handle (issue #63) rides the --json result so a caller can `franky job ...` it."""
+    _mc_setup(monkeypatch)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo", "--json"])
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.stdout)
+    assert isinstance(data["job_id"], str) and data["job_id"]
+
+
+def test_build_survives_registry_failure(monkeypatch):
+    """A registry write blowing up must never fail a build (best-effort contract)."""
+
+    def _raise(*a, **k):
+        raise RuntimeError("registry boom")
+
+    _mc_setup(monkeypatch)
+    monkeypatch.setattr(cli.jobs, "write_record", _raise)
+    monkeypatch.setattr(cli.jobs, "update_record", _raise)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo", "--json"])
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.stdout)
+    assert data["status"] == "pr_opened"
+    assert data["job_id"]  # still generated + surfaced despite the registry failures
+
+
 def test_build_json_no_pr_exits_7(monkeypatch):
     _mc_setup(monkeypatch, container=(0, "did stuff, no url"))
     runner = CliRunner()

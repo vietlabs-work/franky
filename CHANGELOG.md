@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Run registry + `franky jobs` / `franky job status|logs|kill` (#63): every `build`/`iterate`
+  run is recorded under `~/.franky/runs/<job_id>.json` and prints its `job_id` at start (also a
+  `job_id` field in `--json` output), so a run can be listed, inspected, its transcript read, or
+  a stuck one reaped after the fact - or observed/killed from a second shell while it is still
+  in flight. `job status` reports whether the container is still alive; `job kill` reaps the
+  container + its proxy sidecar + internal network. Records store no secret values (names/paths/
+  status/timings + a redacted task summary), the runs dir is pruned (never a `running` record),
+  and job ids are validated so `job status <id>` can't traverse the filesystem. `run_id` now
+  threads into `run_in_container` so container/net/proxy names derive from the job id. Deferred
+  to follow-ups: `--detach`, `job shell`, `logs -f`, `job diagnose`.
 - `franky gh <args>` (#62): a host-side passthrough to the real `gh` CLI using Franky's own
   GitHub token, so an agent caller (whose sandbox has no `gh`/token) can query and act on
   GitHub - confirm a PR landed, read CI checks, comment, `merge`, `api`, etc. - without a

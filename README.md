@@ -200,6 +200,31 @@ Requires the `gh` CLI on the host.
 > Franky's redaction does not know about. Use a **fine-grained PAT** scoped to the repos and
 > permissions you actually want Franky to have. The credential is the limit.
 
+## Tracking runs (`franky jobs` / `franky job`)
+
+Every `build` / `iterate` run is recorded in a small registry (`~/.franky/runs/<job_id>.json`)
+so you can see what happened to it afterwards - or observe and stop one that is stuck. Each run
+prints its `job_id` at start (and it appears as `job_id` in `--json` output).
+
+```
+franky jobs                    # recent runs, newest first: id, command, status, age, repo
+franky job status <job_id>     # one run's record + whether its container is still alive
+franky job logs <job_id>       # print the run's redacted transcript
+franky job kill <job_id>       # force-remove a stuck run's container + reap its proxy/network
+```
+
+This is what turns the half-day silent hang into a 30-second `job status` -> `job kill`. The
+records store **no secret values** (only names, paths, status, timings, and a redacted task
+summary), the runs dir is bounded (old finished records are pruned; a `running` record is never
+pruned), and an unknown/corrupt job id is a clean error (exit 2), never a traceback.
+
+> **Note on in-flight runs.** `franky build` still **blocks** the shell it runs in, so to
+> observe or kill a run *while it is going* you need a second shell/channel to run `franky
+> jobs` / `job kill` from (exactly the case where a dispatching agent left the build running).
+> `job logs` shows the transcript once the run finishes (it is written at the end); for a live
+> view during a run use `franky build -v`. A `--detach` launch mode, `job shell` (exec into a
+> running container), `logs -f`, and `job diagnose` are tracked as follow-ups.
+
 ## Planning a big task
 
 **One franky run = one focused PR.** A run is meant to produce a single, reviewable pull
