@@ -34,6 +34,7 @@ from .container import (
     CONTAINER_TIMEOUT_CODE,
     FRANKY_IMAGE_VAR,
     FRANKY_PROXY_IMAGE_VAR,
+    capture_diagnostics,
     ensure_image_available,
     resolve_image,
     run_in_container,
@@ -512,6 +513,10 @@ def build(
                 "status": final["status"],
                 "exit_code": final["exit_code"],
                 "task": redact(spec.text, secrets)[:_JOB_TASK_SUMMARY_MAX],
+                # Runtime signals from THIS failed attempt (issue #69) so the diagnose pass
+                # reasons over hard facts (exit code, OOM, egress denials) alongside the prose
+                # transcript, not just the prose.
+                "diagnostics": final.get("diagnostics"),
             }
             diagnosis, _diag_code = _diagnose(
                 cfg,
@@ -659,6 +664,8 @@ def iterate(
         )
         if not quiet:
             click.echo(f"franky: job {job_id} started", err=True)
+        # Populated (best-effort) by run_in_container just before container teardown (issue #69).
+        diagnostics: dict = {}
         code, output, duration = _run_pass(
             cfg,
             build_iterate_prompt(spec),
@@ -668,6 +675,7 @@ def iterate(
             progress=progress,
             timeout=max_duration,
             run_id=job_id,
+            diagnostics_sink=diagnostics,
         )
 
         usage = _parse_usage_safe(output)
@@ -696,6 +704,7 @@ def iterate(
             duration=duration,
             exit_code=exit_code,
             log_path=log_path,
+            diagnostics=diagnostics,
         )
         result = build_result(
             status=status,
@@ -937,6 +946,7 @@ def _run_pass(
     progress=None,
     timeout: int | None = None,
     run_id: str | None = None,
+    diagnostics_sink: dict | None = None,
 ) -> tuple[int, str, float]:
     """Run one container pass for `prompt` and return (exit_code, output, duration_secs).
 
@@ -948,6 +958,8 @@ def _run_pass(
     default (FALLBACK_TIMEOUT_SECS), so the kwarg is only forwarded when explicitly set.
     `run_id` pins the container/net/proxy names to a job handle so the run registry can record
     them and `job status`/`kill` can target the SAME containers (issue #63); None -> a fresh id.
+    `diagnostics_sink` (issue #69) is forwarded to run_in_container unchanged - see its
+    docstring; None (the default) means no capture, byte-identical to pre-#69 behavior.
     """
     inner_argv = cfg.engine.inner_argv(prompt, model=None)
     extra = {} if timeout is None else {"timeout": timeout}
@@ -960,6 +972,7 @@ def _run_pass(
         profile_bundle=profile_bundle,
         progress=progress,
         run_id=run_id,
+        diagnostics_sink=diagnostics_sink,
         **extra,
     )
     duration = time.monotonic() - t0
@@ -1092,9 +1105,14 @@ def _record_run_start(job_id, *, command, cfg, repo, summary, branch=None, env=N
 
 
 def _record_run_end(
-    job_id, *, status, pr_url, usage, duration, exit_code, log_path, env=None
+    job_id, *, status, pr_url, usage, duration, exit_code, log_path, diagnostics=None, env=None
 ) -> None:
-    """Update the run record once the pass finishes. Best-effort - never raises into a build."""
+    """Update the run record once the pass finishes. Best-effort - never raises into a build.
+
+    `diagnostics` (issue #69) is the best-effort runtime-signal dict populated (or left empty)
+    by a `diagnostics_sink` passed through `_run_pass`; an empty dict is normalized to None so
+    the on-disk record matches `jobs.new_record`'s "null until populated" contract.
+    """
     env = os.environ if env is None else env
     try:
         economics = {
@@ -1112,6 +1130,7 @@ def _record_run_end(
                 "economics": economics,
                 "exit_code": exit_code,
                 "log_path": str(log_path),
+                "diagnostics": diagnostics or None,
             },
             env,
         )
@@ -1149,6 +1168,8 @@ def _build_once(
     )
     if not quiet:
         click.echo(f"franky: job {job_id} started", err=True)
+    # Populated (best-effort) by run_in_container just before container teardown (issue #69).
+    diagnostics: dict = {}
     code, output, duration = _run_pass(
         cfg,
         build_prompt(spec, branch=branch, prior_failures=prior_failures),
@@ -1158,6 +1179,7 @@ def _build_once(
         progress=progress,
         timeout=timeout,
         run_id=job_id,
+        diagnostics_sink=diagnostics,
     )
 
     # Parse usage ONCE; both the prose econ line and the JSON economics block come from it.
@@ -1189,6 +1211,7 @@ def _build_once(
         duration=duration,
         exit_code=exit_code,
         log_path=log_path,
+        diagnostics=diagnostics,
         env=env,
     )
     return {
@@ -1201,6 +1224,7 @@ def _build_once(
         "log_path": log_path,
         "usage": usage,
         "duration": duration,
+        "diagnostics": diagnostics,
     }
 
 
@@ -1721,6 +1745,22 @@ def job_status(ctx: click.Context, job_id: str, as_json: bool) -> None:
             click.echo(f"ended:      {record.get('ended_at')}")
             click.echo(f"pr_url:     {record.get('pr_url')}")
             click.echo(f"log_path:   {record.get('log_path')}")
+            diag = record.get("diagnostics")
+            if diag:
+                click.echo("diagnostics:")
+                for k in (
+                    "task_exit_code",
+                    "task_state",
+                    "oom_killed",
+                    "dind_ready",
+                    "tmpfs_full",
+                    "proxy_denied_count",
+                ):
+                    if k in diag:
+                        click.echo(f"  {k}: {diag[k]}")
+                denied = diag.get("egress_denied") or []
+                for entry in denied:
+                    click.echo(f"  egress_denied: {entry.get('host')} (x{entry.get('count')})")
     except FrankyError as exc:
         _emit_error(exc, as_json, [])
         ctx.exit(exc.code)
@@ -1762,12 +1802,43 @@ def job_kill(ctx: click.Context, job_id: str, as_json: bool) -> None:
     Reaps in the same task -> proxy -> net order as a normal teardown. The record is marked
     `killed` only if the run was still running or a container was actually reaped, so killing an
     already-finished job never rewrites its real outcome.
+
+    `job kill` is a SEPARATE process from the (likely wedged) `franky build` that started this
+    run, so it is the primary place a stuck run's diagnostics (issue #69) get captured at all -
+    the in-process capture in run_in_container never fires for a process that never returns.
+    Capture happens BEFORE reap_run so the containers still exist to inspect; best-effort, same
+    as everywhere else this dict is built.
     """
     try:
         record = _require_record(job_id)
+        # Only a still-running record has live containers to inspect - a finished run's task/proxy
+        # are already reaped, so capturing there is wasted work (and the patch guard below skips
+        # relabelling it anyway). Called via the module-level name so tests can monkeypatch
+        # franky.cli.capture_diagnostics. LIMITATION: on the kill path there is no live transcript
+        # to read (we pass ""), so dind_ready/tmpfs_full are NOT populated here - only the
+        # docker-inspect (exit/OOM/state) + squid-log (egress) signals are.
+        diag: dict = {}
+        if record.get("status") == "running":
+            kill_secrets = [os.environ[k] for k in SECRET_KEYS if os.environ.get(k)]
+            try:
+                diag = capture_diagnostics(
+                    record.get("container", ""),
+                    record.get("proxy", ""),
+                    "",
+                    subprocess.run,
+                    task_launched=True,
+                    proxy_launched=True,
+                    secrets=kill_secrets,
+                    timeout=3.0,
+                )
+            except Exception:
+                diag = {}
         reaped = reap_run(job_id)
         if record.get("status") == "running" or reaped:
-            jobs.update_record(job_id, {"status": "killed", "ended_at": jobs.now_iso()}, os.environ)
+            patch = {"status": "killed", "ended_at": jobs.now_iso()}
+            if diag:
+                patch["diagnostics"] = diag
+            jobs.update_record(job_id, patch, os.environ)
         if as_json:
             click.echo(
                 json.dumps({"job_id": job_id, "status": "killed", "container_reaped": reaped})

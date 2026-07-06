@@ -112,6 +112,10 @@ def new_record(
         "log_path": "",
         "economics": None,
         "exit_code": None,
+        # Best-effort runtime signals captured host-side just before container teardown
+        # (issue #69); None until (and unless) a diagnostics_sink was populated. See
+        # container.capture_diagnostics for the field shape.
+        "diagnostics": None,
     }
 
 

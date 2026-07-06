@@ -293,6 +293,13 @@ def build_diagnose_prompt(record: dict, transcript: str, nonce: str) -> str:
     `transcript` is ALREADY redacted (run_in_container scrubs its output; the standalone command
     reads the redacted tasks/*.log), so injecting it adds no secret surface. `nonce` is the
     anti-injection token the parser keys on, so the literal must survive into the prompt.
+
+    When `record["diagnostics"]` is present (issue #69: best-effort runtime signals captured
+    host-side just before container teardown), a "Runtime diagnostics" block is rendered right
+    after the metadata, before the transcript. WHY: these are HARD facts (an actual exit code,
+    an actual OOM flag) rather than something the agent has to infer from prose, so they give
+    the diagnose pass a firmer footing than the transcript alone. Absent/empty diagnostics ->
+    no block at all, so a record with no diagnostics produces the exact same prompt as before.
     """
     persona = load_persona()
 
@@ -303,6 +310,23 @@ def build_diagnose_prompt(record: dict, transcript: str, nonce: str) -> str:
         tail = transcript
         note = ""
 
+    diag = record.get("diagnostics")
+    diagnostics_block = ""
+    if diag:
+        lines = ["Runtime diagnostics (captured host-side before container teardown):"]
+        for key in ("task_exit_code", "oom_killed", "task_state", "dind_ready", "tmpfs_full"):
+            if key in diag:
+                lines.append(f"- {key}: {diag[key]}")
+        if "egress_denied" in diag:
+            denied = diag.get("egress_denied") or []
+            rendered = (
+                ", ".join(f"{e.get('host')} (x{e.get('count')})" for e in denied)
+                if denied
+                else "none"
+            )
+            lines.append(f"- egress_denied: {rendered}")
+        diagnostics_block = "\n".join(lines) + "\n\n"
+
     failure_block = (
         "A previous Franky run FAILED. Diagnose why.\n\n"
         "Run metadata:\n"
@@ -312,6 +336,7 @@ def build_diagnose_prompt(record: dict, transcript: str, nonce: str) -> str:
         f"- status: {record.get('status')}\n"
         f"- exit_code: {record.get('exit_code')}\n"
         f"- task: {record.get('task')}\n\n"
+        f"{diagnostics_block}"
         f"Run transcript{note}:\n"
         "-----BEGIN TRANSCRIPT-----\n"
         f"{tail}\n"

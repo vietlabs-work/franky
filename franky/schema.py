@@ -81,6 +81,36 @@ _PLAN_RESULT_SCHEMA: dict = {
     "exit_code": "the process exit code this result corresponds to (0 on success)",
 }
 
+# Static description of the on-disk run record (~/.franky/runs/<job_id>.json), the same shape
+# `franky job status --json` / `franky jobs --json` emit (jobs.new_record + the update_record
+# patches applied on top). This was a pre-existing gap - no schema described the record shape
+# before issue #69 added the `diagnostics` field, which is exactly the surface an agent caller
+# needs described so it can consume `job status --json` without guessing at field meaning.
+_JOB_RECORD_SCHEMA: dict = {
+    "job_id": "the run handle (see result_schema.job_id)",
+    "command": "the Franky command that produced this run: build | iterate | diagnose",
+    "repo": "the target owner/repo",
+    "engine": "the resolved engine name (e.g. pi | claude | codex)",
+    "task": "a redacted, truncated summary of the task text (a handle, not the full prompt)",
+    "container": "the task container's name",
+    "network": "the internal egress network's name",
+    "proxy": "the egress proxy sidecar's name",
+    "branch": "the predicted branch name (`franky/<slug>`), or null (iterate/diagnose have none)",
+    "status": "running | pr_opened | no_pr | agent_error | timeout | already_open | "
+    "iterate_complete | killed | diagnosed | diagnose_failed",
+    "started_at": "ISO-8601 UTC timestamp when the run was registered",
+    "ended_at": "ISO-8601 UTC timestamp when the run finished, or null while running",
+    "pr_url": "the PR URL (string) or null when none was produced",
+    "log_path": "path to the redacted transcript under tasks/, or empty string before it exists",
+    "economics": _RESULT_SCHEMA["economics"],
+    "exit_code": "the process exit code this run finished with, or null while running",
+    "diagnostics": "best-effort runtime signals captured host-side just before container "
+    "teardown (issue #69), or null. Fields (all optional/best-effort): task_exit_code (int), "
+    "oom_killed (bool), task_state (str), dind_ready (bool|null: nested rootless Docker daemon "
+    "readiness), tmpfs_full (bool), egress_denied (array of {host, count} the Squid proxy "
+    "403'd - hosts redacted), proxy_denied_count (int).",
+}
+
 # Static description of the error object (the dict build_error shapes), emitted on stdout
 # under --json on any failure. exit_code == error.code.
 _ERROR_SCHEMA: dict = {
@@ -147,6 +177,7 @@ def build_schema(group: click.Group) -> dict:
         "result_schema": _RESULT_SCHEMA,
         "plan_result_schema": _PLAN_RESULT_SCHEMA,
         "diagnosis_result_schema": _DIAGNOSIS_RESULT_SCHEMA,
+        "job_record_schema": _JOB_RECORD_SCHEMA,
         "error_schema": _ERROR_SCHEMA,
         # JSON object keys are strings; stringify the int exit codes for a valid JSON map.
         "exit_codes": {str(code): meaning for code, meaning in result.EXIT_CODES.items()},

@@ -294,3 +294,31 @@ def test_diagnose_prompt_tail_caps_a_long_transcript():
 def test_diagnose_prompt_short_transcript_not_truncated():
     p = build_diagnose_prompt(_diag_record(), "short", "d3")
     assert "earlier output omitted" not in p
+
+
+def test_diagnose_prompt_includes_runtime_diagnostics_block():
+    # issue #69: hard runtime signals, captured host-side just before teardown, are rendered as
+    # their own block ahead of the transcript so the diagnose pass can reason over facts.
+    record = _diag_record(
+        diagnostics={
+            "task_exit_code": 137,
+            "oom_killed": True,
+            "task_state": "exited",
+            "dind_ready": False,
+            "tmpfs_full": True,
+            "egress_denied": [{"host": "evil.example.com", "count": 2}],
+            "proxy_denied_count": 2,
+        }
+    )
+    p = build_diagnose_prompt(record, "some transcript text", "d4")
+    assert "Runtime diagnostics" in p
+    assert "task_exit_code: 137" in p
+    assert "oom_killed: True" in p
+    assert "dind_ready: False" in p
+    assert "tmpfs_full: True" in p
+    assert "evil.example.com (x2)" in p
+
+
+def test_diagnose_prompt_omits_block_when_no_diagnostics():
+    p = build_diagnose_prompt(_diag_record(), "some transcript text", "d5")
+    assert "Runtime diagnostics" not in p

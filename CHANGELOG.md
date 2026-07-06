@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Capture-before-reap runtime diagnostics (#69): a best-effort `diagnostics` block, captured
+  host-side just before the task/proxy containers are reaped, now lands on every run record
+  (`~/.franky/runs/<id>.json`): task exit code, OOM flag, final container state, nested
+  rootless-DinD readiness, a tmpfs-full heuristic, and any hosts the egress proxy denied (with
+  counts, redacted). Shown in `franky job status` (plain text + `--json`, see `franky schema` ->
+  `job_record_schema`), captured by `job kill` too (before it reaps a wedged run), and fed into
+  `franky job diagnose` / `build --retry`'s diagnose pass as hard evidence alongside the prose
+  transcript. Read-only, host-side `docker inspect`/`docker exec` only - no new secret surface,
+  no container-hardening change; a capture failure never affects the run's outcome.
 - Self-diagnosis + auto-retry (#64): `franky job diagnose <id>` dispatches a read-only meta-agent
   at a failed run's transcript + metadata (it clones/changes nothing) and emits a structured
   root-cause, proposed fix, and a `retryable`/`retry_hint` learning signal (`--json` object; see

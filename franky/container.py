@@ -289,6 +289,131 @@ def reap_run(run_id: str, runner=subprocess.run) -> bool:
     return task_reaped
 
 
+def capture_diagnostics(
+    task: str,
+    proxy: str,
+    transcript: str,
+    runner,
+    *,
+    task_launched: bool,
+    proxy_launched: bool,
+    secrets: list[str],
+    timeout: float = 3.0,
+) -> dict:
+    """Best-effort runtime diagnostics, captured host-side JUST BEFORE the task/proxy
+    containers are reaped (issue #69).
+
+    WHY this exists: once `_reap` fires the container is gone and `franky job diagnose` (or a
+    human) is left analyzing prose alone. A handful of hard signals - did the task OOM, did the
+    nested rootless Docker daemon come up, did the egress proxy deny anything, did a tmpfs fill
+    up - are cheap to grab with a couple of read-only `docker inspect`/`docker exec` calls RIGHT
+    BEFORE teardown, while the containers still exist. This function is that grab.
+
+    WHY it can never regress the run: every docker call below is wrapped in its OWN
+    try/except Exception with `timeout` (default 3s) so one slow/failing capture can never
+    delay or wedge the reap that follows, and a capture failure never raises - it just omits
+    that field. The caller (`run_in_container`) treats the whole call as opt-in-and-optional:
+    a raise here must never change the run's returncode/output.
+
+    WHY no new secret surface: this reads ONLY container state (exit code / OOM flag / status)
+    and the proxy's OWN access log (which contains destination hosts, never request bodies or
+    creds - Squid does blind HTTPS CONNECT). Every host string extracted from the access log is
+    passed through `redact(host, secrets)` before being stored, so a secret that happened to
+    leak into a hostname (e.g. via DNS-exfil attempt) is scrubbed the same way the rest of
+    Franky's output is. The `transcript` passed here MAY be RAW - on the `run_in_container` path
+    this runs in the `finally` BEFORE the closing `redact()` at return, so the string is not yet
+    scrubbed. That is fine BECAUSE we deliberately extract only True/False/None booleans from it
+    and never persist any transcript substring - there is no path for a secret in the transcript
+    to reach the returned dict.
+
+    Returns a dict containing only the fields it successfully captured (a fresh dict each call,
+    never a superset contract) - see the module docstring / issue #69 for the field list.
+    """
+    diag: dict = {}
+
+    if task_launched:
+        try:
+            proc = runner(
+                [
+                    "docker",
+                    "inspect",
+                    "-f",
+                    "{{.State.ExitCode}}|{{.State.OOMKilled}}|{{.State.Status}}",
+                    task,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            parts = (getattr(proc, "stdout", "") or "").strip().split("|")
+            if len(parts) == 3:
+                try:
+                    diag["task_exit_code"] = int(parts[0])
+                except ValueError:
+                    pass  # not parseable - omit rather than store a bogus value
+                diag["oom_killed"] = parts[1].strip().lower() == "true"
+                state = parts[2].strip()
+                if state:
+                    diag["task_state"] = state
+        except Exception:
+            pass
+
+    if proxy_launched:
+        try:
+            proc = runner(
+                ["docker", "exec", proxy, "cat", "/run/squid-access.log"],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            counts: dict[str, int] = {}
+            for line in (getattr(proc, "stdout", "") or "").splitlines():
+                if "TCP_DENIED" not in line:
+                    continue
+                tokens = line.split()
+                host = None
+                # Egress is HTTPS-only blind CONNECT, so a denied request always carries a literal
+                # "CONNECT" method token and its target is the very next token (`host:443`). A
+                # line with no CONNECT token is not a proxied-host denial we can trust (a plain
+                # http:// request URL would mangle to garbage), so skip it rather than guess.
+                if "CONNECT" in tokens:
+                    idx = tokens.index("CONNECT")
+                    if idx + 1 < len(tokens):
+                        host = tokens[idx + 1]
+                if not host:
+                    continue
+                if ":" in host:
+                    host = host.rsplit(":", 1)[0]
+                host = redact(host, secrets)
+                counts[host] = counts.get(host, 0) + 1
+            # Assigned only inside this try (i.e. only when the exec itself succeeded) - an
+            # empty list + zero count IS the correct signal for "no denials", distinct from
+            # "we could not even reach the proxy to check".
+            diag["egress_denied"] = [{"host": h, "count": c} for h, c in sorted(counts.items())]
+            diag["proxy_denied_count"] = sum(counts.values())
+        except Exception:
+            pass
+
+    # Booleans only, extracted from the transcript at capture time - never the raw transcript
+    # text itself (see the WHY-no-secret-surface note above). One try/except around BOTH scans
+    # for symmetry: this is a pure string search with no I/O so it cannot really fail, but if it
+    # somehow did we leave both keys at their safe defaults (dind_ready=None, tmpfs_full=False)
+    # rather than one absent and one defaulted.
+    try:
+        if "rootless dockerd did not become ready" in transcript:
+            diag["dind_ready"] = False
+        elif "rootless dockerd ready" in transcript:
+            diag["dind_ready"] = True
+        else:
+            diag["dind_ready"] = None
+        diag["tmpfs_full"] = "No space left on device" in transcript or "ENOSPC" in transcript
+    except Exception:
+        diag["dind_ready"] = None
+        diag["tmpfs_full"] = False
+
+    return diag
+
+
 def _reap(name: str, runner) -> bool:
     """Best-effort `docker rm -f` so a container does not linger after a timeout/error.
     Returns True iff the reap succeeded. Never raises - the reaper must not mask the
@@ -366,9 +491,15 @@ def run_in_container(
     progress=None,
     popen=subprocess.Popen,
     run_id: str | None = None,
+    diagnostics_sink: dict | None = None,
 ) -> tuple[int, str]:
     """Run the inner engine in a hardened, egress-controlled container; return
     (returncode, redacted_output).
+
+    `diagnostics_sink`, when given a dict, is populated (via `.update`) with best-effort
+    runtime diagnostics (issue #69) captured JUST BEFORE teardown - see `capture_diagnostics`.
+    Opt-in: None (the default) is byte-identical to the pre-#69 behavior for every existing
+    caller/test. A capture failure never changes the returned (code, output).
 
     Topology: an --internal network (no internet route) hosts a Squid proxy (default-deny
     allowlist) and the task container. The task's HTTP(S)_PROXY points at the proxy and its
@@ -510,6 +641,26 @@ def run_in_container(
         # its warnings append to THIS output, which the single return below surfaces.
         code, output = 1, abort.message
     finally:
+        # Capture-before-reap diagnostics (issue #69): MUST run before the reaps below - once
+        # `_reap` fires the container is gone and there is nothing left to inspect. Opt-in
+        # (sink is None for every pre-#69 caller) and fully isolated: any exception here is
+        # swallowed so a capture failure can never delay or wedge the teardown that follows.
+        if diagnostics_sink is not None:
+            try:
+                diagnostics_sink.update(
+                    capture_diagnostics(
+                        task,
+                        proxy,
+                        output,
+                        runner,
+                        task_launched=task_launched,
+                        proxy_launched=proxy_launched,
+                        secrets=secrets,
+                        timeout=3.0,
+                    )
+                )
+            except Exception:
+                pass
         # Best-effort teardown, ALWAYS, in order task -> proxy -> net. A reap FAILURE on the
         # TASK container is surfaced at full severity because it holds the injected creds. A
         # proxy/net reap failure is a lower-severity resource leak (the proxy holds NO creds).

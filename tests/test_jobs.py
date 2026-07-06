@@ -60,6 +60,13 @@ def test_read_missing_returns_none(tmp_path):
     assert jobs.read_record("deadbeef", _env(tmp_path)) is None
 
 
+def test_new_record_includes_null_diagnostics():
+    # diagnostics (issue #69) starts null - it is populated by a diagnostics_sink only when the
+    # container pass actually captures something.
+    record = _rec()
+    assert record["diagnostics"] is None
+
+
 def test_read_malformed_returns_none(tmp_path):
     env = _env(tmp_path)
     jobs.runs_dir(env).mkdir(parents=True, exist_ok=True)
@@ -389,6 +396,40 @@ def test_job_status_json_includes_live_flag(monkeypatch, tmp_path):
     assert json.loads(res.stdout)["container_running"] is False
 
 
+def test_job_status_renders_diagnostics_block(monkeypatch, tmp_path):
+    env = _env(tmp_path)
+    rec = _rec("ee0100", status="killed")
+    rec["diagnostics"] = {
+        "task_exit_code": 137,
+        "task_state": "exited",
+        "oom_killed": True,
+        "dind_ready": False,
+        "tmpfs_full": True,
+        "proxy_denied_count": 2,
+        "egress_denied": [{"host": "evil.example.com", "count": 2}],
+    }
+    jobs.write_record(rec, env)
+    monkeypatch.setattr(cli, "container_running", lambda name: False)
+    res = _cli(monkeypatch, tmp_path, ["job", "status", "ee0100"])
+    assert res.exit_code == 0
+    assert "diagnostics:" in res.stdout
+    assert "task_exit_code: 137" in res.stdout
+    assert "oom_killed: True" in res.stdout
+    assert "egress_denied: evil.example.com (x2)" in res.stdout
+
+
+def test_job_status_json_includes_diagnostics(monkeypatch, tmp_path):
+    env = _env(tmp_path)
+    rec = _rec("ee0101", status="killed")
+    rec["diagnostics"] = {"task_exit_code": 1, "oom_killed": False}
+    jobs.write_record(rec, env)
+    monkeypatch.setattr(cli, "container_running", lambda name: False)
+    res = _cli(monkeypatch, tmp_path, ["job", "status", "ee0101", "--json"])
+    assert res.exit_code == 0
+    data = json.loads(res.stdout)
+    assert data["diagnostics"] == {"task_exit_code": 1, "oom_killed": False}
+
+
 def test_job_status_not_found_exits_2(monkeypatch, tmp_path):
     res = _cli(monkeypatch, tmp_path, ["job", "status", "abcdef"])
     assert res.exit_code == 2
@@ -424,6 +465,8 @@ def test_job_kill_reaps_and_marks_killed(monkeypatch, tmp_path):
     env = _env(tmp_path)
     jobs.write_record(_rec("ab0007", status="running"), env)
     monkeypatch.setattr(cli, "reap_run", lambda job_id: True)
+    # No-op capture so the running-record path never shells out to real docker (issue #69).
+    monkeypatch.setattr(cli, "capture_diagnostics", lambda *a, **k: {})
     res = _cli(monkeypatch, tmp_path, ["job", "kill", "ab0007"])
     assert res.exit_code == 0
     assert "killed" in res.stdout
@@ -435,9 +478,43 @@ def test_job_kill_finished_job_not_relabelled(monkeypatch, tmp_path):
     env = _env(tmp_path)
     jobs.write_record(_rec("cd0008", status="pr_opened"), env)
     monkeypatch.setattr(cli, "reap_run", lambda job_id: False)
+    # A finished record must NOT trigger a capture (its containers are already gone); patch to a
+    # raiser to prove the gate skips it entirely (issue #69).
+    monkeypatch.setattr(
+        cli, "capture_diagnostics", lambda *a, **k: (_ for _ in ()).throw(AssertionError("called"))
+    )
     res = _cli(monkeypatch, tmp_path, ["job", "kill", "cd0008"])
     assert res.exit_code == 0
     assert jobs.read_record("cd0008", env)["status"] == "pr_opened"  # unchanged
+
+
+def test_job_kill_captures_diagnostics_for_running(monkeypatch, tmp_path):
+    """A running run's kill captures diagnostics (issue #69) and persists them on the record."""
+    env = _env(tmp_path)
+    jobs.write_record(_rec("ab0010", status="running"), env)
+    monkeypatch.setattr(cli, "reap_run", lambda job_id: True)
+    canned = {"task_exit_code": 137, "oom_killed": True, "task_state": "exited"}
+    monkeypatch.setattr(cli, "capture_diagnostics", lambda *a, **k: canned)
+    res = _cli(monkeypatch, tmp_path, ["job", "kill", "ab0010"])
+    assert res.exit_code == 0
+    persisted = jobs.read_record("ab0010", env)
+    assert persisted["status"] == "killed"
+    assert persisted["diagnostics"] == canned
+
+
+def test_job_kill_swallows_capture_failure(monkeypatch, tmp_path):
+    """A raising capture must never break the kill: the run still ends up killed (issue #69)."""
+    env = _env(tmp_path)
+    jobs.write_record(_rec("ab0011", status="running"), env)
+    monkeypatch.setattr(cli, "reap_run", lambda job_id: True)
+    monkeypatch.setattr(
+        cli, "capture_diagnostics", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+    res = _cli(monkeypatch, tmp_path, ["job", "kill", "ab0011"])
+    assert res.exit_code == 0
+    persisted = jobs.read_record("ab0011", env)
+    assert persisted["status"] == "killed"
+    assert persisted["diagnostics"] is None  # capture failed -> no diagnostics patch written
 
 
 def test_job_kill_not_found_exits_2(monkeypatch, tmp_path):

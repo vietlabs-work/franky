@@ -233,13 +233,23 @@ a failed run offline. Both members are secret-free by construction (the record c
 value; the transcript was redacted when written), so the bundle exposes nothing new, and its tar
 members carry no host uid/username/timestamp.
 
+### Runtime diagnostics
+
+`franky job status <id>` also shows a `diagnostics:` block: the task's exit code, whether it was
+OOM-killed, its final container state, whether the nested rootless Docker daemon came up
+(`dind_ready`), a tmpfs-full heuristic, and any hosts the egress proxy denied (with counts).
+These are captured host-side, best-effort, right before the task/proxy containers are reaped -
+for a wedged run, `job kill` captures them too (before it reaps). `--json` includes the same
+`diagnostics` object (see `franky schema` -> `job_record_schema`).
+
 ### Diagnose and auto-retry a failed run
 
 `franky job diagnose <id>` dispatches a **read-only meta-agent** at a failed run's transcript +
-metadata: it clones nothing and changes nothing, and emits a structured root-cause, a proposed
-fix, and a `retryable`/`retry_hint` learning signal (`--json` for the machine object; see
-`franky schema` -> `diagnosis_result_schema`). It answers "why did job X hang / produce no PR"
-with an agent that actually reads the evidence.
+metadata (plus the `diagnostics` block above, when present, as hard evidence alongside the
+prose transcript): it clones nothing and changes nothing, and emits a structured root-cause, a
+proposed fix, and a `retryable`/`retry_hint` learning signal (`--json` for the machine object;
+see `franky schema` -> `diagnosis_result_schema`). It answers "why did job X hang / produce no
+PR" with an agent that actually reads the evidence.
 
 `franky build --retry N` closes the loop (bounded, `N` <= 5): on a **retryable** failure
 (timeout / agent-error / no-PR) it diagnoses the attempt, then retries with the root-cause fed

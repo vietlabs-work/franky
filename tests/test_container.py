@@ -10,6 +10,7 @@ from franky.container import (
     build_network_argv,
     build_network_connect_argv,
     build_proxy_argv,
+    capture_diagnostics,
     ensure_image_available,
     image_exists,
     resolve_image,
@@ -786,3 +787,309 @@ def test_run_in_container_blocking_path_unchanged_when_no_progress():
     run_in_container(_cfg(), ["pi"], runner=runner, env={}, sleeper=NOOP_SLEEP)
     # capture_output=True is the blocking-path signature (popen path uses stdout=PIPE)
     assert captured["kwargs"].get("capture_output") is True
+
+
+# ---------------------------------------------------------------------------
+# capture_diagnostics (issue #69): best-effort runtime signals captured host-side just
+# before the task/proxy containers are reaped. Never raises, never touches docker mechanics
+# beyond `docker inspect`/`docker exec`.
+# ---------------------------------------------------------------------------
+
+_SQUID_DENIED_LOG = (
+    "1700000000.000    0 172.0.0.2 TCP_DENIED/403 3822 CONNECT evil.example.com:443 - "
+    "HIER_NONE/- text/html\n"
+    "1700000001.000    0 172.0.0.2 TCP_DENIED/403 3822 CONNECT evil.example.com:443 - "
+    "HIER_NONE/- text/html\n"
+    "1700000002.000    0 172.0.0.2 TCP_DENIED/403 3822 CONNECT other.example.com:443 - "
+    "HIER_NONE/- text/html\n"
+    "1700000003.000    0 172.0.0.2 TCP_MISS/200 1234 CONNECT allowed.example.com:443 - "
+    "HIER_DIRECT/1.2.3.4 -\n"
+)
+
+
+def test_capture_diagnostics_parses_task_inspect():
+    def runner(argv, **kwargs):
+        if argv[:2] == ["docker", "inspect"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="137|true|exited\n", stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    diag = capture_diagnostics(
+        "task1", "proxy1", "", runner, task_launched=True, proxy_launched=False, secrets=[]
+    )
+    assert diag["task_exit_code"] == 137
+    assert diag["oom_killed"] is True
+    assert diag["task_state"] == "exited"
+
+
+def test_capture_diagnostics_skips_task_fields_when_not_launched():
+    def runner(argv, **kwargs):
+        raise AssertionError("must not call docker when task_launched=False")
+
+    diag = capture_diagnostics(
+        "task1", "proxy1", "", runner, task_launched=False, proxy_launched=False, secrets=[]
+    )
+    assert "task_exit_code" not in diag
+
+
+def test_capture_diagnostics_parses_squid_denied_hosts():
+    def runner(argv, **kwargs):
+        if argv[:2] == ["docker", "exec"]:
+            return subprocess.CompletedProcess(argv, 0, stdout=_SQUID_DENIED_LOG, stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    diag = capture_diagnostics(
+        "task1", "proxy1", "", runner, task_launched=False, proxy_launched=True, secrets=[]
+    )
+    assert diag["proxy_denied_count"] == 3
+    assert diag["egress_denied"] == [
+        {"host": "evil.example.com", "count": 2},
+        {"host": "other.example.com", "count": 1},
+    ]
+
+
+def test_capture_diagnostics_dind_ready_markers():
+    failure_diag = capture_diagnostics(
+        "t",
+        "p",
+        "franky: WARNING rootless dockerd did not become ready in 30s",
+        lambda *a, **k: None,
+        task_launched=False,
+        proxy_launched=False,
+        secrets=[],
+    )
+    assert failure_diag["dind_ready"] is False
+
+    ready_diag = capture_diagnostics(
+        "t",
+        "p",
+        "franky: rootless dockerd ready",
+        lambda *a, **k: None,
+        task_launched=False,
+        proxy_launched=False,
+        secrets=[],
+    )
+    assert ready_diag["dind_ready"] is True
+
+    neither_diag = capture_diagnostics(
+        "t",
+        "p",
+        "no marker here at all",
+        lambda *a, **k: None,
+        task_launched=False,
+        proxy_launched=False,
+        secrets=[],
+    )
+    assert neither_diag["dind_ready"] is None
+
+
+def test_capture_diagnostics_tmpfs_full_heuristic():
+    no_space = capture_diagnostics(
+        "t",
+        "p",
+        "write failed: No space left on device",
+        lambda *a, **k: None,
+        task_launched=False,
+        proxy_launched=False,
+        secrets=[],
+    )
+    assert no_space["tmpfs_full"] is True
+
+    enospc = capture_diagnostics(
+        "t",
+        "p",
+        "OSError: [Errno 28] ENOSPC",
+        lambda *a, **k: None,
+        task_launched=False,
+        proxy_launched=False,
+        secrets=[],
+    )
+    assert enospc["tmpfs_full"] is True
+
+    clean = capture_diagnostics(
+        "t",
+        "p",
+        "all good, nothing to see",
+        lambda *a, **k: None,
+        task_launched=False,
+        proxy_launched=False,
+        secrets=[],
+    )
+    assert clean["tmpfs_full"] is False
+
+
+def test_capture_diagnostics_malformed_inspect_output():
+    # Wrong token count AND a non-int exit code: the un-parseable fields are omitted, no raise.
+    def runner(argv, **kwargs):
+        if argv[:2] == ["docker", "inspect"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="not|pipes\n", stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    diag = capture_diagnostics(
+        "task1", "proxy1", "", runner, task_launched=True, proxy_launched=False, secrets=[]
+    )
+    # Only 2 tokens (!= 3), so NONE of the task fields are set - and no exception escaped.
+    assert "task_exit_code" not in diag
+    assert "oom_killed" not in diag
+    assert "task_state" not in diag
+
+
+def test_capture_diagnostics_non_int_exit_code_omits_only_that_field():
+    def runner(argv, **kwargs):
+        if argv[:2] == ["docker", "inspect"]:
+            return subprocess.CompletedProcess(
+                argv, 0, stdout="notanint|false|running\n", stderr=""
+            )
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    diag = capture_diagnostics(
+        "task1", "proxy1", "", runner, task_launched=True, proxy_launched=False, secrets=[]
+    )
+    # 3 tokens, but the exit code is not an int -> that ONE field is omitted, the others land.
+    assert "task_exit_code" not in diag
+    assert diag["oom_killed"] is False
+    assert diag["task_state"] == "running"
+
+
+def test_capture_diagnostics_partial_when_proxy_exec_raises():
+    def runner(argv, **kwargs):
+        if argv[:2] == ["docker", "inspect"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="0|false|exited\n", stderr="")
+        if argv[:2] == ["docker", "exec"]:
+            raise OSError("proxy gone")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    diag = capture_diagnostics(
+        "task1", "proxy1", "", runner, task_launched=True, proxy_launched=True, secrets=[]
+    )
+    assert diag["task_exit_code"] == 0
+    assert diag["task_state"] == "exited"
+    assert "egress_denied" not in diag
+    assert "proxy_denied_count" not in diag
+
+
+def test_capture_diagnostics_empty_squid_log_is_zero_denials():
+    def runner(argv, **kwargs):
+        if argv[:2] == ["docker", "exec"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    diag = capture_diagnostics(
+        "task1", "proxy1", "", runner, task_launched=False, proxy_launched=True, secrets=[]
+    )
+    # The exec SUCCEEDED with zero TCP_DENIED lines - that is a real "no denials" signal, not
+    # "could not check": both keys present, empty/zero.
+    assert diag["egress_denied"] == []
+    assert diag["proxy_denied_count"] == 0
+
+
+def test_capture_diagnostics_redacts_secret_in_denied_host():
+    secret = "sk-or-very-secret-9999"
+    log_line = (
+        f"1700000000.000 0 172.0.0.2 TCP_DENIED/403 3822 CONNECT {secret}.evil.com:443 - "
+        "HIER_NONE/- text/html\n"
+    )
+
+    def runner(argv, **kwargs):
+        if argv[:2] == ["docker", "exec"]:
+            return subprocess.CompletedProcess(argv, 0, stdout=log_line, stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    diag = capture_diagnostics(
+        "task1", "proxy1", "", runner, task_launched=False, proxy_launched=True, secrets=[secret]
+    )
+    assert diag["egress_denied"]
+    for entry in diag["egress_denied"]:
+        assert secret not in entry["host"]
+
+
+def test_capture_diagnostics_raising_runner_omits_fields_without_raising():
+    def raising_runner(argv, **kwargs):
+        raise OSError("docker is on fire")
+
+    diag = capture_diagnostics(
+        "task1", "proxy1", "", raising_runner, task_launched=True, proxy_launched=True, secrets=[]
+    )
+    assert "task_exit_code" not in diag
+    assert "oom_killed" not in diag
+    assert "task_state" not in diag
+    assert "egress_denied" not in diag
+    assert "proxy_denied_count" not in diag
+    # Transcript-only booleans never touch the runner, so they are still present.
+    assert diag["dind_ready"] is None
+    assert diag["tmpfs_full"] is False
+
+
+# ---------------------------------------------------------------------------
+# run_in_container's diagnostics_sink wiring (issue #69)
+# ---------------------------------------------------------------------------
+
+
+def test_run_in_container_no_sink_by_default():
+    def task(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    runner, _ = _orchestration_runner(task)
+    code, output = run_in_container(_cfg(), ["pi"], runner=runner, env={}, sleeper=NOOP_SLEEP)
+    assert code == 0
+    assert "ok" in output
+
+
+def test_run_in_container_populates_diagnostics_sink_when_given():
+    def task(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    runner, _ = _orchestration_runner(task)
+    sink: dict = {}
+    run_in_container(
+        _cfg(), ["pi"], runner=runner, env={}, sleeper=NOOP_SLEEP, diagnostics_sink=sink
+    )
+    # The transcript-scan booleans are unconditionally added, so a non-empty sink proves the
+    # capture actually ran.
+    assert "dind_ready" in sink
+    assert "tmpfs_full" in sink
+
+
+def test_run_in_container_diagnostics_captured_before_task_reap():
+    def task(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    runner, calls = _orchestration_runner(task)
+    sink: dict = {}
+    run_in_container(
+        _cfg(),
+        ["pi"],
+        runner=runner,
+        env={},
+        sleeper=NOOP_SLEEP,
+        diagnostics_sink=sink,
+        run_id="abc123def456",
+    )
+    task_name = "franky-run-abc123def456"
+    inspect_idx = next(
+        i for i, c in enumerate(calls) if c[:3] == ["docker", "inspect", "-f"] and task_name in c
+    )
+    rm_idx = next(
+        i for i, c in enumerate(calls) if c[:3] == ["docker", "rm", "-f"] and task_name in c
+    )
+    assert inspect_idx < rm_idx
+
+
+def test_run_in_container_diagnostics_sink_failure_does_not_affect_result(monkeypatch):
+    import franky.container as container_mod
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("capture exploded")
+
+    monkeypatch.setattr(container_mod, "capture_diagnostics", boom)
+
+    def task(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    runner, _ = _orchestration_runner(task)
+    sink: dict = {}
+    code, output = run_in_container(
+        _cfg(), ["pi"], runner=runner, env={}, sleeper=NOOP_SLEEP, diagnostics_sink=sink
+    )
+    assert code == 0
+    assert "ok" in output
+    assert sink == {}
