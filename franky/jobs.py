@@ -117,6 +117,10 @@ def new_record(
     `snapshot_path` (null here, set later via update_record like diagnostics) is the host-local
     path of the scrubbed, fail-closed-verified workspace snapshot this run produced on timeout.
     Both default null so a caller that never passes them is byte-identical to before.
+
+    `steer_notes` (issue #72) is a bounded audit trail of operator corrections injected via
+    `franky job attach` while this run was live - null until (and unless) `job attach`
+    annotates it via update_record. See cli.job_attach.
     """
     return {
         "job_id": job_id,
@@ -145,6 +149,7 @@ def new_record(
         "replay_of": replay_of,
         "resumed_from": resumed_from,
         "snapshot_path": None,
+        "steer_notes": None,
     }
 
 

@@ -5,12 +5,15 @@ from franky.config import Config
 from franky.container import (
     FRANKY_PROXY_IMAGE_VAR,
     GHCR_REPO_VAR,
+    STEER_FILE,
     _HOME_TMPFS_SIZE,
     build_docker_argv,
     build_network_argv,
     build_network_connect_argv,
     build_proxy_argv,
+    build_steer_argv,
     capture_diagnostics,
+    deliver_steer,
     ensure_image_available,
     image_exists,
     resolve_image,
@@ -1304,3 +1307,68 @@ def test_run_in_container_watchdog_kills_silent_hang():
         popen=blocking_popen,
     )
     assert code == 124  # CONTAINER_TIMEOUT_CODE - the silent hang was killed by the watchdog
+
+
+# ---------------------------------------------------------------------------
+# Mid-run steering mailbox (issue #72, `franky job attach`)
+# ---------------------------------------------------------------------------
+
+
+def test_build_steer_argv_default_file():
+    assert build_steer_argv("franky-run-abc") == [
+        "docker",
+        "exec",
+        "-i",
+        "franky-run-abc",
+        "tee",
+        "-a",
+        STEER_FILE,
+    ]
+
+
+def test_build_steer_argv_custom_file():
+    assert build_steer_argv("c", steer_file="/tmp/other")[-1] == "/tmp/other"
+
+
+def test_deliver_steer_true_on_rc0_and_passes_message_on_stdin():
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, stdout="the message", stderr="")
+
+    assert deliver_steer("franky-run-abc", "stop refactoring", runner=runner) is True
+    (argv, kwargs) = calls[0]
+    assert argv == build_steer_argv("franky-run-abc")
+    assert kwargs["input"] == "stop refactoring"
+
+
+def test_deliver_steer_false_on_nonzero_rc():
+    def runner(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="no such container")
+
+    assert deliver_steer("gone", "msg", runner=runner) is False
+
+
+def test_deliver_steer_false_never_raises_on_oserror():
+    def runner(argv, **kwargs):
+        raise OSError("docker not found")
+
+    assert deliver_steer("c", "msg", runner=runner) is False
+
+
+def test_deliver_steer_false_never_raises_on_timeout():
+    def runner(argv, **kwargs):
+        raise subprocess.TimeoutExpired(argv, kwargs.get("timeout", 10.0))
+
+    assert deliver_steer("c", "msg", runner=runner) is False
+
+
+def test_deliver_steer_does_not_return_captured_output():
+    # tee echoes the message back to its own stdout; deliver_steer must never surface that -
+    # returning a bool only, never the captured stdout/stderr.
+    def runner(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout=kwargs.get("input", ""), stderr="")
+
+    result = deliver_steer("c", "a secret-looking correction", runner=runner)
+    assert result is True  # the only thing deliver_steer returns is the bool

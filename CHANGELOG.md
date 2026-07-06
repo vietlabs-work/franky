@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `franky job attach <job_id>` (#72): inject a one-shot mid-run correction into a LIVE run via
+  a filesystem-mailbox channel - a host-side `docker exec ... tee -a` into a small file under the
+  container's writable HOME tmpfs (no bind mount, no hardening change, no new egress path). Gated
+  per-engine on a new `supports_steering` flag (true for pi/claude/codex); every build-shaped
+  prompt (build/iterate/replay/resume) now tells the agent to poll the mailbox before each new
+  sub-task and delete it after reading, so this is a best-effort, prompt-level channel - delivery
+  is guaranteed, incorporation depends on the engine re-reading the file. `-m` is the
+  unattended-safe path (never hangs); an interactive one-line prompt is TTY-only. The message is
+  redacted for known Franky secrets before delivery/storage and NEVER echoed back (the `tee`
+  output is captured and discarded). Run records gain a bounded `steer_notes` audit trail.
 - `franky job resume <job_id>` (#71): re-enter a hung/timeout/killed run WITH its workspace so a
   fresh engine CONTINUES it instead of restarting. On timeout (and on `job kill`) Franky
   snapshots the container's `/work` before teardown; `resume` restores it into a fresh, still

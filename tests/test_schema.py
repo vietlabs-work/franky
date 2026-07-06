@@ -144,3 +144,18 @@ def test_job_record_schema_documents_resume_fields():
     assert "resumed_from" in jrs
     assert "snapshot_path" in jrs
     assert "resume" in jrs["command"]
+
+
+def test_schema_lists_job_attach_command():
+    schema = build_schema(cli.main)
+    job_cmds = schema["commands"]["job"]["commands"]
+    assert "attach" in job_cmds
+    attach_flags = {f["name"] for f in job_cmds["attach"]["flags"]}
+    assert "message" in attach_flags
+    assert "as_json" in attach_flags
+
+
+def test_job_record_schema_documents_steer_notes():
+    schema = build_schema(cli.main)
+    jrs = schema["job_record_schema"]
+    assert "steer_notes" in jrs

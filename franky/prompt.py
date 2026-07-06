@@ -10,9 +10,26 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from . import container
 from .task import GH_ISSUE_RE, TaskSpec
 
 _PERSONA_PATH = Path(__file__).parent / "persona.md"
+
+# Mid-run steering (issue #72, `franky job attach`): a prompt-level, best-effort channel - the
+# hard guarantee is only that the host successfully writes the steer file; whether the agent
+# ACTUALLY incorporates it depends on its loop re-reading the path at its next major step, the
+# same trust register as build_iterate_prompt's own-PR guard. The path is sourced from
+# container.STEER_FILE (a plain import - container.py does not import prompt.py, so there is no
+# cycle) so the literal the agent is told to poll can NEVER drift from the one the host writes.
+# Appended as the LAST convention line on every build-shaped prompt (a fresh build, iterate,
+# replay, and resume all represent a live run an operator might want to steer).
+_STEER_CONVENTION = (
+    "- Mid-run steering: before starting each new sub-task or major step, check whether "
+    f"the file `{container.STEER_FILE}` exists and is non-empty. If it does, an "
+    "operator has sent you a correction - read it, prioritize its instructions over your "
+    "current plan, then DELETE the file so you do not re-apply the same correction. It will "
+    "not exist unless a correction was sent.\n"
+)
 
 
 def load_persona() -> str:
@@ -149,6 +166,7 @@ def build_prompt(
         f"{close_line}"
         "- Open the PR with `gh pr create`. Do NOT merge it - a human reviews every change.\n"
         "- Keep commit messages and PR text professional; no persona flavor in the deliverables.\n"
+        f"{_STEER_CONVENTION}"
     )
 
     return f"{persona}\n\n{task_block}\n{_prior_failures_block(prior_failures)}{conventions}"
@@ -200,6 +218,7 @@ def build_iterate_prompt(spec: TaskSpec) -> str:
         "- Do NOT open a new PR (no `gh pr create`) and do NOT merge the PR (no `gh pr merge`) - "
         "a human reviews every change.\n"
         "- Keep commit messages and PR text professional; no persona flavor in the deliverables.\n"
+        f"{_STEER_CONVENTION}"
     )
 
     return f"{persona}\n\n{task_block}\n{conventions}"
@@ -263,6 +282,7 @@ def build_replay_prompt(
             "change.\n"
             "- Keep commit messages and PR text professional; no persona flavor in the "
             "deliverables.\n"
+            f"{_STEER_CONVENTION}"
         )
     else:
         conventions = (
@@ -273,6 +293,7 @@ def build_replay_prompt(
             "- Do NOT create or push any branch, and do NOT open a pull request "
             "(`gh pr create`) - this pass only reproduces, it changes nothing on the remote.\n"
             "- Keep your report professional; no persona flavor in the deliverables.\n"
+            f"{_STEER_CONVENTION}"
         )
 
     return f"{persona}\n\n{task_block}\n{conventions}"
@@ -312,6 +333,7 @@ def build_resume_prompt(spec: TaskSpec, *, branch: str) -> str:
         f"{close_line}"
         "- Open the PR with `gh pr create`. Do NOT merge it - a human reviews every change.\n"
         "- Keep commit messages and PR text professional; no persona flavor in the deliverables.\n"
+        f"{_STEER_CONVENTION}"
     )
 
     return f"{persona}\n\n{task_block}\n{conventions}"

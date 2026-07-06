@@ -393,3 +393,16 @@ def test_codex_distill_line_result_event():
 def test_codex_distill_line_unknown_action_type():
     event = {"type": "action", "action": {"type": "something_new"}}
     assert CodexEngine().distill_line(json.dumps(event)) is None
+
+
+# --- supports_steering (issue #72, mid-run steering via `franky job attach`) ---
+
+
+def test_base_engine_defaults_to_no_steering():
+    assert Engine().supports_steering is False
+
+
+def test_pi_claude_codex_all_support_steering():
+    assert PiEngine().supports_steering is True
+    assert ClaudeEngine().supports_steering is True
+    assert CodexEngine().supports_steering is True

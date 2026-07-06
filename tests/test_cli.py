@@ -2680,3 +2680,244 @@ def test_job_resume_not_resumable_command_exits_2(monkeypatch, tmp_path):
     res = CliRunner().invoke(cli.main, ["job", "resume", job_id, "--json"])
     assert res.exit_code == 2, res.output
     assert json.loads(res.stdout)["error"]["kind"] == "not_resumable"
+
+
+# ---------------------------------------------------------------------------
+# `franky job attach` (issue #72) - inject a mid-run correction via the steer-file mailbox
+# ---------------------------------------------------------------------------
+
+
+def _write_attachable_run(env, job_id="a77ac0", engine="pi", status="running", command="build"):
+    rec = jobs.new_record(
+        job_id=job_id,
+        command=command,
+        repo="me/repo",
+        engine=engine,
+        task="do it",
+        container=f"franky-run-{job_id}",
+        network=f"franky-net-{job_id}",
+        proxy=f"franky-proxy-{job_id}",
+        branch="franky/task",
+        started_at="2026-07-05T10:00:00+00:00",
+    )
+    rec["status"] = status
+    jobs.write_record(rec, env)
+    return job_id
+
+
+def _attach_env(monkeypatch, tmp_path, *, alive=True, delivered=True, captured=None):
+    # FRANKY_CONFIG_FILE points at a nonexistent path so the config-file merge job_attach now does
+    # is a hermetic no-op (never reads the real ~/.franky/config on the dev machine).
+    env = {
+        "FRANKY_RUNS_DIR": str(tmp_path / "runs"),
+        "FRANKY_CONFIG_FILE": str(tmp_path / "no-config"),
+    }
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(cli, "container_running", lambda name: alive)
+
+    def fake_deliver(container, message, *a, **k):
+        if captured is not None:
+            captured["container"] = container
+            captured["message"] = message
+        return delivered
+
+    monkeypatch.setattr(cli, "deliver_steer", fake_deliver)
+    return env
+
+
+def test_job_attach_happy_path_json(monkeypatch, tmp_path):
+    captured = {}
+    env = _attach_env(monkeypatch, tmp_path, captured=captured)
+    job_id = _write_attachable_run(env)
+    res = CliRunner().invoke(
+        cli.main, ["job", "attach", job_id, "-m", "stop refactoring, fix the test", "--json"]
+    )
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.stdout)
+    assert data == {"job_id": job_id, "delivered": True, "engine": "pi", "kind": "steered"}
+    assert captured["container"] == f"franky-run-{job_id}"
+    # The DELIVERED payload is framed (operator-correction banner); the AUDIT note stores the
+    # bare (redacted) message, not the framing.
+    assert "operator correction" in captured["message"]
+    assert "stop refactoring, fix the test" in captured["message"]
+    rec = jobs.read_record(job_id, env)
+    assert rec["steer_notes"] == [{"message": "stop refactoring, fix the test", "delivered": True}]
+
+
+def test_job_attach_happy_path_text(monkeypatch, tmp_path):
+    env = _attach_env(monkeypatch, tmp_path)
+    job_id = _write_attachable_run(env)
+    res = CliRunner().invoke(cli.main, ["job", "attach", job_id, "-m", "do X instead"])
+    assert res.exit_code == 0, res.output
+    assert "correction delivered" in res.output
+
+
+def test_job_attach_run_not_alive_exits_2(monkeypatch, tmp_path):
+    env = _attach_env(monkeypatch, tmp_path, alive=False)
+    job_id = _write_attachable_run(env)
+    res = CliRunner().invoke(cli.main, ["job", "attach", job_id, "-m", "hi", "--json"])
+    assert res.exit_code == 2, res.output
+    assert json.loads(res.stdout)["error"]["kind"] == "run_not_alive"
+
+
+def test_job_attach_unsupported_engine_exits_2(monkeypatch, tmp_path):
+    env = _attach_env(monkeypatch, tmp_path)
+    job_id = _write_attachable_run(env, engine="pi")
+    # Monkeypatch the PiEngine class' flag off for this one test so we exercise the
+    # unsupported-engine branch without inventing a fake ENGINES entry.
+    import franky.engine as engine_mod
+
+    monkeypatch.setattr(engine_mod.PiEngine, "supports_steering", False)
+    monkeypatch.setattr(cli, "ENGINES", {"pi": engine_mod.PiEngine})
+    res = CliRunner().invoke(cli.main, ["job", "attach", job_id, "-m", "hi", "--json"])
+    assert res.exit_code == 2, res.output
+    assert json.loads(res.stdout)["error"]["kind"] == "steering_unsupported"
+
+
+def test_job_attach_unknown_engine_exits_2(monkeypatch, tmp_path):
+    env = _attach_env(monkeypatch, tmp_path)
+    job_id = _write_attachable_run(env, engine="some-future-engine")
+    res = CliRunner().invoke(cli.main, ["job", "attach", job_id, "-m", "hi", "--json"])
+    assert res.exit_code == 2, res.output
+    assert json.loads(res.stdout)["error"]["kind"] == "unknown_engine"
+
+
+def test_job_attach_no_message_non_tty_exits_2(monkeypatch, tmp_path):
+    env = _attach_env(monkeypatch, tmp_path)
+    job_id = _write_attachable_run(env)
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: False)
+    res = CliRunner().invoke(cli.main, ["job", "attach", job_id, "--json"])
+    assert res.exit_code == 2, res.output
+    assert json.loads(res.stdout)["error"]["kind"] == "interactive_input_required"
+
+
+def test_job_attach_no_message_tty_prompts(monkeypatch, tmp_path):
+    captured = {}
+    env = _attach_env(monkeypatch, tmp_path, captured=captured)
+    job_id = _write_attachable_run(env)
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)
+    monkeypatch.setattr(cli.click, "prompt", lambda *a, **k: "typed correction")
+    res = CliRunner().invoke(cli.main, ["job", "attach", job_id, "--json"])
+    assert res.exit_code == 0, res.output
+    assert "typed correction" in captured["message"]
+
+
+def test_job_attach_redacts_seeded_secret(monkeypatch, tmp_path):
+    captured = {}
+    env = {**_attach_env(monkeypatch, tmp_path, captured=captured), "GH_TOKEN": "ghp_supersecret"}
+    monkeypatch.setattr(cli.os, "environ", env)
+    job_id = _write_attachable_run(env)
+    res = CliRunner().invoke(
+        cli.main, ["job", "attach", job_id, "-m", "use ghp_supersecret to auth", "--json"]
+    )
+    assert res.exit_code == 0, res.output
+    assert "ghp_supersecret" not in captured["message"]
+    assert "ghp_supersecret" not in res.output
+
+
+def test_job_attach_delivery_fails_then_run_ended_is_run_not_alive(monkeypatch, tmp_path):
+    env = {
+        "FRANKY_RUNS_DIR": str(tmp_path / "runs"),
+        "FRANKY_CONFIG_FILE": str(tmp_path / "no-config"),
+    }
+    monkeypatch.setattr(cli.os, "environ", env)
+    # Alive on the FIRST check (so we get past the pre-check), gone by the time we re-check
+    # after a failed deliver - the race deliver_steer's caller must classify as run_not_alive.
+    calls = {"n": 0}
+
+    def flaky_alive(name):
+        calls["n"] += 1
+        return calls["n"] == 1
+
+    monkeypatch.setattr(cli, "container_running", flaky_alive)
+    monkeypatch.setattr(cli, "deliver_steer", lambda *a, **k: False)
+    job_id = _write_attachable_run(env)
+    res = CliRunner().invoke(cli.main, ["job", "attach", job_id, "-m", "hi", "--json"])
+    assert res.exit_code == 2, res.output
+    assert json.loads(res.stdout)["error"]["kind"] == "run_not_alive"
+
+
+def test_job_attach_delivery_failed_still_running_exits_steer_delivery_failed(
+    monkeypatch, tmp_path
+):
+    env = _attach_env(monkeypatch, tmp_path, delivered=False)
+    job_id = _write_attachable_run(env)
+    res = CliRunner().invoke(cli.main, ["job", "attach", job_id, "-m", "hi", "--json"])
+    assert res.exit_code == 2, res.output
+    assert json.loads(res.stdout)["error"]["kind"] == "steer_delivery_failed"
+    # Best-effort annotation of the failed attempt.
+    rec = jobs.read_record(job_id, env)
+    assert rec["steer_notes"][-1]["delivered"] is False
+
+
+def test_job_attach_not_found_exits_2(monkeypatch, tmp_path):
+    _attach_env(monkeypatch, tmp_path)
+    res = CliRunner().invoke(cli.main, ["job", "attach", "0badcafe", "-m", "hi"])
+    assert res.exit_code == 2
+    assert "no run found" in res.stderr
+
+
+def test_job_attach_empty_message_exits_2(monkeypatch, tmp_path):
+    # A message WAS supplied, just blank - distinct kind from interactive_input_required.
+    env = _attach_env(monkeypatch, tmp_path)
+    job_id = _write_attachable_run(env)
+    res = CliRunner().invoke(cli.main, ["job", "attach", job_id, "-m", "   ", "--json"])
+    assert res.exit_code == 2, res.output
+    assert json.loads(res.stdout)["error"]["kind"] == "empty_message"
+
+
+def test_job_attach_not_steerable_command_exits_2(monkeypatch, tmp_path):
+    # A diagnose run's prompt never carries the steer convention, so attaching to it would be a
+    # misleading "delivered" - the steerability gate must reject it up front.
+    env = _attach_env(monkeypatch, tmp_path)
+    job_id = _write_attachable_run(env, command="diagnose")
+    res = CliRunner().invoke(cli.main, ["job", "attach", job_id, "-m", "hi", "--json"])
+    assert res.exit_code == 2, res.output
+    assert json.loads(res.stdout)["error"]["kind"] == "not_steerable"
+
+
+def test_job_attach_steer_notes_capped_and_truncated(monkeypatch, tmp_path):
+    env = _attach_env(monkeypatch, tmp_path)
+    job_id = _write_attachable_run(env)
+    # Seed the record with a full window of prior notes so a single fresh attach must evict the
+    # oldest (cap = 20, newest kept).
+    seed = [{"message": f"note {i}", "delivered": True} for i in range(20)]
+    jobs.update_record(job_id, {"steer_notes": seed}, env)
+    long_msg = "x" * 600  # > _STEER_NOTE_MSG_MAX (500)
+    res = CliRunner().invoke(cli.main, ["job", "attach", job_id, "-m", long_msg, "--json"])
+    assert res.exit_code == 0, res.output
+    notes = jobs.read_record(job_id, env)["steer_notes"]
+    assert len(notes) == 20  # capped
+    assert notes[0]["message"] == "note 1"  # oldest ("note 0") evicted
+    assert notes[-1]["message"] == "x" * 500  # newest, truncated to 500 chars
+
+
+def test_job_attach_redacts_config_file_only_secret(monkeypatch, tmp_path):
+    # A secret stored ONLY in ~/.franky/config (never exported to env) must still be redacted -
+    # job_attach merges the config file into env before building the secret list (fix #1).
+    from franky.userconfig import write_config_file
+
+    cfg_path = tmp_path / "franky-config"
+    write_config_file(cfg_path, {"GH_TOKEN": "ghp_fileonly_secret"})
+    captured = {}
+    env = {
+        "FRANKY_RUNS_DIR": str(tmp_path / "runs"),
+        "FRANKY_CONFIG_FILE": str(cfg_path),
+    }
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(cli, "container_running", lambda name: True)
+
+    def fake_deliver(container, message, *a, **k):
+        captured["message"] = message
+        return True
+
+    monkeypatch.setattr(cli, "deliver_steer", fake_deliver)
+    job_id = _write_attachable_run(env)
+    res = CliRunner().invoke(
+        cli.main, ["job", "attach", job_id, "-m", "auth with ghp_fileonly_secret", "--json"]
+    )
+    assert res.exit_code == 0, res.output
+    assert "ghp_fileonly_secret" not in captured["message"]
+    assert "ghp_fileonly_secret" not in res.output
+    rec = jobs.read_record(job_id, env)
+    assert "ghp_fileonly_secret" not in json.dumps(rec["steer_notes"])
