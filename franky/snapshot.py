@@ -8,9 +8,10 @@ launched (still fully hardened) container.
 
 WHY it does NOT touch the container hardening: the snapshot is taken with host-side
 `docker cp`/`docker exec` only - no bind mount, no host docker socket, no relaxation of
-`_HARDENING`. The restore likewise `docker cp`s the tar back IN and untars it via `docker exec`,
-and the container waits for a marker file (an env flag) before running the engine. The safety
-boundary is unchanged.
+`_HARDENING`. The restore does NOT `docker cp` the tar back IN (the daemon refuses a `cp` into a
+`--read-only` container, even to a tmpfs target); instead it pipes the tar to `tar -xzf -` over
+`docker exec -i` stdin, extracted as the run uid (1001) which owns `/work`, and the container
+waits for a marker file (an env flag) before running the engine. The safety boundary is unchanged.
 
 SECRET-SAFETY is the crux, because a workspace snapshot could otherwise leak the creds the agent
 carried. Two layers, both fail-closed:
@@ -51,9 +52,6 @@ SNAPSHOT_MARKER = ".franky-resume-ready"
 # passes `-e FRANKY_RESUME_WAIT=1` when resuming; the entrypoint unsets it after the marker lands.
 RESUME_WAIT_ENV = "FRANKY_RESUME_WAIT"
 
-# Default container-side path the workspace tar is copied to before it is untarred into /work.
-_RESUME_TAR_IN = "/tmp/franky-resume.tar.gz"
-
 # Credential FILES that must never live inside a stored snapshot. HOME cred files are not
 # snapshotted (only /work is), but the autonomous agent COULD copy one into /work - so we delete
 # these defensively wherever they appear in the tree. `*.pem` (private keys) is handled separately
@@ -89,49 +87,40 @@ def build_extract_argv(task: str, dest_dir: str) -> list[str]:
     return ["docker", "cp", f"{task}:/work/.", dest_dir]
 
 
-def build_cp_into_argv(task: str, tar_host_path: str, dest_in: str = _RESUME_TAR_IN) -> list[str]:
-    """`docker cp <tar_host_path> <task>:<dest_in>` - copy the workspace tar INTO the container."""
-    return ["docker", "cp", tar_host_path, f"{task}:{dest_in}"]
+def build_untar_argv(task: str, target: str = "/work") -> list[str]:
+    """`docker exec -i <task> tar --no-same-owner -xzf - -C <target>` - extract from STDIN as uid 1001.
 
+    WHY the tar arrives on STDIN and not via `docker cp` + a file: the resume container runs
+    `--read-only` (part of `_HARDENING`), and `docker cp` INTO a read-only container is refused by
+    the daemon outright ("container rootfs is marked read-only") even when the destination is a
+    writable tmpfs. So we never copy a file in - we pipe the snapshot bytes straight to `tar -xzf -`
+    through `docker exec -i` (the same stdin channel `deliver_steer` uses for steering).
 
-def build_untar_argv(task: str, tar_in: str = _RESUME_TAR_IN, target: str = "/work") -> list[str]:
-    """`docker exec -u 0 <task> tar --no-same-owner -xzf <tar_in> -C <target>` - extract as root.
-
-    WHY as root (uid 0), not the image's uid 1001: `finalize_snapshot` writes the snapshot tar
-    mode 0600, and `docker cp` lands it root:root 0600 inside the container. The default
-    `docker exec` runs as `USER franky` (uid 1001), which CANNOT READ a root-owned 0600 file, so
-    an unprivileged untar always fails and every resume would degrade to agent_error. We extract
-    as root and pass `--no-same-owner` so the tar's archived uid/gid are ignored; then
-    `build_chown_argv` hands the tree back to uid 1001 so it is writable under `--read-only`."""
+    WHY as the image's default uid 1001, NOT root: the `/work` tmpfs is owned by uid 1001, and the
+    task profile is `--cap-drop=ALL` (only SETUID/SETGID added back), so root inside the container
+    has NO `CAP_DAC_OVERRIDE`/`CAP_CHOWN` and cannot even write into a 1001-owned dir. Extracting as
+    uid 1001 (which owns `/work`) writes freely; `--no-same-owner` makes `tar` ignore the archived
+    uid/gid so the tree lands owned by 1001 with no chown step needed. Reading the archive is never
+    gated by file perms because it arrives on the exec's stdin, not as an on-disk root-owned file."""
     return [
         "docker",
         "exec",
-        "-u",
-        "0",
+        "-i",
         task,
         "tar",
         "--no-same-owner",
         "-xzf",
-        tar_in,
+        "-",
         "-C",
         target,
     ]
 
 
-def build_chown_argv(task: str, target: str = "/work") -> list[str]:
-    """`docker exec -u 0 <task> chown -R 1001:1001 <target>` - hand the restored tree to uid 1001.
-
-    Run AFTER the root untar (see build_untar_argv): the extracted files land root-owned, so we
-    chown the whole target to the run uid/gid (1001, the uid that owns the `/work` tmpfs) so the
-    resuming engine can actually write to them under the container's `--read-only` root."""
-    return ["docker", "exec", "-u", "0", task, "chown", "-R", "1001:1001", target]
-
-
 def build_marker_argv(task: str, marker: str = f"/work/{SNAPSHOT_MARKER}") -> list[str]:
     """`docker exec <task> touch <marker>` - signal the entrypoint that /work is restored.
 
-    Touched LAST, only after cp + untar both succeed, so the entrypoint never runs the engine on
-    a half-restored /work."""
+    Touched LAST, only after the untar succeeds, so the entrypoint never runs the engine on a
+    half-restored /work. Runs as the default uid 1001, which owns `/work`."""
     return ["docker", "exec", task, "touch", marker]
 
 
@@ -483,19 +472,23 @@ def restore_into_container(
     timeout: float = 20.0,
     sleeper=time.sleep,
 ) -> bool:
-    """Copy a workspace tar INTO a freshly launched container, extract it into /work as root, hand
-    ownership to the run user, and touch the ready marker. Return True iff every docker step
-    succeeded; never raises.
+    """Pipe a workspace tar INTO a freshly launched container over `docker exec -i` stdin, extract
+    it into /work as the run uid (1001), and touch the ready marker. Return True iff every docker
+    step succeeded; never raises.
 
     The container starts in resume-wait mode (see the entrypoint) and blocks until the marker
     appears, so we first poll `container_running` (up to `ready_polls`) to confirm it is up, then:
-    cp tar in -> untar as root (`-u 0 --no-same-owner`) -> chown -R 1001:1001 /work (`-u 0`) ->
-    touch marker, in that order. WHY extract as root then chown (not extract as uid 1001):
-    `docker cp` lands the 0600 tar root-owned, which uid 1001 cannot read - an unprivileged untar
-    would always fail. If ANY step (cp/untar/chown) returns nonzero we return False WITHOUT
-    touching the marker, so the entrypoint times out and exits nonzero rather than running the
-    engine on an empty/half-restored /work. `container` is imported lazily to avoid an import
-    cycle (container imports snapshot)."""
+    untar-from-stdin as uid 1001 (`-i --no-same-owner`) -> touch marker, in that order. WHY stdin,
+    not `docker cp` the tar in: the resume container is `--read-only`, and the daemon refuses a `cp`
+    INTO a read-only container even for a tmpfs target, so a cp-based restore fails on every resume;
+    piping the bytes to `tar -xzf -` avoids the cp entirely. WHY extract as uid 1001, not root +
+    chown: the task profile is `--cap-drop=ALL`, so in-container root lacks the caps to write into
+    the 1001-owned `/work` or to chown - extracting as 1001 (which owns `/work`) with
+    `--no-same-owner` lands the tree owned by 1001 directly, no chown needed (see build_untar_argv).
+    The snapshot file is streamed via `stdin=` (not read fully into memory). If reading the snapshot
+    fails, or the untar returns nonzero, we return False WITHOUT touching the marker, so the
+    entrypoint times out and exits nonzero rather than running the engine on an empty/half-restored
+    /work. `container` is imported lazily to avoid an import cycle (container imports snapshot)."""
     from . import container
 
     try:
@@ -504,19 +497,17 @@ def restore_into_container(
                 break
             sleeper(poll_interval)
 
-        cp = runner(
-            build_cp_into_argv(task, str(snapshot_tar)),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-        if getattr(cp, "returncode", 1) != 0:
-            return False
-        untar = runner(build_untar_argv(task), capture_output=True, text=True, timeout=timeout)
+        # Stream the snapshot bytes to `tar -xzf -` over the exec's stdin; no file is copied in.
+        # No `text=True` here (unlike the marker call below): stdin is a BINARY file object and the
+        # captured stdout/stderr are unused - text mode would try to str-decode them for nothing.
+        with open(snapshot_tar, "rb") as tar_fh:
+            untar = runner(
+                build_untar_argv(task),
+                stdin=tar_fh,
+                capture_output=True,
+                timeout=timeout,
+            )
         if getattr(untar, "returncode", 1) != 0:
-            return False
-        chown = runner(build_chown_argv(task), capture_output=True, text=True, timeout=timeout)
-        if getattr(chown, "returncode", 1) != 0:
             return False
         marker = runner(build_marker_argv(task), capture_output=True, text=True, timeout=timeout)
         return getattr(marker, "returncode", 1) == 0
