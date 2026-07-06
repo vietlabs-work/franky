@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `franky job replay <job_id>` (#70): re-run a recorded `build` (or an earlier `replay`) from
+  its SAVED inputs - the original task text and the exact base commit (the target repo's
+  default-branch tip at the start of that run's build pass, after any --plan-first approval) -
+  to reproduce a failure deterministically.
+  Reproduce-only by default (no branch, no push, no PR); `--open-pr` opts into the normal build
+  conventions once a fix is confirmed. Base commit is pinned in the prompt and pre-flight
+  checked host-side before spending a container pass (a gone commit is refused up front, exit
+  2). NONDETERMINISM CAVEAT: replay reproduces the inputs, not bit-identical output - the LLM
+  is not deterministic. Run records now carry `source`/`task_full`/`base_sha`/`replay_of`
+  fields (`franky schema` -> `job_record_schema`); a `--json` replay result carries a
+  `replay_of` field naming the original job id.
 - Capture-before-reap runtime diagnostics (#69): a best-effort `diagnostics` block, captured
   host-side just before the task/proxy containers are reaped, now lands on every run record
   (`~/.franky/runs/<id>.json`): task exit code, OOM flag, final container state, nested

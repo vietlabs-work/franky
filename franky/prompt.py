@@ -205,6 +205,79 @@ def build_iterate_prompt(spec: TaskSpec) -> str:
     return f"{persona}\n\n{task_block}\n{conventions}"
 
 
+def build_replay_prompt(
+    spec: TaskSpec,
+    *,
+    branch: str,
+    base_sha: str,
+    open_pr: bool,
+) -> str:
+    """Prompt for `franky job replay`: re-run a recorded task from its saved inputs (issue #70).
+
+    WHY this exists: replay reproduces the INPUTS (the original task text + the exact base
+    commit it started from), NOT bit-identical output - the underlying LLM is not
+    deterministic, so two runs over the same inputs can still diverge. The value is a
+    controlled, repeatable starting point for debugging a failure, not a guarantee of the same
+    transcript.
+
+    Standalone like `build_iterate_prompt` - it reuses `_task_block` (for the repo line +
+    task/issue framing, identical to a normal build) but owns its own conventions block so the
+    base-commit pin and the reproduce-only/open-pr split live in exactly one place.
+
+    `base_sha` is ALWAYS pinned: immediately after cloning, the agent must check out that exact
+    commit before doing anything else, so the run starts from the SAME state the original run
+    did (a repo that has moved on since must not silently change what is being reproduced).
+
+    `open_pr=False` (the DEFAULT) is reproduce-only and side-effect-free on the remote: the
+    agent works entirely inside the container to reproduce the outcome, and is told NOT to
+    create a branch, push, or open a PR - so a replay can always be run without risking a
+    duplicate or unwanted PR. `open_pr=True` opts into the normal build conventions (branch,
+    tests-green-before-PR, conventional commits, 3-section PR body, `gh pr create`, never
+    merge) so a confirmed-fixed replay can still land a real PR.
+    """
+    persona = load_persona()
+    task_block, close_line = _task_block(spec, plan=False)
+
+    base_pin = (
+        "This is a REPLAY of an earlier run. After cloning "
+        f"{spec.repo}, immediately check out the exact base commit `{base_sha}` (e.g. "
+        f"`git fetch origin {base_sha} && git checkout {base_sha}`, or `git checkout "
+        f"{base_sha}`) and start ALL work from that commit, so this reproduces the original "
+        "run's starting state.\n"
+    )
+
+    if open_pr:
+        conventions = (
+            "Conventions (follow exactly):\n"
+            f"{base_pin}"
+            f"- Work on a new branch named exactly `{branch}`.\n"
+            "- Run the repo's tests and make them pass BEFORE opening the PR. Do not open a PR "
+            "on red tests.\n"
+            "- Use conventional-commit messages: `<type>: <summary>` (e.g. `feat:`, `fix:`, "
+            "`chore:`).\n"
+            "- PR title uses the same conventional format: `<type>: <summary>`.\n"
+            "- The PR body must contain three sections: what (the change), why (the "
+            "motivation), and a test-plan (how you verified it).\n"
+            f"{close_line}"
+            "- Open the PR with `gh pr create`. Do NOT merge it - a human reviews every "
+            "change.\n"
+            "- Keep commit messages and PR text professional; no persona flavor in the "
+            "deliverables.\n"
+        )
+    else:
+        conventions = (
+            "Conventions (follow exactly):\n"
+            f"{base_pin}"
+            "- REPRODUCE-ONLY MODE: work entirely inside the container to reproduce the "
+            "outcome - make the change, run the repo's tests, and report what happened.\n"
+            "- Do NOT create or push any branch, and do NOT open a pull request "
+            "(`gh pr create`) - this pass only reproduces, it changes nothing on the remote.\n"
+            "- Keep your report professional; no persona flavor in the deliverables.\n"
+        )
+
+    return f"{persona}\n\n{task_block}\n{conventions}"
+
+
 def build_plan_prompt(spec: TaskSpec) -> str:
     """Prompt for the `--plan-first` planning pass: produce a plan, change NOTHING.
 

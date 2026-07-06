@@ -118,6 +118,7 @@ def build_result(
     branch: str | None = None,
     job_id: str | None = None,
     attempts: list | None = None,
+    replay_of: str | None = None,
 ) -> dict:
     """Shape the success/agent-result object emitted on stdout under `--json`.
 
@@ -125,7 +126,9 @@ def build_result(
     PREDICTED branch name (`franky/<slug>`) the host computed before the run; it MAY differ
     from the branch the agent actually created (the agent is autonomous), so treat it as a
     hint, not a guarantee. `iterate` passes null (no host-predicted branch). `usage` is an
-    economics.Usage (input_tokens/output_tokens/cost_usd, each int|None / float|None).
+    economics.Usage (input_tokens/output_tokens/cost_usd, each int|None / float|None). Status
+    is one of: pr_opened | no_pr | agent_error | timeout | already_open | iterate_complete |
+    replay_complete (issue #70: a reproduce-only replay pass finished cleanly).
 
     For the `already_open` status (idempotency short-circuit, no container ran) the caller
     passes the sentinels `duration=0.0` and `log_path=""` - there is no run to time or log.
@@ -133,6 +136,10 @@ def build_result(
     `attempts` (issue #64 #5) is the per-attempt trail from a `--retry` build; it is included
     ONLY when not None, so a plain (no-retry) build emits the exact same keys as before - the
     `attempts` key simply does not appear.
+
+    `replay_of` (issue #70) is the job id of the original run a `franky job replay` is
+    reproducing; included ONLY when not None (mirrors the `attempts` pattern exactly), so build
+    and iterate emit the exact same keys as before.
     """
     result = {
         "status": status,
@@ -153,6 +160,8 @@ def build_result(
     }
     if attempts is not None:
         result["attempts"] = attempts
+    if replay_of is not None:
+        result["replay_of"] = replay_of
     return result
 
 

@@ -104,6 +104,22 @@ def test_job_record_schema_documents_diagnostics():
         assert sub_field in jrs["diagnostics"]
 
 
+def test_result_schema_documents_replay_of():
+    schema = build_schema(cli.main)
+    rs = schema["result_schema"]
+    assert "replay_of" in rs
+    assert "replay_complete" in rs["status"]
+
+
+def test_job_record_schema_documents_replay_fields():
+    schema = build_schema(cli.main)
+    jrs = schema["job_record_schema"]
+    for field in ("source", "task_full", "base_sha", "replay_of"):
+        assert field in jrs
+    assert "replay" in jrs["command"]
+    assert "replay_complete" in jrs["status"]
+
+
 def test_error_schema_shape():
     schema = build_schema(cli.main)
     err = schema["error_schema"]["error"]

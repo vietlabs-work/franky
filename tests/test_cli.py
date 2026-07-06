@@ -2342,3 +2342,192 @@ def test_job_diagnose_timeout_exits_9(monkeypatch, tmp_path):
     res = CliRunner().invoke(cli.main, ["job", "diagnose", job_id, "--json"])
     assert res.exit_code == 9, res.output
     assert json.loads(res.stdout)["error"]["kind"] == "timeout"
+
+
+# ---------------------------------------------------------------------------
+# `franky job replay` (issue #70)
+# ---------------------------------------------------------------------------
+
+
+def _write_replayable_run(
+    env,
+    tmp_path,
+    job_id="feed01",
+    command="build",
+    source="prose",
+    task_full="do it",
+    base_sha="abc1234",
+    branch="franky/task",
+):
+    rec = jobs.new_record(
+        job_id=job_id,
+        command=command,
+        repo="me/repo",
+        engine="pi",
+        task="do it",
+        container="c",
+        network="n",
+        proxy="p",
+        branch=branch,
+        started_at="2026-07-05T10:00:00+00:00",
+        source=source,
+        task_full=task_full,
+        base_sha=base_sha,
+    )
+    rec["status"] = "pr_opened"
+    jobs.write_record(rec, env)
+    return job_id
+
+
+def _replay_env(monkeypatch, tmp_path, container_result, allowed_repos="me/repo"):
+    env = {
+        "FRANKY_ALLOWED_REPOS": allowed_repos,
+        "GH_TOKEN": "ghp_fake",
+        "OPENROUTER_API_KEY": "sk-or-fake",
+        "FRANKY_RUNS_DIR": str(tmp_path / "runs"),
+    }
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: container_result)
+    monkeypatch.setattr(cli.baseref, "commit_exists", lambda *a, **k: True)
+    return env
+
+
+def test_job_replay_reproduce_only_happy_path(monkeypatch, tmp_path):
+    env = _replay_env(monkeypatch, tmp_path, (0, "reproduced the failure"))
+    job_id = _write_replayable_run(env, tmp_path)
+    res = CliRunner().invoke(cli.main, ["job", "replay", job_id, "--json"])
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.stdout)
+    assert data["status"] == "replay_complete"
+    assert data["replay_of"] == job_id
+    assert data["pr_url"] is None
+    new_id = data["job_id"]
+    rec = jobs.read_record(new_id, env)
+    assert rec["command"] == "replay"
+    assert rec["replay_of"] == job_id
+    assert rec["base_sha"] == "abc1234"
+
+
+def test_job_replay_open_pr_opens_pr(monkeypatch, tmp_path):
+    env = _replay_env(monkeypatch, tmp_path, (0, f"opened {PR_URL}"))
+    job_id = _write_replayable_run(env, tmp_path, job_id="aaaa0001")
+    res = CliRunner().invoke(cli.main, ["job", "replay", job_id, "--open-pr", "--json"])
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.stdout)
+    assert data["status"] == "pr_opened"
+    assert data["pr_url"] == PR_URL
+    assert data["replay_of"] == job_id
+
+
+def test_job_replay_missing_base_sha_exits_2(monkeypatch, tmp_path):
+    env = _replay_env(monkeypatch, tmp_path, (0, "x"))
+    job_id = _write_replayable_run(env, tmp_path, job_id="bad00001", base_sha=None)
+    res = CliRunner().invoke(cli.main, ["job", "replay", job_id, "--json"])
+    assert res.exit_code == 2, res.output
+    assert json.loads(res.stdout)["error"]["kind"] == "base_sha_unavailable"
+
+
+def test_job_replay_base_commit_gone_exits_2(monkeypatch, tmp_path):
+    env = _replay_env(monkeypatch, tmp_path, (0, "x"))
+    monkeypatch.setattr(cli.baseref, "commit_exists", lambda *a, **k: False)
+    job_id = _write_replayable_run(env, tmp_path, job_id="deaf0001")
+    res = CliRunner().invoke(cli.main, ["job", "replay", job_id, "--json"])
+    assert res.exit_code == 2, res.output
+    assert json.loads(res.stdout)["error"]["kind"] == "base_commit_gone"
+
+
+def test_job_replay_not_replayable_command_exits_2(monkeypatch, tmp_path):
+    env = _replay_env(monkeypatch, tmp_path, (0, "x"))
+    job_id = _write_replayable_run(env, tmp_path, job_id="deadbeef", command="diagnose")
+    res = CliRunner().invoke(cli.main, ["job", "replay", job_id, "--json"])
+    assert res.exit_code == 2, res.output
+    assert json.loads(res.stdout)["error"]["kind"] == "not_replayable"
+
+
+def test_job_replay_missing_task_full_exits_2(monkeypatch, tmp_path):
+    env = _replay_env(monkeypatch, tmp_path, (0, "x"))
+    job_id = _write_replayable_run(env, tmp_path, job_id="face0001", task_full=None, source=None)
+    res = CliRunner().invoke(cli.main, ["job", "replay", job_id, "--json"])
+    assert res.exit_code == 2, res.output
+    assert json.loads(res.stdout)["error"]["kind"] == "replay_inputs_missing"
+
+
+def test_job_replay_off_allowlist_now_exits_4(monkeypatch, tmp_path):
+    env = _replay_env(monkeypatch, tmp_path, (0, "x"), allowed_repos="other/repo")
+    job_id = _write_replayable_run(env, tmp_path, job_id="facade01")
+    res = CliRunner().invoke(cli.main, ["job", "replay", job_id, "--json"])
+    assert res.exit_code == 4, res.output
+    assert json.loads(res.stdout)["error"]["kind"] == "task_rejected"
+
+
+def test_job_replay_not_found_exits_2(monkeypatch, tmp_path):
+    _replay_env(monkeypatch, tmp_path, (0, "x"))
+    res = CliRunner().invoke(cli.main, ["job", "replay", "nosuchjob"])
+    assert res.exit_code == 2
+    assert "no run found" in res.stderr
+
+
+def test_job_replay_timeout_exits_9_and_prints_no_complete_line(monkeypatch, tmp_path):
+    # A reproduce-only replay that TIMES OUT must exit 9 (status timeout) and, in non-JSON mode,
+    # must NOT print a "complete" line (the failure is carried by the exit code + the log).
+    env = _replay_env(monkeypatch, tmp_path, (cli.CONTAINER_TIMEOUT_CODE, ""))
+    job_id = _write_replayable_run(env, tmp_path, job_id="0ad00001")
+    res = CliRunner().invoke(cli.main, ["job", "replay", job_id])
+    assert res.exit_code == 9, res.output
+    assert "complete" not in res.stderr
+    rec = jobs.read_record(job_id, env)  # original record is untouched
+    assert rec["status"] == "pr_opened"
+
+
+def test_job_replay_agent_error_exits_7(monkeypatch, tmp_path):
+    # A nonzero, non-timeout container exit -> agent_error, exit 7.
+    env = _replay_env(monkeypatch, tmp_path, (3, "the agent crashed"))
+    job_id = _write_replayable_run(env, tmp_path, job_id="0ad00002")
+    res = CliRunner().invoke(cli.main, ["job", "replay", job_id, "--json"])
+    assert res.exit_code == 7, res.output
+    assert json.loads(res.stdout)["status"] == "agent_error"
+
+
+def test_job_replay_open_pr_no_pr_url_exits_7(monkeypatch, tmp_path):
+    # An --open-pr replay whose clean-exit output carries no PR url -> no_pr, exit 7.
+    env = _replay_env(monkeypatch, tmp_path, (0, "did work but never opened a PR"))
+    job_id = _write_replayable_run(env, tmp_path, job_id="0ad00003")
+    res = CliRunner().invoke(cli.main, ["job", "replay", job_id, "--open-pr", "--json"])
+    assert res.exit_code == 7, res.output
+    assert json.loads(res.stdout)["status"] == "no_pr"
+
+
+def test_job_replay_persists_diagnostics(monkeypatch, tmp_path):
+    # Replay is the debugging command; its record MUST carry the captured runtime diagnostics.
+    # Fake run_in_container fills the injected sink (the real one does so before teardown, #69).
+    env = _replay_env(monkeypatch, tmp_path, (0, "reproduced"))
+
+    def fake_run(*a, **k):
+        sink = k.get("diagnostics_sink")
+        if sink is not None:
+            sink.update({"task_exit_code": 0, "oom_killed": False, "dind_ready": True})
+        return (0, "reproduced")
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+    job_id = _write_replayable_run(env, tmp_path, job_id="0ad00004")
+    res = CliRunner().invoke(cli.main, ["job", "replay", job_id, "--json"])
+    assert res.exit_code == 0, res.output
+    new_id = json.loads(res.stdout)["job_id"]
+    rec = jobs.read_record(new_id, env)
+    assert rec["diagnostics"] == {
+        "task_exit_code": 0,
+        "oom_killed": False,
+        "dind_ready": True,
+    }
+
+
+def test_job_replay_malformed_base_sha_exits_2(monkeypatch, tmp_path):
+    # A truthy-but-junk base_sha (corrupt/hand-edited record) is refused before it reaches the
+    # prompt or commit_exists' None-on-uncertain path.
+    env = _replay_env(monkeypatch, tmp_path, (0, "x"))
+    job_id = _write_replayable_run(env, tmp_path, job_id="0ad00005", base_sha="not-a-sha!!")
+    res = CliRunner().invoke(cli.main, ["job", "replay", job_id, "--json"])
+    assert res.exit_code == 2, res.output
+    assert json.loads(res.stdout)["error"]["kind"] == "base_sha_unavailable"
