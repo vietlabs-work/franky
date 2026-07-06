@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `franky job resume <job_id>` (#71): re-enter a hung/timeout/killed run WITH its workspace so a
+  fresh engine CONTINUES it instead of restarting. On timeout (and on `job kill`) Franky
+  snapshots the container's `/work` before teardown; `resume` restores it into a fresh, still
+  fully hardened + egress-controlled container (host-side `docker cp`/`exec` + a resume-wait
+  entrypoint flag - no bind mount, no host socket, no hardening relaxation) and resumes the
+  original branch. The snapshot is scrubbed FAIL-CLOSED (known cred files removed, git remote
+  userinfo + credential helpers stripped, known secret values redacted) and VERIFIED (every file
+  re-scanned for surviving/fresh-token values, git history decompress-scanned via `git cat-file`;
+  any hit refuses the snapshot). It is host-local, mode 0600, pruned with its record (plus orphan
+  sweeping), and NEVER included in `job export`. Only timeout/killed runs produce a snapshot, so
+  only those are resumable. V1 LIMITATION: resume restores the filesystem, not the agent's LLM/
+  session state - a fresh engine re-orients from the branch state. Run records gain
+  `resumed_from`/`snapshot_path` fields; a `--json` resume result carries `resumed_from`.
 - `franky job replay <job_id>` (#70): re-run a recorded `build` (or an earlier `replay`) from
   its SAVED inputs - the original task text and the exact base commit (the target repo's
   default-branch tip at the start of that run's build pass, after any --plan-first approval) -

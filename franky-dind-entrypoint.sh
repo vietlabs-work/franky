@@ -75,4 +75,22 @@ if [ -n "${FRANKY_PROFILE_BUNDLE:-}" ]; then
     unset FRANKY_PROFILE_BUNDLE
 fi
 
+# Resume mode (issue #71): the host docker-cp's the prior workspace into this started
+# container's tmpfs /work and signals by touching the marker. Wait (capped, never unbounded).
+# If the marker never arrives we must NOT run the engine on an empty /work (that would silently
+# become a fresh run) - exit nonzero so the host classifies it as a failed restore.
+if [ -n "${FRANKY_RESUME_WAIT:-}" ]; then
+    ready=0
+    for _ in $(seq 1 120); do
+        if [ -f "/work/.franky-resume-ready" ]; then ready=1; break; fi
+        sleep 1
+    done
+    if [ "${ready}" != 1 ]; then
+        echo "franky: resume workspace was never restored (marker absent after 120s) - refusing to run on an empty /work" >&2
+        exit 75
+    fi
+    rm -f "/work/.franky-resume-ready" 2>/dev/null || true
+    unset FRANKY_RESUME_WAIT
+fi
+
 exec "$@"

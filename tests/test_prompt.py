@@ -363,3 +363,32 @@ def test_replay_prompt_nondeterminism_is_documented_in_module():
     # The docstring (not the prompt text) carries the caveat; assert it exists on the function.
     doc = " ".join(build_replay_prompt.__doc__.lower().split())
     assert "not deterministic" in doc
+
+
+def test_build_resume_prompt_pins_branch_and_restore_conventions():
+    from franky.prompt import build_resume_prompt
+
+    spec = TaskSpec(repo="me/repo", text="add a --json flag", source="prose")
+    p = build_resume_prompt(spec, branch="franky/add-json")
+    assert "me/repo" in p
+    assert "add a --json flag" in p
+    # Pins the exact branch and forbids a new one.
+    assert "franky/add-json" in p
+    assert "do NOT create a new branch" in p or "not create a new branch" in p.lower()
+    # Restore framing: work is already under /work, do not re-clone.
+    assert "/work" in p
+    assert "re-clone" in p.lower()
+    # Keeps the build guardrails: tests green before the PR, and never merge.
+    assert "tests" in p.lower()
+    assert "gh pr create" in p
+    assert "Do NOT merge" in p or "not merge" in p.lower()
+
+
+def test_build_resume_prompt_issue_keeps_closing_keyword():
+    from franky.prompt import build_resume_prompt
+
+    spec = TaskSpec(
+        repo="octocat/hello", text="https://github.com/octocat/hello/issues/42", source="issue"
+    )
+    p = build_resume_prompt(spec, branch="franky/issue-42")
+    assert "Closes #42" in p

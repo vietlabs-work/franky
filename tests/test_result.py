@@ -208,3 +208,35 @@ def test_build_error_shape():
 def test_build_error_default_hint():
     e = build_error(4, "task_rejected", "off allowlist")
     assert e["error"]["hint"] == ""
+
+
+def test_build_result_includes_resumed_from_when_set():
+    r = build_result(
+        status="pr_opened",
+        pr_url="https://github.com/me/repo/pull/12",
+        reason="PR opened",
+        exit_code=0,
+        usage=Usage(),
+        duration=1.0,
+        log_path="tasks/x.log",
+        engine="pi",
+        repo="me/repo",
+        job_id="newid02",
+        resumed_from="origid02",
+    )
+    assert r["resumed_from"] == "origid02"
+
+
+def test_build_result_omits_resumed_from_when_none():
+    r = build_result(
+        status="pr_opened",
+        pr_url="https://github.com/me/repo/pull/12",
+        reason="PR opened",
+        exit_code=0,
+        usage=Usage(),
+        duration=1.0,
+        log_path="tasks/x.log",
+        engine="pi",
+        repo="me/repo",
+    )
+    assert "resumed_from" not in r

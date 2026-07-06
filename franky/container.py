@@ -20,10 +20,12 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
 import time
 import uuid
+from pathlib import Path
 
-from . import egress, franky_version
+from . import egress, franky_version, snapshot
 from .config import redact
 from .profile import PROFILE_BUNDLE_VAR
 
@@ -155,6 +157,7 @@ def build_docker_argv(
     network: str | None = None,
     proxy_url: str | None = None,
     profile_bundle: str | None = None,
+    resume_wait: bool = False,
 ) -> list[str]:
     """Build the full `docker run` argv. Pure - no docker invoked.
 
@@ -175,6 +178,11 @@ def build_docker_argv(
     operator content (Tier-1: static markdown/text only).  The entrypoint decodes and extracts
     it into HOME before exec-ing the engine.  No bind mount is added; the hardening flags are
     unchanged.
+
+    When `resume_wait` is True (issue #71) the container is started in resume-wait mode via
+    `-e FRANKY_RESUME_WAIT=1` (by-value, non-secret): the entrypoint blocks until the host
+    docker-cp's the prior workspace into /work and touches the ready marker. The hardening flags
+    are unchanged - resume uses only host-side docker cp/exec + this env flag, no bind mount.
     """
     container_name = name or f"franky-run-{uuid.uuid4().hex[:12]}"
     argv = ["docker", "run", *_HARDENING, "--name", container_name]
@@ -205,6 +213,9 @@ def build_docker_argv(
         # The entrypoint unpacks this before exec-ing the engine; see profile.py and
         # franky-dind-entrypoint.sh.
         argv += ["-e", f"{PROFILE_BUNDLE_VAR}={profile_bundle}"]
+    if resume_wait:
+        # By-value (non-secret): puts the entrypoint into resume-wait mode (issue #71).
+        argv += ["-e", f"{snapshot.RESUME_WAIT_ENV}=1"]
     for key in passthrough_env:
         argv += ["-e", key]
     argv += [image, *inner_argv]
@@ -492,6 +503,8 @@ def run_in_container(
     popen=subprocess.Popen,
     run_id: str | None = None,
     diagnostics_sink: dict | None = None,
+    snapshot_sink: dict | None = None,
+    resume_workspace: str | None = None,
 ) -> tuple[int, str]:
     """Run the inner engine in a hardened, egress-controlled container; return
     (returncode, redacted_output).
@@ -500,6 +513,17 @@ def run_in_container(
     runtime diagnostics (issue #69) captured JUST BEFORE teardown - see `capture_diagnostics`.
     Opt-in: None (the default) is byte-identical to the pre-#69 behavior for every existing
     caller/test. A capture failure never changes the returned (code, output).
+
+    `snapshot_sink` (issue #71), when given a dict with a `"dest"` path, opts into capturing the
+    task's `/work` workspace ON TIMEOUT: `extract_workspace` runs in the `finally` BEFORE the
+    reap (the only step that needs the container alive), then `finalize_snapshot` (scrub + verify
+    + pack) runs AFTER the reap so teardown is never delayed by it. On success the sink gains a
+    `"snapshot_path"` key. Any failure is swallowed - a snapshot can never regress the run.
+
+    `resume_workspace` (issue #71), when set to a host tar path, RESTORES that workspace into the
+    freshly launched container between launch and the engine run. This forces the streaming
+    (popen) path even without `progress`, because the restore must happen after the container is
+    up but before it completes; a no-op progress callback is used when none was given.
 
     Topology: an --internal network (no internet route) hosts a Squid proxy (default-deny
     allowlist) and the task container. The task's HTTP(S)_PROXY points at the proxy and its
@@ -561,6 +585,14 @@ def run_in_container(
             )
 
         # 5. The task container: on the internal net, all traffic forced through the proxy.
+        # Resume (issue #71) forces the streaming (popen) path even without a progress callback:
+        # the workspace restore must run AFTER the container is up but BEFORE it completes, which
+        # only the popen path exposes. A no-op progress stand-in keeps the streaming loop working
+        # when the caller passed none.
+        resuming = resume_workspace is not None
+        effective_progress = progress
+        if resuming and effective_progress is None:
+            effective_progress = lambda _line: None  # noqa: E731 - tiny no-op for the stream loop
         argv = build_docker_argv(
             image,
             cfg.passthrough_env,
@@ -569,8 +601,9 @@ def run_in_container(
             network=net,
             proxy_url=proxy_url(proxy),
             profile_bundle=profile_bundle,
+            resume_wait=resuming,
         )
-        if progress is not None:
+        if effective_progress is not None:
             # Streaming path: iterate stdout/stderr line by line, redact per line, call
             # progress(), and accumulate raw lines for the end-of-run full-buffer redact.
             # WHY raw accumulation: a secret that spans a line boundary (unlikely for JSONL
@@ -585,18 +618,50 @@ def run_in_container(
                     env=child_env,
                 )
                 task_launched = True
+                # Restore the prior workspace into the just-launched container (issue #71) BEFORE
+                # draining stdout: the container is waiting on the ready marker in resume-wait
+                # mode. A False result is fine to proceed on - the entrypoint will exit 75 quickly
+                # (refusing to run on an empty /work) and the run classifies as agent_error; do
+                # NOT abort the stream, just drain it.
+                if resume_workspace is not None:
+                    snapshot.restore_into_container(
+                        task, Path(resume_workspace), runner, sleeper=sleeper
+                    )
                 raw_lines: list[str] = []
                 t_start = time.monotonic()
                 timed_out = False
+                # HARD wall-clock watchdog (never-hang): the per-line elapsed check below only
+                # fires when a line ARRIVES, so a container that produces NO output (engine wedged,
+                # or a resume-wait container that never gets its marker) would block `for line in
+                # proc.stdout` forever and the timeout would never trigger. A background timer
+                # kills the process at the deadline regardless of output; killing it closes the
+                # pipe, so the read loop ends and we classify the run as a timeout. Cancelled on
+                # normal completion. This matters for `job resume` and `build -v` especially.
+                watchdog_hit = threading.Event()
+
+                def _on_deadline() -> None:
+                    watchdog_hit.set()
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+
+                watchdog = threading.Timer(timeout, _on_deadline)
+                watchdog.daemon = True
+                watchdog.start()
                 try:
                     for line in proc.stdout:
-                        if time.monotonic() - t_start >= timeout:
+                        # Belt-and-suspenders: the per-line elapsed check still catches a slow
+                        # trickle of output between deadline checks; the watchdog above catches a
+                        # total silence.
+                        if watchdog_hit.is_set() or time.monotonic() - t_start >= timeout:
                             proc.kill()
                             timed_out = True
                             break
-                        progress(redact(line, secrets))
+                        effective_progress(redact(line, secrets))
                         raw_lines.append(line)
                 finally:
+                    watchdog.cancel()
                     proc.stdout.close()
                     remaining = max(1.0, timeout - (time.monotonic() - t_start))
                     try:
@@ -604,7 +669,7 @@ def run_in_container(
                     except subprocess.TimeoutExpired:
                         proc.kill()
                         proc.wait()
-                if timed_out:
+                if timed_out or watchdog_hit.is_set():
                     code, output = (
                         CONTAINER_TIMEOUT_CODE,
                         CONTAINER_TIMEOUT_MSG.format(timeout=timeout),
@@ -661,6 +726,21 @@ def run_in_container(
                 )
             except Exception:
                 pass
+        # Snapshot-on-timeout (issue #71): capture /work so `franky job resume` can continue this
+        # run later. The EXTRACT must run before the reap (only the live container has /work), so
+        # it happens here - but ONLY the extract, capped, so the reap is never delayed by the
+        # slower scrub/verify/pack. The finalize runs AFTER the reaps below. Opt-in (sink None for
+        # every non-resume caller) and fully isolated: any failure is swallowed.
+        _snapshot_tmp = None
+        if snapshot_sink is not None and task_launched and code == CONTAINER_TIMEOUT_CODE:
+            try:
+                import tempfile
+
+                _snapshot_tmp = tempfile.mkdtemp(prefix="franky-snapshot-")
+                if not snapshot.extract_workspace(task, _snapshot_tmp, runner):
+                    _snapshot_tmp = None
+            except Exception:
+                _snapshot_tmp = None
         # Best-effort teardown, ALWAYS, in order task -> proxy -> net. A reap FAILURE on the
         # TASK container is surfaced at full severity because it holds the injected creds. A
         # proxy/net reap failure is a lower-severity resource leak (the proxy holds NO creds).
@@ -670,6 +750,17 @@ def run_in_container(
             output += f"\nfranky: WARNING egress proxy {proxy} may not have been removed (resource leak, no creds) - check `docker ps -a`"
         if net_created and not _reap_network(net, runner):
             output += f"\nfranky: WARNING egress network {net} may not have been removed (resource leak) - check `docker network ls`"
+        # Finalize the snapshot AFTER the reap (scrub + fail-closed verify + pack), so the
+        # container is already gone and this potentially-slower step never delays teardown.
+        if _snapshot_tmp is not None:
+            try:
+                path = snapshot.finalize_snapshot(
+                    Path(_snapshot_tmp), Path(snapshot_sink["dest"]), secrets, runner
+                )
+                if path:
+                    snapshot_sink["snapshot_path"] = path
+            except Exception:
+                pass
 
     return code, redact(output, secrets)
 

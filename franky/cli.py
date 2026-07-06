@@ -16,6 +16,7 @@ import os
 import secrets
 import subprocess
 import sys
+import tarfile
 import time
 from collections.abc import Mapping
 from dataclasses import replace as dc_replace
@@ -39,7 +40,7 @@ from .container import (
     resolve_image,
     run_in_container,
 )
-from . import jobs
+from . import jobs, snapshot
 from .container import container_running, reap_run, run_names
 from .engine import ENGINES, PI_PROVIDER_VARS, resolve_engine
 from .github import run_gh
@@ -62,6 +63,7 @@ from .prompt import (
     build_plan_prompt,
     build_prompt,
     build_replay_prompt,
+    build_resume_prompt,
     task_slug,
 )
 from .result import (
@@ -961,6 +963,8 @@ def _run_pass(
     timeout: int | None = None,
     run_id: str | None = None,
     diagnostics_sink: dict | None = None,
+    snapshot_sink: dict | None = None,
+    resume_workspace: str | None = None,
 ) -> tuple[int, str, float]:
     """Run one container pass for `prompt` and return (exit_code, output, duration_secs).
 
@@ -974,6 +978,8 @@ def _run_pass(
     them and `job status`/`kill` can target the SAME containers (issue #63); None -> a fresh id.
     `diagnostics_sink` (issue #69) is forwarded to run_in_container unchanged - see its
     docstring; None (the default) means no capture, byte-identical to pre-#69 behavior.
+    `snapshot_sink`/`resume_workspace` (issue #71) are likewise forwarded unchanged - a
+    snapshot-on-timeout sink and a workspace-to-restore path respectively; both None by default.
     """
     inner_argv = cfg.engine.inner_argv(prompt, model=None)
     extra = {} if timeout is None else {"timeout": timeout}
@@ -987,6 +993,8 @@ def _run_pass(
         progress=progress,
         run_id=run_id,
         diagnostics_sink=diagnostics_sink,
+        snapshot_sink=snapshot_sink,
+        resume_workspace=resume_workspace,
         **extra,
     )
     duration = time.monotonic() - t0
@@ -1099,6 +1107,7 @@ def _record_run_start(
     task_full=None,
     base_sha=None,
     replay_of=None,
+    resumed_from=None,
     env=None,
 ) -> None:
     """Write a status=running registry record before the container pass (issues #63, #64).
@@ -1134,6 +1143,7 @@ def _record_run_start(
             task_full=task_full,
             base_sha=base_sha,
             replay_of=replay_of,
+            resumed_from=resumed_from,
         )
         jobs.write_record(record, env)
         jobs.prune(env)  # only on the write path; never a side effect of a read
@@ -1142,13 +1152,27 @@ def _record_run_start(
 
 
 def _record_run_end(
-    job_id, *, status, pr_url, usage, duration, exit_code, log_path, diagnostics=None, env=None
+    job_id,
+    *,
+    status,
+    pr_url,
+    usage,
+    duration,
+    exit_code,
+    log_path,
+    diagnostics=None,
+    snapshot_path=None,
+    env=None,
 ) -> None:
     """Update the run record once the pass finishes. Best-effort - never raises into a build.
 
     `diagnostics` (issue #69) is the best-effort runtime-signal dict populated (or left empty)
     by a `diagnostics_sink` passed through `_run_pass`; an empty dict is normalized to None so
     the on-disk record matches `jobs.new_record`'s "null until populated" contract.
+
+    `snapshot_path` (issue #71) is the host-local workspace snapshot path a timed-out run left
+    behind (populated by a `snapshot_sink`), or None. It threads into the record so `franky job
+    resume` and `prune` can find/reap the sidecar.
     """
     env = os.environ if env is None else env
     try:
@@ -1168,6 +1192,7 @@ def _record_run_end(
                 "exit_code": exit_code,
                 "log_path": str(log_path),
                 "diagnostics": diagnostics or None,
+                "snapshot_path": snapshot_path or None,
             },
             env,
         )
@@ -1223,6 +1248,8 @@ def _build_once(
         click.echo(f"franky: job {job_id} started", err=True)
     # Populated (best-effort) by run_in_container just before container teardown (issue #69).
     diagnostics: dict = {}
+    # A timed-out build leaves a resumable workspace snapshot (issue #71) keyed to this job id.
+    snapshot_sink: dict = {"dest": str(snapshot.snapshot_path_for(job_id, env))}
     code, output, duration = _run_pass(
         cfg,
         build_prompt(spec, branch=branch, prior_failures=prior_failures),
@@ -1233,6 +1260,7 @@ def _build_once(
         timeout=timeout,
         run_id=job_id,
         diagnostics_sink=diagnostics,
+        snapshot_sink=snapshot_sink,
     )
 
     # Parse usage ONCE; both the prose econ line and the JSON economics block come from it.
@@ -1265,6 +1293,7 @@ def _build_once(
         exit_code=exit_code,
         log_path=log_path,
         diagnostics=diagnostics,
+        snapshot_path=snapshot_sink.get("snapshot_path"),
         env=env,
     )
     return {
@@ -1871,6 +1900,7 @@ def job_kill(ctx: click.Context, job_id: str, as_json: bool) -> None:
         # to read (we pass ""), so dind_ready/tmpfs_full are NOT populated here - only the
         # docker-inspect (exit/OOM/state) + squid-log (egress) signals are.
         diag: dict = {}
+        snapshot_path = None
         if record.get("status") == "running":
             kill_secrets = [os.environ[k] for k in SECRET_KEYS if os.environ.get(k)]
             try:
@@ -1886,11 +1916,27 @@ def job_kill(ctx: click.Context, job_id: str, as_json: bool) -> None:
                 )
             except Exception:
                 diag = {}
+            # Snapshot /work BEFORE reap_run (issue #71): the container is still alive here, so a
+            # killed run stays resumable. Only build/replay/resume runs carry resumable inputs -
+            # an iterate/diagnose run has no workspace worth continuing, so snapshotting it would
+            # just waste work and orphan a tar. Best-effort - a failure never changes the kill.
+            if record.get("command") in ("build", "replay", "resume"):
+                try:
+                    snapshot_path = snapshot.snapshot_workspace(
+                        record.get("container", ""),
+                        snapshot.snapshot_path_for(job_id, os.environ),
+                        kill_secrets,
+                        subprocess.run,
+                    )
+                except Exception:
+                    snapshot_path = None
         reaped = reap_run(job_id)
         if record.get("status") == "running" or reaped:
             patch = {"status": "killed", "ended_at": jobs.now_iso()}
             if diag:
                 patch["diagnostics"] = diag
+            if snapshot_path:
+                patch["snapshot_path"] = snapshot_path
             jobs.update_record(job_id, patch, os.environ)
         if as_json:
             click.echo(
@@ -2257,6 +2303,8 @@ def job_replay(
         # Replay is the debugging command, so capturing runtime signals matters MORE here, not
         # less - same three-line sink pattern as _build_once/iterate.
         diagnostics: dict = {}
+        # A timed-out replay is itself resumable (issue #71) - same snapshot-on-timeout sink.
+        snapshot_sink: dict = {"dest": str(snapshot.snapshot_path_for(new_id, os.environ))}
         # No profile bundle for replay - keep it simple; the original run's own profile (if any)
         # already shaped how it worked, and replay is a debugging tool, not a full build re-run.
         code, output, duration = _run_pass(
@@ -2269,6 +2317,7 @@ def job_replay(
             timeout=max_duration,
             run_id=new_id,
             diagnostics_sink=diagnostics,
+            snapshot_sink=snapshot_sink,
         )
 
         usage = _parse_usage_safe(output)
@@ -2304,6 +2353,7 @@ def job_replay(
             exit_code=exit_code,
             log_path=log_path,
             diagnostics=diagnostics,
+            snapshot_path=snapshot_sink.get("snapshot_path"),
             env=os.environ,
         )
 
@@ -2334,6 +2384,269 @@ def job_replay(
                 f"franky: replay of {job_id} complete (job {new_id}) - see the log in tasks/",
                 err=True,
             )
+        elif status == "no_pr":
+            click.echo(
+                "franky: no PR URL found in agent output - see the redacted log in tasks/",
+                err=True,
+            )
+        ctx.exit(exit_code)
+    except FrankyError as exc:
+        _emit_error(exc, as_json, secrets)
+        ctx.exit(exc.code)
+
+
+@job_group.command("resume")
+@click.argument("job_id")
+@click.option(
+    "--engine",
+    "engine",
+    default=None,
+    type=click.Choice(sorted(ENGINES)),
+    help="Engine override; else FRANKY_ENGINE, else pi.",
+)
+@click.option(
+    "--json", "as_json", is_flag=True, help="Emit the resume result as a single JSON object."
+)
+@click.option(
+    "-v", "--verbose", "verbose", is_flag=True, default=False, help="Stream raw agent output."
+)
+@click.option("-q", "--quiet", "quiet", is_flag=True, help="Suppress progress (implied by --json).")
+@click.option(
+    "--max-duration",
+    "max_duration",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Abort the resume pass after N seconds (default 1800).",
+)
+@click.option(
+    "--force",
+    "force",
+    is_flag=True,
+    help="Skip the idempotency pre-check and resume even if a Franky PR is already open.",
+)
+@click.pass_context
+def job_resume(
+    ctx: click.Context,
+    job_id: str,
+    engine: str | None,
+    as_json: bool,
+    verbose: bool,
+    quiet: bool,
+    max_duration: int | None,
+    force: bool,
+) -> None:
+    """Re-enter a hung/timed-out/killed run WITH its saved /work workspace so it CONTINUES (#71).
+
+    A timed-out or killed run leaves behind a scrubbed, fail-closed-verified, host-local snapshot
+    of its container's `/work` (the repo clone + branch state). `resume` launches a fresh
+    (still fully hardened, egress-controlled) container, restores that workspace into it, and runs
+    a fresh engine that picks the task up from where it left off - instead of restarting from a
+    clean clone.
+
+    Only build/replay runs are resumable (a fresh engine continues from the restored `/work`
+    branch state); iterate/diagnose runs have no such workspace to carry forward.
+
+    V1 LIMITATION: resume restores the FILESYSTEM, NOT the agent's LLM/session state. A fresh
+    engine re-orients from the branch state on disk and continues; it does not remember the prior
+    run's reasoning. Only timeout/killed runs produce a snapshot, so only those are resumable.
+    (Git push still works after resume: the tokenized remote URL is stripped from the snapshot's
+    `.git/config`, but the container re-authenticates from GH_TOKEN, so a bare remote is fine.)
+
+    `--force` skips the idempotency pre-check (bypass, exactly like `build`): resume PUSHES to the
+    branch and opens a PR, so it must not open a second one when a Franky PR is already open -
+    hence the guard, and hence the bypass flag. (`replay` has no `--force` because its default
+    reproduce-only mode pushes nothing; only its `--open-pr` mode gets build's idempotency guard.)
+
+    --json emits the SAME envelope as `build`, with a `resumed_from` field naming the original
+    job id; exit codes follow the documented taxonomy (0 ok, 2 usage, 3 config, 4 task, 7 agent,
+    9 timeout).
+    """
+    quiet = quiet or as_json
+    secrets = cfg_secrets_safe()
+    try:
+        record = _require_record(job_id)
+
+        # Scope gate FIRST so the clearest error wins: a non-resumable command must say
+        # not_resumable, not no_snapshot (an iterate/diagnose run never had resumable inputs).
+        if record.get("command") not in ("build", "replay", "resume"):
+            raise FrankyError(
+                f"cannot resume a {record.get('command')!r} run - resume is only for "
+                "build/replay runs",
+                code=EXIT_USAGE,
+                kind="not_resumable",
+                hint="see `franky jobs`",
+            )
+
+        # A snapshot only exists for a hung/timed-out/killed run - guard on it up front so a run
+        # that was never captured fails cleanly instead of launching an empty resume.
+        snap = snapshot.snapshot_path_for(job_id, os.environ)
+        if not snap.exists():
+            raise FrankyError(
+                "no workspace snapshot for this run - resume is only available for a "
+                "hung/timed-out/killed run whose /work was captured",
+                code=EXIT_USAGE,
+                kind="no_snapshot",
+                hint="see `franky jobs`; only timeout/killed runs produce a snapshot",
+            )
+        # A corrupt/truncated snapshot tar cannot be restored - refuse before spending a container.
+        try:
+            with tarfile.open(snap, "r:gz"):
+                pass
+        except Exception as exc:
+            raise FrankyError(
+                f"workspace snapshot for {job_id} is corrupt or unreadable - cannot resume",
+                code=EXIT_USAGE,
+                kind="snapshot_corrupt",
+            ) from exc
+
+        # Reconstruct the original TaskSpec from the saved inputs (identical to job_replay).
+        source = record.get("source")
+        text = record.get("task_full")
+        repo = record.get("repo")
+        if not source or not text or not repo:
+            raise FrankyError(
+                "this run predates replay/resume support (no saved task inputs) - cannot resume",
+                code=EXIT_USAGE,
+                kind="replay_inputs_missing",
+            )
+
+        # Same config-file merge as build/replay (a config-file token/engine must work here too).
+        try:
+            load_config_file(os.environ)
+        except FrankyError:
+            raise
+        except ValueError as exc:
+            raise ConfigError(f"config file error: {exc}") from exc
+        cfg = load_config(engine, os.environ)
+        secrets = cfg.secret_values()
+
+        # Re-validate the allowlist: the repo may have been dropped since the original run - a
+        # saved record must never bypass the fail-closed gate a fresh build goes through.
+        if not repo_allowed(repo, cfg.allowed_repos):
+            raise TaskRejected(f"repo {repo!r} is no longer in the allowlist - refusing to resume")
+
+        spec = TaskSpec(repo=repo, text=text, source=source)
+        # Prefer the original run's actual branch so the continued work lands on the same head the
+        # idempotency check knows about; fall back to a freshly predicted slug for old records.
+        branch = record.get("branch") or f"franky/{task_slug(spec)}"
+
+        franky_img, proxy_img = _ensure_images(os.environ)
+        verbose = verbose or bool(os.environ.get(FRANKY_VERBOSE_VAR))
+        progress = None if (quiet and not verbose) else _make_progress(cfg.engine, verbose)
+
+        # Idempotency guard (like build): resuming must not open a SECOND PR for the same branch.
+        if not force:
+            existing = find_open_pr(spec.repo, branch, os.environ)
+            if existing:
+                result = build_result(
+                    status="already_open",
+                    pr_url=existing,
+                    reason="a Franky PR is already open for this task",
+                    exit_code=EXIT_SUCCESS,
+                    usage=Usage(),
+                    duration=0.0,
+                    log_path="",
+                    engine=cfg.engine.name,
+                    repo=spec.repo,
+                    branch=branch,
+                    resumed_from=job_id,
+                )
+                _emit_result(
+                    result, as_json, secrets, pr_url=existing, status="already_open", quiet=quiet
+                )
+                ctx.exit(EXIT_SUCCESS)
+
+        new_id = jobs.new_job_id()
+        _record_run_start(
+            new_id,
+            command="resume",
+            cfg=cfg,
+            repo=spec.repo,
+            summary=f"resume of {job_id}",
+            branch=branch,
+            source=source,
+            task_full=text,
+            base_sha=record.get("base_sha"),
+            resumed_from=job_id,
+            env=os.environ,
+        )
+        if not quiet:
+            click.echo(f"franky: job {new_id} started (resume of {job_id})", err=True)
+
+        # Populated (best-effort) by run_in_container just before container teardown (issue #69).
+        diagnostics: dict = {}
+        # A timed-out resume is itself resumable (issue #71) - same snapshot-on-timeout sink.
+        snapshot_sink: dict = {"dest": str(snapshot.snapshot_path_for(new_id, os.environ))}
+        # No profile bundle for resume (mirrors job_replay): the restored /work already carries
+        # the prior run's state, and resume is a continuation tool, not a full build re-run.
+        code, output, duration = _run_pass(
+            cfg,
+            build_resume_prompt(spec, branch=branch),
+            franky_img,
+            proxy_img,
+            None,
+            progress=progress,
+            timeout=max_duration,
+            run_id=new_id,
+            diagnostics_sink=diagnostics,
+            snapshot_sink=snapshot_sink,
+            resume_workspace=str(snap),
+        )
+
+        usage = _parse_usage_safe(output)
+        econ = _economics_line(usage, duration, secrets)
+        if not as_json:
+            click.echo(econ, err=True)
+        log_path = _write_log(output, secrets, footer=econ)
+
+        # Classify (reusing build statuses). Timeout first (124 is nonzero); then nonzero as
+        # agent_error - note the entrypoint's exit 75 on a FAILED restore surfaces here as
+        # agent_error, which is correct; then parse the PR URL.
+        pr_url = None
+        if code == CONTAINER_TIMEOUT_CODE:
+            status, reason, exit_code = "timeout", "exceeded max-duration", EXIT_TIMEOUT
+        elif code != 0:
+            status, reason, exit_code = "agent_error", f"agent exited {code}", EXIT_AGENT
+        else:
+            pr_url = cfg.engine.parse_pr_url(output, repo=spec.repo)
+            if pr_url:
+                status, reason, exit_code = "pr_opened", "PR opened", EXIT_SUCCESS
+            else:
+                status, reason, exit_code = "no_pr", "agent produced no PR URL", EXIT_AGENT
+
+        _record_run_end(
+            new_id,
+            status=status,
+            pr_url=pr_url,
+            usage=usage,
+            duration=duration,
+            exit_code=exit_code,
+            log_path=log_path,
+            diagnostics=diagnostics,
+            snapshot_path=snapshot_sink.get("snapshot_path"),
+            env=os.environ,
+        )
+
+        result = build_result(
+            status=status,
+            pr_url=pr_url,
+            reason=reason,
+            exit_code=exit_code,
+            usage=usage,
+            duration=duration,
+            log_path=str(log_path),
+            engine=cfg.engine.name,
+            repo=spec.repo,
+            branch=branch,
+            job_id=new_id,
+            resumed_from=job_id,
+        )
+        # Non-JSON output mirrors build's discipline: a real PR URL on stdout, a "no PR URL" note
+        # for a clean pass that produced none, and NOTHING extra for timeout/agent_error.
+        if as_json:
+            click.echo(redact(json.dumps(result), secrets))
+        elif status in ("pr_opened", "already_open") and pr_url:
+            click.echo(pr_url)
         elif status == "no_pr":
             click.echo(
                 "franky: no PR URL found in agent output - see the redacted log in tasks/",

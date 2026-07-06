@@ -215,6 +215,7 @@ franky job kill <job_id>       # force-remove a stuck run's container + reap its
 franky job export <job_id>     # bundle a run's record + transcript into a portable .tar.gz
 franky job diagnose <job_id>   # dispatch a read-only agent to explain WHY a run failed
 franky job replay <job_id>     # re-run a build from its saved inputs to reproduce a failure
+franky job resume <job_id>     # continue a hung/timeout/killed run WITH its restored workspace
 ```
 
 This is what turns the half-day silent hang into a 30-second `job status` -> `job kill`. The
@@ -294,6 +295,35 @@ re-run. Pass `--open-pr` once a fix is confirmed to opt into the normal build co
 Only `build`/`replay` runs carry reproducible inputs; a run recorded before replay support was
 added, or whose base commit no longer exists (force-pushed or garbage-collected), is refused
 up front (exit 2) rather than started.
+
+### Resuming a hung / timed-out / killed run
+
+`franky job resume <job_id>` re-enters a hung/timeout/killed run **with its workspace** so a
+fresh engine *continues* it instead of starting over. When a run times out (or you `job kill` a
+wedged one), Franky captures a snapshot of the container's `/work` (the repo clone + its branch
+state) before teardown; `resume` launches a fresh (still fully hardened, egress-controlled)
+container, restores that snapshot into it, and runs the engine on the existing branch.
+
+Only **build/replay** runs are resumable - a fresh engine continues from the restored `/work`
+branch state, which iterate/diagnose runs do not have (resuming one reports `not_resumable`, exit
+2). And only **timeout/killed** runs produce a snapshot, so a clean or never-captured run reports
+`no_snapshot` (exit 2).
+
+> **v1 limitation.** Resume restores the *filesystem*, not the agent's LLM/session state. A fresh
+> engine re-orients from the branch state on disk and continues the task; it does not remember the
+> prior run's reasoning. (Git push still works: the tokenized remote URL is stripped from the
+> snapshot's `.git/config`, but the container re-authenticates from `GH_TOKEN`.)
+
+**Security framing.** The snapshot is scrubbed **fail-closed** before it is stored: known
+credential files (`.git-credentials`, `.netrc`, `*.pem`, ssh keys, `hosts.yml`) are removed, git
+remote URL userinfo and credential-helper lines are stripped from every `.git/config`, and known
+secret values are redacted out of every non-`.git` file. It is then **verified** - every file is
+re-scanned for surviving values and fresh-token patterns, and git history is *decompressed* via
+`git cat-file` and scanned for known values; **any** hit refuses the snapshot (nothing is
+stored). The snapshot is also **contained**: it is host-local, mode `0600`, pruned alongside its
+run record (with orphan sweeping), and **never** included in `franky job export` (the exported
+bundle stays record + redacted transcript only). This is the same trust boundary as
+`~/.franky/config`, which already holds plaintext creds on the host.
 
 ## Planning a big task
 

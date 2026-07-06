@@ -119,6 +119,7 @@ def build_result(
     job_id: str | None = None,
     attempts: list | None = None,
     replay_of: str | None = None,
+    resumed_from: str | None = None,
 ) -> dict:
     """Shape the success/agent-result object emitted on stdout under `--json`.
 
@@ -140,6 +141,10 @@ def build_result(
     `replay_of` (issue #70) is the job id of the original run a `franky job replay` is
     reproducing; included ONLY when not None (mirrors the `attempts` pattern exactly), so build
     and iterate emit the exact same keys as before.
+
+    `resumed_from` (issue #71) is the job id of the original run a `franky job resume` restored
+    the workspace of; included ONLY when not None (same pattern as `replay_of`). A resume reuses
+    the build statuses (pr_opened | no_pr | agent_error | timeout | already_open).
     """
     result = {
         "status": status,
@@ -162,6 +167,8 @@ def build_result(
         result["attempts"] = attempts
     if replay_of is not None:
         result["replay_of"] = replay_of
+    if resumed_from is not None:
+        result["resumed_from"] = resumed_from
     return result
 
 

@@ -790,3 +790,128 @@ def test_job_export_write_failure_json_kind(monkeypatch, tmp_path):
     )
     assert res.exit_code == 2
     assert json.loads(res.stdout)["error"]["kind"] == "export_failed"
+
+
+# ---------------------------------------------------------------------------
+# Workspace snapshot sidecar (issue #71)
+# ---------------------------------------------------------------------------
+
+
+def test_new_record_includes_null_resume_fields():
+    # resumed_from + snapshot_path (issue #71) default null: a plain build/iterate record carries
+    # neither until a resume run / a timeout snapshot populates them.
+    record = _rec()
+    assert record["resumed_from"] is None
+    assert record["snapshot_path"] is None
+
+
+def test_new_record_carries_resumed_from_when_given():
+    record = jobs.new_record(
+        job_id="ab12cd",
+        command="resume",
+        repo="o/r",
+        engine="pi",
+        task="t",
+        container="c",
+        network="n",
+        proxy="p",
+        branch="franky/thing",
+        started_at="2026-07-05T10:00:00+00:00",
+        resumed_from="deadbeef",
+    )
+    assert record["resumed_from"] == "deadbeef"
+    assert record["snapshot_path"] is None
+
+
+def test_prune_unlinks_snapshot_sidecar_with_record(tmp_path):
+    env = _env(tmp_path)
+    now = datetime.now(timezone.utc)
+    jobs.write_record(_rec("aa0002", status="pr_opened", started_at=now.isoformat()), env)
+    jobs.write_record(
+        _rec("aa0001", status="pr_opened", started_at=(now - timedelta(hours=1)).isoformat()), env
+    )
+    # Give the older run a snapshot sidecar; it must be reaped alongside its record.
+    sidecar = jobs.runs_dir(env) / "aa0001.snapshot.tar.gz"
+    sidecar.write_bytes(b"fake snapshot")
+    jobs.prune(env, keep=1)
+    assert not (jobs.runs_dir(env) / "aa0001.json").exists()
+    assert not sidecar.exists()
+
+
+def test_prune_sweeps_orphan_snapshot(tmp_path):
+    env = _env(tmp_path)
+    jobs.runs_dir(env).mkdir(parents=True, exist_ok=True)
+    # A snapshot with NO matching record (a failed record-write / already-pruned record) is swept.
+    orphan = jobs.runs_dir(env) / "0badf00d.snapshot.tar.gz"
+    orphan.write_bytes(b"orphan")
+    jobs.prune(env)
+    assert not orphan.exists()
+
+
+def test_prune_keeps_fresh_running_snapshot(tmp_path):
+    env = _env(tmp_path)
+    now = datetime.now(timezone.utc)
+    # A fresh running record's snapshot must survive the orphan sweep (its record is live).
+    jobs.write_record(_rec("cc0001", status="running", started_at=now.isoformat()), env)
+    sidecar = jobs.runs_dir(env) / "cc0001.snapshot.tar.gz"
+    sidecar.write_bytes(b"in flight")
+    jobs.prune(env)
+    assert sidecar.exists()
+
+
+def test_export_bundle_excludes_snapshot_sidecar(tmp_path):
+    # A snapshot tar sitting beside the record must NEVER be packed into the export bundle - it is
+    # a host-local resume artifact that may contain workspace bytes (issue #71).
+    env = _env(tmp_path)
+    rec = _rec("da7a05", status="killed")
+    jobs.write_record(rec, env)
+    (jobs.runs_dir(env) / "da7a05.snapshot.tar.gz").write_bytes(b"workspace bytes")
+    dest = tmp_path / "bundle.tar.gz"
+    summary = jobs.export_bundle(rec, dest)
+    assert "snapshot" not in " ".join(summary["included"])
+    with tarfile.open(dest, "r:gz") as tar:
+        assert all("snapshot" not in n for n in tar.getnames())
+
+
+def test_job_kill_snapshots_workspace_before_reap(monkeypatch, tmp_path):
+    """A running run's kill captures a workspace snapshot (issue #71) BEFORE reap and records
+    its path."""
+    env = _env(tmp_path)
+    jobs.write_record(_rec("ab0099", status="running"), env)
+    order = []
+    monkeypatch.setattr(cli, "capture_diagnostics", lambda *a, **k: {})
+    monkeypatch.setattr(cli, "reap_run", lambda job_id: (order.append("reap"), True)[1])
+
+    def fake_snapshot_workspace(container, dest, secrets, runner, **kwargs):
+        order.append("snapshot")
+        return str(dest)
+
+    monkeypatch.setattr(cli.snapshot, "snapshot_workspace", fake_snapshot_workspace)
+    res = _cli(monkeypatch, tmp_path, ["job", "kill", "ab0099"])
+    assert res.exit_code == 0
+    # Snapshot must be captured while the container is still alive - before reap_run.
+    assert order == ["snapshot", "reap"]
+    persisted = jobs.read_record("ab0099", env)
+    assert persisted["status"] == "killed"
+    assert persisted["snapshot_path"] == str(jobs.runs_dir(env) / "ab0099.snapshot.tar.gz")
+
+
+def test_job_kill_iterate_running_does_not_snapshot(monkeypatch, tmp_path):
+    """An iterate run has no resumable workspace, so killing it captures diagnostics but must NOT
+    call snapshot_workspace (issue #71)."""
+    env = _env(tmp_path)
+    rec = _rec("ab00aa", status="running")
+    rec["command"] = "iterate"
+    jobs.write_record(rec, env)
+    monkeypatch.setattr(cli, "reap_run", lambda job_id: True)
+    monkeypatch.setattr(cli, "capture_diagnostics", lambda *a, **k: {})
+    monkeypatch.setattr(
+        cli.snapshot,
+        "snapshot_workspace",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("snapshot_workspace called")),
+    )
+    res = _cli(monkeypatch, tmp_path, ["job", "kill", "ab00aa"])
+    assert res.exit_code == 0
+    persisted = jobs.read_record("ab00aa", env)
+    assert persisted["status"] == "killed"
+    assert persisted["snapshot_path"] is None

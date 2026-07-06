@@ -96,6 +96,7 @@ def new_record(
     task_full: str | None = None,
     base_sha: str | None = None,
     replay_of: str | None = None,
+    resumed_from: str | None = None,
 ) -> dict:
     """Shape the initial (status=running) record written before the container pass starts.
 
@@ -110,6 +111,12 @@ def new_record(
     a later `job replay` reconstruct the original TaskSpec; `base_sha` (the default-branch tip at
     build start, see baseref.resolve_base_sha) pins the commit a replay checks out; `replay_of`
     (set only on a run THAT IS a replay) names the original job id being reproduced.
+
+    `resumed_from` + `snapshot_path` support `franky job resume` (issue #71): `resumed_from` (set
+    only on a run THAT IS a resume) names the original job whose workspace was restored;
+    `snapshot_path` (null here, set later via update_record like diagnostics) is the host-local
+    path of the scrubbed, fail-closed-verified workspace snapshot this run produced on timeout.
+    Both default null so a caller that never passes them is byte-identical to before.
     """
     return {
         "job_id": job_id,
@@ -136,6 +143,8 @@ def new_record(
         "task_full": task_full,
         "base_sha": base_sha,
         "replay_of": replay_of,
+        "resumed_from": resumed_from,
+        "snapshot_path": None,
     }
 
 
@@ -252,16 +261,42 @@ def prune(env: Mapping[str, str] | None = None, keep: int = DEFAULT_KEEP) -> int
     grow the dir unbounded.
     """
     records = list_records(env)  # newest first
+    directory = runs_dir(env)
     removed = 0
     for record in records[keep:]:
         if _is_fresh_running(record):
             continue
-        path = _record_path(record.get("job_id", ""), env)
+        job_id = record.get("job_id", "")
+        path = _record_path(job_id, env)
         if path is None:
             continue
         try:
             path.unlink(missing_ok=True)
             removed += 1
+        except OSError:
+            pass
+        # Remove the run's workspace snapshot sidecar (issue #71) alongside its record. The
+        # sidecar path is inlined here (NOT via snapshot.snapshot_path_for) to avoid an import
+        # cycle: snapshot imports jobs.runs_dir, so jobs must not import snapshot.
+        try:
+            (directory / f"{job_id}.snapshot.tar.gz").unlink(missing_ok=True)
+        except OSError:
+            pass
+    # Sweep ORPHAN snapshots (issue #71): a snapshot whose <id>.json record no longer exists (a
+    # failed record-write, or a record pruned in an earlier pass) would otherwise leak disk
+    # forever. A snapshot whose record IS a fresh `running` one is never touched (its record
+    # survives above, so its id is in `live_ids`).
+    live_ids = {r.get("job_id", "") for r in records}
+    try:
+        snapshots = sorted(directory.glob("*.snapshot.tar.gz"))
+    except OSError:
+        snapshots = []
+    for snap in snapshots:
+        snap_id = snap.name[: -len(".snapshot.tar.gz")]
+        if snap_id in live_ids:
+            continue
+        try:
+            snap.unlink(missing_ok=True)
         except OSError:
             pass
     return removed
@@ -379,6 +414,12 @@ def export_bundle(record: dict, dest: Path) -> dict:
     by construction, so this adds no new redaction surface. Returns
     {output_path, bytes, included}. Raises OSError on a write failure (the caller maps it to a
     clean typed error); a transcript that has since been deleted is simply omitted, not fatal.
+
+    DELIBERATELY EXCLUDED (issue #71): the run's workspace snapshot sidecar
+    (`<id>.snapshot.tar.gz`, sitting right beside the record) is NEVER added to the bundle. It is
+    a host-local resume artifact that may contain workspace bytes; unlike record.json and the
+    redacted transcript it is not a secret-free forensic artifact, so it stays on the host. Only
+    the two members below are ever packed - do not extend this to pick up the sidecar.
     """
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)

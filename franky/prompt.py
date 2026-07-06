@@ -278,6 +278,45 @@ def build_replay_prompt(
     return f"{persona}\n\n{task_block}\n{conventions}"
 
 
+def build_resume_prompt(spec: TaskSpec, *, branch: str) -> str:
+    """Prompt for `franky job resume`: continue a hung/timed-out/killed run's restored workspace.
+
+    WHY this differs from a fresh build: resume restores the FILESYSTEM (the prior run's `/work`
+    clone + its branch state), NOT the agent's LLM/session state. A fresh engine therefore
+    re-orients from the branch state on disk and carries the original task forward from where it
+    left off, rather than re-cloning and starting over.
+
+    Standalone like `build_replay_prompt` - it reuses `_task_block` (repo line + task/issue
+    framing, identical to a normal build) but owns its own conventions block so the
+    do-not-re-clone / restored-under-/work framing lives in exactly one place. `branch` is the
+    original run's branch (recorded, or a freshly predicted slug); the agent stays on it so the
+    continued work lands on the same head the idempotency check knows about.
+    """
+    persona = load_persona()
+    task_block, close_line = _task_block(spec, plan=False)
+
+    conventions = (
+        "Conventions (follow exactly):\n"
+        f"- RESUME MODE: your prior workspace - the clone of {spec.repo} and its branch state - "
+        "has been RESTORED under `/work`. `cd` into the existing clone there and do NOT re-clone "
+        "the repo.\n"
+        "- Continue the original task from where it left off, building on the work already "
+        "present in the restored workspace.\n"
+        f"- Stay on the existing branch `{branch}`; do NOT create a new branch.\n"
+        "- Run the repo's tests and make them pass BEFORE opening the PR. Do not open a PR on "
+        "red tests.\n"
+        "- Use conventional-commit messages: `<type>: <summary>` (e.g. `feat:`, `fix:`, "
+        "`chore:`).\n"
+        "- The PR body must contain three sections: what (the change), why (the motivation), "
+        "and a test-plan (how you verified it).\n"
+        f"{close_line}"
+        "- Open the PR with `gh pr create`. Do NOT merge it - a human reviews every change.\n"
+        "- Keep commit messages and PR text professional; no persona flavor in the deliverables.\n"
+    )
+
+    return f"{persona}\n\n{task_block}\n{conventions}"
+
+
 def build_plan_prompt(spec: TaskSpec) -> str:
     """Prompt for the `--plan-first` planning pass: produce a plan, change NOTHING.
 

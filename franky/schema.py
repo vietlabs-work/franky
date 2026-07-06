@@ -44,6 +44,8 @@ _RESULT_SCHEMA: dict = {
     "{job_id, status, retry_hint} - one entry per attempt, in order. Absent on a plain build.",
     "replay_of": "present ONLY on a `franky job replay` run: the job_id of the original run "
     "being reproduced. Absent on build/iterate.",
+    "resumed_from": "present ONLY on a `franky job resume` run: the job_id of the original run "
+    "whose workspace was restored. Absent on build/iterate.",
 }
 
 # Static description of the `franky job diagnose` success object (build_diagnosis_result). A
@@ -90,7 +92,8 @@ _PLAN_RESULT_SCHEMA: dict = {
 # needs described so it can consume `job status --json` without guessing at field meaning.
 _JOB_RECORD_SCHEMA: dict = {
     "job_id": "the run handle (see result_schema.job_id)",
-    "command": "the Franky command that produced this run: build | iterate | diagnose | replay",
+    "command": "the Franky command that produced this run: build | iterate | diagnose | replay | "
+    "resume",
     "repo": "the target owner/repo",
     "engine": "the resolved engine name (e.g. pi | claude | codex)",
     "task": "a redacted, truncated summary of the task text (a handle, not the full prompt)",
@@ -122,6 +125,10 @@ _JOB_RECORD_SCHEMA: dict = {
     "records written before replay support was added.",
     "replay_of": "set ONLY on a run that IS a replay: the job_id of the original run being "
     "reproduced. Null otherwise.",
+    "resumed_from": "set ONLY on a run that IS a resume (issue #71): the job_id of the original "
+    "run whose workspace was restored. Null otherwise.",
+    "snapshot_path": "path to the scrubbed, fail-closed-verified, host-local workspace snapshot "
+    "used to resume this run (issue #71); never exported; null if none.",
 }
 
 # Static description of the error object (the dict build_error shapes), emitted on stdout
