@@ -129,6 +129,53 @@ def test_build_result_no_pr_and_unknown_economics():
     assert r["economics"]["duration_s"] == 2.0
 
 
+def test_build_result_omits_replay_of_when_none():
+    # A plain build/iterate must emit the exact same keys as before replay support existed -
+    # replay_of simply does not appear (mirrors the `attempts` byte-identical contract).
+    r = build_result(
+        status="pr_opened",
+        pr_url="https://github.com/me/repo/pull/11",
+        reason="PR opened",
+        exit_code=0,
+        usage=Usage(),
+        duration=1.0,
+        log_path="tasks/x.log",
+        engine="pi",
+        repo="me/repo",
+    )
+    assert "replay_of" not in r
+    assert set(r.keys()) == {
+        "status",
+        "pr_url",
+        "branch",
+        "reason",
+        "exit_code",
+        "economics",
+        "log_path",
+        "engine",
+        "repo",
+        "job_id",
+    }
+
+
+def test_build_result_includes_replay_of_when_set():
+    r = build_result(
+        status="replay_complete",
+        pr_url=None,
+        reason="reproduce-only replay pass complete",
+        exit_code=0,
+        usage=Usage(),
+        duration=1.0,
+        log_path="tasks/x.log",
+        engine="pi",
+        repo="me/repo",
+        job_id="newid01",
+        replay_of="origid01",
+    )
+    assert r["replay_of"] == "origid01"
+    assert r["status"] == "replay_complete"
+
+
 def test_build_result_iterate_complete_uses_input_url():
     r = build_result(
         status="iterate_complete",

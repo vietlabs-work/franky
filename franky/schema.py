@@ -21,7 +21,7 @@ from . import result
 # JSON the run emits. The field meanings mirror result.build_result.
 _RESULT_SCHEMA: dict = {
     "status": "result class: pr_opened | no_pr | agent_error | timeout | already_open | "
-    "iterate_complete",
+    "iterate_complete | replay_complete",
     "pr_url": "the PR URL (string) or null when none was produced",
     "branch": "the PREDICTED branch name (`franky/<slug>`) computed host-side; MAY differ "
     "from the branch the agent actually created. null for iterate.",
@@ -42,6 +42,8 @@ _RESULT_SCHEMA: dict = {
     "container ran (e.g. already_open).",
     "attempts": "present ONLY for a `build --retry` run (issue #64): an array of "
     "{job_id, status, retry_hint} - one entry per attempt, in order. Absent on a plain build.",
+    "replay_of": "present ONLY on a `franky job replay` run: the job_id of the original run "
+    "being reproduced. Absent on build/iterate.",
 }
 
 # Static description of the `franky job diagnose` success object (build_diagnosis_result). A
@@ -88,7 +90,7 @@ _PLAN_RESULT_SCHEMA: dict = {
 # needs described so it can consume `job status --json` without guessing at field meaning.
 _JOB_RECORD_SCHEMA: dict = {
     "job_id": "the run handle (see result_schema.job_id)",
-    "command": "the Franky command that produced this run: build | iterate | diagnose",
+    "command": "the Franky command that produced this run: build | iterate | diagnose | replay",
     "repo": "the target owner/repo",
     "engine": "the resolved engine name (e.g. pi | claude | codex)",
     "task": "a redacted, truncated summary of the task text (a handle, not the full prompt)",
@@ -97,7 +99,7 @@ _JOB_RECORD_SCHEMA: dict = {
     "proxy": "the egress proxy sidecar's name",
     "branch": "the predicted branch name (`franky/<slug>`), or null (iterate/diagnose have none)",
     "status": "running | pr_opened | no_pr | agent_error | timeout | already_open | "
-    "iterate_complete | killed | diagnosed | diagnose_failed",
+    "iterate_complete | killed | diagnosed | diagnose_failed | replay_complete",
     "started_at": "ISO-8601 UTC timestamp when the run was registered",
     "ended_at": "ISO-8601 UTC timestamp when the run finished, or null while running",
     "pr_url": "the PR URL (string) or null when none was produced",
@@ -109,6 +111,17 @@ _JOB_RECORD_SCHEMA: dict = {
     "oom_killed (bool), task_state (str), dind_ready (bool|null: nested rootless Docker daemon "
     "readiness), tmpfs_full (bool), egress_denied (array of {host, count} the Squid proxy "
     "403'd - hosts redacted), proxy_denied_count (int).",
+    "source": "the TaskSpec source this run was built from: issue | jira | prose | pr, or null "
+    "(issue #70 - lets `job replay` reconstruct the original TaskSpec). Null on records "
+    "written before replay support was added.",
+    "task_full": "the REDACTED, PROSE_MAX_CHARS-capped full task text (issue #70) - the saved "
+    "input `job replay` reconstructs its TaskSpec from, distinct from `task`'s 200-char display "
+    "summary. Null on records written before replay support was added.",
+    "base_sha": "the target repo's default-branch tip at build start (issue #70, see "
+    "baseref.resolve_base_sha) - the commit `job replay` checks out. Null when unresolved or on "
+    "records written before replay support was added.",
+    "replay_of": "set ONLY on a run that IS a replay: the job_id of the original run being "
+    "reproduced. Null otherwise.",
 }
 
 # Static description of the error object (the dict build_error shapes), emitted on stdout

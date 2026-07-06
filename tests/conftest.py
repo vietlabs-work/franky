@@ -52,12 +52,16 @@ def _hermetic_config_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
 
 @pytest.fixture(autouse=True)
 def _no_idempotency_network(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Stub the idempotency pre-check to "no open PR" for every test (no real network).
+    """Stub the host-side GitHub GETs to "nothing found" for every test (no real network).
 
-    `franky build` calls find_open_pr (issue #50) against the GitHub REST API. Default it to
-    None so the existing build tests never hit the network and proceed to the container path;
-    tests that exercise the already_open short-circuit override this symbol explicitly.
+    `franky build` calls find_open_pr (issue #50) AND baseref.resolve_base_sha (issue #70)
+    against the GitHub REST API before the container pass. Default BOTH to None so the existing
+    build tests never hit the network and proceed to the container path; tests that exercise the
+    already_open short-circuit (or a specific base_sha) override these symbols explicitly.
+    Without the resolve_base_sha stub every full-path build test does a real api.github.com GET,
+    which is slow (~13s suite vs ~1.4s) and flaky in CI.
     """
     import franky.cli as cli
 
     monkeypatch.setattr(cli, "find_open_pr", lambda *a, **k: None)
+    monkeypatch.setattr(cli.baseref, "resolve_base_sha", lambda *a, **k: None)

@@ -214,6 +214,7 @@ franky job logs <job_id>       # print the run's redacted transcript
 franky job kill <job_id>       # force-remove a stuck run's container + reap its proxy/network
 franky job export <job_id>     # bundle a run's record + transcript into a portable .tar.gz
 franky job diagnose <job_id>   # dispatch a read-only agent to explain WHY a run failed
+franky job replay <job_id>     # re-run a build from its saved inputs to reproduce a failure
 ```
 
 This is what turns the half-day silent hang into a 30-second `job status` -> `job kill`. The
@@ -269,6 +270,30 @@ result then carries an `attempts` trail; a plain `build` (no `--retry`) is uncha
 > `job logs` shows the transcript once the run finishes (it is written at the end); for a live
 > view during a run use `franky build -v`. A `--detach` launch mode, `job shell` (exec into a
 > running container), and `logs -f` are tracked as follow-ups.
+
+### Replaying a run
+
+`franky job replay <job_id>` re-runs a recorded `build` (or an earlier `replay`) from its
+**saved inputs** - the original task text and the exact base commit (the target repo's
+default-branch tip at the start of that run's build pass, after any `--plan-first` approval) -
+so you get a controlled, repeatable starting
+point for debugging a failure. It is **reproduce-only by default**: the container makes the
+change and reports what happened, but pushes nothing and opens no PR, so it is always safe to
+re-run. Pass `--open-pr` once a fix is confirmed to opt into the normal build conventions
+(branch, tests-green-before-PR, `gh pr create`).
+
+> **Nondeterminism caveat.** Replay reproduces the *inputs* (task + base commit), not
+> bit-identical output - the underlying LLM is not deterministic, so a replay's transcript can
+> still diverge from the original even with identical inputs.
+
+> **Source-fidelity note.** A jira- or prose-sourced replay uses the frozen task text recorded
+> at the original run. An issue-sourced replay re-fetches the live issue via `gh issue view`
+> inside the container, so it reflects the issue's current content, not necessarily its state
+> at the original run.
+
+Only `build`/`replay` runs carry reproducible inputs; a run recorded before replay support was
+added, or whose base commit no longer exists (force-pushed or garbage-collected), is refused
+up front (exit 2) rather than started.
 
 ## Planning a big task
 

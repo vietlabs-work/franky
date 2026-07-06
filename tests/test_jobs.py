@@ -67,6 +67,39 @@ def test_new_record_includes_null_diagnostics():
     assert record["diagnostics"] is None
 
 
+def test_new_record_includes_null_replay_fields():
+    # source/task_full/base_sha/replay_of (issue #70) all default to null when a caller (like
+    # iterate/diagnose) never passes them - a record with no saved inputs cannot be replayed.
+    record = _rec()
+    assert record["source"] is None
+    assert record["task_full"] is None
+    assert record["base_sha"] is None
+    assert record["replay_of"] is None
+
+
+def test_new_record_carries_replay_fields_when_given():
+    record = jobs.new_record(
+        job_id="eee555",
+        command="build",
+        repo="o/r",
+        engine="pi",
+        task="do a thing",
+        container="c",
+        network="n",
+        proxy="p",
+        branch="franky/thing",
+        started_at="2026-07-05T10:00:00+00:00",
+        source="prose",
+        task_full="do a thing in full",
+        base_sha="abc1234",
+        replay_of=None,
+    )
+    assert record["source"] == "prose"
+    assert record["task_full"] == "do a thing in full"
+    assert record["base_sha"] == "abc1234"
+    assert record["replay_of"] is None
+
+
 def test_read_malformed_returns_none(tmp_path):
     env = _env(tmp_path)
     jobs.runs_dir(env).mkdir(parents=True, exist_ok=True)

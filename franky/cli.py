@@ -24,9 +24,9 @@ from pathlib import Path
 
 import click
 
-from . import franky_version
+from . import baseref, franky_version
 from ._install import detect_install
-from .config import GH_TOKEN_VAR, Config, load_config, redact
+from .config import GH_TOKEN_VAR, Config, load_config, redact, repo_allowed
 from .decompose import build_plan_result, parse_decomposition
 from .diagnosis import build_diagnosis_result, parse_diagnosis
 from .economics import Usage, format_economics, parse_usage
@@ -61,6 +61,7 @@ from .prompt import (
     build_iterate_prompt,
     build_plan_prompt,
     build_prompt,
+    build_replay_prompt,
     task_slug,
 )
 from .result import (
@@ -73,6 +74,7 @@ from .result import (
     DockerError,
     FrankyError,
     NetworkError,
+    TaskRejected,
     build_error,
     build_result,
 )
@@ -453,6 +455,15 @@ def build(
                     )
                 ctx.exit(EXIT_SUCCESS)
 
+        # Capture the replay pin ONCE, before the attempt loop (issue #70): the base commit is
+        # "the target repo's default-branch tip at build start", so every attempt of THIS build
+        # (including retries) records the SAME base_sha - a retry re-diagnosing the same task is
+        # still reproducing the same starting state, not a moving target. Best-effort: one extra
+        # GitHub GET alongside the existing idempotency check; None (unresolved) just means a
+        # later `job replay` of this run cannot pin a commit, never a build failure.
+        base_sha = baseref.resolve_base_sha(spec.repo, os.environ)
+        task_full = redact(spec.text, secrets)[:PROSE_MAX_CHARS]
+
         # PHASE 2 (or the only phase without --plan-first): build it and open the PR, with up to
         # `retry` diagnose-and-retry rounds (issue #64 #5). Each attempt is its own registered run
         # (issue #63); `--retry 0` runs the loop body exactly once, identical to before.
@@ -494,6 +505,9 @@ def build(
                 quiet=quiet,
                 prior_failures=prior_failures,
                 env=os.environ,
+                source=spec.source,
+                task_full=task_full,
+                base_sha=base_sha,
             )
             attempts.append(
                 {"job_id": final["job_id"], "status": final["status"], "retry_hint": ""}
@@ -1073,7 +1087,20 @@ def cfg_secrets_safe() -> list[str]:
     return [v for v in (os.environ.get(JIRA_API_TOKEN_VAR), os.environ.get(JIRA_EMAIL_VAR)) if v]
 
 
-def _record_run_start(job_id, *, command, cfg, repo, summary, branch=None, env=None) -> None:
+def _record_run_start(
+    job_id,
+    *,
+    command,
+    cfg,
+    repo,
+    summary,
+    branch=None,
+    source=None,
+    task_full=None,
+    base_sha=None,
+    replay_of=None,
+    env=None,
+) -> None:
     """Write a status=running registry record before the container pass (issues #63, #64).
 
     Best-effort: any failure is swallowed so a registry hiccup can never block a run (mirrors
@@ -1081,6 +1108,12 @@ def _record_run_start(job_id, *, command, cfg, repo, summary, branch=None, env=N
     the full string first so a secret can't be sliced in half and dodge the pattern. Takes `repo`
     + `summary` directly (not a TaskSpec) so build/iterate AND the specless `diagnose` pass can
     all register through this one helper.
+
+    `source`/`task_full`/`base_sha`/`replay_of` (issue #70) are the replay-support fields; all
+    default to None so a caller that never passes them is byte-identical to before. `task_full`
+    MUST already be redacted by the caller (build passes `redact(spec.text, secrets)
+    [:PROSE_MAX_CHARS]`) - unlike `summary`, this helper does not re-redact it, since the caller
+    controls truncation length independently of `_JOB_TASK_SUMMARY_MAX`.
     """
     env = os.environ if env is None else env
     try:
@@ -1097,6 +1130,10 @@ def _record_run_start(job_id, *, command, cfg, repo, summary, branch=None, env=N
             proxy=proxy,
             branch=branch,
             started_at=jobs.now_iso(),
+            source=source,
+            task_full=task_full,
+            base_sha=base_sha,
+            replay_of=replay_of,
         )
         jobs.write_record(record, env)
         jobs.prune(env)  # only on the write path; never a side effect of a read
@@ -1153,6 +1190,9 @@ def _build_once(
     quiet,
     prior_failures,
     env,
+    source=None,
+    task_full=None,
+    base_sha=None,
 ) -> dict:
     """Run ONE build attempt end to end and return its outcome (issue #64 #5).
 
@@ -1161,10 +1201,23 @@ def _build_once(
     and finalizes the record. Returns a dict the `build` retry loop consumes:
     {job_id, status, reason, exit_code, pr_url, output, log_path, usage, duration}. The
     classification (timeout > nonzero > pr_opened > no_pr) is identical to the pre-retry code.
+
+    `source`/`task_full`/`base_sha` (issue #70) are threaded straight into `_record_run_start`
+    so every build attempt's record carries the saved inputs a later `job replay` needs; all
+    default to None (a caller that omits them records byte-identical to before).
     """
     job_id = jobs.new_job_id()
     _record_run_start(
-        job_id, command="build", cfg=cfg, repo=spec.repo, summary=spec.text, branch=branch, env=env
+        job_id,
+        command="build",
+        cfg=cfg,
+        repo=spec.repo,
+        summary=spec.text,
+        branch=branch,
+        source=source,
+        task_full=task_full,
+        base_sha=base_sha,
+        env=env,
     )
     if not quiet:
         click.echo(f"franky: job {job_id} started", err=True)
@@ -2001,6 +2054,292 @@ def job_diagnose(
             for line in _format_diagnosis(diagnosis):
                 click.echo(redact(line, secrets))
         ctx.exit(EXIT_SUCCESS)
+    except FrankyError as exc:
+        _emit_error(exc, as_json, secrets)
+        ctx.exit(exc.code)
+
+
+@job_group.command("replay")
+@click.argument("job_id")
+@click.option(
+    "--engine",
+    "engine",
+    default=None,
+    type=click.Choice(sorted(ENGINES)),
+    help="Engine override; else FRANKY_ENGINE, else pi.",
+)
+@click.option(
+    "--json", "as_json", is_flag=True, help="Emit the replay result as a single JSON object."
+)
+@click.option(
+    "-v", "--verbose", "verbose", is_flag=True, default=False, help="Stream raw agent output."
+)
+@click.option("-q", "--quiet", "quiet", is_flag=True, help="Suppress progress (implied by --json).")
+@click.option(
+    "--max-duration",
+    "max_duration",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Abort the replay pass after N seconds (default 1800).",
+)
+@click.option(
+    "--open-pr",
+    "open_pr",
+    is_flag=True,
+    default=False,
+    help="Opt into opening a real PR (branch + gh pr create) instead of the default "
+    "reproduce-only pass.",
+)
+@click.pass_context
+def job_replay(
+    ctx: click.Context,
+    job_id: str,
+    engine: str | None,
+    as_json: bool,
+    verbose: bool,
+    quiet: bool,
+    max_duration: int | None,
+    open_pr: bool,
+) -> None:
+    """Re-run a recorded build/replay from its SAVED inputs to reproduce a failure (issue #70).
+
+    Reconstructs the original task (its source + REDACTED full text, saved at the time of the
+    original run) and re-runs it in the SAME hardened, egress-controlled container `build`
+    uses, pinned to the EXACT base commit the original run started from (the target repo's
+    default-branch tip at that run's build start - see `franky/baseref.py`). REPRODUCE-ONLY by
+    default: the container makes the change and reports what happened, but creates no branch,
+    pushes nothing, and opens no PR - a replay is always safe to run without risking a
+    duplicate PR. Pass --open-pr to opt into the normal build conventions (a `franky/<slug>`
+    branch, tests-green-before-PR, `gh pr create`) once a fix is confirmed.
+
+    NONDETERMINISM CAVEAT: replay reproduces the INPUTS (the task text + the base commit), NOT
+    bit-identical output - the underlying LLM is not deterministic, so a replay's transcript can
+    still diverge from the original even with identical inputs.
+
+    SOURCE-FIDELITY NOTE: a jira- or prose-sourced replay uses the FROZEN task text recorded at
+    the original run (jira: the fetched issue body as it was then; prose: the prose itself) - it
+    reflects that run's inputs exactly. An ISSUE-sourced replay instead re-fetches the live issue
+    via `gh issue view` inside the container (identical to a normal `build` on an issue URL), so
+    it reflects the issue's CURRENT content, not necessarily its state at the original run.
+
+    Only `build`/`replay` runs have saved, reproducible inputs (`iterate`/`diagnose` runs do
+    not) - replaying anything else is exit 2. A run recorded before replay support was added has
+    no saved inputs either and cannot be replayed (exit 2), and a base commit that no longer
+    exists on the repo (force-pushed or garbage-collected) is refused up front (exit 2) rather
+    than started and left to fail deep inside the container.
+
+    --json emits one machine-readable result object on stdout (the SAME envelope as `build`,
+    with a `replay_of` field naming the original job id); exit codes follow the documented
+    taxonomy (0 ok, 2 usage, 3 config, 4 task, 7 agent, 9 timeout).
+    """
+    quiet = quiet or as_json
+    secrets = cfg_secrets_safe()
+    try:
+        record = _require_record(job_id)
+        if record.get("command") not in ("build", "replay"):
+            raise FrankyError(
+                f"cannot replay a {record.get('command')!r} run - only build/replay runs have "
+                "reproducible inputs",
+                code=EXIT_USAGE,
+                kind="not_replayable",
+                hint="see `franky jobs` for build runs",
+            )
+
+        # Reconstruct the original TaskSpec from the saved inputs. A record written before
+        # replay support was added has none of these - refuse cleanly rather than replay junk.
+        source = record.get("source")
+        text = record.get("task_full")
+        repo = record.get("repo")
+        if not source or not text or not repo:
+            raise FrankyError(
+                "this run predates replay support (no saved task inputs) - cannot replay",
+                code=EXIT_USAGE,
+                kind="replay_inputs_missing",
+            )
+
+        # Same config-file merge as build/diagnose (a config-file token/engine must work here too).
+        try:
+            load_config_file(os.environ)
+        except FrankyError:
+            raise
+        except ValueError as exc:
+            raise ConfigError(f"config file error: {exc}") from exc
+        cfg = load_config(engine, os.environ)
+        secrets = cfg.secret_values()
+
+        # Re-validate the allowlist: the repo may have been dropped from it since the original
+        # run - a saved record must never bypass the fail-closed gate a fresh build goes through.
+        if not repo_allowed(repo, cfg.allowed_repos):
+            raise TaskRejected(f"repo {repo!r} is no longer in the allowlist - refusing to replay")
+
+        base_sha = record.get("base_sha")
+        if not base_sha:
+            raise FrankyError(
+                "no base commit was recorded for this run - cannot replay deterministically",
+                code=EXIT_USAGE,
+                kind="base_sha_unavailable",
+                hint="only runs recorded after replay support was added carry a base commit",
+            )
+        # Shape-validate BEFORE it reaches the prompt (or commit_exists' None-on-uncertain path):
+        # a corrupt/hand-edited record could carry a junk base_sha that is truthy but not a real
+        # sha; refuse it rather than interpolate it into the replay prompt's checkout instruction.
+        if not baseref.is_valid_sha(base_sha):
+            raise FrankyError(
+                "recorded base commit is malformed - cannot replay",
+                code=EXIT_USAGE,
+                kind="base_sha_unavailable",
+            )
+
+        # Pre-flight, host-side: fail fast (no container spent) if the commit is PROVABLY gone.
+        # None (uncertain - a flaky check or a genuinely ambiguous response) proceeds anyway; the
+        # in-container checkout fails cleanly if the commit truly no longer exists.
+        exists = baseref.commit_exists(repo, base_sha, os.environ)
+        if exists is False:
+            raise FrankyError(
+                f"base commit {base_sha} no longer exists on {repo} (force-pushed or "
+                "garbage-collected) - cannot replay",
+                code=EXIT_USAGE,
+                kind="base_commit_gone",
+            )
+
+        spec = TaskSpec(repo=repo, text=text, source=source)
+        # Prefer the ORIGINAL run's actual branch (if recorded) so an --open-pr replay targets
+        # the same head the idempotency check already knows about; fall back to a freshly
+        # predicted slug for very old records with no branch saved (iterate/diagnose have none,
+        # but those are already rejected above).
+        branch = record.get("branch") or f"franky/{task_slug(spec)}"
+
+        franky_img, proxy_img = _ensure_images(os.environ)
+        verbose = verbose or bool(os.environ.get(FRANKY_VERBOSE_VAR))
+        progress = None if (quiet and not verbose) else _make_progress(cfg.engine, verbose)
+
+        # --open-pr replay reuses build's idempotency guard: retrying a replay must not open a
+        # second PR for the same branch.
+        if open_pr:
+            existing = find_open_pr(spec.repo, branch, os.environ)
+            if existing:
+                result = build_result(
+                    status="already_open",
+                    pr_url=existing,
+                    reason="a Franky PR is already open for this task",
+                    exit_code=EXIT_SUCCESS,
+                    usage=Usage(),
+                    duration=0.0,
+                    log_path="",
+                    engine=cfg.engine.name,
+                    repo=spec.repo,
+                    branch=branch,
+                    replay_of=job_id,
+                )
+                _emit_result(
+                    result, as_json, secrets, pr_url=existing, status="already_open", quiet=quiet
+                )
+                ctx.exit(EXIT_SUCCESS)
+
+        new_id = jobs.new_job_id()
+        _record_run_start(
+            new_id,
+            command="replay",
+            cfg=cfg,
+            repo=spec.repo,
+            summary=f"replay of {job_id}",
+            branch=branch,
+            source=source,
+            task_full=text,
+            base_sha=base_sha,
+            replay_of=job_id,
+            env=os.environ,
+        )
+        if not quiet:
+            click.echo(f"franky: job {new_id} started (replay of {job_id})", err=True)
+
+        # Populated (best-effort) by run_in_container just before container teardown (issue #69).
+        # Replay is the debugging command, so capturing runtime signals matters MORE here, not
+        # less - same three-line sink pattern as _build_once/iterate.
+        diagnostics: dict = {}
+        # No profile bundle for replay - keep it simple; the original run's own profile (if any)
+        # already shaped how it worked, and replay is a debugging tool, not a full build re-run.
+        code, output, duration = _run_pass(
+            cfg,
+            build_replay_prompt(spec, branch=branch, base_sha=base_sha, open_pr=open_pr),
+            franky_img,
+            proxy_img,
+            profile_bundle=None,
+            progress=progress,
+            timeout=max_duration,
+            run_id=new_id,
+            diagnostics_sink=diagnostics,
+        )
+
+        usage = _parse_usage_safe(output)
+        econ = _economics_line(usage, duration, secrets)
+        if not as_json:
+            click.echo(econ, err=True)
+        log_path = _write_log(output, secrets, footer=econ)
+
+        pr_url = None
+        if code == CONTAINER_TIMEOUT_CODE:
+            status, reason, exit_code = "timeout", "exceeded max-duration", EXIT_TIMEOUT
+        elif code != 0:
+            status, reason, exit_code = "agent_error", f"agent exited {code}", EXIT_AGENT
+        elif open_pr:
+            pr_url = cfg.engine.parse_pr_url(output, repo=spec.repo)
+            if pr_url:
+                status, reason, exit_code = "pr_opened", "PR opened", EXIT_SUCCESS
+            else:
+                status, reason, exit_code = "no_pr", "agent produced no PR URL", EXIT_AGENT
+        else:
+            # Reproduce-only clean exit: neither a build success nor failure (see jobs.py's
+            # _SUCCESS_STATUSES/_FAILURE_STATUSES comment) - the pass ran and reported, that's it.
+            status = "replay_complete"
+            reason = "reproduce-only replay pass complete"
+            exit_code = EXIT_SUCCESS
+
+        _record_run_end(
+            new_id,
+            status=status,
+            pr_url=pr_url,
+            usage=usage,
+            duration=duration,
+            exit_code=exit_code,
+            log_path=log_path,
+            diagnostics=diagnostics,
+            env=os.environ,
+        )
+
+        result = build_result(
+            status=status,
+            pr_url=pr_url,
+            reason=reason,
+            exit_code=exit_code,
+            usage=usage,
+            duration=duration,
+            log_path=str(log_path),
+            engine=cfg.engine.name,
+            repo=spec.repo,
+            branch=branch,
+            job_id=new_id,
+            replay_of=job_id,
+        )
+        # Non-JSON output mirrors build's discipline: a real PR URL on stdout, a labeled
+        # completion line (stderr) ONLY for a clean reproduce-only pass, a "no PR URL" note for
+        # an --open-pr pass that produced none, and NOTHING extra for timeout/agent_error (the
+        # exit code + the redacted log already carry the failure - never print "complete" for it).
+        if as_json:
+            click.echo(redact(json.dumps(result), secrets))
+        elif status in ("pr_opened", "already_open") and pr_url:
+            click.echo(pr_url)
+        elif status == "replay_complete" and not quiet:
+            click.echo(
+                f"franky: replay of {job_id} complete (job {new_id}) - see the log in tasks/",
+                err=True,
+            )
+        elif status == "no_pr":
+            click.echo(
+                "franky: no PR URL found in agent output - see the redacted log in tasks/",
+                err=True,
+            )
+        ctx.exit(exit_code)
     except FrankyError as exc:
         _emit_error(exc, as_json, secrets)
         ctx.exit(exc.code)

@@ -5,6 +5,7 @@ from franky.prompt import (
     build_iterate_prompt,
     build_plan_prompt,
     build_prompt,
+    build_replay_prompt,
     load_persona,
     task_slug,
 )
@@ -322,3 +323,43 @@ def test_diagnose_prompt_includes_runtime_diagnostics_block():
 def test_diagnose_prompt_omits_block_when_no_diagnostics():
     p = build_diagnose_prompt(_diag_record(), "some transcript text", "d5")
     assert "Runtime diagnostics" not in p
+
+
+# ---------------------------------------------------------------------------
+# build_replay_prompt (issue #70)
+# ---------------------------------------------------------------------------
+
+
+def _replay_spec():
+    return TaskSpec(repo="me/repo", text="add a --json flag", source="prose")
+
+
+def test_replay_prompt_pins_base_commit():
+    p = build_replay_prompt(_replay_spec(), branch="franky/task", base_sha="abc1234", open_pr=False)
+    assert "REPLAY" in p
+    assert "abc1234" in p
+    assert "check out" in p.lower()
+    assert "me/repo" in p
+
+
+def test_replay_prompt_reproduce_only_forbids_push_and_pr():
+    p = build_replay_prompt(_replay_spec(), branch="franky/task", base_sha="abc1234", open_pr=False)
+    assert "do not create or push any branch" in p.lower()
+    assert "gh pr create" in p
+    assert "do not" in p.lower() and "pull request" in p.lower()
+    # REPRODUCE-ONLY mode must not carry the real build's PR/branch conventions.
+    assert "franky/task" not in p
+
+
+def test_replay_prompt_open_pr_uses_build_conventions():
+    p = build_replay_prompt(_replay_spec(), branch="franky/task", base_sha="abc1234", open_pr=True)
+    assert "franky/task" in p
+    assert "gh pr create" in p
+    assert "conventional" in p.lower()
+    assert "abc1234" in p  # base commit is STILL pinned even with --open-pr
+
+
+def test_replay_prompt_nondeterminism_is_documented_in_module():
+    # The docstring (not the prompt text) carries the caveat; assert it exists on the function.
+    doc = " ".join(build_replay_prompt.__doc__.lower().split())
+    assert "not deterministic" in doc

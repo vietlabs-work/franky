@@ -52,6 +52,10 @@ STALE_RUNNING_SECS = 24 * 3600
 # Terminal-status classification for `compute_stats` (issue #64). `running` is non-terminal (it
 # is neither, and is reported separately as running_fresh / hangs). `already_open` never reaches
 # the registry (it short-circuits before a record is written), so it is intentionally absent.
+# `replay_complete` (issue #70) is ALSO intentionally absent: a reproduce-only replay is neither
+# a build success nor failure, exactly like the diagnose statuses below it. A `--open-pr` replay
+# instead reuses `pr_opened`/`no_pr` and so folds into pass-rate exactly as `iterate` already
+# does - deliberate, not an oversight.
 _SUCCESS_STATUSES = frozenset({"pr_opened", "iterate_complete"})
 _FAILURE_STATUSES = frozenset({"no_pr", "agent_error", "timeout", "killed"})
 
@@ -88,12 +92,24 @@ def new_record(
     proxy: str,
     branch: str | None,
     started_at: str,
+    source: str | None = None,
+    task_full: str | None = None,
+    base_sha: str | None = None,
+    replay_of: str | None = None,
 ) -> dict:
     """Shape the initial (status=running) record written before the container pass starts.
 
     `task` MUST already be redacted + truncated by the caller - the record stores no secret
     value. Runtime fields (status/ended_at/pr_url/economics/exit_code/log_path) are filled in
     by update_record when the pass finishes.
+
+    Four fields added for `franky job replay` (issue #70), all null-default so a caller that
+    never passes them (iterate, diagnose) is byte-identical to before: `source` (the TaskSpec's
+    source: issue|jira|prose|pr) + `task_full` (the REDACTED, PROSE_MAX_CHARS-capped full task
+    text - a replay's saved input, distinct from `task`'s 200-char display summary) together let
+    a later `job replay` reconstruct the original TaskSpec; `base_sha` (the default-branch tip at
+    build start, see baseref.resolve_base_sha) pins the commit a replay checks out; `replay_of`
+    (set only on a run THAT IS a replay) names the original job id being reproduced.
     """
     return {
         "job_id": job_id,
@@ -116,6 +132,10 @@ def new_record(
         # (issue #69); None until (and unless) a diagnostics_sink was populated. See
         # container.capture_diagnostics for the field shape.
         "diagnostics": None,
+        "source": source,
+        "task_full": task_full,
+        "base_sha": base_sha,
+        "replay_of": replay_of,
     }
 
 
