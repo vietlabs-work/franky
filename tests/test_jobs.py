@@ -67,6 +67,13 @@ def test_new_record_includes_null_diagnostics():
     assert record["diagnostics"] is None
 
 
+def test_new_record_includes_null_steer_notes():
+    # steer_notes (issue #72) starts null - it is populated (best-effort) only when `franky job
+    # attach` injects at least one correction while the run is live.
+    record = _rec()
+    assert record["steer_notes"] is None
+
+
 def test_new_record_includes_null_replay_fields():
     # source/task_full/base_sha/replay_of (issue #70) all default to null when a caller (like
     # iterate/diagnose) never passes them - a record with no saved inputs cannot be replayed.

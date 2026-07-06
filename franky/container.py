@@ -148,6 +148,14 @@ _PROXY_HARDENING = [
 PROXY_READY_POLLS = 30
 PROXY_READY_INTERVAL = 0.5
 
+# The mid-run steering mailbox (issue #72, `franky job attach`). HOME (/home/franky) is one of
+# the writable tmpfs mounts under --read-only (see _HARDENING above), so a file written there by
+# a host-side `docker exec` is a plain filesystem write - no bind mount, no new writable surface.
+# The prompt (see prompt.py's _STEER_CONVENTION) tells the running agent to poll this exact path
+# before each new sub-task; delivery here is guaranteed, incorporation is best-effort (the agent
+# has to actually re-read the file at its next step).
+STEER_FILE = "/home/franky/.franky-steer.md"
+
 
 def build_docker_argv(
     image: str,
@@ -284,6 +292,50 @@ def container_running(name: str, runner=subprocess.run) -> bool:
     except Exception:
         return False
     return (getattr(proc, "stdout", "") or "").strip() == "true"
+
+
+def build_steer_argv(container: str, steer_file: str = STEER_FILE) -> list[str]:
+    """`docker exec -i <container> tee -a <steer_file>` - the mid-run steering delivery argv.
+
+    Pure - no docker invoked. The correction message is delivered on STDIN (via `input=` at
+    the call site), NEVER on the argv or interpolated into a shell string, so an operator
+    message can never be parsed as a shell command inside the container. `tee -a` both creates
+    the file (if absent) and appends (if the agent has not yet consumed a prior correction),
+    and the file it creates is owned by the exec user (uid 1001, the same non-root user the
+    task runs as - see _RUN_UID), so the agent can read (and delete) it.
+    """
+    return ["docker", "exec", "-i", container, "tee", "-a", steer_file]
+
+
+def deliver_steer(
+    container: str,
+    message: str,
+    runner=subprocess.run,
+    *,
+    timeout: float = 10.0,
+) -> bool:
+    """Deliver `message` into `container`'s steer-file mailbox. Returns True iff the exec
+    succeeded (exit 0). Never raises - any failure (docker gone, container not running, a
+    hung exec, docker not installed) degrades to False so `job attach` can report a clean
+    typed error instead of a traceback.
+
+    WHY the captured stdout/stderr is discarded: `tee` echoes whatever it was fed straight back
+    to its own stdout, so `proc.stdout` here would just be the operator's message a second time.
+    Returning or logging it would create a second, unredacted copy of operator-supplied prose
+    outside the normal redact-before-print path - so we deliberately capture-and-drop it rather
+    than surface it anywhere.
+    """
+    try:
+        proc = runner(
+            build_steer_argv(container),
+            input=message,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except Exception:
+        return False
+    return getattr(proc, "returncode", 1) == 0
 
 
 def reap_run(run_id: str, runner=subprocess.run) -> bool:

@@ -11,6 +11,8 @@ from franky.prompt import (
 )
 from franky.task import TaskSpec
 
+import franky.container as container
+
 
 def test_load_persona_has_professional_guard():
     persona = load_persona()
@@ -392,3 +394,44 @@ def test_build_resume_prompt_issue_keeps_closing_keyword():
     )
     p = build_resume_prompt(spec, branch="franky/issue-42")
     assert "Closes #42" in p
+
+
+# ---------------------------------------------------------------------------
+# Mid-run steering convention (issue #72, `franky job attach`)
+# ---------------------------------------------------------------------------
+
+
+def test_steer_convention_path_matches_container_steer_file():
+    # The two literals can never drift: the prompt tells the agent to poll EXACTLY the path
+    # deliver_steer writes to.
+    from franky.prompt import _STEER_CONVENTION
+
+    assert container.STEER_FILE in _STEER_CONVENTION
+
+
+def test_steer_convention_present_in_build_prompt():
+    spec = TaskSpec(repo="me/repo", text="add a --json flag", source="prose")
+    p = build_prompt(spec)
+    assert container.STEER_FILE in p
+    assert "check" in p.lower() and "delete" in p.lower()
+
+
+def test_steer_convention_present_in_iterate_prompt():
+    spec = TaskSpec(repo="me/repo", text="https://github.com/me/repo/pull/42", source="pr")
+    p = build_iterate_prompt(spec)
+    assert container.STEER_FILE in p
+
+
+def test_steer_convention_present_in_replay_prompt_both_modes():
+    spec = TaskSpec(repo="me/repo", text="add a --json flag", source="prose")
+    for open_pr in (True, False):
+        p = build_replay_prompt(spec, branch="franky/task", base_sha="abc1234", open_pr=open_pr)
+        assert container.STEER_FILE in p
+
+
+def test_steer_convention_present_in_resume_prompt():
+    from franky.prompt import build_resume_prompt
+
+    spec = TaskSpec(repo="me/repo", text="add a --json flag", source="prose")
+    p = build_resume_prompt(spec, branch="franky/add-json")
+    assert container.STEER_FILE in p

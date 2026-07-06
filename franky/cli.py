@@ -41,7 +41,7 @@ from .container import (
     run_in_container,
 )
 from . import jobs, snapshot
-from .container import container_running, reap_run, run_names
+from .container import container_running, deliver_steer, reap_run, run_names
 from .engine import ENGINES, PI_PROVIDER_VARS, resolve_engine
 from .github import run_gh
 from .idempotency import find_open_pr
@@ -114,6 +114,15 @@ _RETRYABLE_STATUSES = frozenset({"timeout", "agent_error", "no_pr"})
 # of an existing transcript, not agentic work, and `--retry` fires it automatically, so it caps
 # far below build's 1800s default. `--max-duration` overrides it on the standalone command.
 _DIAGNOSE_DEFAULT_TIMEOUT = 300
+
+# Bound on the audit trail (issue #72): a run that gets steered many times should not grow its
+# record file unbounded - the last _STEER_NOTES_MAX corrections are plenty for a post-hoc look.
+_STEER_NOTES_MAX = 20
+
+# Run commands whose prompt carries the steer convention (see prompt.py's _STEER_CONVENTION), so
+# the agent actually polls the mailbox. A diagnose/plan run never polls it, so `job attach` refuses
+# those up front rather than reporting a misleading "delivered" success (issue #72).
+_STEERABLE_COMMANDS = frozenset({"build", "replay", "resume", "iterate"})
 
 
 def _stdin_is_interactive() -> bool:
@@ -2655,6 +2664,191 @@ def job_resume(
         ctx.exit(exit_code)
     except FrankyError as exc:
         _emit_error(exc, as_json, secrets)
+        ctx.exit(exc.code)
+
+
+# Cap on a single stored steer-note message. A correction is short operator prose; truncating
+# keeps one runaway paste from bloating the record file.
+_STEER_NOTE_MSG_MAX = 500
+
+
+def _append_steer_note(job_id: str, record: dict, safe_msg: str, *, delivered: bool) -> None:
+    """Best-effort audit-trail append for `job attach` (issue #72).
+
+    NOT concurrency-safe by design: the notes list is built from the STALE in-memory `record`
+    snapshot job_attach captured before delivery, not re-read at append time, so two near-
+    concurrent `job attach` calls on the same run can lose a note. That is an accepted trade-off
+    for a single-operator CLI whose steer_notes are an informational audit trail, not a
+    transactional log. Truncates each message to `_STEER_NOTE_MSG_MAX` and caps the list to the
+    last `_STEER_NOTES_MAX` entries so the record file stays bounded. A registry hiccup here must
+    never turn a delivered correction into a reported failure - wrap and swallow.
+    """
+    try:
+        notes = list(record.get("steer_notes") or [])
+        notes.append({"message": safe_msg[:_STEER_NOTE_MSG_MAX], "delivered": delivered})
+        notes = notes[-_STEER_NOTES_MAX:]
+        jobs.update_record(job_id, {"steer_notes": notes}, os.environ)
+    except Exception:
+        pass
+
+
+@job_group.command("attach")
+@click.argument("job_id")
+@click.option(
+    "-m",
+    "--message",
+    "message",
+    default=None,
+    help="The correction to inject (one-shot, unattended-safe). Omit for an interactive "
+    "one-line prompt (TTY only).",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit a JSON ack object.")
+@click.pass_context
+def job_attach(ctx: click.Context, job_id: str, message: str | None, as_json: bool) -> None:
+    """Inject a mid-run correction into a running Franky job.
+
+    Delivers a one-shot correction to a job that is still running, so you can redirect an agent
+    that has gone off course without killing and restarting it. This is a best-effort,
+    PROMPT-LEVEL channel: delivery into the container is guaranteed, but whether the agent
+    actually incorporates the correction depends on it re-reading the message at its next major
+    step - it may not react instantly. Only build/replay/resume/iterate runs can be steered.
+
+    `-m` is the unattended-safe path (never hangs). Omit it for a single interactive prompt -
+    but ONLY when stdin is a TTY; in a non-TTY it fails fast (exit 2) rather than hang.
+
+    NOTE: never pass a secret via `-m` - chat history, shell history, and process argv are all
+    unsafe places for a credential. The message IS redacted for any Franky-known secret value
+    before it is delivered or recorded, but that is a safety net, not a reason to rely on it.
+
+    Live output streaming (watching the run react in real time) is NOT part of this v1 - only
+    one-shot injection is supported; see `franky job status`/`job logs` to check in afterward.
+    """
+    try:
+        record = _require_record(job_id)
+
+        # Steerability gate FIRST so the clearest error wins: only build-shaped runs carry the
+        # steer convention in their prompt (see _STEERABLE_COMMANDS), so a diagnose/plan run never
+        # polls the mailbox and attaching to it would report a misleading "delivered" success.
+        command = record.get("command")
+        if command not in _STEERABLE_COMMANDS:
+            raise FrankyError(
+                f"cannot steer a {command!r} run - only build/replay/resume/iterate runs poll "
+                "for corrections",
+                code=EXIT_USAGE,
+                kind="not_steerable",
+                hint="see `franky jobs`",
+            )
+
+        # Resolve the engine from the RECORD, not a fresh load_config - attach invokes no engine
+        # and needs no creds, so it must work even if the operator's current env lacks them.
+        engine_name = record.get("engine")
+        engine_cls = ENGINES.get(engine_name)
+        if engine_cls is None:
+            raise FrankyError(
+                f"unknown engine {engine_name!r} on this run - cannot steer",
+                code=EXIT_USAGE,
+                kind="unknown_engine",
+                hint="see `franky jobs`",
+            )
+        engine = engine_cls()
+        if not engine.supports_steering:
+            raise FrankyError(
+                f"engine {engine_name!r} does not support live steering",
+                code=EXIT_USAGE,
+                kind="steering_unsupported",
+            )
+
+        if not container_running(record.get("container", "")):
+            raise FrankyError(
+                f"run {job_id} is not running - nothing to steer",
+                code=EXIT_USAGE,
+                kind="run_not_alive",
+                hint="see `franky job status`",
+            )
+
+        if message is None:
+            if _stdin_is_interactive():
+                message = click.prompt("correction", err=True)
+            else:
+                raise FrankyError(
+                    'attach needs a correction - pass -m "..." (stdin is not a TTY for an '
+                    "interactive prompt)",
+                    code=EXIT_USAGE,
+                    kind="interactive_input_required",
+                    hint="pass -m",
+                )
+        if not message.strip():
+            raise FrankyError(
+                "the correction is empty - nothing to inject",
+                code=EXIT_USAGE,
+                kind="empty_message",
+                hint="pass a non-empty -m",
+            )
+
+        # Merge the user config file into env (setdefault, so process env still wins) BEFORE
+        # building the secret list: an operator may keep creds only in ~/.franky/config, not env,
+        # and a mistakenly-pasted secret must be redacted regardless of where the cred lives.
+        try:
+            load_config_file(os.environ)
+        except FrankyError:
+            raise
+        except ValueError as exc:
+            raise ConfigError(f"config file error: {exc}") from exc
+
+        # Defense-in-depth: an operator could paste a secret into the correction by mistake. This
+        # scrubs any known Franky secret VALUE, but is a safety net, not a reason to rely on it -
+        # the docstring/README warn against passing one via -m in the first place.
+        env_secrets = [os.environ[k] for k in SECRET_KEYS if os.environ.get(k)]
+        safe_msg = redact(message, env_secrets)
+        # Frame the delivered payload with a banner so the agent can tell an operator correction
+        # apart from its own scratch content. The audit note stores the bare safe_msg, not this.
+        framed = f"\n----- operator correction -----\n{safe_msg}\n"
+
+        delivered = deliver_steer(record.get("container", ""), framed)
+        if not delivered:
+            # Best-effort audit even on a failed delivery - a post-hoc look at `job status`
+            # should show the attempt, not silently drop it.
+            _append_steer_note(job_id, record, safe_msg, delivered=False)
+            if not container_running(record.get("container", "")):
+                # The run finished in the gap between our alive check and the exec - report the
+                # race as run_not_alive rather than a confusing delivery failure.
+                raise FrankyError(
+                    f"run {job_id} is not running - nothing to steer",
+                    code=EXIT_USAGE,
+                    kind="run_not_alive",
+                    hint="see `franky job status`",
+                )
+            raise FrankyError(
+                "failed to deliver the correction to the running container",
+                code=EXIT_USAGE,
+                kind="steer_delivery_failed",
+            )
+
+        _append_steer_note(job_id, record, safe_msg, delivered=True)
+
+        if as_json:
+            click.echo(
+                redact(
+                    json.dumps(
+                        {
+                            "job_id": job_id,
+                            "delivered": True,
+                            "engine": engine_name,
+                            "kind": "steered",
+                        }
+                    ),
+                    env_secrets,
+                )
+            )
+        else:
+            click.echo(
+                f"franky: correction delivered to job {job_id} - the agent will pick it up at "
+                "its next step",
+                err=False,
+            )
+        ctx.exit(EXIT_SUCCESS)
+    except FrankyError as exc:
+        _emit_error(exc, as_json, [])
         ctx.exit(exc.code)
 
 

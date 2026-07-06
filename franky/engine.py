@@ -146,6 +146,16 @@ class Engine:
 
     name: str = ""
 
+    # Whether an operator can inject a mid-run correction via the steer-file mailbox (issue
+    # #72, `franky job attach`). True means the engine's PROMPT tells it to poll the steer
+    # file - not that the engine natively polls a filesystem path itself. The polling behavior
+    # comes entirely from the conventions block build_prompt/build_replay_prompt/
+    # build_resume_prompt/build_iterate_prompt append (see prompt.py's _STEER_CONVENTION); an
+    # engine that ignores its own prompt instructions would not actually pick up a correction
+    # even with this flag True, but every current engine follows its system prompt closely
+    # enough for this best-effort channel to work.
+    supports_steering: bool = False
+
     def inner_argv(self, prompt: str, model: str | None) -> list[str]:
         raise NotImplementedError
 
@@ -182,6 +192,7 @@ class Engine:
 
 class PiEngine(Engine):
     name = "pi"
+    supports_steering = True
 
     def inner_argv(self, prompt: str, model: str | None) -> list[str]:
         argv = ["pi", "-p", prompt, "--mode", "json"]
@@ -251,6 +262,7 @@ class PiEngine(Engine):
 
 class ClaudeEngine(Engine):
     name = "claude"
+    supports_steering = True
 
     def inner_argv(self, prompt: str, model: str | None) -> list[str]:
         argv = [
@@ -308,6 +320,7 @@ class ClaudeEngine(Engine):
 
 class CodexEngine(Engine):
     name = "codex"
+    supports_steering = True
 
     def inner_argv(self, prompt: str, model: str | None) -> list[str]:
         # --dangerously-bypass-approvals-and-sandbox is load-bearing, not a convenience: codex

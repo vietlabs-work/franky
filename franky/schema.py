@@ -129,6 +129,9 @@ _JOB_RECORD_SCHEMA: dict = {
     "run whose workspace was restored. Null otherwise.",
     "snapshot_path": "path to the scrubbed, fail-closed-verified, host-local workspace snapshot "
     "used to resume this run (issue #71); never exported; null if none.",
+    "steer_notes": "operator corrections injected via `franky job attach` while the run was "
+    "live (issue #72): a bounded list of {message (redacted), delivered} - or null if none. "
+    "Audit trail only.",
 }
 
 # Static description of the error object (the dict build_error shapes), emitted on stdout

@@ -216,6 +216,7 @@ franky job export <job_id>     # bundle a run's record + transcript into a porta
 franky job diagnose <job_id>   # dispatch a read-only agent to explain WHY a run failed
 franky job replay <job_id>     # re-run a build from its saved inputs to reproduce a failure
 franky job resume <job_id>     # continue a hung/timeout/killed run WITH its restored workspace
+franky job attach <job_id>     # inject a mid-run correction into a LIVE run's steer-file mailbox
 ```
 
 This is what turns the half-day silent hang into a 30-second `job status` -> `job kill`. The
@@ -324,6 +325,33 @@ stored). The snapshot is also **contained**: it is host-local, mode `0600`, prun
 run record (with orphan sweeping), and **never** included in `franky job export` (the exported
 bundle stays record + redacted transcript only). This is the same trust boundary as
 `~/.franky/config`, which already holds plaintext creds on the host.
+
+### Steering a live run
+
+```
+franky job attach <job_id> -m "stop refactoring, just fix the failing test"
+```
+
+injects a mid-run correction into a still-running build/iterate/replay/resume pass. It only
+works on a job that is currently `running` and whose engine opted into steering (pi, claude, and
+codex all do); it delivers the message via a host-side `docker exec` into a small mailbox file
+inside the container - no bind mount, no change to the container's hardening.
+
+This is a **best-effort, prompt-level channel**: delivery is guaranteed (the file write either
+succeeds or `attach` reports `steer_delivery_failed`), but *incorporation* depends on the
+engine's own loop re-reading the mailbox at its next major step - Franky's prompt tells every
+engine to check for it before starting a new sub-task, but a run deep inside a single long tool
+call may not notice it immediately.
+
+`-m` is the unattended-safe path (never hangs). Omit it for a single interactive prompt, but
+only in a TTY - a non-interactive shell fails fast (exit 2) instead of hanging.
+
+> **Never pass a secret via `-m`.** Chat history, shell history, and process argv are all unsafe
+> places for a credential. The message is redacted for any known Franky secret *value* before
+> delivery, but that is a safety net, not a reason to rely on it.
+
+Live output streaming (watching the run react to the correction in real time) is **not** part of
+this v1 - check back with `franky job status` / `job logs` once the run finishes.
 
 ## Planning a big task
 
