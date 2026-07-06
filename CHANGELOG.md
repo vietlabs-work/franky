@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-07-06
+
 ### Added
 - `franky job attach <job_id>` (#72): inject a one-shot mid-run correction into a LIVE run via
   a filesystem-mailbox channel - a host-side `docker exec ... tee -a` into a small file under the
