@@ -2531,3 +2531,152 @@ def test_job_replay_malformed_base_sha_exits_2(monkeypatch, tmp_path):
     res = CliRunner().invoke(cli.main, ["job", "replay", job_id, "--json"])
     assert res.exit_code == 2, res.output
     assert json.loads(res.stdout)["error"]["kind"] == "base_sha_unavailable"
+
+
+# ---------------------------------------------------------------------------
+# `franky job resume` (issue #71)
+# ---------------------------------------------------------------------------
+
+
+def _write_resumable_run(
+    env,
+    tmp_path,
+    job_id="fee01",
+    command="build",
+    source="prose",
+    task_full="do it",
+    base_sha="abc1234",
+    branch="franky/task",
+    with_snapshot=True,
+    snapshot_bytes=None,
+):
+    import tarfile as _tarfile
+
+    rec = jobs.new_record(
+        job_id=job_id,
+        command=command,
+        repo="me/repo",
+        engine="pi",
+        task="do it",
+        container="c",
+        network="n",
+        proxy="p",
+        branch=branch,
+        started_at="2026-07-05T10:00:00+00:00",
+        source=source,
+        task_full=task_full,
+        base_sha=base_sha,
+    )
+    rec["status"] = "timeout"
+    jobs.write_record(rec, env)
+    if with_snapshot:
+        snap_path = jobs.runs_dir(env) / f"{job_id}.snapshot.tar.gz"
+        snap_path.parent.mkdir(parents=True, exist_ok=True)
+        if snapshot_bytes is not None:
+            snap_path.write_bytes(snapshot_bytes)
+        else:
+            # A real (empty) gzip tar so tarfile.open(r:gz) succeeds.
+            with _tarfile.open(snap_path, "w:gz"):
+                pass
+    return job_id
+
+
+def _resume_env(monkeypatch, tmp_path, container_result, allowed_repos="me/repo", captured=None):
+    env = {
+        "FRANKY_ALLOWED_REPOS": allowed_repos,
+        "GH_TOKEN": "ghp_fake",
+        "OPENROUTER_API_KEY": "sk-or-fake",
+        "FRANKY_RUNS_DIR": str(tmp_path / "runs"),
+    }
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    monkeypatch.setattr(cli, "find_open_pr", lambda *a, **k: None)
+
+    def fake_run(*a, **k):
+        if captured is not None:
+            captured.update(k)
+        return container_result
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+    return env
+
+
+def test_job_resume_no_snapshot_exits_2(monkeypatch, tmp_path):
+    env = _resume_env(monkeypatch, tmp_path, (0, "x"))
+    job_id = _write_resumable_run(env, tmp_path, job_id="beef01", with_snapshot=False)
+    res = CliRunner().invoke(cli.main, ["job", "resume", job_id, "--json"])
+    assert res.exit_code == 2, res.output
+    assert json.loads(res.stdout)["error"]["kind"] == "no_snapshot"
+
+
+def test_job_resume_corrupt_snapshot_exits_2(monkeypatch, tmp_path):
+    env = _resume_env(monkeypatch, tmp_path, (0, "x"))
+    job_id = _write_resumable_run(env, tmp_path, job_id="beef02", snapshot_bytes=b"not a gzip tar")
+    res = CliRunner().invoke(cli.main, ["job", "resume", job_id, "--json"])
+    assert res.exit_code == 2, res.output
+    assert json.loads(res.stdout)["error"]["kind"] == "snapshot_corrupt"
+
+
+def test_job_resume_happy_path(monkeypatch, tmp_path):
+    captured = {}
+    env = _resume_env(monkeypatch, tmp_path, (0, f"opened {PR_URL}"), captured=captured)
+    job_id = _write_resumable_run(env, tmp_path, job_id="beef03")
+    res = CliRunner().invoke(cli.main, ["job", "resume", job_id, "--json"])
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.stdout)
+    assert data["status"] == "pr_opened"
+    assert data["pr_url"] == PR_URL
+    assert data["resumed_from"] == job_id
+    new_id = data["job_id"]
+    rec = jobs.read_record(new_id, env)
+    assert rec["command"] == "resume"
+    assert rec["resumed_from"] == job_id
+    # resume_workspace was threaded through to run_in_container, pointing at the snapshot tar.
+    assert captured["resume_workspace"] == str(jobs.runs_dir(env) / f"{job_id}.snapshot.tar.gz")
+
+
+def test_job_resume_off_allowlist_now_exits_4(monkeypatch, tmp_path):
+    env = _resume_env(monkeypatch, tmp_path, (0, "x"), allowed_repos="other/repo")
+    job_id = _write_resumable_run(env, tmp_path, job_id="beef04")
+    res = CliRunner().invoke(cli.main, ["job", "resume", job_id, "--json"])
+    assert res.exit_code == 4, res.output
+    assert json.loads(res.stdout)["error"]["kind"] == "task_rejected"
+
+
+def test_job_resume_idempotency_short_circuit(monkeypatch, tmp_path):
+    env = _resume_env(monkeypatch, tmp_path, (0, "x"))
+    monkeypatch.setattr(cli, "find_open_pr", lambda *a, **k: PR_URL)
+    job_id = _write_resumable_run(env, tmp_path, job_id="beef05")
+    res = CliRunner().invoke(cli.main, ["job", "resume", job_id, "--json"])
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.stdout)
+    assert data["status"] == "already_open"
+    assert data["pr_url"] == PR_URL
+    assert data["resumed_from"] == job_id
+
+
+def test_job_resume_missing_task_full_exits_2(monkeypatch, tmp_path):
+    env = _resume_env(monkeypatch, tmp_path, (0, "x"))
+    job_id = _write_resumable_run(env, tmp_path, job_id="beef06", task_full=None, source=None)
+    res = CliRunner().invoke(cli.main, ["job", "resume", job_id, "--json"])
+    assert res.exit_code == 2, res.output
+    assert json.loads(res.stdout)["error"]["kind"] == "replay_inputs_missing"
+
+
+def test_job_resume_not_found_exits_2(monkeypatch, tmp_path):
+    _resume_env(monkeypatch, tmp_path, (0, "x"))
+    res = CliRunner().invoke(cli.main, ["job", "resume", "0badcafe"])
+    assert res.exit_code == 2
+    assert "no run found" in res.stderr
+
+
+def test_job_resume_not_resumable_command_exits_2(monkeypatch, tmp_path):
+    # An iterate/diagnose run has no resumable workspace; the scope gate must win over no_snapshot.
+    env = _resume_env(monkeypatch, tmp_path, (0, "x"))
+    job_id = _write_resumable_run(
+        env, tmp_path, job_id="beef07", command="iterate", with_snapshot=False
+    )
+    res = CliRunner().invoke(cli.main, ["job", "resume", job_id, "--json"])
+    assert res.exit_code == 2, res.output
+    assert json.loads(res.stdout)["error"]["kind"] == "not_resumable"

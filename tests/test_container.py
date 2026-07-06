@@ -1093,3 +1093,214 @@ def test_run_in_container_diagnostics_sink_failure_does_not_affect_result(monkey
     assert code == 0
     assert "ok" in output
     assert sink == {}
+
+
+# ---------------------------------------------------------------------------
+# Resume + snapshot wiring (issue #71)
+# ---------------------------------------------------------------------------
+
+
+def test_build_docker_argv_resume_wait_adds_env_and_keeps_hardening():
+    argv = build_docker_argv("franky", {"GH_TOKEN": "x"}, ["pi"], resume_wait=True)
+    # The resume-wait env flag is present, by-value (non-secret).
+    e_values = [argv[i + 1] for i, t in enumerate(argv) if t == "-e"]
+    assert "FRANKY_RESUME_WAIT=1" in e_values
+    # ALL hardening flags still present with resume on - the boundary is untouched.
+    assert "--cap-drop=ALL" in argv
+    assert "--read-only" in argv
+    assert "--rm" in argv
+    assert "--cap-add=SETUID" in argv
+    assert "--cap-add=SETGID" in argv
+    assert "--security-opt=systempaths=unconfined" in argv
+    assert "--device" in argv and "/dev/net/tun" in argv
+    assert "--pids-limit=2048" in argv
+    assert "--memory=8g" in argv and "--memory-swap=8g" in argv
+    # No host bind mount / no docker socket even in resume mode.
+    joined = " ".join(argv)
+    assert "-v" not in argv and "--mount" not in argv
+    assert "docker.sock" not in joined
+
+
+def test_build_docker_argv_no_resume_wait_by_default():
+    argv = build_docker_argv("franky", {"GH_TOKEN": "x"}, ["pi"])
+    e_values = [argv[i + 1] for i, t in enumerate(argv) if t == "-e"]
+    assert "FRANKY_RESUME_WAIT=1" not in e_values
+
+
+def test_run_in_container_snapshots_on_timeout():
+    """A timed-out run populates snapshot_sink: extract fires BEFORE the task reap, finalize
+    after."""
+    calls = []
+
+    def task(argv, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout"))
+
+    base_runner, _ = _orchestration_runner(task)
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        return base_runner(argv, **kwargs)
+
+    import tempfile
+
+    dest = tempfile.mktemp(suffix=".snapshot.tar.gz")
+    sink = {"dest": dest}
+    code, _out = run_in_container(
+        _cfg(),
+        ["pi"],
+        timeout=5,
+        runner=runner,
+        env={},
+        sleeper=NOOP_SLEEP,
+        run_id="abc123def456",
+        snapshot_sink=sink,
+    )
+    assert code == 124
+    task_name = "franky-run-abc123def456"
+    cp_idx = next(i for i, c in enumerate(calls) if c[:2] == ["docker", "cp"] and task_name in c[2])
+    rm_idx = next(
+        i for i, c in enumerate(calls) if c[:3] == ["docker", "rm", "-f"] and task_name in c
+    )
+    # extract (docker cp) must happen BEFORE the task reap so /work still exists.
+    assert cp_idx < rm_idx
+    # finalize wrote the snapshot path back into the sink (empty tmpdir -> clean, verified tar).
+    assert sink.get("snapshot_path") == dest
+    import os as _os
+
+    _os.unlink(dest)
+
+
+def test_run_in_container_no_snapshot_on_clean_run():
+    def task(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    runner, calls = _orchestration_runner(task)
+    sink = {"dest": "/tmp/should-not-be-written.tar.gz"}
+    code, _out = run_in_container(
+        _cfg(), ["pi"], runner=runner, env={}, sleeper=NOOP_SLEEP, snapshot_sink=sink
+    )
+    assert code == 0
+    # No docker cp (extract) on a non-timeout run, and no snapshot path recorded.
+    assert not any(c[:2] == ["docker", "cp"] for c in calls)
+    assert "snapshot_path" not in sink
+
+
+def test_run_in_container_resume_restores_after_launch():
+    """resume_workspace forces the streaming path and fires cp/untar/chown/touch after launch."""
+    calls = []
+    base_runner, _ = _orchestration_runner(
+        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+    )
+
+    def full_runner(argv, **kwargs):
+        calls.append(argv)
+        # container_running poll -> report the task up so restore proceeds immediately.
+        if argv[:3] == ["docker", "inspect", "-f"] and "{{.State.Running}}" in argv:
+            return subprocess.CompletedProcess(argv, 0, stdout="true", stderr="")
+        if argv[:2] == ["docker", "cp"] or argv[:2] == ["docker", "exec"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        return base_runner(argv, **kwargs)
+
+    code, out = run_in_container(
+        _cfg(),
+        ["pi"],
+        runner=full_runner,
+        env={},
+        sleeper=NOOP_SLEEP,
+        popen=_fake_popen_factory(["event\n"]),
+        run_id="beef00beef00",
+        resume_workspace="/host/snap.tar.gz",
+    )
+    task_name = "franky-run-beef00beef00"
+    # cp INTO the container, untar (as root), chown, and marker touch all fire.
+    assert any(c[:2] == ["docker", "cp"] and f"{task_name}:" in c[3] for c in calls)
+    assert any("tar" in c and "-xzf" in c for c in calls)
+    assert any("chown" in c for c in calls)
+    assert any("touch" in c for c in calls)
+
+
+def test_run_in_container_resume_false_restore_does_not_change_result():
+    """A failed restore (cp rc!=0) must not change the returned (code, output)."""
+
+    base_runner, _ = _orchestration_runner(
+        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+    )
+
+    def runner(argv, **kwargs):
+        if argv[:3] == ["docker", "inspect", "-f"] and "{{.State.Running}}" in argv:
+            return subprocess.CompletedProcess(argv, 0, stdout="true", stderr="")
+        if argv[:2] == ["docker", "cp"]:
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="cp boom")
+        return base_runner(argv, **kwargs)
+
+    code, out = run_in_container(
+        _cfg(),
+        ["pi"],
+        runner=runner,
+        env={},
+        sleeper=NOOP_SLEEP,
+        popen=_fake_popen_factory(["streamed line\n"]),
+        run_id="beeff00dbeef",
+        resume_workspace="/host/snap.tar.gz",
+    )
+    # The stream still drained normally; the restore failure is swallowed.
+    assert code == 0
+    assert "streamed line" in out
+
+
+class _BlockingPopen:
+    """Fake Popen whose stdout NEVER yields a line and never EOFs until .kill() is called.
+
+    Models a silently-wedged container (engine hung, or a resume-wait container that never gets
+    its marker): `for line in proc.stdout` blocks on __next__ until the watchdog kills it."""
+
+    def __init__(self):
+        import threading
+
+        self.returncode = -9
+        self._killed = threading.Event()
+        self.stdout = self
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self._killed.wait()  # block until killed, then signal EOF
+        raise StopIteration
+
+    def close(self):
+        pass
+
+    def wait(self, timeout=None):
+        self._killed.wait(timeout)
+        return self.returncode
+
+    def kill(self):
+        self._killed.set()
+
+
+def test_run_in_container_watchdog_kills_silent_hang():
+    """A container that produces NO output must still hit the wall-clock watchdog and time out,
+    not block forever (never-hang). Proves the streaming path's timeout fires without any line."""
+
+    def task(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    runner, _ = _orchestration_runner(task)
+
+    def blocking_popen(argv, **kwargs):
+        return _BlockingPopen()
+
+    # Sub-second timeout keeps the suite fast; the watchdog Timer fires at ~0.3s and kills the
+    # (otherwise forever-blocking) fake, ending the read loop.
+    code, _out = run_in_container(
+        _cfg(),
+        ["pi"],
+        timeout=0.3,
+        runner=runner,
+        env={},
+        sleeper=NOOP_SLEEP,
+        progress=lambda _line: None,
+        popen=blocking_popen,
+    )
+    assert code == 124  # CONTAINER_TIMEOUT_CODE - the silent hang was killed by the watchdog

@@ -125,3 +125,22 @@ def test_error_schema_shape():
     err = schema["error_schema"]["error"]
     for field in ("code", "kind", "message", "hint"):
         assert field in err
+
+
+def test_result_schema_documents_resumed_from():
+    from franky.cli import main
+    from franky.schema import build_schema
+
+    schema = build_schema(main)
+    assert "resumed_from" in schema["result_schema"]
+
+
+def test_job_record_schema_documents_resume_fields():
+    from franky.cli import main
+    from franky.schema import build_schema
+
+    schema = build_schema(main)
+    jrs = schema["job_record_schema"]
+    assert "resumed_from" in jrs
+    assert "snapshot_path" in jrs
+    assert "resume" in jrs["command"]
