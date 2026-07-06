@@ -21,8 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `franky job resume <job_id>` (#71): re-enter a hung/timeout/killed run WITH its workspace so a
   fresh engine CONTINUES it instead of restarting. On timeout (and on `job kill`) Franky
   snapshots the container's `/work` before teardown; `resume` restores it into a fresh, still
-  fully hardened + egress-controlled container (host-side `docker cp`/`exec` + a resume-wait
-  entrypoint flag - no bind mount, no host socket, no hardening relaxation) and resumes the
+  fully hardened + egress-controlled container (host-side `docker cp` to capture, the tar piped
+  back in over `docker exec -i` stdin to restore, + a resume-wait entrypoint flag - no bind mount,
+  no host socket, no hardening relaxation) and resumes the
   original branch. The snapshot is scrubbed FAIL-CLOSED (known cred files removed, git remote
   userinfo + credential helpers stripped, known secret values redacted) and VERIFIED (every file
   re-scanned for surviving/fresh-token values, git history decompress-scanned via `git cat-file`;
@@ -91,6 +92,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `franky gh pr list --json` yields clean JSON on stdout; `gh`'s own exit code is passed
   through (missing token -> exit 5, `gh` not installed on the host -> exit 6). Non-interactive
   by design (output is captured then redacted).
+
+### Fixed
+- `franky job resume` (#71) could never restore a workspace - two daemon-level failures the
+  hermetic suite (which mocks the runner) could not catch, both found via real-Docker smoke:
+  1. It began with `docker cp <tar> <container>:/tmp/...`, but the resume container runs
+     `--read-only`, and the daemon refuses a `cp` INTO a read-only container ("container rootfs is
+     marked read-only") even when the destination is a writable tmpfs.
+  2. It then untarred and chowned as in-container root (`-u 0`), but the task profile is
+     `--cap-drop=ALL` (only SETUID/SETGID re-added), so root has no `CAP_DAC_OVERRIDE`/`CAP_CHOWN`
+     and cannot write into - or chown - the uid-1001-owned `/work` tmpfs.
+  Restore now pipes the tar to `tar --no-same-owner -xzf -` over `docker exec -i` stdin (the
+  channel `job attach` already uses) extracted as the default uid 1001, which owns `/work` - no
+  `docker cp` in, no root, no chown step. Capture (`docker cp` OUT) was never affected. Verified
+  end-to-end against the real hardened image (`--cap-drop=ALL --read-only`, 1001-owned tmpfs).
 
 ## [0.0.5] - 2026-07-03
 

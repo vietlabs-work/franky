@@ -5,12 +5,18 @@
 # The `\#` is escaped: a bare `#` would start a Make comment and eat the `)`.
 VERSION ?= $(shell for kv in $(MAKEOVERRIDES); do n=$${kv%%=*}; l=$$(printf '%s' "$$n" | tr A-Z a-z); if [ "$$l" = version ] || [ "$$l" = v ]; then printf '%s' "$${kv\#*=}"; break; fi; done)
 
-.PHONY: smoke-dind eval release release-dry
+.PHONY: smoke-dind smoke-resume eval release release-dry
 # Manual gate for always-on rootless Docker-in-Docker (#12). Needs real Docker; not in CI (the
 # pytest suite never touches real Docker). Run before merging changes to the Dockerfile,
 # franky-dind-entrypoint.sh, container.py's _HARDENING, or egress.py.
 smoke-dind:
 	bash scripts/smoke-dind.sh
+
+# Manual gate for the `franky job resume` restore path (#71). Needs real Docker + the `franky`
+# image; not in CI. Run before merging changes to franky/snapshot.py's restore path, the
+# resume-wait branch of franky-dind-entrypoint.sh, or container.py's task _HARDENING.
+smoke-resume:
+	bash scripts/smoke-resume.sh
 
 # Opt-in, out-of-band agent-quality eval (#25). Needs real Docker + engine creds + a sandbox
 # repo (see evals/README.md); NOT in CI. Bare `make eval` runs evals/tasks.json once; pass

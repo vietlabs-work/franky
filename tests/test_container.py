@@ -1188,8 +1188,12 @@ def test_run_in_container_no_snapshot_on_clean_run():
     assert "snapshot_path" not in sink
 
 
-def test_run_in_container_resume_restores_after_launch():
-    """resume_workspace forces the streaming path and fires cp/untar/chown/touch after launch."""
+def test_run_in_container_resume_restores_after_launch(tmp_path):
+    """resume_workspace forces the streaming path and fires untar/chown/touch after launch.
+
+    The tar is piped over `docker exec -i` stdin (no `docker cp` INTO the read-only container)."""
+    snap = tmp_path / "snap.tar.gz"
+    snap.write_bytes(b"fake-tar-bytes")
     calls = []
     base_runner, _ = _orchestration_runner(
         lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
@@ -1212,18 +1216,19 @@ def test_run_in_container_resume_restores_after_launch():
         sleeper=NOOP_SLEEP,
         popen=_fake_popen_factory(["event\n"]),
         run_id="beef00beef00",
-        resume_workspace="/host/snap.tar.gz",
+        resume_workspace=str(snap),
     )
-    task_name = "franky-run-beef00beef00"
-    # cp INTO the container, untar (as root), chown, and marker touch all fire.
-    assert any(c[:2] == ["docker", "cp"] and f"{task_name}:" in c[3] for c in calls)
-    assert any("tar" in c and "-xzf" in c for c in calls)
-    assert any("chown" in c for c in calls)
+    # No cp INTO the container; the untar (stdin, as uid 1001) and marker touch fire. No chown.
+    assert not any(c[:2] == ["docker", "cp"] and "franky-run-beef00beef00:" in c[3] for c in calls)
+    assert any("tar" in c and "-xzf" in c and "-" in c for c in calls)
+    assert not any("chown" in c for c in calls)
     assert any("touch" in c for c in calls)
 
 
-def test_run_in_container_resume_false_restore_does_not_change_result():
-    """A failed restore (cp rc!=0) must not change the returned (code, output)."""
+def test_run_in_container_resume_false_restore_does_not_change_result(tmp_path):
+    """A failed restore (untar rc!=0) must not change the returned (code, output)."""
+    snap = tmp_path / "snap.tar.gz"
+    snap.write_bytes(b"fake-tar-bytes")
 
     base_runner, _ = _orchestration_runner(
         lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
@@ -1232,8 +1237,8 @@ def test_run_in_container_resume_false_restore_does_not_change_result():
     def runner(argv, **kwargs):
         if argv[:3] == ["docker", "inspect", "-f"] and "{{.State.Running}}" in argv:
             return subprocess.CompletedProcess(argv, 0, stdout="true", stderr="")
-        if argv[:2] == ["docker", "cp"]:
-            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="cp boom")
+        if "tar" in argv and "-xzf" in argv:
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="untar boom")
         return base_runner(argv, **kwargs)
 
     code, out = run_in_container(
@@ -1244,7 +1249,7 @@ def test_run_in_container_resume_false_restore_does_not_change_result():
         sleeper=NOOP_SLEEP,
         popen=_fake_popen_factory(["streamed line\n"]),
         run_id="beeff00dbeef",
-        resume_workspace="/host/snap.tar.gz",
+        resume_workspace=str(snap),
     )
     # The stream still drained normally; the restore failure is swallowed.
     assert code == 0

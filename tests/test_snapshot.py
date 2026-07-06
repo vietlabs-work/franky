@@ -27,43 +27,21 @@ def test_build_extract_argv():
     ]
 
 
-def test_build_cp_into_argv():
-    assert snapshot.build_cp_into_argv("task1", "/host/snap.tar.gz") == [
-        "docker",
-        "cp",
-        "/host/snap.tar.gz",
-        "task1:/tmp/franky-resume.tar.gz",
-    ]
-
-
 def test_build_untar_argv():
-    # Extract AS ROOT (-u 0) with --no-same-owner: docker cp lands the 0600 tar root-owned, which
-    # uid 1001 cannot read; a chown step follows to hand ownership back to the run user.
+    # Extract as the default uid 1001 (which owns /work), reading the tar from STDIN (`-i` +
+    # `-xzf -`) with --no-same-owner. WHY not -u 0: the task profile is --cap-drop=ALL, so
+    # in-container root cannot write into the 1001-owned /work; WHY stdin not a cp'd file: the
+    # resume container is --read-only and `docker cp` INTO it is refused even for a tmpfs target.
     assert snapshot.build_untar_argv("task1") == [
         "docker",
         "exec",
-        "-u",
-        "0",
+        "-i",
         "task1",
         "tar",
         "--no-same-owner",
         "-xzf",
-        "/tmp/franky-resume.tar.gz",
+        "-",
         "-C",
-        "/work",
-    ]
-
-
-def test_build_chown_argv():
-    assert snapshot.build_chown_argv("task1") == [
-        "docker",
-        "exec",
-        "-u",
-        "0",
-        "task1",
-        "chown",
-        "-R",
-        "1001:1001",
         "/work",
     ]
 
@@ -330,52 +308,66 @@ def test_extract_workspace_oserror_false(tmp_path):
 
 def _restore_kind(argv):
     """Classify a restore-orchestration docker call by its operation (or None for polls)."""
-    if argv[:2] == ["docker", "cp"]:
-        return "cp"
-    for verb in ("tar", "chown", "touch"):
+    for verb in ("tar", "touch"):
         if verb in argv:
             return verb
     return None
 
 
-def test_restore_into_container_ordered_calls_and_true():
+def _snap_file(tmp_path):
+    """A real (tiny) on-disk snapshot file - restore now opens it to stream over exec stdin."""
+    p = tmp_path / "snap.tar.gz"
+    p.write_bytes(b"fake-tar-bytes")
+    return str(p)
+
+
+def test_restore_into_container_ordered_calls_and_true(tmp_path):
     calls = []
+    saw_untar_stdin = False
 
     def runner(argv, **kwargs):
+        nonlocal saw_untar_stdin
         calls.append(argv)
+        if "tar" in argv and "-xzf" in argv:
+            stdin = kwargs.get("stdin")
+            # The tar must be fed as a BINARY file object over stdin (never a cp'd file, never text).
+            saw_untar_stdin = stdin is not None and getattr(stdin, "mode", "") == "rb"
         if argv[:3] == ["docker", "inspect", "-f"]:
             return subprocess.CompletedProcess(argv, 0, stdout="true", stderr="")
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-    ok = snapshot.restore_into_container("task1", "/host/snap.tar.gz", runner, sleeper=NOOP_SLEEP)
+    ok = snapshot.restore_into_container("task1", _snap_file(tmp_path), runner, sleeper=NOOP_SLEEP)
     assert ok is True
-    # cp INTO -> untar (as root) -> chown to run user -> marker, in that exact order.
+    # untar-from-stdin (as uid 1001) -> marker, in that exact order. No cp, no chown.
     kinds = [k for k in (_restore_kind(c) for c in calls) if k is not None]
-    assert kinds == ["cp", "tar", "chown", "touch"]
-    # The untar runs as root and does not preserve archive ownership.
+    assert kinds == ["tar", "touch"]
+    # The untar reads from stdin (-i + -xzf -), runs as the default uid (no -u 0 - root cannot
+    # write the 1001-owned /work under --cap-drop=ALL), and does not preserve archive owner.
     untar = next(c for c in calls if "tar" in c and "-xzf" in c)
-    assert untar[:4] == ["docker", "exec", "-u", "0"]
+    assert untar[:4] == ["docker", "exec", "-i", "task1"]
+    assert "-u" not in untar
     assert "--no-same-owner" in untar
+    assert untar[untar.index("-xzf") + 1] == "-"
+    assert saw_untar_stdin  # the snapshot bytes are fed via stdin, never a cp'd file
 
 
-def test_restore_into_container_does_not_touch_marker_on_cp_failure():
+def test_restore_into_container_returns_false_when_snapshot_unreadable(tmp_path):
     calls = []
 
     def runner(argv, **kwargs):
         calls.append(argv)
         if argv[:3] == ["docker", "inspect", "-f"]:
             return subprocess.CompletedProcess(argv, 0, stdout="true", stderr="")
-        if argv[:2] == ["docker", "cp"]:
-            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="cp failed")
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-    ok = snapshot.restore_into_container("task1", "/host/snap.tar.gz", runner, sleeper=NOOP_SLEEP)
+    # A missing snapshot file must fail closed: no untar/chown/marker, and never raise.
+    missing = str(tmp_path / "nope.tar.gz")
+    ok = snapshot.restore_into_container("task1", missing, runner, sleeper=NOOP_SLEEP)
     assert ok is False
-    # The marker (touch) must NEVER fire if cp failed - the entrypoint must hard-fail instead.
-    assert not any(_restore_kind(c) == "touch" for c in calls)
+    assert not any(_restore_kind(c) is not None for c in calls)
 
 
-def test_restore_into_container_does_not_touch_marker_on_untar_failure():
+def test_restore_into_container_does_not_touch_marker_on_untar_failure(tmp_path):
     calls = []
 
     def runner(argv, **kwargs):
@@ -386,34 +378,18 @@ def test_restore_into_container_does_not_touch_marker_on_untar_failure():
             return subprocess.CompletedProcess(argv, 1, stdout="", stderr="tar failed")
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-    ok = snapshot.restore_into_container("task1", "/host/snap.tar.gz", runner, sleeper=NOOP_SLEEP)
+    ok = snapshot.restore_into_container("task1", _snap_file(tmp_path), runner, sleeper=NOOP_SLEEP)
     assert ok is False
-    # Neither chown nor marker fires after a failed untar.
-    assert not any(_restore_kind(c) in ("chown", "touch") for c in calls)
-
-
-def test_restore_into_container_does_not_touch_marker_on_chown_failure():
-    calls = []
-
-    def runner(argv, **kwargs):
-        calls.append(argv)
-        if argv[:3] == ["docker", "inspect", "-f"]:
-            return subprocess.CompletedProcess(argv, 0, stdout="true", stderr="")
-        if "chown" in argv:
-            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="chown failed")
-        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
-
-    ok = snapshot.restore_into_container("task1", "/host/snap.tar.gz", runner, sleeper=NOOP_SLEEP)
-    assert ok is False
+    # The marker must NOT fire after a failed untar.
     assert not any(_restore_kind(c) == "touch" for c in calls)
 
 
-def test_restore_into_container_never_raises_on_runner_oserror():
+def test_restore_into_container_never_raises_on_runner_oserror(tmp_path):
     def runner(argv, **kwargs):
         raise OSError("docker gone")
 
     ok = snapshot.restore_into_container(
-        "task1", "/host/snap.tar.gz", runner, ready_polls=1, sleeper=NOOP_SLEEP
+        "task1", _snap_file(tmp_path), runner, ready_polls=1, sleeper=NOOP_SLEEP
     )
     assert ok is False
 
