@@ -1001,7 +1001,7 @@ def test_config_init_codex_wizard_with_codex_key(tmp_path, monkeypatch):
     assert "OPENAI_API_KEY" not in data
 
 
-def test_config_init_codex_wizard_falls_back_to_openai(tmp_path, monkeypatch):
+def test_config_init_codex_wizard_does_not_fall_back_to_openai(tmp_path, monkeypatch):
     cfg_path = tmp_path / "franky-config"
     monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
     monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)
@@ -1009,8 +1009,7 @@ def test_config_init_codex_wizard_falls_back_to_openai(tmp_path, monkeypatch):
         "codex\n"  # engine
         "me/repo\n"  # FRANKY_ALLOWED_REPOS
         "ghp_wiz\n"  # GH_TOKEN
-        "\n"  # CODEX_API_KEY empty -> fall through to OPENAI_API_KEY
-        "sk-openai\n"  # OPENAI_API_KEY
+        "\n"  # CODEX_API_KEY empty
         "n\n"  # JIRA: no
         "n\n"  # profile: no
     )
@@ -1019,8 +1018,9 @@ def test_config_init_codex_wizard_falls_back_to_openai(tmp_path, monkeypatch):
     from franky.userconfig import read_config_file
 
     data = read_config_file(cfg_path)
-    assert data["OPENAI_API_KEY"] == "sk-openai"
+    assert "OPENAI_API_KEY" not in data
     assert "CODEX_API_KEY" not in data
+    assert "OPENAI_API_KEY instead" not in res.output
 
 
 def test_iterate_load_config_file_malformed_gives_clean_error(tmp_path, monkeypatch):

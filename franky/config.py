@@ -99,7 +99,7 @@ def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
       1. allowlist unset/blank -> refuse (we will not act on an open set of repos)
       2. GH_TOKEN missing -> refuse (cannot clone or open a PR without it)
       3. engine creds missing -> refuse (pi: no provider var set; claude: token missing;
-         codex: neither CODEX_API_KEY nor OPENAI_API_KEY set)
+         codex: CODEX_API_KEY unset)
     """
     # resolve_engine raises a plain ValueError for an unknown FRANKY_ENGINE; rewrap as a
     # ConfigError so it gets exit code 3 + a JSON error, keeping the message identical.

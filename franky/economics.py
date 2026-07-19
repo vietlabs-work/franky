@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 # Event "type" values that mark a terminal/summary event carrying the run's cumulative
 # usage. We read usage/cost from the LAST such event (never sum) - see parse_usage.
-_TERMINAL_TYPES = {"result", "message_stop", "done", "final", "summary"}
+_TERMINAL_TYPES = {"result", "message_stop", "done", "final", "summary", "turn.completed"}
 
 
 @dataclass
@@ -34,7 +34,7 @@ def parse_usage(output: str) -> Usage:
     WHY last-terminal, not sum: engines (both pi --mode json and claude --output-format
     stream-json) emit one JSON event per line, where intermediate events carry per-chunk
     usage sub-totals. The terminal event (type "result", "message_stop", "done", "final",
-    or "summary") carries the run's cumulative total. Summing across events double-counts;
+    "summary", or "turn.completed") carries the run's cumulative total. Summing across events double-counts;
     picking the terminal event gives the correct once-only total. If no terminal event
     carries usage, we fall back to the last event that has any usage, which is still the
     most complete reading available.
@@ -59,7 +59,7 @@ def parse_usage(output: str) -> Usage:
             continue
 
         event_type = event.get("type", "")
-        is_terminal = event_type in _TERMINAL_TYPES
+        is_terminal = isinstance(event_type, str) and event_type in _TERMINAL_TYPES
 
         # Check for a recognizable usage block.
         if _extract_tokens(event) != (None, None):

@@ -3015,17 +3015,9 @@ def config_init() -> None:
         if val:
             data["CLAUDE_CODE_OAUTH_TOKEN"] = val
     elif engine_choice == "codex":
-        val = click.prompt(
-            "CODEX_API_KEY (or press Enter to use OPENAI_API_KEY instead)",
-            hide_input=True,
-            default="",
-        ).strip()
+        val = click.prompt("CODEX_API_KEY", hide_input=True, default="").strip()
         if val:
             data["CODEX_API_KEY"] = val
-        else:
-            oai = click.prompt("OPENAI_API_KEY", hide_input=True).strip()
-            if oai:
-                data["OPENAI_API_KEY"] = oai
 
     # Optional JIRA
     click.echo()

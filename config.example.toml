@@ -53,8 +53,7 @@ OPENROUTER_API_KEY = "sk-or-your_key_here"
 # CLAUDE_CODE_OAUTH_TOKEN = "your_oauth_token_here"
 
 # --- codex engine creds (only needed when FRANKY_ENGINE = "codex") ----------
-# API-key auth. Set ONE: CODEX_API_KEY (recommended for automation), or
-# OPENAI_API_KEY directly - either authenticates codex.
+# Single-run API-key auth for `codex exec`.
 # CODEX_API_KEY = "sk-your_codex_key_here"
 
 # --- Auto-update hint on `franky build` (OPTIONAL, host CLI only) -----------

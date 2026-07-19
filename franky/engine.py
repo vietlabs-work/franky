@@ -33,12 +33,10 @@ PI_PROVIDER_VARS = (
 
 CLAUDE_TOKEN_VAR = "CLAUDE_CODE_OAUTH_TOKEN"
 
-# codex authenticates with an API key. BOTH vars work: CODEX_API_KEY is the automation-
-# recommended one, OPENAI_API_KEY also authenticates (it doubles as the codex key). Gate on
-# whichever is present, BYOK-style like pi - so a keyless codex run is the fail-closed case.
-# OPENAI_API_KEY is deliberately shared with PI_PROVIDER_VARS: it is a different engine, gated
-# independently, and build_allowlist only ever consults the ONE resolved engine's hosts.
-CODEX_PROVIDER_VARS = ("CODEX_API_KEY", "OPENAI_API_KEY")
+# codex exec reads CODEX_API_KEY for one non-interactive run. OPENAI_API_KEY remains a pi
+# provider credential; codex only uses it when persisted through `codex login --with-api-key`,
+# which Franky's fresh container deliberately does not do.
+CODEX_PROVIDER_VARS = ("CODEX_API_KEY",)
 CODEX_PROVIDER_HOST = "api.openai.com"
 
 # Which network host each provider cred talks to. WHY this is SEPARATE from required_env:
@@ -344,25 +342,19 @@ class CodexEngine(Engine):
         return _scan_jsonl_for_pr_url(output, repo)
 
     def required_env(self, env: Mapping[str, str] | None = None) -> list[str]:
-        """The codex provider vars that ARE set (non-empty) in `env` (defaults to os.environ).
-        Empty list => no creds => fail-closed. Mirrors PiEngine: gate on whichever key the
-        operator actually set."""
+        """Return CODEX_API_KEY when set, else empty so config fails closed."""
         env = os.environ if env is None else env
         return [v for v in CODEX_PROVIDER_VARS if env.get(v)]
 
     def provider_hosts(self, env: Mapping[str, str] | None = None) -> list[str]:
-        # Both codex keys talk to the same host, so this is all-or-nothing: the host opens iff
-        # ANY codex key is present. Gating on key presence (rather than claude's unconditional
-        # return) keeps required_env and provider_hosts parallel and never opens api.openai.com
-        # for a keyless run.
+        # Open the provider host only when the selected codex run has its required key.
         env = os.environ if env is None else env
         if any(env.get(v) for v in CODEX_PROVIDER_VARS):
             return [CODEX_PROVIDER_HOST]
         return []
 
     def cred_hint(self) -> str:
-        # codex accepts either var; CODEX_API_KEY is the automation-recommended one.
-        return f"set one of: {', '.join(CODEX_PROVIDER_VARS)}"
+        return f"set {CODEX_PROVIDER_VARS[0]}"
 
     def distill_line(self, line: str) -> str | None:
         line = line.strip()
@@ -375,21 +367,26 @@ class CodexEngine(Engine):
         if not isinstance(event, dict):
             return None
         event_type = event.get("type")
-        if event_type == "action":
-            action = event.get("action") or {}
-            atype = action.get("type", "")
-            if atype == "exec":
-                cmd_obj = action.get("command") or {}
-                cmd = str(cmd_obj.get("cmd", "")).split("\n")[0][:60]
+        item = event.get("item")
+        if isinstance(item, dict):
+            if event_type == "item.started" and item.get("type") == "command_execution":
+                cmd = str(item.get("command", "")).split("\n")[0][:60]
                 return f"franky: running: {cmd}" if cmd else "franky: running command"
-            if atype == "file_write":
-                path = action.get("path", "")
-                return f"franky: writing {path}" if path else "franky: writing file"
-            if atype == "file_read":
-                path = action.get("path", "")
-                return f"franky: reading {path}" if path else "franky: reading file"
-        if event_type == "result":
+            if event_type == "item.completed" and item.get("type") == "file_change":
+                path = item.get("path", "")
+                changes = item.get("changes")
+                if not path and isinstance(changes, list):
+                    for change in changes:
+                        if isinstance(change, dict) and change.get("path"):
+                            path = change["path"]
+                            break
+                return f"franky: writing {path}" if path else None
+        if event_type == "turn.completed":
             return "franky: agent complete"
+        if event_type == "turn.failed":
+            return "franky: agent failed"
+        if event_type == "error":
+            return "franky: agent error"
         return None
 
 

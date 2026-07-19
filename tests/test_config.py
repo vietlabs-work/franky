@@ -89,9 +89,8 @@ def test_fail_closed_pi_no_provider():
 
 
 def test_fail_closed_codex_no_provider():
-    # codex selected but neither CODEX_API_KEY nor OPENAI_API_KEY set -> refuse, and the hint
-    # must name codex's own vars (sourced from CodexEngine.cred_hint), never pi's.
-    env = _env()  # carries OPENROUTER_API_KEY (a pi var), which must NOT satisfy codex
+    # OPENAI_API_KEY is valid for pi but must not satisfy codex exec's single-run auth.
+    env = _env(OPENAI_API_KEY="sk-openai-fake")
     with pytest.raises(ValueError, match="creds") as ei:
         load_config("codex", env)
     msg = str(ei.value)
