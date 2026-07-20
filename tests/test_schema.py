@@ -56,6 +56,7 @@ def test_schema_recurses_into_subgroups():
     assert "config" in cmds
     assert "commands" in cmds["config"]
     assert "set" in cmds["config"]["commands"]
+    assert set(cmds["auth"]["commands"]) == {"login", "logout", "status"}
 
 
 def test_result_schema_documents_fields_and_predicted_branch():

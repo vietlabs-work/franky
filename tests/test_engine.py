@@ -180,6 +180,7 @@ def test_codex_inner_argv_without_model():
         "exec",
         "do it",
         "--json",
+        "--ignore-user-config",
         "--dangerously-bypass-approvals-and-sandbox",
     ]
 
@@ -240,6 +241,16 @@ def test_codex_cred_hint_names_its_vars():
     # codex must NOT advertise the other engines' creds.
     assert "ANTHROPIC_API_KEY" not in hint
     assert CLAUDE_TOKEN_VAR not in hint
+
+
+def test_codex_exec_ignores_persisted_user_config():
+    argv = CodexEngine().inner_argv("do it", None)
+    assert "--ignore-user-config" in argv
+
+
+def test_codex_subscription_uses_chatgpt_and_refresh_hosts_only():
+    hosts = CodexEngine().provider_hosts({"FRANKY_CODEX_SUBSCRIPTION": "1"})
+    assert hosts == ["chatgpt.com", "auth.openai.com"]
 
 
 # ---------------------------------------------------------------------------

@@ -38,6 +38,9 @@ CLAUDE_TOKEN_VAR = "CLAUDE_CODE_OAUTH_TOKEN"
 # which Franky's fresh container deliberately does not do.
 CODEX_PROVIDER_VARS = ("CODEX_API_KEY",)
 CODEX_PROVIDER_HOST = "api.openai.com"
+CODEX_SUBSCRIPTION_HOSTS = ("chatgpt.com", "auth.openai.com")
+CODEX_SUBSCRIPTION_VAR = "FRANKY_CODEX_SUBSCRIPTION"
+CODEX_AUTH_VOLUME = "franky-codex-auth"
 
 # Which network host each provider cred talks to. WHY this is SEPARATE from required_env:
 # required_env is about cred gating (do we have a key at all), this is about the egress
@@ -332,6 +335,7 @@ class CodexEngine(Engine):
             "exec",
             prompt,
             "--json",
+            "--ignore-user-config",
             "--dangerously-bypass-approvals-and-sandbox",
         ]
         if model:
@@ -347,14 +351,15 @@ class CodexEngine(Engine):
         return [v for v in CODEX_PROVIDER_VARS if env.get(v)]
 
     def provider_hosts(self, env: Mapping[str, str] | None = None) -> list[str]:
-        # Open the provider host only when the selected codex run has its required key.
         env = os.environ if env is None else env
         if any(env.get(v) for v in CODEX_PROVIDER_VARS):
             return [CODEX_PROVIDER_HOST]
+        if env.get(CODEX_SUBSCRIPTION_VAR) == "1":
+            return list(CODEX_SUBSCRIPTION_HOSTS)
         return []
 
     def cred_hint(self) -> str:
-        return f"set {CODEX_PROVIDER_VARS[0]}"
+        return f"set {CODEX_PROVIDER_VARS[0]} or run `franky auth login codex`"
 
     def distill_line(self, line: str) -> str | None:
         line = line.strip()

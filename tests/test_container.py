@@ -1,13 +1,15 @@
 import subprocess
 
-
+import franky.container as container_mod
 from franky.config import Config
 from franky.container import (
+    CODEX_AUTH_HOME,
     FRANKY_PROXY_IMAGE_VAR,
     GHCR_REPO_VAR,
     STEER_FILE,
     _HOME_TMPFS_SIZE,
     build_docker_argv,
+    build_codex_auth_scrub_argv,
     build_network_argv,
     build_network_connect_argv,
     build_proxy_argv,
@@ -18,8 +20,12 @@ from franky.container import (
     image_exists,
     resolve_image,
     run_in_container,
+    codex_auth_ready,
+    codex_auth_status,
+    codex_auth_login,
+    codex_auth_logout,
 )
-from franky.engine import PiEngine
+from franky.engine import CODEX_AUTH_VOLUME, CodexEngine, PiEngine
 from franky.profile import PROFILE_BUNDLE_VAR
 
 SECRET = "sk-or-very-secret-9999"
@@ -126,6 +132,174 @@ def test_build_docker_argv_no_mounts_or_socket():
     assert "--mount" not in argv
     assert "docker.sock" not in joined
     assert "/var/run/docker.sock" not in joined
+
+
+def test_codex_subscription_mounts_only_fixed_named_volume():
+    argv = build_docker_argv(
+        "franky", {"GH_TOKEN": "x"}, ["codex", "exec"], auth_volume=CODEX_AUTH_VOLUME
+    )
+    mount = argv[argv.index("--mount") + 1]
+    assert mount == f"type=volume,src={CODEX_AUTH_VOLUME},dst={CODEX_AUTH_HOME}"
+    assert "type=bind" not in " ".join(argv)
+    assert "docker.sock" not in " ".join(argv)
+
+
+def test_codex_auth_scrub_keeps_only_auth_json_and_has_no_network():
+    argv = build_codex_auth_scrub_argv("franky", require_auth=True)
+    joined = " ".join(argv)
+    assert "--network none" in joined
+    assert "auth.json" in joined
+    assert "config.toml" not in joined
+    assert "! -L" in joined
+    assert "65536" in joined
+    assert CODEX_AUTH_VOLUME in joined
+    assert "type=bind" not in joined
+
+
+def test_codex_auth_ready_checks_volume_before_scrubbing():
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        if argv[:3] == ["docker", "volume", "inspect"]:
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="No such volume")
+        raise AssertionError("missing volume must fail before docker run")
+
+    assert not codex_auth_ready("franky", runner=runner)
+    assert len(calls) == 1
+
+
+def test_codex_auth_ready_rejects_malformed_json():
+    def runner(argv, **kwargs):
+        if argv[:3] == ["docker", "volume", "inspect"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="[]", stderr="")
+        if "--entrypoint" in argv and argv[argv.index("--entrypoint") + 1] == "cat":
+            return subprocess.CompletedProcess(argv, 0, stdout="not-json", stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    assert not codex_auth_ready("franky", runner=runner)
+
+
+def test_codex_auth_ready_rejects_oversized_json():
+    def runner(argv, **kwargs):
+        if argv[:3] == ["docker", "volume", "inspect"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="[]", stderr="")
+        if "--entrypoint" in argv and argv[argv.index("--entrypoint") + 1] == "cat":
+            return subprocess.CompletedProcess(
+                argv, 0, stdout='{"token":"' + "x" * 65536, stderr=""
+            )
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    assert not codex_auth_ready("franky", runner=runner)
+
+
+def test_codex_auth_status_uses_read_only_volume_and_no_network():
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        if "--entrypoint" in argv and argv[argv.index("--entrypoint") + 1] == "cat":
+            return subprocess.CompletedProcess(
+                argv, 0, stdout='{"access_token":"subscription-token"}', stderr=""
+            )
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    assert codex_auth_status("franky", runner=runner)
+    status_argv = calls[-1]
+    assert status_argv[-2:] == ["login", "status"]
+    assert "--network" in status_argv and "none" in status_argv
+    assert ",readonly" in status_argv[status_argv.index("--mount") + 1]
+
+
+def test_codex_auth_login_is_device_flow_and_logout_removes_fixed_volume():
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        if "--entrypoint" in argv and argv[argv.index("--entrypoint") + 1] == "cat":
+            return subprocess.CompletedProcess(
+                argv, 0, stdout='{"access_token":"subscription-token"}', stderr=""
+            )
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    assert codex_auth_login("franky", runner=runner)
+    login_argv = next(argv for argv in calls if "--device-auth" in argv)
+    assert 'cli_auth_credentials_store="file"' in login_argv
+    assert "--mount" in login_argv and CODEX_AUTH_VOLUME in " ".join(login_argv)
+    assert "--network" not in login_argv  # trusted operator flow needs OpenAI egress
+    calls.clear()
+    assert codex_auth_logout(runner=runner)
+    assert calls == [["docker", "volume", "rm", CODEX_AUTH_VOLUME]]
+
+
+def test_run_in_container_fails_closed_when_codex_auth_scrub_fails():
+    calls = []
+    cfg = Config(
+        engine=CodexEngine(),
+        allowed_repos=["me/repo"],
+        passthrough_env={"GH_TOKEN": "ghp_fake"},
+        auth_volume=CODEX_AUTH_VOLUME,
+    )
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        if argv[:3] == ["docker", "volume", "inspect"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="[]", stderr="")
+        if argv[:2] == ["docker", "run"]:
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
+        raise AssertionError(argv)
+
+    code, out = run_in_container(cfg, ["codex", "exec"], runner=runner, env={})
+    assert code != 0
+    assert "subscription login" in out
+    assert not any(argv[:3] == ["docker", "network", "create"] for argv in calls)
+
+
+def test_run_in_container_redacts_codex_subscription_tokens(monkeypatch):
+    token = "subscription-token-that-must-never-reach-logs"
+    cfg = Config(
+        engine=CodexEngine(),
+        allowed_repos=["me/repo"],
+        passthrough_env={"GH_TOKEN": "ghp_fake"},
+        auth_volume=CODEX_AUTH_VOLUME,
+    )
+    monkeypatch.setattr(container_mod, "_codex_auth_state", lambda *a, **k: [token])
+
+    def task(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout=f"leaked {token}", stderr="")
+
+    runner, _ = _orchestration_runner(task)
+    code, out = run_in_container(cfg, ["codex", "exec"], runner=runner, env={}, sleeper=NOOP_SLEEP)
+    assert code == 0
+    assert token not in out
+    assert "***REDACTED***" in out
+
+
+def test_run_in_container_stream_redacts_codex_subscription_tokens(monkeypatch):
+    token = "subscription-token-that-must-never-reach-progress"
+    cfg = Config(
+        engine=CodexEngine(),
+        allowed_repos=["me/repo"],
+        passthrough_env={"GH_TOKEN": "ghp_fake"},
+        auth_volume=CODEX_AUTH_VOLUME,
+    )
+    monkeypatch.setattr(container_mod, "_codex_auth_state", lambda *a, **k: [token])
+    runner, _ = _orchestration_runner(
+        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+    )
+    seen = []
+    code, out = run_in_container(
+        cfg,
+        ["codex", "exec"],
+        runner=runner,
+        env={},
+        sleeper=NOOP_SLEEP,
+        progress=seen.append,
+        popen=_fake_popen_factory([f"leaked {token}\n"]),
+    )
+    assert code == 0
+    assert all(token not in line for line in seen)
+    assert token not in out
 
 
 def test_build_docker_argv_only_passthrough_env_as_e_flags():

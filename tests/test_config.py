@@ -2,7 +2,13 @@ import pytest
 
 import franky.config as config_mod
 from franky.config import Config, load_config, redact, repo_allowed, validate_allowlist_entry
-from franky.engine import ClaudeEngine, CodexEngine, PiEngine
+from franky.engine import (
+    CODEX_AUTH_VOLUME,
+    CODEX_SUBSCRIPTION_VAR,
+    ClaudeEngine,
+    CodexEngine,
+    PiEngine,
+)
 
 SECRET = "sk-super-secret-value-123"
 
@@ -58,6 +64,20 @@ def test_load_config_engine_resolution_codex():
     assert "OPENROUTER_API_KEY" not in cfg.passthrough_env
 
 
+def test_load_config_codex_subscription_uses_fixed_volume():
+    env = _env(**{CODEX_SUBSCRIPTION_VAR: "1"})
+    cfg = load_config("codex", env)
+    assert cfg.auth_volume == CODEX_AUTH_VOLUME
+    assert cfg.passthrough_env == {"GH_TOKEN": "ghp_fake"}
+
+
+def test_load_config_codex_api_key_takes_precedence_over_subscription():
+    env = _env(CODEX_API_KEY="sk-codex-fake", **{CODEX_SUBSCRIPTION_VAR: "1"})
+    cfg = load_config("codex", env)
+    assert cfg.auth_volume is None
+    assert cfg.passthrough_env["CODEX_API_KEY"] == "sk-codex-fake"
+
+
 def test_fail_closed_allowlist_unset():
     env = _env()
     del env["FRANKY_ALLOWED_REPOS"]
@@ -97,6 +117,7 @@ def test_fail_closed_codex_no_provider():
     assert "engine 'codex'" in msg
     assert "CODEX_API_KEY" in msg
     assert "OPENROUTER_API_KEY" not in msg  # no pi vars leak into the codex refusal
+    assert "auth login codex" in msg
 
 
 def test_config_no_longer_couples_to_pi_provider_vars():

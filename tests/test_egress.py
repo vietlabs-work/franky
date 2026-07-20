@@ -64,6 +64,13 @@ def test_codex_allowlist_no_openai_when_no_key():
     assert "api.openai.com" not in allow
 
 
+def test_codex_allowlist_opens_chatgpt_and_refresh_hosts_for_subscription_marker():
+    allow = build_allowlist(CodexEngine(), {"FRANKY_CODEX_SUBSCRIPTION": "1"}, [])
+    assert "chatgpt.com" in allow
+    assert "auth.openai.com" in allow
+    assert "api.openai.com" not in allow
+
+
 def test_pi_ollama_host_parsed_from_url():
     allow = build_allowlist(PiEngine(), {"OLLAMA_HOST": "http://ollama.internal:11434"}, [])
     assert "ollama.internal" in allow

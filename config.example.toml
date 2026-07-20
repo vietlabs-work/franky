@@ -14,7 +14,7 @@
 # Which coding agent runs inside the container. Default: pi.
 #   pi     - vendor-neutral, bring-your-own-key (BYOK), many providers
 #   claude - Claude Code (claude -p), uses your Claude subscription token
-#   codex  - OpenAI Codex (codex exec), API-key auth
+#   codex  - OpenAI Codex (codex exec), ChatGPT subscription or API-key auth
 FRANKY_ENGINE = "pi"
 
 # --- Trusted-repo allowlist (REQUIRED, fail-closed) -------------------------
@@ -53,7 +53,10 @@ OPENROUTER_API_KEY = "sk-or-your_key_here"
 # CLAUDE_CODE_OAUTH_TOKEN = "your_oauth_token_here"
 
 # --- codex engine creds (only needed when FRANKY_ENGINE = "codex") ----------
-# Single-run API-key auth for `codex exec`.
+# Recommended for a ChatGPT subscription: run `franky auth login codex` once.
+# This writes only the non-secret marker below; credentials stay in a Docker named volume.
+# FRANKY_CODEX_SUBSCRIPTION = "1"
+# Alternatively, use single-run API-key auth. It takes precedence over subscription auth.
 # CODEX_API_KEY = "sk-your_codex_key_here"
 
 # --- Auto-update hint on `franky build` (OPTIONAL, host CLI only) -----------
