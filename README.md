@@ -36,7 +36,7 @@ all ship in the one image.
 |--------|-----|------|-------|
 | `pi` (default) | `@earendil-works/pi-coding-agent` | BYOK provider key | MIT, 15+ providers (OpenRouter, Anthropic, OpenAI, Ollama, ...) |
 | `claude` | `@anthropic-ai/claude-code` | `CLAUDE_CODE_OAUTH_TOKEN` | Most capable; uses your Claude subscription |
-| `codex` | `@openai/codex` | `CODEX_API_KEY` or `OPENAI_API_KEY` | OpenAI Codex headless (`codex exec`); API-key auth only |
+| `codex` | `@openai/codex` | `CODEX_API_KEY` | OpenAI Codex headless (`codex exec`); API-key auth only |
 
 Select with `--engine pi|claude|codex`, or set `FRANKY_ENGINE`. Resolution order:
 `--engine` flag > `FRANKY_ENGINE` > default `pi`.
@@ -110,8 +110,7 @@ add an engine), so Codex, Cursor, pi, or Claude Code all start with the same con
    - `FRANKY_ALLOWED_REPOS` - the trusted-repo allowlist (see below).
    - `GH_TOKEN` - scoped to contents + pull_requests on those repos.
    - the selected engine's creds (a provider key for `pi`,
-     `CLAUDE_CODE_OAUTH_TOKEN` for `claude`, or `CODEX_API_KEY` / `OPENAI_API_KEY`
-     for `codex`).
+     `CLAUDE_CODE_OAUTH_TOKEN` for `claude`, or `CODEX_API_KEY` for `codex`).
    - for JIRA tasks: `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN` (host-side only,
      never forwarded into the container).
 4. Run:

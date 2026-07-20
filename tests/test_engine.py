@@ -212,21 +212,19 @@ def test_codex_required_env_returns_present_subset(monkeypatch):
 
 
 def test_codex_required_env_both_keys_present(monkeypatch):
-    # The shared OPENAI_API_KEY makes the both-set case the non-obvious one: both are returned,
-    # in declaration order (CODEX_API_KEY first).
+    # OPENAI_API_KEY remains a pi credential but is not a direct codex exec credential.
     for v in CODEX_PROVIDER_VARS:
         monkeypatch.delenv(v, raising=False)
     monkeypatch.setenv("CODEX_API_KEY", "sk-codex-fake")
     monkeypatch.setenv("OPENAI_API_KEY", "sk-fake")
-    assert CodexEngine().required_env() == ["CODEX_API_KEY", "OPENAI_API_KEY"]
+    assert CodexEngine().required_env() == ["CODEX_API_KEY"]
 
 
-def test_codex_required_env_accepts_openai_key(monkeypatch):
-    # OPENAI_API_KEY also authenticates codex (it doubles as the codex key).
+def test_codex_required_env_ignores_openai_key(monkeypatch):
     for v in CODEX_PROVIDER_VARS:
         monkeypatch.delenv(v, raising=False)
     monkeypatch.setenv("OPENAI_API_KEY", "sk-fake")
-    assert CodexEngine().required_env() == ["OPENAI_API_KEY"]
+    assert CodexEngine().required_env() == []
 
 
 def test_codex_required_env_empty_when_none_set(monkeypatch):
@@ -238,7 +236,7 @@ def test_codex_required_env_empty_when_none_set(monkeypatch):
 def test_codex_cred_hint_names_its_vars():
     hint = CodexEngine().cred_hint()
     assert "CODEX_API_KEY" in hint
-    assert "OPENAI_API_KEY" in hint
+    assert "OPENAI_API_KEY" not in hint
     # codex must NOT advertise the other engines' creds.
     assert "ANTHROPIC_API_KEY" not in hint
     assert CLAUDE_TOKEN_VAR not in hint
@@ -364,35 +362,58 @@ def test_pi_distill_line_message_no_tool_use():
 # --- CodexEngine distill_line ---
 
 
-def test_codex_distill_line_exec_action():
+def test_codex_distill_line_command_started():
     event = {
-        "type": "action",
-        "action": {"type": "exec", "command": {"cmd": "git status\nmore"}},
+        "type": "item.started",
+        "item": {
+            "id": "item_1",
+            "type": "command_execution",
+            "command": "git status\nmore",
+            "status": "in_progress",
+        },
     }
     result = CodexEngine().distill_line(json.dumps(event))
     assert result == "franky: running: git status"
 
 
-def test_codex_distill_line_file_write_action():
-    event = {"type": "action", "action": {"type": "file_write", "path": "src/util.py"}}
+def test_codex_distill_line_file_change_completed():
+    event = {
+        "type": "item.completed",
+        "item": {
+            "id": "item_2",
+            "type": "file_change",
+            "changes": [{"path": "src/util.py", "kind": "update"}],
+            "status": "completed",
+        },
+    }
     result = CodexEngine().distill_line(json.dumps(event))
     assert result == "franky: writing src/util.py"
 
 
-def test_codex_distill_line_file_read_action():
-    event = {"type": "action", "action": {"type": "file_read", "path": "README.md"}}
-    result = CodexEngine().distill_line(json.dumps(event))
-    assert result == "franky: reading README.md"
+def test_codex_distill_line_malformed_file_changes_returns_none():
+    event = {
+        "type": "item.completed",
+        "item": {"type": "file_change", "changes": 42},
+    }
+    assert CodexEngine().distill_line(json.dumps(event)) is None
 
 
-def test_codex_distill_line_result_event():
-    event = {"type": "result", "output": {"type": "success"}}
+def test_codex_distill_line_turn_completed():
+    event = {"type": "turn.completed", "usage": {"input_tokens": 100, "output_tokens": 20}}
     assert CodexEngine().distill_line(json.dumps(event)) == "franky: agent complete"
 
 
-def test_codex_distill_line_unknown_action_type():
-    event = {"type": "action", "action": {"type": "something_new"}}
-    assert CodexEngine().distill_line(json.dumps(event)) is None
+@pytest.mark.parametrize(
+    ("event", "expected"),
+    [
+        ({"type": "turn.failed", "error": {"message": "secret detail"}}, "franky: agent failed"),
+        ({"type": "error", "message": "secret detail"}, "franky: agent error"),
+    ],
+)
+def test_codex_distill_line_failure_hides_payload(event, expected):
+    result = CodexEngine().distill_line(json.dumps(event))
+    assert result == expected
+    assert "secret detail" not in result
 
 
 # --- supports_steering (issue #72, mid-run steering via `franky job attach`) ---

@@ -77,6 +77,36 @@ def test_parse_usage_picks_terminal_not_intermediate():
     assert u.cost_usd == pytest.approx(0.05)
 
 
+def test_parse_usage_codex_turn_completed_is_terminal():
+    output = "\n".join(
+        [
+            _line(
+                {
+                    "type": "turn.completed",
+                    "usage": {
+                        "input_tokens": 900,
+                        "cached_input_tokens": 800,
+                        "output_tokens": 100,
+                        "reasoning_output_tokens": 75,
+                    },
+                }
+            ),
+            _line(
+                {
+                    "type": "item.completed",
+                    "usage": {"input_tokens": 1, "output_tokens": 2},
+                }
+            ),
+        ]
+    )
+    assert parse_usage(output) == Usage(input_tokens=900, output_tokens=100)
+
+
+def test_parse_usage_non_string_event_type_never_raises():
+    output = _line({"type": [], "usage": {"input_tokens": 5, "output_tokens": 2}})
+    assert parse_usage(output) == Usage(input_tokens=5, output_tokens=2)
+
+
 def test_parse_usage_tokens_without_cost():
     """Usage present but no cost field -> cost_usd is None, tokens set correctly."""
     output = _line({"type": "result", "usage": {"input_tokens": 42, "output_tokens": 7}})
