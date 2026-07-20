@@ -1637,6 +1637,25 @@ def test_profile_show_lists_expanded_files(tmp_path, monkeypatch):
     assert "[skills]" in res.output  # the expanded-files loop ran, not just the TOML echo
 
 
+def test_profile_show_lists_mcp_names_and_domains_without_values(tmp_path, monkeypatch):
+    mcp = tmp_path / "mcp.json"
+    mcp.write_text('{"token":"${LINEAR_API_KEY}"}\n', encoding="utf-8")
+    prof = tmp_path / "profile.toml"
+    prof.write_text(
+        f'[profile]\nmcp_configs = ["{mcp}"]\nmcp_credentials = ["LINEAR_API_KEY"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setenv("FRANKY_PROFILE_PATH", str(prof))
+    monkeypatch.setenv("LINEAR_API_KEY", "mcp-secret-value")
+
+    res = CliRunner().invoke(cli.main, ["profile", "show"])
+
+    assert res.exit_code == 0, res.output
+    assert "LINEAR_API_KEY" in res.output
+    assert "mcp-secret-value" not in res.output
+
+
 def test_profile_show_empty_expansion(tmp_path, monkeypatch):
     empty = tmp_path / "skills"
     empty.mkdir()
@@ -1667,6 +1686,146 @@ def test_profile_check_clean_exits_zero(tmp_path, monkeypatch):
     res = CliRunner().invoke(cli.main, ["profile", "check"])
     assert res.exit_code == 0, res.output
     assert "OK:" in res.output
+
+
+def test_profile_check_requires_mcp_credential_from_process_environment(tmp_path, monkeypatch):
+    mcp = tmp_path / "mcp.json"
+    mcp.write_text('{"token":"${LINEAR_API_KEY}"}\n', encoding="utf-8")
+    prof = tmp_path / "profile.toml"
+    prof.write_text(
+        f'[profile]\nmcp_configs = ["{mcp}"]\nmcp_credentials = ["LINEAR_API_KEY"]\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setenv("FRANKY_PROFILE_PATH", str(prof))
+    monkeypatch.delenv("LINEAR_API_KEY", raising=False)
+
+    res = CliRunner().invoke(cli.main, ["profile", "check"])
+
+    assert res.exit_code != 0
+    assert "LINEAR_API_KEY" in res.output
+
+
+def test_load_profile_bundle_applies_named_credential_egress_and_redaction(tmp_path, monkeypatch):
+    from franky.config import Config
+    from franky.container import build_docker_argv
+    from franky.engine import PiEngine
+
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    mcp = tmp_path / "mcp.json"
+    mcp.write_text(
+        '{"url":"https://mcp.linear.app/mcp","token":"${LINEAR_API_KEY}"}\n',
+        encoding="utf-8",
+    )
+    prof = tmp_path / "profile.toml"
+    prof.write_text(
+        f'[profile]\nmcp_configs = ["{mcp}"]\n'
+        'mcp_credentials = ["LINEAR_API_KEY"]\n'
+        'mcp_domains = ["mcp.linear.app"]\n',
+        encoding="utf-8",
+    )
+    cfg = Config(engine=PiEngine(), allowed_repos=["me/repo"])
+    secrets = []
+
+    bundle = cli._load_profile_bundle(
+        str(prof), {"LINEAR_API_KEY": "mcp-secret-value"}, secrets, cfg
+    )
+
+    assert bundle
+    assert cfg.passthrough_env == {"LINEAR_API_KEY": "mcp-secret-value"}
+    assert cfg.extra_allowed_domains == ["mcp.linear.app"]
+    assert secrets == ["mcp-secret-value"]
+    argv = build_docker_argv("franky", cfg.passthrough_env, ["pi"])
+    assert "LINEAR_API_KEY" in argv
+    assert "mcp-secret-value" not in argv
+
+
+def test_build_does_not_accept_mcp_credential_loaded_from_franky_config(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    mcp = tmp_path / "mcp.json"
+    mcp.write_text('{"token":"${LINEAR_API_KEY}"}\n', encoding="utf-8")
+    prof = tmp_path / "profile.toml"
+    prof.write_text(
+        f'[profile]\nmcp_configs = ["{mcp}"]\nmcp_credentials = ["LINEAR_API_KEY"]\n',
+        encoding="utf-8",
+    )
+    user_config = tmp_path / "config"
+    user_config.write_text('[franky]\nLINEAR_API_KEY = "file-secret"\n', encoding="utf-8")
+    env = {
+        **_build_env(),
+        "FRANKY_PROFILE_PATH": str(prof),
+        "FRANKY_CONFIG_FILE": str(user_config),
+    }
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(cli, "find_open_pr", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+
+    res = CliRunner().invoke(cli.main, ["build", "do it", "--repo", "me/repo"])
+
+    assert res.exit_code == 3, res.output
+    assert "LINEAR_API_KEY" in res.output
+    assert "file-secret" not in res.output
+
+
+def test_run_pass_keeps_codex_user_config_ignored_and_adds_explicit_mcp_overrides(
+    tmp_path, monkeypatch
+):
+    from franky.config import Config
+    from franky.engine import CodexEngine
+
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    mcp = tmp_path / ".codex" / "franky-mcp.config.toml"
+    mcp.parent.mkdir()
+    mcp.write_text('[mcp_servers.linear]\ncommand = "npx"\n', encoding="utf-8")
+    prof = tmp_path / "profile.toml"
+    prof.write_text(
+        f'[profile]\nmcp_configs = ["{mcp}"]\n',
+        encoding="utf-8",
+    )
+    cfg = Config(engine=CodexEngine(), allowed_repos=["me/repo"])
+    cli._load_profile_bundle(str(prof), {}, [], cfg)
+    seen = {}
+
+    def fake_run(_cfg, inner_argv, **_kwargs):
+        seen["argv"] = inner_argv
+        return 0, "ok"
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+    cli._run_pass(cfg, "do it", "franky", "franky-proxy")
+
+    assert "--ignore-user-config" in seen["argv"]
+    assert "--profile" not in seen["argv"]
+    assert seen["argv"][-2:] == ["-c", 'mcp_servers.linear={ command = "npx" }']
+
+
+def test_run_pass_loads_only_reserved_claude_mcp_config(tmp_path, monkeypatch):
+    from franky.config import Config
+    from franky.engine import ClaudeEngine
+
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    mcp = tmp_path / ".claude" / "franky-mcp.json"
+    mcp.parent.mkdir()
+    mcp.write_text('{"mcpServers":{}}\n', encoding="utf-8")
+    prof = tmp_path / "profile.toml"
+    prof.write_text(f'[profile]\nmcp_configs = ["{mcp}"]\n', encoding="utf-8")
+    cfg = Config(engine=ClaudeEngine(), allowed_repos=["me/repo"])
+    cli._load_profile_bundle(str(prof), {}, [], cfg)
+    seen = {}
+
+    def fake_run(_cfg, inner_argv, **_kwargs):
+        seen["argv"] = inner_argv
+        return 0, "ok"
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+    cli._run_pass(cfg, "do it", "franky", "franky-proxy")
+
+    assert "--dangerously-skip-permissions" in seen["argv"]
+    assert seen["argv"][-3:] == [
+        "--mcp-config",
+        "/home/franky/.claude/franky-mcp.json",
+        "--strict-mcp-config",
+    ]
 
 
 def test_profile_check_secret_hit_nonzero_and_names_file_without_value(tmp_path, monkeypatch):
@@ -1727,12 +1886,20 @@ def test_profile_init_merges_existing(tmp_path, monkeypatch):
     from franky.profile import read_profile_raw
 
     prof = tmp_path / "profile.toml"
-    prof.write_text('[profile]\nskills = ["~/existing.md"]\n', encoding="utf-8")
+    prof.write_text(
+        '[profile]\nskills = ["~/existing.md"]\n'
+        'mcp_credentials = ["LINEAR_API_KEY"]\n'
+        'mcp_domains = ["mcp.linear.app"]\n',
+        encoding="utf-8",
+    )
     monkeypatch.setenv("FRANKY_PROFILE_PATH", str(prof))
     wizard_input = "~/new.md\n\n\n"  # add a skill, skip instructions + knowledge
     res = CliRunner().invoke(cli.main, ["profile", "init"], input=wizard_input)
     assert res.exit_code == 0, res.output
-    assert read_profile_raw(prof)["skills"] == ["~/existing.md", "~/new.md"]
+    raw = read_profile_raw(prof)
+    assert raw["skills"] == ["~/existing.md", "~/new.md"]
+    assert raw["mcp_credentials"] == ["LINEAR_API_KEY"]
+    assert raw["mcp_domains"] == ["mcp.linear.app"]
 
 
 def test_config_init_profile_prompt_yes_writes_both(tmp_path, monkeypatch):

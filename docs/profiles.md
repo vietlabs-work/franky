@@ -1,4 +1,4 @@
-# Profiles: injecting operator skills and instructions
+# Profiles: injecting operator skills, instructions, and MCP config
 
 ## Problem
 
@@ -33,14 +33,13 @@ files exactly where it would locally (e.g. `~/.claude/CLAUDE.md`).
 | Invariant | Status after this change |
 |-----------|--------------------------|
 | No bind mounts, no host FS access | **Unchanged** — no new mount is added; content arrives via an env var |
-| Secrets pass by name, never by value | **Unchanged** — the bundle is curated prose, not a credential |
-| Fail-closed | **Maintained** — secret scan aborts the run before any container starts |
+| Secrets pass by name, never by value | **Unchanged** - the bundle contains prose or validated credential names, never values |
+| Fail-closed | **Maintained** - config validation and secret scan abort before any container starts |
 | Container hardening flags (`_HARDENING`) | **Unchanged** — no flags are added, removed, or relaxed |
 | Egress stays default-deny | **Unchanged** — no new egress path is opened |
 
-### What is NOT supported (Tier-2, future)
+### What is NOT supported
 
-- MCP server configs (require their own egress + credentials — design separately).
 - `~/.claude.json` or any credential-bearing file (never).
 - Auto-discovery of "all my skills" without an explicit allowlist.
 
@@ -71,6 +70,63 @@ knowledge = [
 ]
 ```
 
+## MCP configuration
+
+Profiles can also carry engine-native JSON or TOML MCP configuration. Franky validates
+the config before packing it, passes credentials by environment-variable name, and adds
+only the declared hosts to the existing proxy allowlist.
+
+```toml
+# ~/.franky/profile.toml
+[profile]
+mcp_configs = ["~/.codex/franky-mcp.config.toml"]
+mcp_credentials = ["LINEAR_API_KEY"]
+mcp_domains = ["mcp.linear.app"]
+```
+
+```toml
+# ~/.codex/franky-mcp.config.toml
+[mcp_servers.linear]
+url = "https://mcp.linear.app/mcp"
+bearer_token_env_var = "LINEAR_API_KEY"
+```
+
+Supply each credential in the process environment that starts Franky:
+
+```bash
+export LINEAR_API_KEY=...
+franky profile check
+franky build https://github.com/you/repo/issues/42
+```
+
+MCP credentials are intentionally not loaded from `~/.franky/config`. Each name must
+match `[A-Z_][A-Z0-9_]*`, have a non-empty process value, and be referenced by a config.
+Config strings may reference a declared name as exact `NAME` or `${NAME}`. A field whose
+key is the credential name must use exactly `${NAME}`; a literal value is refused.
+Franky's own `FRANKY_*`, proxy, HOME, PATH, Docker, and engine-home variables are reserved.
+Credential-like config fields also refuse literal values and must name a declaration.
+
+`mcp_domains` entries are hostnames only. Every explicit HTTP(S) URL in a config must use
+a declared hostname. Schemes, ports, paths, and wildcards are rejected in the domain list.
+The proxy remains default-deny at runtime.
+
+Codex keeps `--ignore-user-config`. Its MCP file must be exactly
+`~/.codex/franky-mcp.config.toml` and contain only the top-level `mcp_servers` table.
+Franky parses that table and passes each server as an explicit `-c` override, so mutable
+Codex user config is never enabled.
+
+Claude's reserved file is `~/.claude/franky-mcp.json`. It may contain only the top-level
+`mcpServers` object; Franky starts Claude with that exact container path through
+`--mcp-config ... --strict-mcp-config`. `~/.claude.json` remains unsupported.
+
+Pi has no built-in MCP config loader. Inject a Pi MCP extension at its normal HOME-relative
+path through an existing profile file list, and let that extension read a bundled JSON/TOML
+config. `mcp_credentials` and `mcp_domains` still provide its named credentials and runtime
+egress policy. Franky does not claim an arbitrary Pi config will auto-load.
+
+MCP config paths are explicit files under HOME; globs and formats other than JSON/TOML are
+refused. Franky does not install servers. Use binaries already in the image or `npx`.
+
 ## Usage
 
 ```bash
@@ -95,16 +151,16 @@ Instead of hand-writing the TOML, use the `franky profile` command group (mirror
 ```bash
 franky profile init     # interactive wizard: scaffold ~/.franky/profile.toml
                         #   (merges into an existing file, never clobbers it)
-franky profile check    # dry-run the build's gate: expand globs + secret-scan;
+franky profile check    # dry-run: files + MCP config/creds/domains + secret scan;
                         #   prints what WOULD inject; nonzero exit + offending file on a hit
 franky profile show     # print the profile.toml + the glob-expanded file list
 franky profile path     # print the resolved profile path
 ```
 
 `franky profile check` is the high-value one: it runs the **same** `load_profile` +
-`scan_for_secrets` path the build runs, so it catches a misconfigured profile (a missing
-file, or a credential that would trip the fail-closed gate) in under a second instead of
-aborting a multi-minute build. It names the offending file but never prints file contents.
+MCP validation and secret-scan path the build runs, so it catches missing files or process
+credentials, malformed config, undeclared hosts, and literal secrets before a build. It
+names offending files and variables but never prints credential values or file contents.
 
 `franky config init` also offers to set up a profile at the end of the wizard, so the
 feature is discoverable during onboarding.

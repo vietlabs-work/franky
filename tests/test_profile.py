@@ -5,6 +5,7 @@ All tests are hermetic: no real files outside of tmp_path, no network, no Docker
 
 import base64
 import io
+import json
 import tarfile
 from pathlib import Path
 
@@ -15,12 +16,15 @@ from franky.profile import (
     PROFILE_PATH_VAR,
     ProfileSpec,
     build_bundle,
+    codex_mcp_overrides,
     load_profile,
     profile_file_path,
     profile_path,
     read_profile_raw,
+    resolve_mcp_credentials,
     scan_for_secrets,
     scan_profile_files,
+    validate_mcp_engine,
     write_profile,
 )
 
@@ -248,6 +252,254 @@ def test_load_profile_non_string_entry_raises(tmp_path):
         load_profile(cfg)
 
 
+def test_load_profile_mcp_fields_and_round_trip(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    mcp = tmp_path / ".codex" / "franky-mcp.config.toml"
+    mcp.parent.mkdir()
+    mcp.write_text(
+        '[mcp_servers.linear]\nurl = "https://mcp.linear.app/mcp"\n'
+        'bearer_token_env_var = "LINEAR_API_KEY"\n',
+        encoding="utf-8",
+    )
+    cfg = tmp_path / "profile.toml"
+    table = {
+        "mcp_configs": [str(mcp)],
+        "mcp_credentials": ["LINEAR_API_KEY"],
+        "mcp_domains": ["mcp.linear.app"],
+    }
+    write_profile(cfg, table)
+
+    spec = load_profile(cfg)
+
+    assert spec.mcp_configs == [mcp]
+    assert spec.mcp_credentials == ["LINEAR_API_KEY"]
+    assert spec.mcp_domains == ["mcp.linear.app"]
+    assert read_profile_raw(cfg) == table
+
+
+def test_load_profile_accepts_nested_json_mcp_config(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    mcp = tmp_path / ".claude" / "mcp.json"
+    mcp.parent.mkdir()
+    mcp.write_text(
+        '{"mcpServers":{"linear":{"url":"https://mcp.linear.app/mcp",'
+        '"env":{"LINEAR_API_KEY":"${LINEAR_API_KEY}"}}}}\n',
+        encoding="utf-8",
+    )
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text(
+        f'[profile]\nmcp_configs = ["{mcp}"]\n'
+        'mcp_credentials = ["LINEAR_API_KEY"]\n'
+        'mcp_domains = ["mcp.linear.app"]\n',
+        encoding="utf-8",
+    )
+
+    assert load_profile(cfg).mcp_configs == [mcp]
+
+
+def test_load_profile_requires_every_declared_credential_to_be_referenced(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    mcp = tmp_path / "mcp.json"
+    mcp.write_text('{"command":"npx"}\n', encoding="utf-8")
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text(
+        f'[profile]\nmcp_configs = ["{mcp}"]\nmcp_credentials = ["LINEAR_API_KEY"]\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="not referenced"):
+        load_profile(cfg)
+
+
+def test_codex_mcp_overrides_require_isolated_top_level_and_serialize_values(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    mcp = tmp_path / ".codex" / "franky-mcp.config.toml"
+    mcp.parent.mkdir()
+    mcp.write_text(
+        '[mcp_servers."linear.remote"]\nurl = "https://mcp.linear.app/mcp"\n'
+        'args = ["serve", "--stdio"]\nenabled = true\ntimeout_sec = 10\n'
+        "startup_timeout_sec = 1.5\n"
+        'bearer_token_env_var = "LINEAR_API_KEY"\n',
+        encoding="utf-8",
+    )
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text(
+        f'[profile]\nmcp_configs = ["{mcp}"]\n'
+        'mcp_credentials = ["LINEAR_API_KEY"]\n'
+        'mcp_domains = ["mcp.linear.app"]\n',
+        encoding="utf-8",
+    )
+
+    overrides = codex_mcp_overrides(load_profile(cfg))
+
+    assert len(overrides) == 1
+    assert overrides[0].startswith('mcp_servers."linear.remote"=')
+    assert 'args = ["serve", "--stdio"]' in overrides[0]
+    assert "startup_timeout_sec = 1.5" in overrides[0]
+    assert 'bearer_token_env_var = "LINEAR_API_KEY"' in overrides[0]
+
+    mcp.write_text('model = "forbidden"\n[mcp_servers.ok]\ncommand = "npx"\n')
+    with pytest.raises(ValueError, match="only the top-level mcp_servers"):
+        load_profile(cfg)
+
+
+def test_claude_mcp_config_requires_isolated_top_level(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    mcp = tmp_path / ".claude" / "franky-mcp.json"
+    mcp.parent.mkdir()
+    mcp.write_text('{"mcpServers":{},"permissions":{}}\n', encoding="utf-8")
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text(f'[profile]\nmcp_configs = ["{mcp}"]\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="only the top-level mcpServers"):
+        load_profile(cfg)
+
+    mcp.write_text('{"mcpServers":{}}\n', encoding="utf-8")
+    assert load_profile(cfg).mcp_configs == [mcp]
+
+
+@pytest.mark.parametrize("name", ["lowercase", "1TOKEN", "TOKEN-NAME", "TOKEN NAME"])
+def test_load_profile_rejects_invalid_mcp_credential_name(tmp_path, name):
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text(f'[profile]\nmcp_credentials = ["{name}"]\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="credential name"):
+        load_profile(cfg)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["FRANKY_PROFILE_BUNDLE", "HOME", "HTTP_PROXY", "NO_PROXY", "DOCKER_HOST"],
+)
+def test_load_profile_rejects_reserved_runtime_credential_name(tmp_path, name):
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text(f'[profile]\nmcp_credentials = ["{name}"]\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="reserved runtime variable"):
+        load_profile(cfg)
+
+
+@pytest.mark.parametrize(
+    "domain", ["https://mcp.example.com", "mcp.example.com:443", "*.example.com"]
+)
+def test_load_profile_rejects_invalid_mcp_domain(tmp_path, domain):
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text(f'[profile]\nmcp_domains = ["{domain}"]\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="hostname"):
+        load_profile(cfg)
+
+
+def test_load_profile_rejects_mcp_config_outside_home(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path / "home"))
+    mcp = tmp_path / "mcp.json"
+    mcp.write_text("{}\n", encoding="utf-8")
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text(f'[profile]\nmcp_configs = ["{mcp}"]\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="under HOME"):
+        load_profile(cfg)
+
+
+def test_load_profile_rejects_unsupported_mcp_config_format(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    mcp = tmp_path / "mcp.yaml"
+    mcp.write_text("servers: {}\n", encoding="utf-8")
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text(f'[profile]\nmcp_configs = ["{mcp}"]\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="JSON or TOML"):
+        load_profile(cfg)
+
+
+@pytest.mark.parametrize(
+    ("content", "message"),
+    [
+        ('{"token":"${UNDECLARED}"}\n', "undeclared credential"),
+        ('{"env":{"LINEAR_API_KEY":"literal-value"}}\n', "literal value"),
+        ('{"url":"https://evil.example/mcp"}\n', "not declared"),
+    ],
+)
+def test_load_profile_rejects_unsafe_mcp_content(tmp_path, monkeypatch, content, message):
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    mcp = tmp_path / "mcp.json"
+    mcp.write_text(content, encoding="utf-8")
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text(
+        f'[profile]\nmcp_configs = ["{mcp}"]\n'
+        'mcp_credentials = ["LINEAR_API_KEY"]\n'
+        'mcp_domains = ["mcp.linear.app"]\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match=message):
+        load_profile(cfg)
+
+
+@pytest.mark.parametrize("key", ["MCP_TOKEN", "bearer_token_env_var"])
+def test_load_profile_rejects_undeclared_credential_like_literal(tmp_path, monkeypatch, key):
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    mcp = tmp_path / "mcp.json"
+    mcp.write_text(json.dumps({key: "short-secret"}) + "\n", encoding="utf-8")
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text(f'[profile]\nmcp_configs = ["{mcp}"]\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match=f"credential-like field {key}"):
+        load_profile(cfg)
+
+
+def test_validate_mcp_engine_rejects_config_that_selected_engine_cannot_load(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    generic = tmp_path / "mcp.json"
+    generic.write_text("{}\n", encoding="utf-8")
+    spec = ProfileSpec(mcp_configs=[generic])
+
+    with pytest.raises(ValueError, match="Codex MCP config must use"):
+        validate_mcp_engine(spec, "codex")
+    with pytest.raises(ValueError, match="Claude MCP config must use"):
+        validate_mcp_engine(spec, "claude")
+    validate_mcp_engine(spec, "pi")
+
+
+def test_resolve_mcp_credentials_requires_nonempty_process_env():
+    spec = ProfileSpec(mcp_credentials=["LINEAR_API_KEY"])
+    with pytest.raises(ValueError, match="LINEAR_API_KEY"):
+        resolve_mcp_credentials(spec, {})
+    assert resolve_mcp_credentials(spec, {"LINEAR_API_KEY": "secret"}) == {
+        "LINEAR_API_KEY": "secret"
+    }
+
+
+def test_resolve_mcp_credentials_rejects_actual_value_anywhere_in_config(tmp_path):
+    mcp = tmp_path / "mcp.json"
+    mcp.write_text(
+        '{"env_vars":["LINEAR_API_KEY"],"other":"short-secret"}\n',
+        encoding="utf-8",
+    )
+    spec = ProfileSpec(mcp_configs=[mcp], mcp_credentials=["LINEAR_API_KEY"])
+    with pytest.raises(ValueError, match="literal value of credential LINEAR_API_KEY"):
+        resolve_mcp_credentials(spec, {"LINEAR_API_KEY": "short-secret"})
+
+
+def test_mcp_secret_scan_allows_declared_placeholder_but_not_other_literal_secret(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    mcp = tmp_path / "mcp.toml"
+    mcp.write_text(
+        '[env]\nOPENAI_API_KEY = "${OPENAI_API_KEY}"\n',
+        encoding="utf-8",
+    )
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text(
+        f'[profile]\nmcp_configs = ["{mcp}"]\nmcp_credentials = ["OPENAI_API_KEY"]\n',
+        encoding="utf-8",
+    )
+    spec = load_profile(cfg)
+    build_bundle(spec)
+
+    mcp.write_text(
+        '[env]\nOPENAI_API_KEY = "${OPENAI_API_KEY}"\n'
+        'other = "ghp_aaaaaaaaaaOPENAIAPIKEYaaaaaaaaaaaaaaaaaaaa"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="credential"):
+        build_bundle(load_profile(cfg))
+
+
 # ---------------------------------------------------------------------------
 # build_bundle
 # ---------------------------------------------------------------------------
@@ -326,6 +578,22 @@ def test_build_bundle_arcname_relative_to_home(tmp_path, monkeypatch):
     names = tf.getnames()
     assert len(names) == 1
     assert names[0] == ".claude/skills/my-skill.md"
+
+
+def test_build_bundle_preserves_reserved_mcp_path_for_home_symlink(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    source = tmp_path / "configs" / "claude.json"
+    source.parent.mkdir()
+    source.write_text('{"mcpServers":{}}\n', encoding="utf-8")
+    mcp = tmp_path / ".claude" / "franky-mcp.json"
+    mcp.parent.mkdir()
+    mcp.symlink_to(source)
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text(f'[profile]\nmcp_configs = ["{mcp}"]\n', encoding="utf-8")
+
+    bundle = build_bundle(load_profile(cfg))
+
+    assert _decode_bundle(bundle).getnames() == [".claude/franky-mcp.json"]
 
 
 def test_build_bundle_arcname_fallback_for_outside_home(tmp_path, monkeypatch):

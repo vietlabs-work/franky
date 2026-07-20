@@ -62,6 +62,8 @@ class Config:
     passthrough_env: dict[str, str] = field(default_factory=dict)
     extra_allowed_domains: list[str] = field(default_factory=list)
     auth_volume: str | None = None
+    codex_mcp_overrides: list[str] = field(default_factory=list)
+    claude_mcp_config_path: str | None = None
 
     def secret_values(self) -> list[str]:
         """Secret strings known to the host and therefore available for output redaction.

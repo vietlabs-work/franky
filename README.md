@@ -112,11 +112,11 @@ add an engine), so Codex, Cursor, pi, or Claude Code all start with the same con
    franky config list                  # view the file (secrets masked)
    franky config path                  # show where the file lives
    ```
-   To inject your own skills / instructions / knowledge into the container, set up an
+   To inject your own skills / instructions / knowledge or MCP config into the container, set up an
    operator profile (see [docs/profiles.md](docs/profiles.md)):
    ```
    franky profile init                 # interactive wizard -> ~/.franky/profile.toml
-   franky profile check                # dry-run: what would inject + secret scan
+   franky profile check                # dry-run: files + MCP policy + secret scan
    franky profile show                 # view the profile + expanded file list
    franky profile path                 # show where the profile lives
    ```
@@ -506,11 +506,19 @@ container with:
   touches your filesystem or your host's Docker daemon
 - only the selected engine's required env vars passed in; nothing else
 
+MCP profiles can add explicitly named process-environment credentials and hostname-only
+egress destinations. Credential values reach Docker only through name-only `-e NAME` flags
+and join the redactor; native JSON/TOML config reaches HOME through the existing profile
+bundle. Franky recognizes only the reserved Codex and Claude MCP files; Pi requires a
+profile-injected MCP extension. See [Profiles](docs/profiles.md#mcp-configuration).
+
 Codex subscription auth is the narrow persistence exception: only the fixed Docker named
 volume `franky-codex-auth` is mounted at `/home/franky/.codex`, and only for subscription
 runs. Before every autonomous run a trusted networkless helper deletes every entry except
 `auth.json`, rejects malformed or unsafe-shaped state, and loads token values only into the
-in-memory redactor; Codex also runs with `--ignore-user-config`. Subscription runs can reach
+in-memory redactor; Codex also runs with `--ignore-user-config`. A validated
+`~/.codex/franky-mcp.config.toml` is parsed on the host and supplied only as explicit `-c`
+MCP server overrides, never loaded as user config. Subscription runs can reach
 only `chatgpt.com` and `auth.openai.com` through the normal proxy cage. The volume is writable
 so Codex can rotate OAuth tokens; like every engine credential available to an autonomous
 agent, a hostile task can invalidate it. `franky auth logout codex` removes the whole volume.
