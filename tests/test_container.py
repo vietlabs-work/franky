@@ -1,6 +1,6 @@
 import subprocess
 
-
+import franky.container as container_mod
 from franky.config import Config
 from franky.container import (
     CODEX_AUTH_HOME,
@@ -150,6 +150,8 @@ def test_codex_auth_scrub_keeps_only_auth_json_and_has_no_network():
     assert "--network none" in joined
     assert "auth.json" in joined
     assert "config.toml" not in joined
+    assert "! -L" in joined
+    assert "65536" in joined
     assert CODEX_AUTH_VOLUME in joined
     assert "type=bind" not in joined
 
@@ -167,11 +169,39 @@ def test_codex_auth_ready_checks_volume_before_scrubbing():
     assert len(calls) == 1
 
 
+def test_codex_auth_ready_rejects_malformed_json():
+    def runner(argv, **kwargs):
+        if argv[:3] == ["docker", "volume", "inspect"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="[]", stderr="")
+        if "--entrypoint" in argv and argv[argv.index("--entrypoint") + 1] == "cat":
+            return subprocess.CompletedProcess(argv, 0, stdout="not-json", stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    assert not codex_auth_ready("franky", runner=runner)
+
+
+def test_codex_auth_ready_rejects_oversized_json():
+    def runner(argv, **kwargs):
+        if argv[:3] == ["docker", "volume", "inspect"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="[]", stderr="")
+        if "--entrypoint" in argv and argv[argv.index("--entrypoint") + 1] == "cat":
+            return subprocess.CompletedProcess(
+                argv, 0, stdout='{"token":"' + "x" * 65536, stderr=""
+            )
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    assert not codex_auth_ready("franky", runner=runner)
+
+
 def test_codex_auth_status_uses_read_only_volume_and_no_network():
     calls = []
 
     def runner(argv, **kwargs):
         calls.append(argv)
+        if "--entrypoint" in argv and argv[argv.index("--entrypoint") + 1] == "cat":
+            return subprocess.CompletedProcess(
+                argv, 0, stdout='{"access_token":"subscription-token"}', stderr=""
+            )
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
     assert codex_auth_status("franky", runner=runner)
@@ -186,6 +216,10 @@ def test_codex_auth_login_is_device_flow_and_logout_removes_fixed_volume():
 
     def runner(argv, **kwargs):
         calls.append(argv)
+        if "--entrypoint" in argv and argv[argv.index("--entrypoint") + 1] == "cat":
+            return subprocess.CompletedProcess(
+                argv, 0, stdout='{"access_token":"subscription-token"}', stderr=""
+            )
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
     assert codex_auth_login("franky", runner=runner)
@@ -219,6 +253,53 @@ def test_run_in_container_fails_closed_when_codex_auth_scrub_fails():
     assert code != 0
     assert "subscription login" in out
     assert not any(argv[:3] == ["docker", "network", "create"] for argv in calls)
+
+
+def test_run_in_container_redacts_codex_subscription_tokens(monkeypatch):
+    token = "subscription-token-that-must-never-reach-logs"
+    cfg = Config(
+        engine=CodexEngine(),
+        allowed_repos=["me/repo"],
+        passthrough_env={"GH_TOKEN": "ghp_fake"},
+        auth_volume=CODEX_AUTH_VOLUME,
+    )
+    monkeypatch.setattr(container_mod, "_codex_auth_state", lambda *a, **k: [token])
+
+    def task(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout=f"leaked {token}", stderr="")
+
+    runner, _ = _orchestration_runner(task)
+    code, out = run_in_container(cfg, ["codex", "exec"], runner=runner, env={}, sleeper=NOOP_SLEEP)
+    assert code == 0
+    assert token not in out
+    assert "***REDACTED***" in out
+
+
+def test_run_in_container_stream_redacts_codex_subscription_tokens(monkeypatch):
+    token = "subscription-token-that-must-never-reach-progress"
+    cfg = Config(
+        engine=CodexEngine(),
+        allowed_repos=["me/repo"],
+        passthrough_env={"GH_TOKEN": "ghp_fake"},
+        auth_volume=CODEX_AUTH_VOLUME,
+    )
+    monkeypatch.setattr(container_mod, "_codex_auth_state", lambda *a, **k: [token])
+    runner, _ = _orchestration_runner(
+        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+    )
+    seen = []
+    code, out = run_in_container(
+        cfg,
+        ["codex", "exec"],
+        runner=runner,
+        env={},
+        sleeper=NOOP_SLEEP,
+        progress=seen.append,
+        popen=_fake_popen_factory([f"leaked {token}\n"]),
+    )
+    assert code == 0
+    assert all(token not in line for line in seen)
+    assert token not in out
 
 
 def test_build_docker_argv_only_passthrough_env_as_e_flags():

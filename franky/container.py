@@ -18,6 +18,7 @@ the allowlist POLICY lives in egress.py.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import threading
@@ -47,6 +48,7 @@ _RUN_UID = 1001
 _RUN_GID = 1001
 _HOME = "/home/franky"
 CODEX_AUTH_HOME = f"{_HOME}/.codex"
+_CODEX_AUTH_MAX_BYTES = 64 * 1024
 # XDG_RUNTIME_DIR for the always-on rootless Docker daemon: it puts docker.sock + runtime state
 # here (dockerd-rootless.sh defaults to /run/user/<uid>).
 _XDG_RUNTIME = f"/run/user/{_RUN_UID}"
@@ -280,7 +282,11 @@ def _codex_auth_argv(
 
 def build_codex_auth_scrub_argv(image: str, *, require_auth: bool) -> list[str]:
     """Build a networkless helper that keeps only auth.json in persistent CODEX_HOME."""
-    check = f" && test -f {CODEX_AUTH_HOME}/auth.json && test -s {CODEX_AUTH_HOME}/auth.json"
+    auth_file = f"{CODEX_AUTH_HOME}/auth.json"
+    check = (
+        f" && test ! -L {auth_file} && test -f {auth_file} && test -s {auth_file}"
+        f" && test $(wc -c < {auth_file}) -le {_CODEX_AUTH_MAX_BYTES}"
+    )
     if not require_auth:
         check = ""
     command = (
@@ -295,20 +301,58 @@ def _codex_auth_volume_exists(runner) -> bool:
 
 
 def codex_auth_ready(image: str, runner=subprocess.run) -> bool:
-    """Scrub persistent state and require a non-empty regular auth.json."""
+    """Scrub persistent state and require a bounded, valid Codex credential."""
+    return _codex_auth_state(image, runner) is not None
+
+
+def _codex_auth_state(image: str, runner=subprocess.run) -> list[str] | None:
+    """Return auth strings for in-memory redaction, never logging or persisting them."""
     if not _codex_auth_volume_exists(runner):
-        return False
+        return None
     proc = _run(runner, build_codex_auth_scrub_argv(image, require_auth=True))
-    return proc is not None and getattr(proc, "returncode", 1) == 0
+    if proc is None or getattr(proc, "returncode", 1) != 0:
+        return None
+    auth_file = f"{CODEX_AUTH_HOME}/auth.json"
+    read = _run(
+        runner,
+        _codex_auth_argv(image, "cat", [auth_file], readonly_volume=True),
+    )
+    raw = getattr(read, "stdout", "") if read is not None else ""
+    if (
+        getattr(read, "returncode", 1) != 0
+        or not raw
+        or len(raw.encode("utf-8", errors="replace")) > _CODEX_AUTH_MAX_BYTES
+    ):
+        return None
+    try:
+        payload = json.loads(raw)
+    except (RecursionError, TypeError, ValueError):
+        return None
+    if not isinstance(payload, dict) or not payload:
+        return None
+    status = _run(
+        runner,
+        _codex_auth_argv(image, "codex", ["login", "status"], readonly_volume=True),
+    )
+    if status is None or getattr(status, "returncode", 1) != 0:
+        return None
+
+    secrets: list[str] = []
+    pending = [payload]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, dict):
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
+        elif isinstance(value, str) and len(value) >= 8:
+            secrets.append(value)
+    return secrets
 
 
 def codex_auth_status(image: str, runner=subprocess.run) -> bool:
     """Ask Codex to recognize the scrubbed credential without granting network access."""
-    if not codex_auth_ready(image, runner):
-        return False
-    argv = _codex_auth_argv(image, "codex", ["login", "status"], readonly_volume=True)
-    proc = _run(runner, argv)
-    return proc is not None and getattr(proc, "returncode", 1) == 0
+    return _codex_auth_state(image, runner) is not None
 
 
 def codex_auth_login(image: str, runner=subprocess.run) -> bool:
@@ -647,8 +691,9 @@ def _wait_proxy_ready(proxy_name: str, runner, sleeper=time.sleep) -> bool:
 
 def _run(runner, argv):
     """Run a fire-and-check docker subcommand (network create/connect, proxy run), capturing
-    output. Returns the proc (or None on OSError) so the caller can check returncode. We do
-    NOT pass these through the task's child_env: orchestration commands need no creds."""
+    output. Returns the proc (or None on OSError) so the caller can check returncode. Codex's
+    auth reader deliberately captures credential JSON for in-memory redaction and discards it;
+    no call here prints captured output. We do NOT pass the task's child_env."""
     try:
         return runner(argv, capture_output=True, text=True)
     except OSError:
@@ -739,11 +784,13 @@ def run_in_container(
 
     try:
         if cfg.auth_volume:
-            if not codex_auth_ready(image, runner):
+            auth_secrets = _codex_auth_state(image, runner)
+            if auth_secrets is None:
                 raise _AbortRun(
                     "franky: Codex subscription login is missing or invalid - "
                     "run `franky auth login codex`"
                 )
+            secrets.extend(auth_secrets)
 
         # 1. Internal network. If this fails there is nothing to reap (it was not created).
         if getattr(_run(runner, build_network_argv(net)), "returncode", 1) != 0:

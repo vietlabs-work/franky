@@ -50,8 +50,10 @@ franky auth status codex
 franky auth logout codex
 ```
 
-The credential stays in the fixed `franky-codex-auth` Docker named volume, never in the
-host's `~/.codex`. If `CODEX_API_KEY` is also set, the API key takes precedence.
+The credential file stays in the fixed `franky-codex-auth` Docker named volume, never in
+the host's `~/.codex`. Franky reads its bounded token strings into memory only so terminal
+and transcript output can be redacted. If `CODEX_API_KEY` is also set, the API key takes
+precedence.
 
 ## Install
 
@@ -507,8 +509,11 @@ container with:
 Codex subscription auth is the narrow persistence exception: only the fixed Docker named
 volume `franky-codex-auth` is mounted at `/home/franky/.codex`, and only for subscription
 runs. Before every autonomous run a trusted networkless helper deletes every entry except
-`auth.json`; Codex also runs with `--ignore-user-config`. The task remains inside the normal
-proxy cage. `franky auth logout codex` removes the whole volume.
+`auth.json`, rejects malformed or unsafe-shaped state, and loads token values only into the
+in-memory redactor; Codex also runs with `--ignore-user-config`. Subscription runs can reach
+only `chatgpt.com` and `auth.openai.com` through the normal proxy cage. The volume is writable
+so Codex can rotate OAuth tokens; like every engine credential available to an autonomous
+agent, a hostile task can invalidate it. `franky auth logout codex` removes the whole volume.
 
 ### Docker-in-Docker (always on)
 

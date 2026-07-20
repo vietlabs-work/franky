@@ -38,6 +38,7 @@ CLAUDE_TOKEN_VAR = "CLAUDE_CODE_OAUTH_TOKEN"
 # which Franky's fresh container deliberately does not do.
 CODEX_PROVIDER_VARS = ("CODEX_API_KEY",)
 CODEX_PROVIDER_HOST = "api.openai.com"
+CODEX_SUBSCRIPTION_HOSTS = ("chatgpt.com", "auth.openai.com")
 CODEX_SUBSCRIPTION_VAR = "FRANKY_CODEX_SUBSCRIPTION"
 CODEX_AUTH_VOLUME = "franky-codex-auth"
 
@@ -351,8 +352,10 @@ class CodexEngine(Engine):
 
     def provider_hosts(self, env: Mapping[str, str] | None = None) -> list[str]:
         env = os.environ if env is None else env
-        if any(env.get(v) for v in CODEX_PROVIDER_VARS) or env.get(CODEX_SUBSCRIPTION_VAR) == "1":
+        if any(env.get(v) for v in CODEX_PROVIDER_VARS):
             return [CODEX_PROVIDER_HOST]
+        if env.get(CODEX_SUBSCRIPTION_VAR) == "1":
+            return list(CODEX_SUBSCRIPTION_HOSTS)
         return []
 
     def cred_hint(self) -> str:

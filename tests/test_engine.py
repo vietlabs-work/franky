@@ -248,6 +248,11 @@ def test_codex_exec_ignores_persisted_user_config():
     assert "--ignore-user-config" in argv
 
 
+def test_codex_subscription_uses_chatgpt_and_refresh_hosts_only():
+    hosts = CodexEngine().provider_hosts({"FRANKY_CODEX_SUBSCRIPTION": "1"})
+    assert hosts == ["chatgpt.com", "auth.openai.com"]
+
+
 # ---------------------------------------------------------------------------
 # distill_line: per-engine distilled progress renderers
 # ---------------------------------------------------------------------------

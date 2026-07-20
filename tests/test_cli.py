@@ -1066,12 +1066,35 @@ def test_auth_login_codex_does_not_persist_marker_on_failure(tmp_path, monkeypat
     assert not cfg_path.exists()
 
 
+def test_auth_login_codex_clears_stale_marker_before_failure(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "config"
+    cli.write_config_file(cfg_path, {"FRANKY_CODEX_SUBSCRIPTION": "1"})
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setattr(cli, "_codex_auth_image", lambda: "franky:test")
+    monkeypatch.setattr(cli, "codex_auth_login", lambda image: False)
+    res = CliRunner().invoke(cli.main, ["auth", "login", "codex"])
+    assert res.exit_code != 0
+    assert "FRANKY_CODEX_SUBSCRIPTION" not in cli.read_config_file(cfg_path)
+
+
 def test_auth_status_codex_uses_persisted_volume(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "config"
+    cli.write_config_file(cfg_path, {"FRANKY_CODEX_SUBSCRIPTION": "1"})
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
     monkeypatch.setattr(cli, "_codex_auth_image", lambda: "franky:test")
     monkeypatch.setattr(cli, "codex_auth_status", lambda image: True)
     res = CliRunner().invoke(cli.main, ["auth", "status", "codex"])
     assert res.exit_code == 0
     assert "ready" in res.output
+
+
+def test_auth_status_codex_requires_enabled_marker(tmp_path, monkeypatch):
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", str(tmp_path / "config"))
+    monkeypatch.setattr(cli, "_codex_auth_image", lambda: "franky:test")
+    monkeypatch.setattr(cli, "codex_auth_status", lambda image: True)
+    res = CliRunner().invoke(cli.main, ["auth", "status", "codex"])
+    assert res.exit_code != 0
+    assert "not enabled" in res.output
 
 
 def test_auth_logout_codex_removes_marker_after_volume(tmp_path, monkeypatch):
@@ -1082,6 +1105,16 @@ def test_auth_logout_codex_removes_marker_after_volume(tmp_path, monkeypatch):
     res = CliRunner().invoke(cli.main, ["auth", "logout", "codex"])
     assert res.exit_code == 0, res.output
     assert cli.read_config_file(cfg_path) == {"FRANKY_ENGINE": "codex"}
+
+
+def test_auth_logout_codex_keeps_marker_cleared_when_volume_removal_fails(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "config"
+    cli.write_config_file(cfg_path, {"FRANKY_CODEX_SUBSCRIPTION": "1"})
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setattr(cli, "codex_auth_logout", lambda: False)
+    res = CliRunner().invoke(cli.main, ["auth", "logout", "codex"])
+    assert res.exit_code != 0
+    assert "FRANKY_CODEX_SUBSCRIPTION" not in cli.read_config_file(cfg_path)
 
 
 def test_build_load_config_file_malformed_gives_clean_error(tmp_path, monkeypatch):

@@ -2869,6 +2869,25 @@ def _codex_auth_image() -> str:
     return image
 
 
+def _codex_auth_marker_enabled() -> bool:
+    env_value = os.environ.get(CODEX_SUBSCRIPTION_VAR)
+    if env_value is not None:
+        return env_value == "1"
+    path = config_file_path(dict(os.environ))
+    try:
+        return read_config_file(path).get(CODEX_SUBSCRIPTION_VAR) == "1"
+    except ValueError as exc:
+        raise click.ClickException(f"config file error: {exc}") from exc
+
+
+def _clear_codex_auth_marker() -> None:
+    path = config_file_path(dict(os.environ))
+    try:
+        unset_value(path, CODEX_SUBSCRIPTION_VAR)
+    except ValueError as exc:
+        raise click.ClickException(f"could not update config: {exc}") from exc
+
+
 @main.group("auth")
 def auth_group() -> None:
     """Manage persistent engine subscription authentication."""
@@ -2879,6 +2898,7 @@ def auth_group() -> None:
 def auth_login(engine: str) -> None:
     """Log in once from a browserless container using a code opened elsewhere."""
     image = _codex_auth_image()
+    _clear_codex_auth_marker()
     if not codex_auth_login(image):
         raise click.ClickException("Codex subscription login failed")
     path = config_file_path(dict(os.environ))
@@ -2893,6 +2913,8 @@ def auth_login(engine: str) -> None:
 @click.argument("engine", type=click.Choice(["codex"]))
 def auth_status(engine: str) -> None:
     """Check that the persistent Codex credential is present and validly shaped."""
+    if not _codex_auth_marker_enabled():
+        raise click.ClickException("Codex subscription login is not enabled")
     if not codex_auth_status(_codex_auth_image()):
         raise click.ClickException("Codex subscription login is not ready")
     click.echo("Codex subscription login is ready.")
@@ -2902,13 +2924,11 @@ def auth_status(engine: str) -> None:
 @click.argument("engine", type=click.Choice(["codex"]))
 def auth_logout(engine: str) -> None:
     """Delete the persistent Codex credential volume and disable subscription auth."""
+    _clear_codex_auth_marker()
     if not codex_auth_logout():
-        raise click.ClickException("Codex subscription logout failed")
-    path = config_file_path(dict(os.environ))
-    try:
-        unset_value(path, CODEX_SUBSCRIPTION_VAR)
-    except ValueError as exc:
-        raise click.ClickException(f"logout succeeded but config update failed: {exc}") from exc
+        raise click.ClickException(
+            "Codex subscription disabled, but the credential volume could not be removed"
+        )
     click.echo("Codex subscription login removed.")
 
 
