@@ -36,10 +36,22 @@ all ship in the one image.
 |--------|-----|------|-------|
 | `pi` (default) | `@earendil-works/pi-coding-agent` | BYOK provider key | MIT, 15+ providers (OpenRouter, Anthropic, OpenAI, Ollama, ...) |
 | `claude` | `@anthropic-ai/claude-code` | `CLAUDE_CODE_OAUTH_TOKEN` | Most capable; uses your Claude subscription |
-| `codex` | `@openai/codex` | `CODEX_API_KEY` | OpenAI Codex headless (`codex exec`); API-key auth only |
+| `codex` | `@openai/codex` | ChatGPT subscription or `CODEX_API_KEY` | OpenAI Codex headless (`codex exec`) |
 
 Select with `--engine pi|claude|codex`, or set `FRANKY_ENGINE`. Resolution order:
 `--engine` flag > `FRANKY_ENGINE` > default `pi`.
+
+For a ChatGPT subscription, log in once without a browser in Docker. Open the displayed
+URL and code on any other device; later Codex runs reuse and refresh the credential:
+
+```
+franky auth login codex
+franky auth status codex
+franky auth logout codex
+```
+
+The credential stays in the fixed `franky-codex-auth` Docker named volume, never in the
+host's `~/.codex`. If `CODEX_API_KEY` is also set, the API key takes precedence.
 
 ## Install
 
@@ -110,7 +122,8 @@ add an engine), so Codex, Cursor, pi, or Claude Code all start with the same con
    - `FRANKY_ALLOWED_REPOS` - the trusted-repo allowlist (see below).
    - `GH_TOKEN` - scoped to contents + pull_requests on those repos.
    - the selected engine's creds (a provider key for `pi`,
-     `CLAUDE_CODE_OAUTH_TOKEN` for `claude`, or `CODEX_API_KEY` for `codex`).
+     `CLAUDE_CODE_OAUTH_TOKEN` for `claude`, or `franky auth login codex` / `CODEX_API_KEY`
+     for `codex`).
    - for JIRA tasks: `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN` (host-side only,
      never forwarded into the container).
 4. Run:
@@ -490,6 +503,12 @@ container with:
   the container and the nested Docker daemon is rootless, so the agent never
   touches your filesystem or your host's Docker daemon
 - only the selected engine's required env vars passed in; nothing else
+
+Codex subscription auth is the narrow persistence exception: only the fixed Docker named
+volume `franky-codex-auth` is mounted at `/home/franky/.codex`, and only for subscription
+runs. Before every autonomous run a trusted networkless helper deletes every entry except
+`auth.json`; Codex also runs with `--ignore-user-config`. The task remains inside the normal
+proxy cage. `franky auth logout codex` removes the whole volume.
 
 ### Docker-in-Docker (always on)
 

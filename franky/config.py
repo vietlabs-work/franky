@@ -13,7 +13,7 @@ import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 
-from .engine import Engine, resolve_engine
+from .engine import CODEX_AUTH_VOLUME, CODEX_SUBSCRIPTION_VAR, Engine, resolve_engine
 from .result import AuthError, ConfigError
 
 REDACT_TOKEN = "***REDACTED***"
@@ -61,10 +61,14 @@ class Config:
     allowed_repos: list[str]
     passthrough_env: dict[str, str] = field(default_factory=dict)
     extra_allowed_domains: list[str] = field(default_factory=list)
+    auth_volume: str | None = None
 
     def secret_values(self) -> list[str]:
-        """The actual secret strings to scrub from any output. Just the values of the
-        env we pass through - those are the only secrets that reach the container."""
+        """Secret strings known to the host and therefore available for output redaction.
+
+        Subscription auth.json never crosses the Docker volume boundary, so its contents are
+        intentionally neither read nor returned here.
+        """
         return [v for v in self.passthrough_env.values() if v]
 
 
@@ -129,7 +133,10 @@ def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
         )
 
     cred_vars = engine.required_env(env)
-    if not cred_vars:
+    subscription_auth = (
+        engine.name == "codex" and env.get(CODEX_SUBSCRIPTION_VAR) == "1" and not cred_vars
+    )
+    if not cred_vars and not subscription_auth:
         # The hint comes from the engine itself so the refusal names THIS engine's vars -
         # shared config stays engine-agnostic (no hardcoded pi vars).
         raise AuthError(
@@ -160,6 +167,7 @@ def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
         allowed_repos=allowed,
         passthrough_env=passthrough,
         extra_allowed_domains=extra_domains,
+        auth_volume=CODEX_AUTH_VOLUME if subscription_auth else None,
     )
 
 

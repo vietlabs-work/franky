@@ -36,7 +36,12 @@ except ModuleNotFoundError:
     import tomli as tomllib  # type: ignore[import-not-found,no-redef]
 
 from .config import GH_TOKEN_VAR
-from .engine import CLAUDE_TOKEN_VAR, CODEX_PROVIDER_VARS, PI_PROVIDER_VARS
+from .engine import (
+    CLAUDE_TOKEN_VAR,
+    CODEX_PROVIDER_VARS,
+    CODEX_SUBSCRIPTION_VAR,
+    PI_PROVIDER_VARS,
+)
 from .jira import JIRA_API_TOKEN_VAR
 
 # The table name used in the TOML file.
@@ -84,6 +89,7 @@ _NON_SECRET_SETTABLE_KEYS: frozenset[str] = frozenset(
         "FRANKY_NO_UPDATE_CHECK",
         "FRANKY_AUTO_UPDATE",
         "FRANKY_PROFILE_PATH",
+        CODEX_SUBSCRIPTION_VAR,
     }
 )
 
@@ -206,6 +212,14 @@ def set_value(path: Path, key: str, value: str) -> None:
     data = read_config_file(path)
     data[key] = value
     write_config_file(path, data)
+
+
+def unset_value(path: Path, key: str) -> None:
+    """Remove one key while preserving the rest. Missing keys are a no-op."""
+    data = read_config_file(path)
+    if key in data:
+        del data[key]
+        write_config_file(path, data)
 
 
 def load_config_file(env: dict[str, str] | None = None, path: Path | None = None) -> None:

@@ -21,6 +21,7 @@ from franky.userconfig import (
     mask_value,
     read_config_file,
     set_value,
+    unset_value,
     write_config_file,
 )
 
@@ -178,6 +179,13 @@ def test_set_value_preserves_other_keys(tmp_path: Path) -> None:
     data = read_config_file(p)
     assert data["GH_TOKEN"] == "new"
     assert data["FRANKY_ENGINE"] == "pi"
+
+
+def test_unset_value_removes_only_requested_key(tmp_path: Path) -> None:
+    p = tmp_path / "config"
+    write_config_file(p, {"FRANKY_CODEX_SUBSCRIPTION": "1", "FRANKY_ENGINE": "codex"})
+    unset_value(p, "FRANKY_CODEX_SUBSCRIPTION")
+    assert read_config_file(p) == {"FRANKY_ENGINE": "codex"}
 
 
 # ---------------------------------------------------------------------------

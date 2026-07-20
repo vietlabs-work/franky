@@ -27,6 +27,7 @@ from pathlib import Path
 
 from . import egress, franky_version, snapshot
 from .config import redact
+from .engine import CODEX_AUTH_VOLUME, CODEX_SUBSCRIPTION_VAR
 from .profile import PROFILE_BUNDLE_VAR
 
 # Long agent runs: a full clone-build-test-PR cycle can take many minutes. 30 min cap.
@@ -45,6 +46,7 @@ CONTAINER_TIMEOUT_MSG = "franky: container timed out after {timeout}s"
 _RUN_UID = 1001
 _RUN_GID = 1001
 _HOME = "/home/franky"
+CODEX_AUTH_HOME = f"{_HOME}/.codex"
 # XDG_RUNTIME_DIR for the always-on rootless Docker daemon: it puts docker.sock + runtime state
 # here (dockerd-rootless.sh defaults to /run/user/<uid>).
 _XDG_RUNTIME = f"/run/user/{_RUN_UID}"
@@ -166,6 +168,7 @@ def build_docker_argv(
     proxy_url: str | None = None,
     profile_bundle: str | None = None,
     resume_wait: bool = False,
+    auth_volume: str | None = None,
 ) -> list[str]:
     """Build the full `docker run` argv. Pure - no docker invoked.
 
@@ -191,9 +194,17 @@ def build_docker_argv(
     `-e FRANKY_RESUME_WAIT=1` (by-value, non-secret): the entrypoint blocks until the host
     docker-cp's the prior workspace into /work and touches the ready marker. The hardening flags
     are unchanged - resume uses only host-side docker cp/exec + this env flag, no bind mount.
+
+    `auth_volume` is the fixed Codex subscription named volume selected by fail-closed config.
+    It is never a caller-supplied path or bind mount.
     """
     container_name = name or f"franky-run-{uuid.uuid4().hex[:12]}"
     argv = ["docker", "run", *_HARDENING, "--name", container_name]
+    if auth_volume:
+        argv += [
+            "--mount",
+            f"type=volume,src={auth_volume},dst={CODEX_AUTH_HOME}",
+        ]
     if network:
         argv += ["--network", network]
     if proxy_url:
@@ -228,6 +239,119 @@ def build_docker_argv(
         argv += ["-e", key]
     argv += [image, *inner_argv]
     return argv
+
+
+def _codex_auth_argv(
+    image: str,
+    entrypoint: str,
+    args: list[str],
+    *,
+    networkless: bool = True,
+    user: str = f"{_RUN_UID}:{_RUN_GID}",
+    readonly_volume: bool = False,
+    extra: list[str] | None = None,
+) -> list[str]:
+    """The one hardened shape used by trusted fixed-volume auth helpers."""
+    mount = f"type=volume,src={CODEX_AUTH_VOLUME},dst={CODEX_AUTH_HOME}"
+    if readonly_volume:
+        mount += ",readonly"
+    return [
+        "docker",
+        "run",
+        "--rm",
+        *(["--network", "none"] if networkless else []),
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges",
+        "--read-only",
+        "--pids-limit=128",
+        "--memory=512m",
+        "--memory-swap=512m",
+        "--user",
+        user,
+        *(extra or []),
+        "--mount",
+        mount,
+        "--entrypoint",
+        entrypoint,
+        image,
+        *args,
+    ]
+
+
+def build_codex_auth_scrub_argv(image: str, *, require_auth: bool) -> list[str]:
+    """Build a networkless helper that keeps only auth.json in persistent CODEX_HOME."""
+    check = f" && test -f {CODEX_AUTH_HOME}/auth.json && test -s {CODEX_AUTH_HOME}/auth.json"
+    if not require_auth:
+        check = ""
+    command = (
+        f"find {CODEX_AUTH_HOME} -mindepth 1 ! -path {CODEX_AUTH_HOME}/auth.json -delete{check}"
+    )
+    return _codex_auth_argv(image, "sh", ["-c", command])
+
+
+def _codex_auth_volume_exists(runner) -> bool:
+    proc = _run(runner, ["docker", "volume", "inspect", CODEX_AUTH_VOLUME])
+    return proc is not None and getattr(proc, "returncode", 1) == 0
+
+
+def codex_auth_ready(image: str, runner=subprocess.run) -> bool:
+    """Scrub persistent state and require a non-empty regular auth.json."""
+    if not _codex_auth_volume_exists(runner):
+        return False
+    proc = _run(runner, build_codex_auth_scrub_argv(image, require_auth=True))
+    return proc is not None and getattr(proc, "returncode", 1) == 0
+
+
+def codex_auth_status(image: str, runner=subprocess.run) -> bool:
+    """Ask Codex to recognize the scrubbed credential without granting network access."""
+    if not codex_auth_ready(image, runner):
+        return False
+    argv = _codex_auth_argv(image, "codex", ["login", "status"], readonly_volume=True)
+    proc = _run(runner, argv)
+    return proc is not None and getattr(proc, "returncode", 1) == 0
+
+
+def codex_auth_login(image: str, runner=subprocess.run) -> bool:
+    """Run trusted browserless Codex login, persisting only file-backed credentials."""
+    create = _run(runner, ["docker", "volume", "create", CODEX_AUTH_VOLUME])
+    if create is None or getattr(create, "returncode", 1) != 0:
+        return False
+    init_argv = _codex_auth_argv(
+        image,
+        "chown",
+        [f"{_RUN_UID}:{_RUN_GID}", CODEX_AUTH_HOME],
+        user="0:0",
+        extra=["--cap-add=CHOWN"],
+    )
+    init = _run(runner, init_argv)
+    scrub = _run(runner, build_codex_auth_scrub_argv(image, require_auth=False))
+    if any(p is None or getattr(p, "returncode", 1) != 0 for p in (init, scrub)):
+        return False
+    login_argv = _codex_auth_argv(
+        image,
+        "codex",
+        ["-c", 'cli_auth_credentials_store="file"', "login", "--device-auth"],
+        networkless=False,
+        extra=["--tmpfs", f"/tmp:uid={_RUN_UID},gid={_RUN_GID}"],
+    )
+    try:
+        proc = runner(login_argv)
+    except OSError:
+        return False
+    if getattr(proc, "returncode", 1) != 0:
+        return False
+    return codex_auth_ready(image, runner)
+
+
+def codex_auth_logout(runner=subprocess.run) -> bool:
+    """Remove the fixed auth volume; missing state is already logged out."""
+    proc = _run(runner, ["docker", "volume", "rm", CODEX_AUTH_VOLUME])
+    if proc is None:
+        return False
+    return (
+        getattr(proc, "returncode", 1) == 0
+        or "no such volume" in (getattr(proc, "stderr", "") or "").lower()
+    )
 
 
 def build_network_argv(net_name: str) -> list[str]:
@@ -598,7 +722,10 @@ def run_in_container(
     # behavior for callers that do not track a job).
     net, proxy, task = run_names(run_id or uuid.uuid4().hex[:12])
 
-    allowed = egress.build_allowlist(cfg.engine, cfg.passthrough_env, cfg.extra_allowed_domains)
+    provider_env = dict(cfg.passthrough_env)
+    if cfg.auth_volume:
+        provider_env[CODEX_SUBSCRIPTION_VAR] = "1"
+    allowed = egress.build_allowlist(cfg.engine, provider_env, cfg.extra_allowed_domains)
 
     child_env = dict(os.environ if env is None else env)
     child_env.update(cfg.passthrough_env)
@@ -611,6 +738,13 @@ def run_in_container(
     code, output = 1, ""
 
     try:
+        if cfg.auth_volume:
+            if not codex_auth_ready(image, runner):
+                raise _AbortRun(
+                    "franky: Codex subscription login is missing or invalid - "
+                    "run `franky auth login codex`"
+                )
+
         # 1. Internal network. If this fails there is nothing to reap (it was not created).
         if getattr(_run(runner, build_network_argv(net)), "returncode", 1) != 0:
             raise _AbortRun("franky: could not create egress network - refusing to run")
@@ -654,6 +788,7 @@ def run_in_container(
             proxy_url=proxy_url(proxy),
             profile_bundle=profile_bundle,
             resume_wait=resuming,
+            auth_volume=cfg.auth_volume,
         )
         if effective_progress is not None:
             # Streaming path: iterate stdout/stderr line by line, redact per line, call

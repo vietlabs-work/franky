@@ -33,6 +33,9 @@ from .diagnosis import build_diagnosis_result, parse_diagnosis
 from .economics import Usage, format_economics, parse_usage
 from .container import (
     CONTAINER_TIMEOUT_CODE,
+    codex_auth_login,
+    codex_auth_logout,
+    codex_auth_status,
     FRANKY_IMAGE_VAR,
     FRANKY_PROXY_IMAGE_VAR,
     capture_diagnostics,
@@ -42,7 +45,7 @@ from .container import (
 )
 from . import jobs, snapshot
 from .container import container_running, deliver_steer, reap_run, run_names
-from .engine import ENGINES, PI_PROVIDER_VARS, resolve_engine
+from .engine import CODEX_SUBSCRIPTION_VAR, ENGINES, PI_PROVIDER_VARS, resolve_engine
 from .github import run_gh
 from .idempotency import find_open_pr
 from .jira import JIRA_API_TOKEN_VAR, JIRA_EMAIL_VAR, fetch_jira_issue
@@ -91,6 +94,7 @@ from .userconfig import (
     mask_value,
     read_config_file,
     set_value,
+    unset_value,
     write_config_file,
 )
 
@@ -2853,6 +2857,62 @@ def job_attach(ctx: click.Context, job_id: str, message: str | None, as_json: bo
 
 
 # ---------------------------------------------------------------------------
+# `franky auth` subgroup
+# ---------------------------------------------------------------------------
+
+
+def _codex_auth_image() -> str:
+    image = resolve_image(dict(os.environ))
+    ok, reason = ensure_image_available(image)
+    if not ok:
+        raise click.ClickException(f"Codex auth image unavailable ({reason})")
+    return image
+
+
+@main.group("auth")
+def auth_group() -> None:
+    """Manage persistent engine subscription authentication."""
+
+
+@auth_group.command("login")
+@click.argument("engine", type=click.Choice(["codex"]))
+def auth_login(engine: str) -> None:
+    """Log in once from a browserless container using a code opened elsewhere."""
+    image = _codex_auth_image()
+    if not codex_auth_login(image):
+        raise click.ClickException("Codex subscription login failed")
+    path = config_file_path(dict(os.environ))
+    try:
+        set_value(path, CODEX_SUBSCRIPTION_VAR, "1")
+    except ValueError as exc:
+        raise click.ClickException(f"login succeeded but config update failed: {exc}") from exc
+    click.echo("Codex subscription login ready.")
+
+
+@auth_group.command("status")
+@click.argument("engine", type=click.Choice(["codex"]))
+def auth_status(engine: str) -> None:
+    """Check that the persistent Codex credential is present and validly shaped."""
+    if not codex_auth_status(_codex_auth_image()):
+        raise click.ClickException("Codex subscription login is not ready")
+    click.echo("Codex subscription login is ready.")
+
+
+@auth_group.command("logout")
+@click.argument("engine", type=click.Choice(["codex"]))
+def auth_logout(engine: str) -> None:
+    """Delete the persistent Codex credential volume and disable subscription auth."""
+    if not codex_auth_logout():
+        raise click.ClickException("Codex subscription logout failed")
+    path = config_file_path(dict(os.environ))
+    try:
+        unset_value(path, CODEX_SUBSCRIPTION_VAR)
+    except ValueError as exc:
+        raise click.ClickException(f"logout succeeded but config update failed: {exc}") from exc
+    click.echo("Codex subscription login removed.")
+
+
+# ---------------------------------------------------------------------------
 # `franky config` subgroup
 # ---------------------------------------------------------------------------
 # WHY a separate group (not just more top-level commands):
@@ -3015,6 +3075,7 @@ def config_init() -> None:
         if val:
             data["CLAUDE_CODE_OAUTH_TOKEN"] = val
     elif engine_choice == "codex":
+        click.echo("Leave CODEX_API_KEY empty to use `franky auth login codex` after init.")
         val = click.prompt("CODEX_API_KEY", hide_input=True, default="").strip()
         if val:
             data["CODEX_API_KEY"] = val
