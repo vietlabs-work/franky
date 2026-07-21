@@ -85,4 +85,13 @@ def build_allowlist(
         + list(extra_domains)
     )
     cleaned = {d.strip() for d in raw if d and d.strip()}
-    return sorted(cleaned)
+    dot_families = {domain[1:].lower() for domain in cleaned if domain.startswith(".")}
+    return sorted(
+        domain
+        for domain in cleaned
+        if domain.startswith(".")
+        or not any(
+            domain.lower() == family or domain.lower().endswith(f".{family}")
+            for family in dot_families
+        )
+    )

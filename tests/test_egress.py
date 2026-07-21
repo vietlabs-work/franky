@@ -102,7 +102,21 @@ def test_allowlist_dedup_and_sorted():
     assert len(allow) == len(set(allow))
     # whitespace stripped before dedup
     assert "api.anthropic.com" in allow
-    assert allow.count("github.com") == 1
+    assert "github.com" not in allow
+
+
+def test_allowlist_drops_exact_hosts_covered_by_dot_family_rule():
+    allow = build_allowlist(
+        ClaudeEngine(),
+        {},
+        ["api.github.com", "github.com", "mcp.githubusercontent.com"],
+    )
+
+    assert ".github.com" in allow
+    assert ".githubusercontent.com" in allow
+    assert "api.github.com" not in allow
+    assert "github.com" not in allow
+    assert "mcp.githubusercontent.com" not in allow
 
 
 def test_docker_registries_always_allowlisted():

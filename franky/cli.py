@@ -51,12 +51,17 @@ from .idempotency import find_open_pr
 from .jira import JIRA_API_TOKEN_VAR, JIRA_EMAIL_VAR, fetch_jira_issue
 from .profile import (
     PROFILE_CATEGORIES,
+    PROFILE_FILE_CATEGORIES,
     build_bundle,
+    claude_mcp_config_path,
+    codex_mcp_overrides,
     load_profile,
     profile_file_path,
     profile_path,
     read_profile_raw,
+    resolve_mcp_credentials,
     scan_profile_files,
+    validate_mcp_engine,
     write_profile,
 )
 from .prompt import (
@@ -285,7 +290,7 @@ def main() -> None:
     "profile_path_opt",
     default=None,
     type=click.Path(exists=True, dir_okay=False),
-    help="Path to a profile.toml to inject skills/instructions/knowledge into the container. "
+    help="Path to a profile.toml to inject operator files/MCP config into the container. "
     "Auto-discovered from ~/.franky/profile.toml if present.",
 )
 @click.option(
@@ -371,6 +376,7 @@ def build(
     quiet = quiet or as_json
     # Best-effort secret list for any error raised before cfg exists.
     secrets = cfg_secrets_safe()
+    process_env = dict(os.environ)
     try:
         # stdin task input: `build - --repo ...`. A TTY on `-` would block forever, so fail
         # fast (never-hang); otherwise read the prose task from stdin.
@@ -413,7 +419,7 @@ def build(
 
         # Build the profile bundle (optional). Auto-discovers ~/.franky/profile.toml unless
         # overridden by --profile or FRANKY_PROFILE_PATH. Fails closed on detected credentials.
-        bundle = _load_profile_bundle(profile_path_opt, os.environ, secrets)
+        bundle = _load_profile_bundle(profile_path_opt, process_env, secrets, cfg)
 
         # Verbose mode: raw passthrough of agent output to stderr. Quiet (or --json) -> no
         # progress callback at all. Else distilled milestones (the default).
@@ -659,6 +665,7 @@ def iterate(
     """
     quiet = quiet or as_json
     secrets = cfg_secrets_safe()
+    process_env = dict(os.environ)
     try:
         if not quiet:
             maybe_auto_update()
@@ -682,7 +689,7 @@ def iterate(
 
         franky_img, proxy_img = _ensure_images(os.environ)
 
-        bundle = _load_profile_bundle(None, os.environ, secrets)
+        bundle = _load_profile_bundle(None, process_env, secrets, cfg)
         verbose = verbose or bool(os.environ.get(FRANKY_VERBOSE_VAR))
         progress = None if (quiet and not verbose) else _make_progress(cfg.engine, verbose)
         # Register the run before it starts (issue #63), same as build - iterate has no
@@ -772,7 +779,7 @@ def iterate(
     "profile_path_opt",
     default=None,
     type=click.Path(exists=True, dir_okay=False),
-    help="Path to a profile.toml to inject skills/instructions/knowledge into the container. "
+    help="Path to a profile.toml to inject operator files/MCP config into the container. "
     "Auto-discovered from ~/.franky/profile.toml if present.",
 )
 @click.option(
@@ -820,6 +827,7 @@ def plan(
     # --json implies --quiet: the JSON object is the only thing stdout/stderr should carry.
     quiet = quiet or as_json
     secrets = cfg_secrets_safe()
+    process_env = dict(os.environ)
     try:
         # stdin task input mirrors `build -` (never-hang on a TTY).
         task_input_str = _read_task_input(task_input)
@@ -832,7 +840,7 @@ def plan(
         cfg, spec, _branch, secrets = _resolve_task_spec(task_input_str, repo, engine, os.environ)
 
         franky_img, proxy_img = _ensure_images(os.environ)
-        bundle = _load_profile_bundle(profile_path_opt, os.environ, secrets)
+        bundle = _load_profile_bundle(profile_path_opt, process_env, secrets, cfg)
         progress = None if quiet else _make_progress(cfg.engine, False)
 
         # Per-run nonce fenced into the prompt + parser: a hostile issue body / repo file
@@ -995,6 +1003,10 @@ def _run_pass(
     snapshot-on-timeout sink and a workspace-to-restore path respectively; both None by default.
     """
     inner_argv = cfg.engine.inner_argv(prompt, model=None)
+    for override in cfg.codex_mcp_overrides:
+        inner_argv += ["-c", override]
+    if cfg.claude_mcp_config_path:
+        inner_argv += ["--mcp-config", cfg.claude_mcp_config_path, "--strict-mcp-config"]
     extra = {} if timeout is None else {"timeout": timeout}
     t0 = time.monotonic()
     code, output = run_in_container(
@@ -1016,8 +1028,9 @@ def _run_pass(
 
 def _load_profile_bundle(
     profile_path_opt: str | None,
-    env: dict,
+    credential_env: dict,
     secrets: list[str],
+    cfg: Config,
 ) -> str | None:
     """Load, scan, and pack the operator profile bundle; return None if no profile is found.
 
@@ -1032,15 +1045,30 @@ def _load_profile_bundle(
     if profile_path_opt:
         ppath = Path(profile_path_opt)
     else:
-        ppath = profile_path(env)
+        ppath = profile_path(dict(os.environ))
 
     if ppath is None:
         return None
 
     try:
         spec = load_profile(ppath)
+        validate_mcp_engine(spec, cfg.engine.name)
+        mcp_env = resolve_mcp_credentials(spec, credential_env)
     except ValueError as exc:
         raise ConfigError(redact(str(exc), secrets)) from exc
+
+    cfg.passthrough_env.update(mcp_env)
+    secrets.extend(mcp_env.values())
+    cfg.extra_allowed_domains.extend(
+        domain for domain in spec.mcp_domains if domain not in cfg.extra_allowed_domains
+    )
+    if cfg.engine.name == "codex":
+        try:
+            cfg.codex_mcp_overrides = codex_mcp_overrides(spec)
+        except ValueError as exc:
+            raise ConfigError(redact(str(exc), secrets)) from exc
+    elif cfg.engine.name == "claude":
+        cfg.claude_mcp_config_path = claude_mcp_config_path(spec)
 
     if not spec.all_files():
         return None
@@ -3240,7 +3268,7 @@ def profile_show() -> None:
     if not files:
         click.echo("  (none)", err=True)
         return
-    for category in PROFILE_CATEGORIES:
+    for category in PROFILE_FILE_CATEGORIES:
         for fp in getattr(spec, category):
             click.echo(f"  [{category}] {fp} ({fp.stat().st_size} bytes)", err=True)
 
@@ -3261,6 +3289,7 @@ def profile_check() -> None:
 
     try:
         spec = load_profile(path)
+        resolve_mcp_credentials(spec, dict(os.environ))
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -3270,7 +3299,7 @@ def profile_check() -> None:
         # unintended state). Echo the declared patterns so the operator knows what to fix.
         declared = read_profile_raw(path)
         click.echo("profile has no files to inject - declared patterns matched nothing:", err=True)
-        for category in PROFILE_CATEGORIES:
+        for category in PROFILE_FILE_CATEGORIES:
             for pattern in declared.get(category, []):
                 click.echo(f"  [{category}] {pattern}", err=True)
         return
