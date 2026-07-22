@@ -1,4 +1,4 @@
-# Franky build image: one image bundles both coding-agent engines (pi default, claude alt) AND
+# Franky build image: one image bundles all coding-agent engines AND
 # an always-on rootless Docker daemon (issue #12) so a task can build/test repos whose suites
 # need local infra (docker compose, testcontainers, `docker build`). Hardened at run time (see
 # franky/container.py); the image pre-bakes the toolchain so no task needs runtime root apt.
@@ -81,12 +81,14 @@ COPY --from=docker-dl /out/cli-plugins/ /usr/local/lib/docker/cli-plugins/
 #   pi     -> @earendil-works/pi-coding-agent  (bin: pi)
 #   claude -> @anthropic-ai/claude-code        (bin: claude)
 #   codex  -> @openai/codex                    (bin: codex)
+#   opencode -> opencode-ai                    (bin: opencode)
 # Clean the npm cache in the SAME layer - otherwise ~100MB of /root/.npm download
 # cache commits into the image (it is dead weight at runtime; npm refetches on demand).
 RUN npm install -g \
         @earendil-works/pi-coding-agent \
         @anthropic-ai/claude-code \
         @openai/codex \
+        opencode-ai \
     && npm cache clean --force
 
 # Non-root: the agent (and the rootless Docker daemon) run as this unprivileged user inside the

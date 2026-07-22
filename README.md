@@ -37,9 +37,19 @@ all ship in the one image.
 | `pi` (default) | `@earendil-works/pi-coding-agent` | BYOK provider key | MIT, 15+ providers (OpenRouter, Anthropic, OpenAI, Ollama, ...) |
 | `claude` | `@anthropic-ai/claude-code` | `CLAUDE_CODE_OAUTH_TOKEN` | Most capable; uses your Claude subscription |
 | `codex` | `@openai/codex` | ChatGPT subscription or `CODEX_API_KEY` | OpenAI Codex headless (`codex exec`) |
+| `opencode` | `opencode-ai` | `OPENROUTER_API_KEY` | OpenRouter only; requires `FRANKY_MODEL=openrouter/<model-id>` |
 
-Select with `--engine pi|claude|codex`, or set `FRANKY_ENGINE`. Resolution order:
+Select with `--engine pi|claude|codex|opencode`, or set `FRANKY_ENGINE`. Resolution order:
 `--engine` flag > `FRANKY_ENGINE` > default `pi`.
+
+OpenCode requires an explicit OpenRouter model. Nested model IDs are supported:
+
+```
+franky config set FRANKY_ENGINE opencode
+franky config set FRANKY_MODEL openrouter/anthropic/claude-sonnet-4
+franky config set OPENROUTER_API_KEY
+franky build "fix the flaky retry test" --repo you/repo --engine opencode
+```
 
 For a ChatGPT subscription, log in once without a browser in Docker. Open the displayed
 URL and code on any other device; later Codex runs reuse and refresh the credential:
@@ -125,12 +135,13 @@ add an engine), so Codex, Cursor, pi, or Claude Code all start with the same con
    - `GH_TOKEN` - scoped to contents + pull_requests on those repos.
    - the selected engine's creds (a provider key for `pi`,
      `CLAUDE_CODE_OAUTH_TOKEN` for `claude`, or `franky auth login codex` / `CODEX_API_KEY`
-     for `codex`).
+     for `codex`; OpenCode requires `OPENROUTER_API_KEY` and
+     `FRANKY_MODEL=openrouter/<model-id>`).
    - for JIRA tasks: `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN` (host-side only,
      never forwarded into the container).
 4. Run:
    ```
-   franky build <gh-issue-url | jira KEY | "prose" | -> [--repo owner/repo] [--engine pi|claude|codex] [--plan-first] [--json] [-q] [-y]
+   franky build <gh-issue-url | jira KEY | "prose" | -> [--repo owner/repo] [--engine pi|claude|codex|opencode] [--plan-first] [--json] [-q] [-y]
    ```
 
 Each run writes a redacted log to `tasks/<timestamp>.log` and prints the PR URL.
@@ -154,7 +165,7 @@ check, point it back at the PR and it responds with **additive follow-up commits
 the same branch:
 
 ```
-franky iterate https://github.com/you/repo/pull/42 [--engine pi|claude|codex]
+franky iterate https://github.com/you/repo/pull/42 [--engine pi|claude|codex|opencode]
 ```
 
 It runs the **same hardened, egress-controlled container** as `franky build`, but instead
@@ -491,7 +502,8 @@ Read this before pointing Franky at anything.
 
 **Container hardening is load-bearing.** Because the agent runs autonomously
 (claude with `--dangerously-skip-permissions`, codex with
-`--dangerously-bypass-approvals-and-sandbox`, pi with its default tools), the
+`--dangerously-bypass-approvals-and-sandbox`, OpenCode with `--auto --pure`, and pi with its
+default tools), the
 OS-level isolation is what bounds it, not tool-permission prompts. Franky runs the
 container with:
 

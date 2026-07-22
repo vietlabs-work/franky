@@ -314,6 +314,19 @@ def test_mask_value_jira_email_not_masked() -> None:
     assert result == "user@example.com"
 
 
+def test_franky_model_is_settable_and_non_secret() -> None:
+    assert "FRANKY_MODEL" in SETTABLE_KEYS
+    assert "FRANKY_MODEL" not in SECRET_KEYS
+    assert mask_value("FRANKY_MODEL", "openrouter/anthropic/claude-x") == (
+        "openrouter/anthropic/claude-x"
+    )
+
+
+def test_openrouter_api_key_remains_secret() -> None:
+    assert "OPENROUTER_API_KEY" in SECRET_KEYS
+    assert mask_value("OPENROUTER_API_KEY", "sk-or-secret") == REDACT_TOKEN
+
+
 # ---------------------------------------------------------------------------
 # SETTABLE_KEYS - sanity
 # ---------------------------------------------------------------------------

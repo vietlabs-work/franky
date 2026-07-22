@@ -7,8 +7,10 @@ from franky.engine import (
     CODEX_SUBSCRIPTION_VAR,
     ClaudeEngine,
     CodexEngine,
+    OpenCodeEngine,
     PiEngine,
 )
+from franky.result import ConfigError
 
 SECRET = "sk-super-secret-value-123"
 
@@ -62,6 +64,57 @@ def test_load_config_engine_resolution_codex():
     assert isinstance(cfg.engine, CodexEngine)
     assert cfg.passthrough_env["CODEX_API_KEY"] == "sk-codex-fake"
     assert "OPENROUTER_API_KEY" not in cfg.passthrough_env
+
+
+def test_load_config_opencode_propagates_model_and_isolates_credentials():
+    env = _env(
+        FRANKY_MODEL="openrouter/anthropic/claude-x",
+        OPENAI_API_KEY="sk-openai-fake",
+        CLAUDE_CODE_OAUTH_TOKEN="oauth-fake",
+    )
+    cfg = load_config("opencode", env)
+    assert isinstance(cfg.engine, OpenCodeEngine)
+    assert cfg.model == "openrouter/anthropic/claude-x"
+    assert cfg.passthrough_env == {
+        "GH_TOKEN": "ghp_fake",
+        "OPENROUTER_API_KEY": "sk-or-fake",
+    }
+
+
+def test_load_config_propagates_model_for_other_engines_without_opencode_validation():
+    cfg = load_config(None, _env(FRANKY_MODEL="provider/model with spaces"))
+    assert cfg.model == "provider/model with spaces"
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        "",
+        "openrouter",
+        "openrouter/",
+        "openrouter//model",
+        "openrouter/model/",
+        "openrouter/model id",
+        "openrouter/ model",
+        "other/model",
+    ],
+)
+def test_load_config_opencode_rejects_missing_or_invalid_model(model):
+    with pytest.raises(ConfigError, match="FRANKY_MODEL|openrouter/<model-id>"):
+        load_config("opencode", _env(FRANKY_MODEL=model))
+
+
+def test_load_config_opencode_accepts_nested_nonempty_model_id():
+    cfg = load_config("opencode", _env(FRANKY_MODEL="openrouter/anthropic/claude-x"))
+    assert cfg.model == "openrouter/anthropic/claude-x"
+
+
+def test_load_config_opencode_requires_openrouter_auth_only():
+    env = _env(FRANKY_MODEL="openrouter/anthropic/claude-x", OPENAI_API_KEY="sk-openai-fake")
+    del env["OPENROUTER_API_KEY"]
+    with pytest.raises(ValueError, match="OPENROUTER_API_KEY") as exc:
+        load_config("opencode", env)
+    assert "OPENAI_API_KEY" not in str(exc.value)
 
 
 def test_load_config_codex_subscription_uses_fixed_volume():

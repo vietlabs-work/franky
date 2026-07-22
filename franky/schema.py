@@ -36,7 +36,7 @@ _RESULT_SCHEMA: dict = {
     },
     "log_path": "path to the redacted task log under tasks/; empty string for already_open "
     "(no run)",
-    "engine": "the resolved engine name (e.g. pi | claude | codex)",
+    "engine": "the resolved engine name (e.g. pi | claude | codex | opencode)",
     "repo": "the target owner/repo",
     "job_id": "the run handle (issue #63); use with `franky job status|logs|kill`. null when no "
     "container ran (e.g. already_open).",
@@ -62,7 +62,7 @@ _DIAGNOSIS_RESULT_SCHEMA: dict = {
     "(false for a deterministic failure). `build --retry` stops when this is false.",
     "retry_hint": "one concise instruction fed into a retry attempt (issue #64 #5)",
     "confidence": "the agent's confidence: low | medium | high",
-    "engine": "the resolved engine name",
+    "engine": "the resolved engine name (e.g. pi | claude | codex | opencode)",
     "exit_code": "the process exit code this result corresponds to (0 on success)",
 }
 
@@ -80,7 +80,7 @@ _PLAN_RESULT_SCHEMA: dict = {
         }
     ],
     "rationale": "why the task fits one PR or how it was split",
-    "engine": "the resolved engine name (e.g. pi | claude | codex)",
+    "engine": "the resolved engine name (e.g. pi | claude | codex | opencode)",
     "repo": "the target owner/repo",
     "exit_code": "the process exit code this result corresponds to (0 on success)",
 }
@@ -95,7 +95,7 @@ _JOB_RECORD_SCHEMA: dict = {
     "command": "the Franky command that produced this run: build | iterate | diagnose | replay | "
     "resume",
     "repo": "the target owner/repo",
-    "engine": "the resolved engine name (e.g. pi | claude | codex)",
+    "engine": "the resolved engine name (e.g. pi | claude | codex | opencode)",
     "task": "a redacted, truncated summary of the task text (a handle, not the full prompt)",
     "container": "the task container's name",
     "network": "the internal egress network's name",

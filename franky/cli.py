@@ -1002,7 +1002,7 @@ def _run_pass(
     `snapshot_sink`/`resume_workspace` (issue #71) are likewise forwarded unchanged - a
     snapshot-on-timeout sink and a workspace-to-restore path respectively; both None by default.
     """
-    inner_argv = cfg.engine.inner_argv(prompt, model=None)
+    inner_argv = cfg.engine.inner_argv(prompt, model=cfg.model)
     for override in cfg.codex_mcp_overrides:
         inner_argv += ["-c", override]
     if cfg.claude_mcp_config_path:
@@ -3127,6 +3127,13 @@ def config_init() -> None:
         val = click.prompt("CODEX_API_KEY", hide_input=True, default="").strip()
         if val:
             data["CODEX_API_KEY"] = val
+    elif engine_choice == "opencode":
+        model = click.prompt("FRANKY_MODEL (openrouter/<model-id>)").strip()
+        if model:
+            data["FRANKY_MODEL"] = model
+        val = click.prompt("OPENROUTER_API_KEY", hide_input=True).strip()
+        if val:
+            data["OPENROUTER_API_KEY"] = val
 
     # Optional JIRA
     click.echo()

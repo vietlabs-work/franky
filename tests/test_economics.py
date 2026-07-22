@@ -185,6 +185,116 @@ def test_parse_usage_rejects_negative_and_non_finite_values():
     assert u2.cost_usd is None
 
 
+def test_parse_usage_sums_opencode_step_finish_dimensions():
+    output = "\n".join(
+        [
+            _line(
+                {
+                    "type": "step_finish",
+                    "part": {
+                        "tokens": {"input": 10, "output": 3, "reasoning": 2, "cache": 8},
+                        "cost": 0.01,
+                    },
+                }
+            ),
+            _line(
+                {
+                    "type": "step_finish",
+                    "part": {
+                        "tokens": {"input": 20, "output": 4, "reasoning": 1, "cache": 9},
+                        "cost": 0.02,
+                    },
+                }
+            ),
+        ]
+    )
+    usage = parse_usage(output)
+    assert usage.input_tokens == 30
+    assert usage.output_tokens == 7
+    assert usage.cost_usd == pytest.approx(0.03)
+
+
+def test_parse_usage_opencode_preserves_absent_dimensions_as_none():
+    output = _line({"type": "step_finish", "part": {"tokens": {"input": 5, "output": -1}}})
+    assert parse_usage(output) == Usage(input_tokens=5)
+
+
+def test_parse_usage_opencode_malformed_nonfinite_and_overflow_never_raise():
+    output = "\n".join(
+        [
+            _line({"type": "step_finish", "part": []}),
+            _line({"type": "step_finish", "part": {"tokens": []}}),
+            '{"type":"step_finish","part":{"tokens":{"input":Infinity},"cost":Infinity}}',
+            _line({"type": "step_finish", "part": {"cost": 10**400}}),
+            _line({"type": "step_finish", "part": {"tokens": {"input": 2}, "cost": 1e308}}),
+            _line({"type": "step_finish", "part": {"cost": 1e308}}),
+        ]
+    )
+    assert parse_usage(output) == Usage(input_tokens=2)
+
+
+def test_parse_usage_opencode_events_override_generic_terminal_without_double_counting():
+    output = "\n".join(
+        [
+            _line(
+                {
+                    "type": "result",
+                    "usage": {"input_tokens": 999, "output_tokens": 999},
+                    "cost": 9.99,
+                }
+            ),
+            _line(
+                {
+                    "type": "step_finish",
+                    "part": {"tokens": {"input": 2, "output": 1}, "cost": 0.01},
+                }
+            ),
+        ]
+    )
+    assert parse_usage(output) == Usage(input_tokens=2, output_tokens=1, cost_usd=0.01)
+
+
+def test_parse_usage_opencode_cost_only_selects_opencode_mode():
+    output = "\n".join(
+        [
+            _line({"type": "result", "usage": {"input_tokens": 99, "output_tokens": 9}}),
+            _line({"type": "step_finish", "part": {"cost": 0.25}}),
+        ]
+    )
+    assert parse_usage(output) == Usage(cost_usd=0.25)
+
+
+def test_parse_usage_invalid_opencode_boolean_and_fractional_values_preserve_generic_fallback():
+    output = "\n".join(
+        [
+            _line(
+                {
+                    "type": "result",
+                    "usage": {"input_tokens": 40, "output_tokens": 8},
+                    "cost": 0.4,
+                }
+            ),
+            _line(
+                {
+                    "type": "step_finish",
+                    "part": {"tokens": {"input": True, "output": 1.5}, "cost": True},
+                }
+            ),
+        ]
+    )
+    assert parse_usage(output) == Usage(input_tokens=40, output_tokens=8, cost_usd=0.4)
+
+
+def test_parse_usage_opencode_accepts_integer_like_tokens_and_numeric_cost_strings():
+    output = _line(
+        {
+            "type": "step_finish",
+            "part": {"tokens": {"input": "5", "output": 2.0}, "cost": "0.25"},
+        }
+    )
+    assert parse_usage(output) == Usage(input_tokens=5, output_tokens=2, cost_usd=0.25)
+
+
 # ---------------------------------------------------------------------------
 # format_economics: output format
 # ---------------------------------------------------------------------------

@@ -92,7 +92,7 @@ def _fallback_pr_url(output: str, pattern: re.Pattern[str]) -> str | None:
 
 
 def _scan_jsonl_for_pr_url(output: str, repo: str | None = None) -> str | None:
-    """Both engines emit one JSON object per line. Walk lines, json.loads each (skip any
+    """The engines emit one JSON object per line. Walk lines, json.loads each (skip any
     non-JSON line, never raise), and return the last PR URL found in the stringified event
     values. Falls back to the plain-text regex over the whole output if nothing is found.
     Matches are scoped to `repo` when given (see _pr_url_pattern).
@@ -117,28 +117,30 @@ def _scan_jsonl_for_pr_url(output: str, repo: str | None = None) -> str | None:
     return found or _fallback_pr_url(output, pattern)
 
 
-def _tool_use_summary(name: str, inp: dict) -> str:
+def _tool_use_summary(name: object, inp: dict) -> str:
     """Return a compact `franky: <verb> <detail>` line for a tool-use event.
 
     Shared by all engine distillers so the wording is consistent across engines.
     """
-    if name in ("Edit", "MultiEdit"):
-        path = inp.get("file_path", "") or inp.get("path", "")
+    name = name if isinstance(name, str) else ""
+    lower_name = name.lower()
+    if lower_name in ("edit", "multiedit"):
+        path = str(inp.get("file_path", "") or inp.get("filePath", "") or inp.get("path", ""))[:60]
         return f"franky: editing {path}" if path else "franky: editing file"
-    if name == "Write":
-        path = inp.get("file_path", "") or inp.get("path", "")
+    if lower_name == "write":
+        path = str(inp.get("file_path", "") or inp.get("filePath", "") or inp.get("path", ""))[:60]
         return f"franky: writing {path}" if path else "franky: writing file"
-    if name == "Read":
-        path = inp.get("file_path", "") or inp.get("path", "")
+    if lower_name == "read":
+        path = str(inp.get("file_path", "") or inp.get("filePath", "") or inp.get("path", ""))[:60]
         return f"franky: reading {path}" if path else "franky: reading file"
-    if name in ("Bash", "execute_bash"):
+    if lower_name in ("bash", "execute_bash"):
         cmd = str(inp.get("command", "") or inp.get("cmd", "")).split("\n")[0][:60]
         return f"franky: running: {cmd}" if cmd else "franky: running command"
-    if name in ("Glob", "GlobTool", "glob"):
-        pat = inp.get("pattern", "")
+    if lower_name in ("glob", "globtool", "grep", "search"):
+        pat = str(inp.get("pattern", "") or inp.get("query", ""))[:60]
         return f"franky: searching: {pat}" if pat else "franky: searching"
     if name:
-        return f"franky: {name.lower()}"
+        return f"franky: {lower_name[:60]}"
     return "franky: tool call"
 
 
@@ -395,10 +397,67 @@ class CodexEngine(Engine):
         return None
 
 
+class OpenCodeEngine(Engine):
+    name = "opencode"
+
+    def inner_argv(self, prompt: str, model: str | None) -> list[str]:
+        return [
+            "opencode",
+            "run",
+            "--format",
+            "json",
+            "--auto",
+            "--pure",
+            "--model",
+            model or "",
+            prompt,
+        ]
+
+    def parse_pr_url(self, output: str, repo: str | None = None) -> str | None:
+        return _scan_jsonl_for_pr_url(output, repo)
+
+    def required_env(self, env: Mapping[str, str] | None = None) -> list[str]:
+        env = os.environ if env is None else env
+        return ["OPENROUTER_API_KEY"] if env.get("OPENROUTER_API_KEY") else []
+
+    def provider_hosts(self, env: Mapping[str, str] | None = None) -> list[str]:
+        return ["openrouter.ai"]
+
+    def cred_hint(self) -> str:
+        return "set OPENROUTER_API_KEY"
+
+    def distill_line(self, line: str) -> str | None:
+        try:
+            event = json.loads(line)
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(event, dict):
+            return None
+        event_type = event.get("type")
+        if event_type == "error":
+            return "franky: agent error"
+        part = event.get("part")
+        if not isinstance(part, dict):
+            return None
+        if event_type == "step_finish":
+            return "franky: step complete"
+        if event_type != "tool_use":
+            return None
+        state = part.get("state")
+        if not isinstance(state, dict):
+            return None
+        inp = state.get("input")
+        tool = part.get("tool")
+        if not isinstance(inp, dict):
+            return None
+        return _tool_use_summary(tool, inp)
+
+
 ENGINES: dict[str, type[Engine]] = {
     "pi": PiEngine,
     "claude": ClaudeEngine,
     "codex": CodexEngine,
+    "opencode": OpenCodeEngine,
 }
 DEFAULT_ENGINE = "pi"
 
