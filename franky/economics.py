@@ -172,7 +172,9 @@ def _extract_cost(event: dict | None) -> float | None:
 
 def _int_or_none(val: object) -> int | None:
     """Return val as int when it is a non-negative integer-like number, else None."""
-    if val is None:
+    if val is None or isinstance(val, bool):
+        return None
+    if isinstance(val, float) and not val.is_integer():
         return None
     try:
         i = int(val)
@@ -183,7 +185,7 @@ def _int_or_none(val: object) -> int | None:
 
 def _float_or_none(val: object) -> float | None:
     """Return val as float when it is a non-negative finite number, else None."""
-    if val is None:
+    if val is None or isinstance(val, bool):
         return None
     try:
         f = float(val)

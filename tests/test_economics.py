@@ -264,6 +264,37 @@ def test_parse_usage_opencode_cost_only_selects_opencode_mode():
     assert parse_usage(output) == Usage(cost_usd=0.25)
 
 
+def test_parse_usage_invalid_opencode_boolean_and_fractional_values_preserve_generic_fallback():
+    output = "\n".join(
+        [
+            _line(
+                {
+                    "type": "result",
+                    "usage": {"input_tokens": 40, "output_tokens": 8},
+                    "cost": 0.4,
+                }
+            ),
+            _line(
+                {
+                    "type": "step_finish",
+                    "part": {"tokens": {"input": True, "output": 1.5}, "cost": True},
+                }
+            ),
+        ]
+    )
+    assert parse_usage(output) == Usage(input_tokens=40, output_tokens=8, cost_usd=0.4)
+
+
+def test_parse_usage_opencode_accepts_integer_like_tokens_and_numeric_cost_strings():
+    output = _line(
+        {
+            "type": "step_finish",
+            "part": {"tokens": {"input": "5", "output": 2.0}, "cost": "0.25"},
+        }
+    )
+    assert parse_usage(output) == Usage(input_tokens=5, output_tokens=2, cost_usd=0.25)
+
+
 # ---------------------------------------------------------------------------
 # format_economics: output format
 # ---------------------------------------------------------------------------
