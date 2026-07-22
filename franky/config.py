@@ -21,6 +21,7 @@ REDACT_TOKEN = "***REDACTED***"
 GH_TOKEN_VAR = "GH_TOKEN"
 ALLOWED_REPOS_VAR = "FRANKY_ALLOWED_REPOS"
 EXTRA_ALLOWED_DOMAINS_VAR = "FRANKY_EXTRA_ALLOWED_DOMAINS"
+MODEL_VAR = "FRANKY_MODEL"
 
 # Valid allowlist entry pattern: the literal "*" (match any repo) OR exactly one "/"
 # with GitHub-compatible owner/name segments (alphanumeric, dash, underscore, dot).
@@ -38,6 +39,7 @@ _ALLOWLIST_ENTRY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.*-]+$")
 # This guards repo_allowed against a multi-slash repo (e.g. "owner/sub/path") sneaking
 # past an "owner/*" pattern by matching the trailing "sub/path" against the name glob.
 _REPO_RE = re.compile(r"^[^/\s]+/[^/\s]+$")
+_OPENCODE_MODEL_RE = re.compile(r"^openrouter/[^/\s]+(?:/[^/\s]+)*$")
 
 
 def redact(text: str, secrets: Iterable[str]) -> str:
@@ -64,6 +66,7 @@ class Config:
     auth_volume: str | None = None
     codex_mcp_overrides: list[str] = field(default_factory=list)
     claude_mcp_config_path: str | None = None
+    model: str | None = None
 
     def secret_values(self) -> list[str]:
         """Secret strings known to the host and therefore available for output redaction.
@@ -104,8 +107,9 @@ def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
     only the VAR name):
       1. allowlist unset/blank -> refuse (we will not act on an open set of repos)
       2. GH_TOKEN missing -> refuse (cannot clone or open a PR without it)
-      3. engine creds missing -> refuse (pi: no provider var set; claude: token missing;
-         codex: CODEX_API_KEY unset)
+      3. OpenCode model missing/invalid -> refuse
+      4. engine creds missing -> refuse (pi: no provider var set; claude: token missing;
+         codex: CODEX_API_KEY unset; opencode: OPENROUTER_API_KEY unset)
     """
     # resolve_engine raises a plain ValueError for an unknown FRANKY_ENGINE; rewrap as a
     # ConfigError so it gets exit code 3 + a JSON error, keeping the message identical.
@@ -132,6 +136,12 @@ def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
     if not gh_token:
         raise AuthError(
             f"{GH_TOKEN_VAR} is unset or empty - refusing (needed to clone + open the PR)"
+        )
+
+    model = env.get(MODEL_VAR) or None
+    if engine.name == "opencode" and (model is None or not _OPENCODE_MODEL_RE.fullmatch(model)):
+        raise ConfigError(
+            f"{MODEL_VAR} must be set to 'openrouter/<model-id>' for engine 'opencode'"
         )
 
     cred_vars = engine.required_env(env)
@@ -170,6 +180,7 @@ def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
         passthrough_env=passthrough,
         extra_allowed_domains=extra_domains,
         auth_volume=CODEX_AUTH_VOLUME if subscription_auth else None,
+        model=model,
     )
 
 

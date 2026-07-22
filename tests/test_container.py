@@ -1,7 +1,7 @@
 import subprocess
 
 import franky.container as container_mod
-from franky.config import Config
+from franky.config import Config, load_config
 from franky.container import (
     CODEX_AUTH_HOME,
     FRANKY_PROXY_IMAGE_VAR,
@@ -334,6 +334,22 @@ def test_build_docker_argv_cross_engine_env_isolation():
     assert "CODEX_API_KEY" in cx_e
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in cx_e
     assert "OPENROUTER_API_KEY" not in cx_e
+
+
+def test_opencode_config_emits_only_name_only_selected_credentials():
+    secret_values = {
+        "GH_TOKEN": "gh-secret",
+        "OPENROUTER_API_KEY": "or-secret",
+        "OPENAI_API_KEY": "oa-secret",
+        "ANTHROPIC_API_KEY": "an-secret",
+        "FRANKY_ALLOWED_REPOS": "me/repo",
+        "FRANKY_MODEL": "openrouter/anthropic/claude-x",
+    }
+    cfg = load_config("opencode", secret_values)
+    argv = build_docker_argv("franky", cfg.passthrough_env, ["opencode", "run"])
+    e_values = [argv[i + 1] for i, token in enumerate(argv) if token == "-e"]
+    assert sorted(e_values) == ["GH_TOKEN", "OPENROUTER_API_KEY"]
+    assert all(value not in argv for value in secret_values.values())
 
 
 def test_build_docker_argv_image_and_inner_last():

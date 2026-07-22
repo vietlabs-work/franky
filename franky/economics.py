@@ -31,13 +31,10 @@ class Usage:
 def parse_usage(output: str) -> Usage:
     """Walk engine JSONL output and extract the best-effort token/cost summary.
 
-    WHY last-terminal, not sum: engines (both pi --mode json and claude --output-format
-    stream-json) emit one JSON event per line, where intermediate events carry per-chunk
-    usage sub-totals. The terminal event (type "result", "message_stop", "done", "final",
-    "summary", or "turn.completed") carries the run's cumulative total. Summing across events double-counts;
-    picking the terminal event gives the correct once-only total. If no terminal event
-    carries usage, we fall back to the last event that has any usage, which is still the
-    most complete reading available.
+    OpenCode emits per-step totals, so its valid step_finish dimensions are summed. Other
+    engines emit cumulative terminal totals: picking the last terminal event avoids double
+    counting intermediate chunks. If no terminal event carries usage, use the last event
+    with any usage.
 
     Non-JSON lines (banners, log lines) are silently skipped. Non-numeric or garbage
     values are treated as absent. The function never raises.
@@ -46,6 +43,11 @@ def parse_usage(output: str) -> Usage:
     # We pick the last terminal candidate, else the last any candidate.
     usage_candidates: list[tuple[bool, dict]] = []
     cost_candidates: list[tuple[bool, dict]] = []
+    opencode_input: int | None = None
+    opencode_output: int | None = None
+    opencode_cost: float | None = None
+    opencode_cost_overflowed = False
+    opencode_found = False
 
     for line in output.splitlines():
         line = line.strip()
@@ -59,6 +61,25 @@ def parse_usage(output: str) -> Usage:
             continue
 
         event_type = event.get("type", "")
+        if event_type == "step_finish":
+            part = event.get("part")
+            if isinstance(part, dict):
+                tokens = part.get("tokens")
+                inp = _int_or_none(tokens.get("input")) if isinstance(tokens, dict) else None
+                out = _int_or_none(tokens.get("output")) if isinstance(tokens, dict) else None
+                cost = _float_or_none(part.get("cost"))
+                if inp is not None:
+                    opencode_input = (opencode_input or 0) + inp
+                if out is not None:
+                    opencode_output = (opencode_output or 0) + out
+                if cost is not None and not opencode_cost_overflowed:
+                    total = (opencode_cost or 0.0) + cost
+                    if math.isfinite(total):
+                        opencode_cost = total
+                    else:
+                        opencode_cost = None
+                        opencode_cost_overflowed = True
+                opencode_found |= inp is not None or out is not None or cost is not None
         is_terminal = isinstance(event_type, str) and event_type in _TERMINAL_TYPES
 
         # Check for a recognizable usage block.
@@ -68,6 +89,13 @@ def parse_usage(output: str) -> Usage:
         # Check for a recognizable cost field.
         if _extract_cost(event) is not None:
             cost_candidates.append((is_terminal, event))
+
+    if opencode_found:
+        return Usage(
+            input_tokens=opencode_input,
+            output_tokens=opencode_output,
+            cost_usd=None if opencode_cost_overflowed else opencode_cost,
+        )
 
     # For each dimension: prefer the last terminal candidate, else the last any candidate.
     usage_event = _pick_best(usage_candidates)
@@ -149,7 +177,7 @@ def _int_or_none(val: object) -> int | None:
     try:
         i = int(val)
         return i if i >= 0 else None
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -160,7 +188,7 @@ def _float_or_none(val: object) -> float | None:
     try:
         f = float(val)
         return f if math.isfinite(f) and f >= 0 else None
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 

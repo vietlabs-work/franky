@@ -1828,6 +1828,28 @@ def test_run_pass_loads_only_reserved_claude_mcp_config(tmp_path, monkeypatch):
     ]
 
 
+def test_run_pass_threads_configured_model_to_engine(monkeypatch):
+    from franky.config import Config
+    from franky.engine import OpenCodeEngine
+
+    cfg = Config(
+        engine=OpenCodeEngine(),
+        allowed_repos=["me/repo"],
+        model="openrouter/anthropic/claude-x",
+    )
+    seen = {}
+
+    def fake_run(_cfg, inner_argv, **_kwargs):
+        seen["argv"] = inner_argv
+        return 0, "ok"
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+    cli._run_pass(cfg, "do it", "franky", "franky-proxy")
+
+    assert seen["argv"][-3:] == ["--model", "openrouter/anthropic/claude-x", "do it"]
+    assert seen["argv"] == OpenCodeEngine().inner_argv("do it", cfg.model)
+
+
 def test_profile_check_secret_hit_nonzero_and_names_file_without_value(tmp_path, monkeypatch):
     leak = tmp_path / "leak.md"
     leak.write_text(f"token {_GHP_FAKE}\n", encoding="utf-8")
@@ -1929,6 +1951,23 @@ def test_config_init_profile_prompt_yes_writes_both(tmp_path, monkeypatch):
     assert res.exit_code == 0, res.output
     assert read_config_file(cfg_path)["FRANKY_ENGINE"] == "pi"
     assert read_profile_raw(prof_path)["skills"] == ["~/.claude/skills/*.md"]
+
+
+def test_config_init_opencode_persists_model_and_openrouter_key(tmp_path, monkeypatch):
+    from franky.userconfig import read_config_file
+
+    cfg_path = tmp_path / "franky-config"
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)
+    wizard_input = "opencode\nme/repo\nghp_wiz\nopenrouter/anthropic/claude-x\nsk-or-wiz\nn\nn\n"
+
+    res = CliRunner().invoke(cli.main, ["config", "init"], input=wizard_input)
+
+    assert res.exit_code == 0, res.output
+    config = read_config_file(cfg_path)
+    assert config["FRANKY_ENGINE"] == "opencode"
+    assert config["FRANKY_MODEL"] == "openrouter/anthropic/claude-x"
+    assert config["OPENROUTER_API_KEY"] == "sk-or-wiz"
 
 
 # ---------------------------------------------------------------------------

@@ -160,3 +160,9 @@ def test_job_record_schema_documents_steer_notes():
     schema = build_schema(cli.main)
     jrs = schema["job_record_schema"]
     assert "steer_notes" in jrs
+
+
+def test_static_engine_descriptions_include_opencode():
+    schema = build_schema(cli.main)
+    for section in ("result_schema", "plan_result_schema", "job_record_schema"):
+        assert "opencode" in schema[section]["engine"]

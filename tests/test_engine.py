@@ -12,6 +12,7 @@ from franky.engine import (
     ClaudeEngine,
     CodexEngine,
     Engine,
+    OpenCodeEngine,
     PiEngine,
     _fallback_pr_url,
     resolve_engine,
@@ -251,6 +252,120 @@ def test_codex_exec_ignores_persisted_user_config():
 def test_codex_subscription_uses_chatgpt_and_refresh_hosts_only():
     hosts = CodexEngine().provider_hosts({"FRANKY_CODEX_SUBSCRIPTION": "1"})
     assert hosts == ["chatgpt.com", "auth.openai.com"]
+
+
+# --- opencode engine --------------------------------------------------------
+
+
+def test_opencode_inner_argv_requires_explicit_model():
+    assert OpenCodeEngine().inner_argv("do it", "openrouter/anthropic/claude-x") == [
+        "opencode",
+        "run",
+        "--format",
+        "json",
+        "--auto",
+        "--pure",
+        "--model",
+        "openrouter/anthropic/claude-x",
+        "do it",
+    ]
+
+
+def test_opencode_registered_and_resolvable():
+    assert ENGINES.get("opencode") is OpenCodeEngine
+    assert isinstance(resolve_engine("opencode", {}), OpenCodeEngine)
+    assert isinstance(resolve_engine(None, {"FRANKY_ENGINE": "opencode"}), OpenCodeEngine)
+
+
+def test_opencode_auth_and_provider_are_openrouter_only():
+    engine = OpenCodeEngine()
+    env = {"OPENROUTER_API_KEY": "or", "OPENAI_API_KEY": "oa"}
+    assert engine.required_env(env) == ["OPENROUTER_API_KEY"]
+    assert engine.provider_hosts(env) == ["openrouter.ai"]
+    assert "OPENROUTER_API_KEY" in engine.cred_hint()
+    assert "OPENAI_API_KEY" not in engine.cred_hint()
+
+
+def test_opencode_parse_pr_url_is_repo_scoped():
+    output = json.dumps(
+        {
+            "type": "tool_use",
+            "part": {
+                "state": {
+                    "output": "https://github.com/attacker/evil/pull/1 "
+                    "https://github.com/octocat/hello/pull/7"
+                }
+            },
+        }
+    )
+    assert OpenCodeEngine().parse_pr_url(output, "octocat/hello") == (
+        "https://github.com/octocat/hello/pull/7"
+    )
+
+
+def test_opencode_does_not_claim_steering_support():
+    assert OpenCodeEngine().supports_steering is False
+
+
+@pytest.mark.parametrize(
+    ("tool", "input_data", "expected"),
+    [
+        ("read", {"filePath": "src/app.py"}, "franky: reading src/app.py"),
+        ("write", {"filePath": "out.txt"}, "franky: writing out.txt"),
+        ("edit", {"filePath": "src/app.py"}, "franky: editing src/app.py"),
+        ("bash", {"command": "pytest -q\nignored"}, "franky: running: pytest -q"),
+        ("search", {"pattern": "needle"}, "franky: searching: needle"),
+    ],
+)
+def test_opencode_distills_tool_use(tool, input_data, expected):
+    event = {
+        "type": "tool_use",
+        "part": {"tool": tool, "state": {"input": input_data}},
+    }
+    assert OpenCodeEngine().distill_line(json.dumps(event)) == expected
+
+
+def test_opencode_distilled_tool_detail_is_bounded():
+    event = {
+        "type": "tool_use",
+        "part": {"tool": "read", "state": {"input": {"filePath": "x" * 200}}},
+    }
+    result = OpenCodeEngine().distill_line(json.dumps(event))
+    assert result == f"franky: reading {'x' * 60}"
+
+
+def test_opencode_unknown_tool_name_is_bounded():
+    event = {
+        "type": "tool_use",
+        "part": {"tool": "X" * 200, "state": {"input": {}}},
+    }
+    assert OpenCodeEngine().distill_line(json.dumps(event)) == f"franky: {'x' * 60}"
+
+
+def test_opencode_distills_step_finish_and_error_without_payload():
+    engine = OpenCodeEngine()
+    assert engine.distill_line(json.dumps({"type": "step_finish", "part": {}})) == (
+        "franky: step complete"
+    )
+    error = engine.distill_line(
+        json.dumps({"type": "error", "error": "secret failure payload", "data": {"key": "x"}})
+    )
+    assert error == "franky: agent error"
+    assert "secret" not in error
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"type": "tool_use"},
+        {"type": "tool_use", "part": []},
+        {"type": "tool_use", "part": {"state": []}},
+        {"type": "tool_use", "part": {"tool": "read", "state": {"input": []}}},
+        {"type": "text", "part": {"text": "unbounded prose"}},
+    ],
+)
+def test_opencode_suppresses_malformed_and_prose_events(event):
+    assert OpenCodeEngine().distill_line(json.dumps(event)) is None
 
 
 # ---------------------------------------------------------------------------

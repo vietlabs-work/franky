@@ -9,6 +9,7 @@ from franky.engine import (
     PI_PROVIDER_VARS,
     ClaudeEngine,
     CodexEngine,
+    OpenCodeEngine,
     PiEngine,
 )
 
@@ -69,6 +70,16 @@ def test_codex_allowlist_opens_chatgpt_and_refresh_hosts_for_subscription_marker
     assert "chatgpt.com" in allow
     assert "auth.openai.com" in allow
     assert "api.openai.com" not in allow
+
+
+def test_opencode_provider_allowlist_is_openrouter_only():
+    allow = build_allowlist(
+        OpenCodeEngine(),
+        {"OPENROUTER_API_KEY": "or", "OPENAI_API_KEY": "oa", "ANTHROPIC_API_KEY": "an"},
+        [],
+    )
+    provider_hosts = {"openrouter.ai", "api.openai.com", "api.anthropic.com"}
+    assert provider_hosts & set(allow) == {"openrouter.ai"}
 
 
 def test_pi_ollama_host_parsed_from_url():
