@@ -212,6 +212,18 @@ def _assert_release_preconditions(root: Path, v: str, run) -> None:
     _assert_tag_absent(run, v)
 
 
+def _assert_release_inputs(root: Path, v: str) -> None:
+    current = read_pyproject_version(root)
+    if tuple(map(int, v.split("."))) <= tuple(map(int, current.split("."))):
+        print(
+            f"release.py: version {v} must be newer than current version {current}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    extract_notes(root, "Unreleased")
+
+
 def _origin_web_url(run):
     """Best-effort https://github.com/owner/repo from the origin remote, or None if it can't be
     derived. Handles ssh (git@github.com:o/r.git), ssh-url, and https forms."""
@@ -332,6 +344,8 @@ def cmd_release(args, run, root: Path, sleep=time.sleep) -> None:
             file=sys.stderr,
         )
         raise SystemExit(1)
+
+    _assert_release_inputs(root, v)
 
     if args.dry_run:
         print(f"[dry-run] would bump pyproject.toml and franky/__init__.py to {v}")

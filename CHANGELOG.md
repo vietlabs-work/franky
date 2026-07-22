@@ -7,7 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.0.6] - 2026-07-22
+### Added
+- OpenCode engine support with model-selected OpenRouter or direct Moonshot Kimi K3 credentials
+  and provider egress.
+- Persistent Codex subscription authentication through the isolated `franky-codex-auth` volume.
+- Tier-2 operator profiles for validated MCP configuration, credential names, and endpoint hosts.
+
+### Fixed
+- Codex headless execution/auth and JSONL parsing now match the current CLI contract.
+- OpenCode rejects unsupported direct Moonshot models, non-string tool names, and invalid usage
+  values.
 
 ## [0.1.0] - 2026-07-06
 
