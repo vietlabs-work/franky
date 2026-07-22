@@ -69,6 +69,7 @@ def test_load_config_engine_resolution_codex():
 def test_load_config_opencode_propagates_model_and_isolates_credentials():
     env = _env(
         FRANKY_MODEL="openrouter/anthropic/claude-x",
+        MOONSHOT_API_KEY="sk-moonshot-fake",
         OPENAI_API_KEY="sk-openai-fake",
         CLAUDE_CODE_OAUTH_TOKEN="oauth-fake",
     )
@@ -100,7 +101,7 @@ def test_load_config_propagates_model_for_other_engines_without_opencode_validat
     ],
 )
 def test_load_config_opencode_rejects_missing_or_invalid_model(model):
-    with pytest.raises(ConfigError, match="FRANKY_MODEL|openrouter/<model-id>"):
+    with pytest.raises(ConfigError, match="FRANKY_MODEL"):
         load_config("opencode", _env(FRANKY_MODEL=model))
 
 
@@ -109,12 +110,28 @@ def test_load_config_opencode_accepts_nested_nonempty_model_id():
     assert cfg.model == "openrouter/anthropic/claude-x"
 
 
-def test_load_config_opencode_requires_openrouter_auth_only():
-    env = _env(FRANKY_MODEL="openrouter/anthropic/claude-x", OPENAI_API_KEY="sk-openai-fake")
+def test_load_config_opencode_accepts_direct_moonshot_without_rewriting_model():
+    env = _env(FRANKY_MODEL="moonshotai/kimi-k3", MOONSHOT_API_KEY="sk-moonshot-fake")
+    cfg = load_config("opencode", env)
+    assert cfg.model == "moonshotai/kimi-k3"
+    assert cfg.passthrough_env == {
+        "GH_TOKEN": "ghp_fake",
+        "MOONSHOT_API_KEY": "sk-moonshot-fake",
+    }
+
+
+def test_load_config_opencode_direct_moonshot_rejects_openrouter_key():
+    env = _env(FRANKY_MODEL="moonshotai/kimi-k3")
+    with pytest.raises(ValueError, match="MOONSHOT_API_KEY"):
+        load_config("opencode", env)
+
+
+def test_load_config_opencode_openrouter_rejects_moonshot_key():
+    env = _env(FRANKY_MODEL="openrouter/anthropic/claude-x", MOONSHOT_API_KEY="moon")
     del env["OPENROUTER_API_KEY"]
     with pytest.raises(ValueError, match="OPENROUTER_API_KEY") as exc:
         load_config("opencode", env)
-    assert "OPENAI_API_KEY" not in str(exc.value)
+    assert "MOONSHOT_API_KEY" not in str(exc.value)
 
 
 def test_load_config_codex_subscription_uses_fixed_volume():

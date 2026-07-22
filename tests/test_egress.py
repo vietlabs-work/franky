@@ -72,14 +72,22 @@ def test_codex_allowlist_opens_chatgpt_and_refresh_hosts_for_subscription_marker
     assert "api.openai.com" not in allow
 
 
-def test_opencode_provider_allowlist_is_openrouter_only():
+def test_opencode_provider_allowlist_follows_model_only():
     allow = build_allowlist(
         OpenCodeEngine(),
-        {"OPENROUTER_API_KEY": "or", "OPENAI_API_KEY": "oa", "ANTHROPIC_API_KEY": "an"},
+        {"OPENROUTER_API_KEY": "or", "MOONSHOT_API_KEY": "moon"},
         [],
+        model="moonshotai/kimi-k3",
     )
-    provider_hosts = {"openrouter.ai", "api.openai.com", "api.anthropic.com"}
-    assert provider_hosts & set(allow) == {"openrouter.ai"}
+    assert {"openrouter.ai", "api.moonshot.ai"} & set(allow) == {"api.moonshot.ai"}
+
+    allow = build_allowlist(
+        OpenCodeEngine(),
+        {"OPENROUTER_API_KEY": "or", "MOONSHOT_API_KEY": "moon"},
+        [],
+        model="openrouter/moonshotai/kimi-k3",
+    )
+    assert {"openrouter.ai", "api.moonshot.ai"} & set(allow) == {"openrouter.ai"}
 
 
 def test_pi_ollama_host_parsed_from_url():

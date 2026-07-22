@@ -45,7 +45,13 @@ from .container import (
 )
 from . import jobs, snapshot
 from .container import container_running, deliver_steer, reap_run, run_names
-from .engine import CODEX_SUBSCRIPTION_VAR, ENGINES, PI_PROVIDER_VARS, resolve_engine
+from .engine import (
+    CODEX_SUBSCRIPTION_VAR,
+    ENGINES,
+    PI_PROVIDER_VARS,
+    opencode_provider,
+    resolve_engine,
+)
 from .github import run_gh
 from .idempotency import find_open_pr
 from .jira import JIRA_API_TOKEN_VAR, JIRA_EMAIL_VAR, fetch_jira_issue
@@ -3128,12 +3134,15 @@ def config_init() -> None:
         if val:
             data["CODEX_API_KEY"] = val
     elif engine_choice == "opencode":
-        model = click.prompt("FRANKY_MODEL (openrouter/<model-id>)").strip()
+        model = click.prompt("FRANKY_MODEL (provider/model)").strip()
         if model:
             data["FRANKY_MODEL"] = model
-        val = click.prompt("OPENROUTER_API_KEY", hide_input=True).strip()
-        if val:
-            data["OPENROUTER_API_KEY"] = val
+        provider = opencode_provider(model)
+        if provider:
+            credential = provider[0]
+            val = click.prompt(credential, hide_input=True).strip()
+            if val:
+                data[credential] = val
 
     # Optional JIRA
     click.echo()

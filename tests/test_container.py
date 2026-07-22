@@ -25,7 +25,7 @@ from franky.container import (
     codex_auth_login,
     codex_auth_logout,
 )
-from franky.engine import CODEX_AUTH_VOLUME, CodexEngine, PiEngine
+from franky.engine import CODEX_AUTH_VOLUME, CodexEngine, OpenCodeEngine, PiEngine
 from franky.profile import PROFILE_BUNDLE_VAR
 
 SECRET = "sk-or-very-secret-9999"
@@ -350,6 +350,30 @@ def test_opencode_config_emits_only_name_only_selected_credentials():
     e_values = [argv[i + 1] for i, token in enumerate(argv) if token == "-e"]
     assert sorted(e_values) == ["GH_TOKEN", "OPENROUTER_API_KEY"]
     assert all(value not in argv for value in secret_values.values())
+
+
+def test_opencode_profile_credential_does_not_widen_provider_egress():
+    cfg = Config(
+        engine=OpenCodeEngine(),
+        allowed_repos=["me/repo"],
+        passthrough_env={
+            "GH_TOKEN": "ghp_fake",
+            "MOONSHOT_API_KEY": "moon",
+            "OPENROUTER_API_KEY": "profile-added",
+        },
+        model="moonshotai/kimi-k3",
+    )
+    runner, calls = _orchestration_runner(
+        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+    )
+
+    code, _ = run_in_container(cfg, ["opencode", "run"], runner=runner, env={}, sleeper=NOOP_SLEEP)
+
+    assert code == 0
+    proxy_argv = next(argv for argv in calls if argv[:3] == ["docker", "run", "-d"])
+    allowed_arg = next(arg for arg in proxy_argv if arg.startswith("FRANKY_ALLOWED_DOMAINS="))
+    assert "api.moonshot.ai" in allowed_arg
+    assert "openrouter.ai" not in allowed_arg
 
 
 def test_build_docker_argv_image_and_inner_last():

@@ -7,6 +7,7 @@ from franky.engine import (
     CODEX_PROVIDER_VARS,
     DEFAULT_ENGINE,
     ENGINES,
+    OPENCODE_PROVIDERS,
     PI_PROVIDER_VARS,
     PR_URL_RE,
     ClaudeEngine,
@@ -15,6 +16,7 @@ from franky.engine import (
     OpenCodeEngine,
     PiEngine,
     _fallback_pr_url,
+    opencode_provider,
     resolve_engine,
 )
 
@@ -277,13 +279,53 @@ def test_opencode_registered_and_resolvable():
     assert isinstance(resolve_engine(None, {"FRANKY_ENGINE": "opencode"}), OpenCodeEngine)
 
 
-def test_opencode_auth_and_provider_are_openrouter_only():
+def test_opencode_provider_selects_supported_prefix():
+    assert OPENCODE_PROVIDERS == {
+        "moonshotai": ("MOONSHOT_API_KEY", "api.moonshot.ai"),
+        "openrouter": ("OPENROUTER_API_KEY", "openrouter.ai"),
+    }
+    assert opencode_provider("moonshotai/kimi-k3") == (
+        "MOONSHOT_API_KEY",
+        "api.moonshot.ai",
+    )
+    assert opencode_provider("openrouter/moonshotai/kimi-k3") == (
+        "OPENROUTER_API_KEY",
+        "openrouter.ai",
+    )
+    assert opencode_provider("other/model") is None
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        None,
+        "",
+        "moonshotai",
+        "moonshotai/",
+        "moonshotai//kimi-k3",
+        "moonshotai/kimi k3",
+        "moonshotai/not-kimi-k3",
+        "moonshotai/kimi-k3/extra",
+    ],
+)
+def test_opencode_provider_rejects_unsupported_or_malformed_model(model):
+    assert opencode_provider(model) is None
+
+
+@pytest.mark.parametrize(
+    ("model", "credential", "host"),
+    [
+        ("moonshotai/kimi-k3", "MOONSHOT_API_KEY", "api.moonshot.ai"),
+        ("openrouter/moonshotai/kimi-k3", "OPENROUTER_API_KEY", "openrouter.ai"),
+    ],
+)
+def test_opencode_auth_and_provider_follow_model(model, credential, host):
     engine = OpenCodeEngine()
-    env = {"OPENROUTER_API_KEY": "or", "OPENAI_API_KEY": "oa"}
-    assert engine.required_env(env) == ["OPENROUTER_API_KEY"]
-    assert engine.provider_hosts(env) == ["openrouter.ai"]
+    env = {"OPENROUTER_API_KEY": "or", "MOONSHOT_API_KEY": "moon"}
+    assert engine.required_env(env, model) == [credential]
+    assert engine.provider_hosts(env, model) == [host]
     assert "OPENROUTER_API_KEY" in engine.cred_hint()
-    assert "OPENAI_API_KEY" not in engine.cred_hint()
+    assert "MOONSHOT_API_KEY" in engine.cred_hint()
 
 
 def test_opencode_parse_pr_url_is_repo_scoped():

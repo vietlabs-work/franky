@@ -37,15 +37,23 @@ all ship in the one image.
 | `pi` (default) | `@earendil-works/pi-coding-agent` | BYOK provider key | MIT, 15+ providers (OpenRouter, Anthropic, OpenAI, Ollama, ...) |
 | `claude` | `@anthropic-ai/claude-code` | `CLAUDE_CODE_OAUTH_TOKEN` | Most capable; uses your Claude subscription |
 | `codex` | `@openai/codex` | ChatGPT subscription or `CODEX_API_KEY` | OpenAI Codex headless (`codex exec`) |
-| `opencode` | `opencode-ai` | `OPENROUTER_API_KEY` | OpenRouter only; requires `FRANKY_MODEL=openrouter/<model-id>` |
+| `opencode` | `opencode-ai` | `MOONSHOT_API_KEY` or `OPENROUTER_API_KEY` | Provider selected by `FRANKY_MODEL` |
 
 Select with `--engine pi|claude|codex|opencode`, or set `FRANKY_ENGINE`. Resolution order:
 `--engine` flag > `FRANKY_ENGINE` > default `pi`.
 
-OpenCode requires an explicit OpenRouter model. Nested model IDs are supported:
+OpenCode requires an explicit provider/model. Direct Moonshot:
 
 ```
 franky config set FRANKY_ENGINE opencode
+franky config set FRANKY_MODEL moonshotai/kimi-k3
+franky config set MOONSHOT_API_KEY
+franky build "fix the flaky retry test" --repo you/repo --engine opencode
+```
+
+OpenRouter fallback, including nested model IDs:
+
+```
 franky config set FRANKY_MODEL openrouter/anthropic/claude-sonnet-4
 franky config set OPENROUTER_API_KEY
 franky build "fix the flaky retry test" --repo you/repo --engine opencode
@@ -135,8 +143,9 @@ add an engine), so Codex, Cursor, pi, or Claude Code all start with the same con
    - `GH_TOKEN` - scoped to contents + pull_requests on those repos.
    - the selected engine's creds (a provider key for `pi`,
      `CLAUDE_CODE_OAUTH_TOKEN` for `claude`, or `franky auth login codex` / `CODEX_API_KEY`
-     for `codex`; OpenCode requires `OPENROUTER_API_KEY` and
-     `FRANKY_MODEL=openrouter/<model-id>`).
+     for `codex`; OpenCode supports `FRANKY_MODEL=moonshotai/kimi-k3` with
+     `MOONSHOT_API_KEY`, or `FRANKY_MODEL=openrouter/<model-id>` with
+     `OPENROUTER_API_KEY`).
    - for JIRA tasks: `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN` (host-side only,
      never forwarded into the container).
 4. Run:
@@ -588,8 +597,9 @@ Squid proxy enforcing a domain allowlist.
   cannot resolve or reach an off-allowlist host directly; only the proxy resolves.
 - **Fail-closed.** Franky refuses to start the task unless the proxy is confirmed
   healthy, and the proxy refuses to start with an empty or malformed allowlist.
-- **The allowlist** covers: your engine's provider host (e.g. `api.anthropic.com`,
-  `openrouter.ai`, `api.openai.com`), GitHub (clone/push/PR), the npm + PyPI
+- **The allowlist** covers: your engine's selected provider host (e.g.
+  `api.moonshot.ai`, `openrouter.ai`, `api.anthropic.com`, `api.openai.com`), GitHub
+  (clone/push/PR), the npm + PyPI
   registries, and - because
   Docker-in-Docker is always on - a broad set of well-known **container image
   registries** (Docker Hub + CDN, GHCR, GCR/Artifact Registry, `registry.k8s.io`,

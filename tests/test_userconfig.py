@@ -11,7 +11,12 @@ from pathlib import Path
 import pytest
 
 from franky.config import GH_TOKEN_VAR, REDACT_TOKEN
-from franky.engine import CLAUDE_TOKEN_VAR, CODEX_PROVIDER_VARS, PI_PROVIDER_VARS
+from franky.engine import (
+    CLAUDE_TOKEN_VAR,
+    CODEX_PROVIDER_VARS,
+    OPENCODE_PROVIDERS,
+    PI_PROVIDER_VARS,
+)
 from franky.jira import JIRA_API_TOKEN_VAR
 from franky.userconfig import (
     SECRET_KEYS,
@@ -268,6 +273,7 @@ def test_secret_keys_is_exact_union() -> None:
         frozenset({GH_TOKEN_VAR})
         | frozenset(PI_PROVIDER_VARS)
         | frozenset(CODEX_PROVIDER_VARS)
+        | frozenset(credential for credential, _host in OPENCODE_PROVIDERS.values())
         | frozenset({CLAUDE_TOKEN_VAR})
         | frozenset({JIRA_API_TOKEN_VAR})
     ) - frozenset({"OLLAMA_HOST"})  # the one URL excluded from the credential set
@@ -325,6 +331,11 @@ def test_franky_model_is_settable_and_non_secret() -> None:
 def test_openrouter_api_key_remains_secret() -> None:
     assert "OPENROUTER_API_KEY" in SECRET_KEYS
     assert mask_value("OPENROUTER_API_KEY", "sk-or-secret") == REDACT_TOKEN
+
+
+def test_moonshot_api_key_is_secret() -> None:
+    assert "MOONSHOT_API_KEY" in SECRET_KEYS
+    assert mask_value("MOONSHOT_API_KEY", "sk-moonshot-secret") == REDACT_TOKEN
 
 
 # ---------------------------------------------------------------------------
