@@ -433,6 +433,37 @@ def test_release_dry_run_no_file_writes(repo):
     assert mutating == []
 
 
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_release_refuses_empty_unreleased_before_side_effects(repo, dry_run):
+    changelog = repo / "CHANGELOG.md"
+    changelog.write_text(
+        "# Changelog\n\n## [Unreleased]\n\n## [0.1.0] - 2026-01-01\n\nOld stuff.\n"
+    )
+    before = {path: path.read_text() for path in repo.rglob("*") if path.is_file()}
+    fake_run, calls = make_fake_run()
+    args = ["1.2.3"] + (["--dry-run"] if dry_run else [])
+
+    with pytest.raises(SystemExit):
+        main(args, run=fake_run, root=repo)
+
+    assert calls == []
+    assert {path: path.read_text() for path in before} == before
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("version", ["0.0.9", "0.1.0"])
+def test_release_refuses_non_increasing_version_before_side_effects(repo, dry_run, version):
+    before = {path: path.read_text() for path in repo.rglob("*") if path.is_file()}
+    fake_run, calls = make_fake_run()
+    args = [version] + (["--dry-run"] if dry_run else [])
+
+    with pytest.raises(SystemExit):
+        main(args, run=fake_run, root=repo)
+
+    assert calls == []
+    assert {path: path.read_text() for path in before} == before
+
+
 # --- tag recovery ---
 
 
