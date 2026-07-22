@@ -297,9 +297,18 @@ def test_opencode_provider_selects_supported_prefix():
 
 @pytest.mark.parametrize(
     "model",
-    [None, "", "moonshotai", "moonshotai/", "moonshotai//kimi-k3", "moonshotai/kimi k3"],
+    [
+        None,
+        "",
+        "moonshotai",
+        "moonshotai/",
+        "moonshotai//kimi-k3",
+        "moonshotai/kimi k3",
+        "moonshotai/not-kimi-k3",
+        "moonshotai/kimi-k3/extra",
+    ],
 )
-def test_opencode_provider_rejects_malformed_model(model):
+def test_opencode_provider_rejects_unsupported_or_malformed_model(model):
     assert opencode_provider(model) is None
 
 

@@ -68,7 +68,10 @@ def opencode_provider(model: str | None) -> tuple[str, str] | None:
     """Return the credential variable and API host selected by an OpenCode model."""
     if not model or not _OPENCODE_MODEL_RE.fullmatch(model):
         return None
-    return OPENCODE_PROVIDERS.get(model.split("/", 1)[0])
+    prefix = model.split("/", 1)[0]
+    if prefix == "moonshotai" and model != "moonshotai/kimi-k3":
+        return None
+    return OPENCODE_PROVIDERS.get(prefix)
 
 
 def _ollama_host(value: str) -> str | None:
