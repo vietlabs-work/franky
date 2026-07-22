@@ -1,4 +1,4 @@
-__version__ = "0.1.0"
+__version__ = "0.0.6"
 
 
 def franky_version() -> str:
