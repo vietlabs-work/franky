@@ -57,6 +57,19 @@ PI_PROVIDER_HOSTS = {
     "MISTRAL_API_KEY": "api.mistral.ai",
 }
 
+OPENCODE_PROVIDERS: dict[str, tuple[str, str]] = {
+    "moonshotai": ("MOONSHOT_API_KEY", "api.moonshot.ai"),
+    "openrouter": ("OPENROUTER_API_KEY", "openrouter.ai"),
+}
+_OPENCODE_MODEL_RE = re.compile(r"^[^/\s]+(?:/[^/\s]+)+$")
+
+
+def opencode_provider(model: str | None) -> tuple[str, str] | None:
+    """Return the credential variable and API host selected by an OpenCode model."""
+    if not model or not _OPENCODE_MODEL_RE.fullmatch(model):
+        return None
+    return OPENCODE_PROVIDERS.get(model.split("/", 1)[0])
+
 
 def _ollama_host(value: str) -> str | None:
     """Parse the host out of an OLLAMA_HOST value. The value is a URL (e.g.
@@ -165,10 +178,14 @@ class Engine:
     def parse_pr_url(self, output: str, repo: str | None = None) -> str | None:
         raise NotImplementedError
 
-    def required_env(self, env: Mapping[str, str] | None = None) -> list[str]:
+    def required_env(
+        self, env: Mapping[str, str] | None = None, model: str | None = None
+    ) -> list[str]:
         raise NotImplementedError
 
-    def provider_hosts(self, env: Mapping[str, str] | None = None) -> list[str]:
+    def provider_hosts(
+        self, env: Mapping[str, str] | None = None, model: str | None = None
+    ) -> list[str]:
         """The network hosts the engine must reach to talk to its model provider. Feeds the
         egress allowlist. SEPARATE from required_env (cred gating) on purpose - same source
         data, different concern."""
@@ -206,14 +223,18 @@ class PiEngine(Engine):
     def parse_pr_url(self, output: str, repo: str | None = None) -> str | None:
         return _scan_jsonl_for_pr_url(output, repo)
 
-    def required_env(self, env: Mapping[str, str] | None = None) -> list[str]:
+    def required_env(
+        self, env: Mapping[str, str] | None = None, model: str | None = None
+    ) -> list[str]:
         """The provider vars that ARE set (non-empty) in `env` (defaults to os.environ).
         Empty list => no creds => fail-closed. Takes `env` so load_config gates against the
         same mapping it resolves the rest of the config from."""
         env = os.environ if env is None else env
         return [v for v in PI_PROVIDER_VARS if env.get(v)]
 
-    def provider_hosts(self, env: Mapping[str, str] | None = None) -> list[str]:
+    def provider_hosts(
+        self, env: Mapping[str, str] | None = None, model: str | None = None
+    ) -> list[str]:
         """For each provider var actually set in `env` (defaults to os.environ), the host it
         talks to. OLLAMA_HOST is parsed from its URL value; the rest map via
         PI_PROVIDER_HOSTS. Deduped, empties dropped, sorted for a deterministic allowlist."""
@@ -286,12 +307,16 @@ class ClaudeEngine(Engine):
     def parse_pr_url(self, output: str, repo: str | None = None) -> str | None:
         return _scan_jsonl_for_pr_url(output, repo)
 
-    def required_env(self, env: Mapping[str, str] | None = None) -> list[str]:
+    def required_env(
+        self, env: Mapping[str, str] | None = None, model: str | None = None
+    ) -> list[str]:
         # env is part of the Engine interface but unused here: claude always needs exactly
         # this one token, regardless of what else is in the environment.
         return [CLAUDE_TOKEN_VAR]
 
-    def provider_hosts(self, env: Mapping[str, str] | None = None) -> list[str]:
+    def provider_hosts(
+        self, env: Mapping[str, str] | None = None, model: str | None = None
+    ) -> list[str]:
         # Like required_env, claude ignores env: it always talks to exactly one host.
         return ["api.anthropic.com"]
 
@@ -347,12 +372,16 @@ class CodexEngine(Engine):
     def parse_pr_url(self, output: str, repo: str | None = None) -> str | None:
         return _scan_jsonl_for_pr_url(output, repo)
 
-    def required_env(self, env: Mapping[str, str] | None = None) -> list[str]:
+    def required_env(
+        self, env: Mapping[str, str] | None = None, model: str | None = None
+    ) -> list[str]:
         """Return CODEX_API_KEY when set, else empty so config fails closed."""
         env = os.environ if env is None else env
         return [v for v in CODEX_PROVIDER_VARS if env.get(v)]
 
-    def provider_hosts(self, env: Mapping[str, str] | None = None) -> list[str]:
+    def provider_hosts(
+        self, env: Mapping[str, str] | None = None, model: str | None = None
+    ) -> list[str]:
         env = os.environ if env is None else env
         if any(env.get(v) for v in CODEX_PROVIDER_VARS):
             return [CODEX_PROVIDER_HOST]
@@ -416,15 +445,21 @@ class OpenCodeEngine(Engine):
     def parse_pr_url(self, output: str, repo: str | None = None) -> str | None:
         return _scan_jsonl_for_pr_url(output, repo)
 
-    def required_env(self, env: Mapping[str, str] | None = None) -> list[str]:
+    def required_env(
+        self, env: Mapping[str, str] | None = None, model: str | None = None
+    ) -> list[str]:
         env = os.environ if env is None else env
-        return ["OPENROUTER_API_KEY"] if env.get("OPENROUTER_API_KEY") else []
+        provider = opencode_provider(model)
+        return [provider[0]] if provider and env.get(provider[0]) else []
 
-    def provider_hosts(self, env: Mapping[str, str] | None = None) -> list[str]:
-        return ["openrouter.ai"]
+    def provider_hosts(
+        self, env: Mapping[str, str] | None = None, model: str | None = None
+    ) -> list[str]:
+        provider = opencode_provider(model)
+        return [provider[1]] if provider else []
 
     def cred_hint(self) -> str:
-        return "set OPENROUTER_API_KEY"
+        return "set MOONSHOT_API_KEY or OPENROUTER_API_KEY for the selected FRANKY_MODEL"
 
     def distill_line(self, line: str) -> str | None:
         try:

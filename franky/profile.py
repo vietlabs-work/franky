@@ -108,7 +108,8 @@ _SECRET_PATTERNS: list[tuple[str, re.Pattern]] = [
         "env-var assignment of a known secret variable",
         re.compile(
             r"(?m)^[ \t]*"
-            r"(GH_TOKEN|ANTHROPIC_API_KEY|ANTHROPIC_OAUTH_TOKEN|OPENROUTER_API_KEY"
+            r"(GH_TOKEN|ANTHROPIC_API_KEY|ANTHROPIC_OAUTH_TOKEN|MOONSHOT_API_KEY"
+            r"|OPENROUTER_API_KEY"
             r"|OPENAI_API_KEY|CODEX_API_KEY|CLAUDE_CODE_OAUTH_TOKEN|GEMINI_API_KEY"
             r"|GROQ_API_KEY|MISTRAL_API_KEY|JIRA_API_TOKEN)"
             r"\s*=\s*[^\s#\n]"

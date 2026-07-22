@@ -873,11 +873,20 @@ def test_config_list_shows_masked_secrets(tmp_path, monkeypatch):
     from franky.userconfig import write_config_file
 
     cfg_path = tmp_path / "franky-config"
-    write_config_file(cfg_path, {"GH_TOKEN": "ghp_real", "FRANKY_ENGINE": "pi"})
+    write_config_file(
+        cfg_path,
+        {
+            "GH_TOKEN": "ghp_real",
+            "MOONSHOT_API_KEY": "moonshot_real",
+            "FRANKY_ENGINE": "pi",
+        },
+    )
     monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
     res = CliRunner().invoke(cli.main, ["config", "list"])
     assert res.exit_code == 0, res.output
     assert "ghp_real" not in res.output
+    assert "moonshot_real" not in res.output
+    assert "MOONSHOT_API_KEY" in res.output
     assert "***REDACTED***" in res.output
     assert "FRANKY_ENGINE" in res.output
     assert "pi" in res.output
@@ -922,6 +931,23 @@ def test_config_set_secret_via_hidden_prompt(tmp_path, monkeypatch):
     from franky.userconfig import read_config_file
 
     assert read_config_file(cfg_path)["GH_TOKEN"] == "ghp_from_prompt"
+
+
+def test_config_set_moonshot_key_requires_hidden_prompt(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "franky-config"
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
+    positional = CliRunner().invoke(cli.main, ["config", "set", "MOONSHOT_API_KEY", "moonshot_bad"])
+    assert positional.exit_code != 0
+    assert "secret" in positional.output
+
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)
+    prompted = CliRunner().invoke(
+        cli.main, ["config", "set", "MOONSHOT_API_KEY"], input="moonshot_prompted\n"
+    )
+    assert prompted.exit_code == 0, prompted.output
+    from franky.userconfig import read_config_file
+
+    assert read_config_file(cfg_path)["MOONSHOT_API_KEY"] == "moonshot_prompted"
 
 
 def test_config_set_unknown_key_rejected(tmp_path, monkeypatch):
@@ -1968,6 +1994,24 @@ def test_config_init_opencode_persists_model_and_openrouter_key(tmp_path, monkey
     assert config["FRANKY_ENGINE"] == "opencode"
     assert config["FRANKY_MODEL"] == "openrouter/anthropic/claude-x"
     assert config["OPENROUTER_API_KEY"] == "sk-or-wiz"
+
+
+def test_config_init_opencode_persists_direct_moonshot_key(tmp_path, monkeypatch):
+    from franky.userconfig import read_config_file
+
+    cfg_path = tmp_path / "franky-config"
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)
+    wizard_input = "opencode\nme/repo\nghp_wiz\nmoonshotai/kimi-k3\nsk-moon-wiz\nn\nn\n"
+
+    res = CliRunner().invoke(cli.main, ["config", "init"], input=wizard_input)
+
+    assert res.exit_code == 0, res.output
+    config = read_config_file(cfg_path)
+    assert config["FRANKY_ENGINE"] == "opencode"
+    assert config["FRANKY_MODEL"] == "moonshotai/kimi-k3"
+    assert config["MOONSHOT_API_KEY"] == "sk-moon-wiz"
+    assert "OPENROUTER_API_KEY" not in config
 
 
 # ---------------------------------------------------------------------------

@@ -40,6 +40,7 @@ from .engine import (
     CLAUDE_TOKEN_VAR,
     CODEX_PROVIDER_VARS,
     CODEX_SUBSCRIPTION_VAR,
+    OPENCODE_PROVIDERS,
     PI_PROVIDER_VARS,
 )
 from .jira import JIRA_API_TOKEN_VAR
@@ -63,6 +64,7 @@ SECRET_KEYS: frozenset[str] = frozenset(
         {GH_TOKEN_VAR}
         | set(PI_PROVIDER_VARS)
         | set(CODEX_PROVIDER_VARS)
+        | {credential for credential, _host in OPENCODE_PROVIDERS.values()}
         | {CLAUDE_TOKEN_VAR}
         | {JIRA_API_TOKEN_VAR}
     )

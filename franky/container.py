@@ -770,7 +770,9 @@ def run_in_container(
     provider_env = dict(cfg.passthrough_env)
     if cfg.auth_volume:
         provider_env[CODEX_SUBSCRIPTION_VAR] = "1"
-    allowed = egress.build_allowlist(cfg.engine, provider_env, cfg.extra_allowed_domains)
+    allowed = egress.build_allowlist(
+        cfg.engine, provider_env, cfg.extra_allowed_domains, model=cfg.model
+    )
 
     child_env = dict(os.environ if env is None else env)
     child_env.update(cfg.passthrough_env)

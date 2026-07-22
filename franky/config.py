@@ -13,7 +13,13 @@ import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 
-from .engine import CODEX_AUTH_VOLUME, CODEX_SUBSCRIPTION_VAR, Engine, resolve_engine
+from .engine import (
+    CODEX_AUTH_VOLUME,
+    CODEX_SUBSCRIPTION_VAR,
+    Engine,
+    opencode_provider,
+    resolve_engine,
+)
 from .result import AuthError, ConfigError
 
 REDACT_TOKEN = "***REDACTED***"
@@ -39,7 +45,6 @@ _ALLOWLIST_ENTRY_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.*-]+$")
 # This guards repo_allowed against a multi-slash repo (e.g. "owner/sub/path") sneaking
 # past an "owner/*" pattern by matching the trailing "sub/path" against the name glob.
 _REPO_RE = re.compile(r"^[^/\s]+/[^/\s]+$")
-_OPENCODE_MODEL_RE = re.compile(r"^openrouter/[^/\s]+(?:/[^/\s]+)*$")
 
 
 def redact(text: str, secrets: Iterable[str]) -> str:
@@ -109,7 +114,7 @@ def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
       2. GH_TOKEN missing -> refuse (cannot clone or open a PR without it)
       3. OpenCode model missing/invalid -> refuse
       4. engine creds missing -> refuse (pi: no provider var set; claude: token missing;
-         codex: CODEX_API_KEY unset; opencode: OPENROUTER_API_KEY unset)
+         codex: CODEX_API_KEY unset; opencode: selected provider key unset)
     """
     # resolve_engine raises a plain ValueError for an unknown FRANKY_ENGINE; rewrap as a
     # ConfigError so it gets exit code 3 + a JSON error, keeping the message identical.
@@ -139,16 +144,26 @@ def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
         )
 
     model = env.get(MODEL_VAR) or None
-    if engine.name == "opencode" and (model is None or not _OPENCODE_MODEL_RE.fullmatch(model)):
-        raise ConfigError(
-            f"{MODEL_VAR} must be set to 'openrouter/<model-id>' for engine 'opencode'"
-        )
+    opencode_credential: str | None = None
+    if engine.name == "opencode":
+        provider = opencode_provider(model)
+        if provider is None:
+            raise ConfigError(
+                f"{MODEL_VAR} must select a supported OpenCode provider, for example "
+                "'moonshotai/kimi-k3' or 'openrouter/<model-id>'"
+            )
+        opencode_credential = provider[0]
 
-    cred_vars = engine.required_env(env)
+    cred_vars = engine.required_env(env, model)
     subscription_auth = (
         engine.name == "codex" and env.get(CODEX_SUBSCRIPTION_VAR) == "1" and not cred_vars
     )
     if not cred_vars and not subscription_auth:
+        if opencode_credential:
+            raise AuthError(
+                f"{opencode_credential} is unset or empty - refusing "
+                f"(required by {MODEL_VAR}={model})"
+            )
         # The hint comes from the engine itself so the refusal names THIS engine's vars -
         # shared config stays engine-agnostic (no hardcoded pi vars).
         raise AuthError(

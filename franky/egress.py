@@ -68,17 +68,18 @@ def build_allowlist(
     engine: Engine,
     passthrough_env: Mapping[str, str],
     extra_domains: list[str],
+    model: str | None = None,
 ) -> list[str]:
     """The full default-deny allowlist: the engine's provider host(s) + GitHub + language
     registries + container image registries (always-on DinD) + any operator extras. Stripped,
     empties dropped, deduped, sorted for determinism.
 
-    `passthrough_env` is the same mapping Franky resolved its config from, so the provider
-    host(s) match the cred(s) actually being injected - no host is opened that the engine has
-    no key for.
+    `passthrough_env` is the same mapping Franky resolved its config from. `model` selects the
+    OpenCode provider explicitly, so an unrelated credential added by a profile cannot widen
+    provider egress.
     """
     raw = (
-        list(engine.provider_hosts(passthrough_env))
+        list(engine.provider_hosts(passthrough_env, model))
         + GITHUB_DOMAINS
         + REGISTRY_DOMAINS
         + DOCKER_REGISTRY_DOMAINS

@@ -87,6 +87,7 @@ def test_scan_detects_secret_env_var_assignment():
     "varname",
     [
         "ANTHROPIC_API_KEY",
+        "MOONSHOT_API_KEY",
         "OPENROUTER_API_KEY",
         "OPENAI_API_KEY",
         "CODEX_API_KEY",
