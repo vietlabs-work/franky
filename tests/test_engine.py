@@ -392,6 +392,26 @@ def test_distill_line_unknown_event_returns_none():
         assert engine.distill_line(line) is None
 
 
+@pytest.mark.parametrize("name", [None, ["not-a-string"]])
+def test_distillers_non_string_tool_names_use_generic_summary(name):
+    cases = [
+        (PiEngine(), {"type": "tool_use", "name": name, "input": {}}),
+        (
+            ClaudeEngine(),
+            {
+                "type": "assistant",
+                "message": {"content": [{"type": "tool_use", "name": name, "input": {}}]},
+            },
+        ),
+        (
+            OpenCodeEngine(),
+            {"type": "tool_use", "part": {"tool": name, "state": {"input": {}}}},
+        ),
+    ]
+    for engine, event in cases:
+        assert engine.distill_line(json.dumps(event)) == "franky: tool call"
+
+
 # --- ClaudeEngine distill_line ---
 
 

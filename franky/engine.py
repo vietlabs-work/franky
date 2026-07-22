@@ -117,11 +117,12 @@ def _scan_jsonl_for_pr_url(output: str, repo: str | None = None) -> str | None:
     return found or _fallback_pr_url(output, pattern)
 
 
-def _tool_use_summary(name: str, inp: dict) -> str:
+def _tool_use_summary(name: object, inp: dict) -> str:
     """Return a compact `franky: <verb> <detail>` line for a tool-use event.
 
     Shared by all engine distillers so the wording is consistent across engines.
     """
+    name = name if isinstance(name, str) else ""
     lower_name = name.lower()
     if lower_name in ("edit", "multiedit"):
         path = str(inp.get("file_path", "") or inp.get("filePath", "") or inp.get("path", ""))[:60]
@@ -447,7 +448,7 @@ class OpenCodeEngine(Engine):
             return None
         inp = state.get("input")
         tool = part.get("tool")
-        if not isinstance(inp, dict) or not isinstance(tool, str):
+        if not isinstance(inp, dict):
             return None
         return _tool_use_summary(tool, inp)
 
