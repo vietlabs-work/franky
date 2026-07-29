@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from franky.profile import (
+    PR_TEMPLATE_CONTAINER_PATH,
     PROFILE_BUNDLE_VAR,
     PROFILE_PATH_VAR,
     ProfileSpec,
@@ -595,6 +596,66 @@ def test_build_bundle_preserves_reserved_mcp_path_for_home_symlink(tmp_path, mon
     bundle = build_bundle(load_profile(cfg))
 
     assert _decode_bundle(bundle).getnames() == [".claude/franky-mcp.json"]
+
+
+def test_build_bundle_pr_template_packs_at_the_fixed_path(tmp_path, monkeypatch):
+    """The PR template lands at the constant path prompt.py names, wherever it lives on the host.
+
+    Load-bearing: `prompt.py` tells the agent to read PR_TEMPLATE_CONTAINER_PATH literally, so the
+    arcname must NOT follow the host layout the way every other category does.
+    """
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    template = tmp_path / "somewhere" / "deep" / "my-pr-style.md"
+    template.parent.mkdir(parents=True)
+    template.write_text("# PR spec\n\nLead with a summary.\n", encoding="utf-8")
+
+    tf = _decode_bundle(build_bundle(ProfileSpec(pr_template=[template])))
+
+    assert tf.getnames() == [".franky/pr-template.md"]
+    assert PR_TEMPLATE_CONTAINER_PATH.endswith("/.franky/pr-template.md")
+    extracted = tf.extractfile(tf.getmembers()[0]).read().decode("utf-8")
+    assert "Lead with a summary." in extracted
+
+
+def test_build_bundle_pr_template_is_secret_scanned(tmp_path):
+    template = tmp_path / "pr.md"
+    template.write_text("GH_TOKEN=ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890ab\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="credential"):
+        build_bundle(ProfileSpec(pr_template=[template]))
+
+
+def test_load_profile_pr_template_resolves_and_joins_all_files(tmp_path):
+    template = tmp_path / "pr.md"
+    template.write_text("# PR spec\n", encoding="utf-8")
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text(f'[profile]\npr_template = ["{template}"]\n', encoding="utf-8")
+
+    spec = load_profile(cfg)
+
+    assert spec.pr_template == [template]
+    assert template in spec.all_files()
+
+
+def test_load_profile_rejects_multiple_pr_templates(tmp_path):
+    """The fixed arcname means two entries would silently overwrite each other - fail closed."""
+    first = tmp_path / "a.md"
+    second = tmp_path / "b.md"
+    first.write_text("# a\n", encoding="utf-8")
+    second.write_text("# b\n", encoding="utf-8")
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text(f'[profile]\npr_template = ["{first}", "{second}"]\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="at most one"):
+        load_profile(cfg)
+
+
+def test_load_profile_rejects_pr_template_glob(tmp_path):
+    (tmp_path / "one.md").write_text("# a\n", encoding="utf-8")
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text(f'[profile]\npr_template = ["{tmp_path}/*.md"]\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="explicit files"):
+        load_profile(cfg)
 
 
 def test_build_bundle_arcname_fallback_for_outside_home(tmp_path, monkeypatch):

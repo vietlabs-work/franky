@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from . import container
+from . import container, profile
 from .task import GH_ISSUE_RE, TaskSpec
 
 _PERSONA_PATH = Path(__file__).parent / "persona.md"
@@ -29,6 +29,28 @@ _STEER_CONVENTION = (
     "operator has sent you a correction - read it, prioritize its instructions over your "
     "current plan, then DELETE the file so you do not re-apply the same correction. It will "
     "not exist unless a correction was sent.\n"
+)
+
+
+# Operator PR-description spec (profile category `pr_template`): the operator's own house style
+# for a PR body, injected by the profile bundle at a FIXED container path so the literal named
+# here can never drift from where the bundle unpacks it. Same register as _STEER_CONVENTION -
+# stated UNCONDITIONALLY, because with no profile (or no `pr_template` entry) the file simply does
+# not exist and the default shape above stands, so a run without one is unchanged. It has to
+# override rather than extend the default: the two describe the same artifact, and an agent handed
+# both without a precedence rule splits the difference. Carried by every PR-opening prompt (build,
+# replay --open-pr, resume); `job replay`/`job resume` do not pack a profile bundle today, so the
+# file is simply absent there and the default shape stands, exactly as for a profile-less build.
+_PR_TEMPLATE_CONVENTION = (
+    "- Before you write the PR, check whether the file "
+    f"`{profile.PR_TEMPLATE_CONTAINER_PATH}` exists and is non-empty. If it does, it is the "
+    "operator's own PR-description spec: read it and follow it for the PR title and body, "
+    "OVERRIDING the default title/body shape above wherever the two disagree (still include the "
+    "closing keyword if one was required above). Take ONLY its PR title/body spec: it was likely "
+    "written for an interactive tool, so ignore any workflow steps, tool names, or approval gates "
+    "in it - you are autonomous, nobody is there to approve a draft, and the conventions above "
+    "still decide when and how you open the PR. It will not exist unless the operator configured "
+    "one.\n"
 )
 
 
@@ -164,6 +186,7 @@ def build_prompt(
         "- The PR body must contain three sections: what (the change), why (the motivation), "
         "and a test-plan (how you verified it).\n"
         f"{close_line}"
+        f"{_PR_TEMPLATE_CONVENTION}"
         "- Open the PR with `gh pr create`. Do NOT merge it - a human reviews every change.\n"
         "- Keep commit messages and PR text professional; no persona flavor in the deliverables.\n"
         f"{_STEER_CONVENTION}"
@@ -278,6 +301,7 @@ def build_replay_prompt(
             "- The PR body must contain three sections: what (the change), why (the "
             "motivation), and a test-plan (how you verified it).\n"
             f"{close_line}"
+            f"{_PR_TEMPLATE_CONVENTION}"
             "- Open the PR with `gh pr create`. Do NOT merge it - a human reviews every "
             "change.\n"
             "- Keep commit messages and PR text professional; no persona flavor in the "
@@ -331,6 +355,7 @@ def build_resume_prompt(spec: TaskSpec, *, branch: str) -> str:
         "- The PR body must contain three sections: what (the change), why (the motivation), "
         "and a test-plan (how you verified it).\n"
         f"{close_line}"
+        f"{_PR_TEMPLATE_CONVENTION}"
         "- Open the PR with `gh pr create`. Do NOT merge it - a human reviews every change.\n"
         "- Keep commit messages and PR text professional; no persona flavor in the deliverables.\n"
         f"{_STEER_CONVENTION}"

@@ -6,12 +6,14 @@ from franky.prompt import (
     build_plan_prompt,
     build_prompt,
     build_replay_prompt,
+    build_resume_prompt,
     load_persona,
     task_slug,
 )
 from franky.task import TaskSpec
 
 import franky.container as container
+import franky.profile as profile
 
 
 def test_load_persona_has_professional_guard():
@@ -435,3 +437,48 @@ def test_steer_convention_present_in_resume_prompt():
     spec = TaskSpec(repo="me/repo", text="add a --json flag", source="prose")
     p = build_resume_prompt(spec, branch="franky/add-json")
     assert container.STEER_FILE in p
+
+
+# ---------------------------------------------------------------------------
+# Operator PR-template convention (profile category `pr_template`)
+# ---------------------------------------------------------------------------
+
+
+def test_pr_template_convention_path_matches_profile_container_path():
+    # The two literals can never drift: the prompt tells the agent to read EXACTLY the path
+    # build_bundle packs the operator's template to.
+    from franky.prompt import _PR_TEMPLATE_CONVENTION
+
+    assert profile.PR_TEMPLATE_CONTAINER_PATH in _PR_TEMPLATE_CONVENTION
+    # It must OVERRIDE the default shape, not sit alongside it ambiguously...
+    assert "OVERRIDING" in _PR_TEMPLATE_CONVENTION
+    # ...and an autonomous run must not stall on an approval gate the operator's spec carries,
+    # since those specs are typically written for an interactive tool.
+    assert "approval gates" in _PR_TEMPLATE_CONVENTION
+
+
+def test_pr_template_convention_present_in_every_pr_opening_prompt():
+    spec = TaskSpec(repo="me/repo", text="add a --json flag", source="prose")
+    path = profile.PR_TEMPLATE_CONTAINER_PATH
+    assert path in build_prompt(spec)
+    assert path in build_replay_prompt(spec, branch="franky/t", base_sha="abc1234", open_pr=True)
+    assert path in build_resume_prompt(spec, branch="franky/add-json")
+
+
+def test_pr_template_convention_absent_from_prompts_that_open_no_pr():
+    # Nothing to shape a PR body for: the read-only passes and the reproduce-only replay.
+    spec = TaskSpec(repo="me/repo", text="add a --json flag", source="prose")
+    path = profile.PR_TEMPLATE_CONTAINER_PATH
+    assert path not in build_plan_prompt(spec)
+    assert path not in build_decompose_prompt(spec, "deadbeef")
+    assert path not in build_replay_prompt(spec, branch="franky/t", base_sha="abc", open_pr=False)
+
+
+def test_pr_template_convention_keeps_the_closing_keyword_for_an_issue():
+    # The template overrides the BODY SHAPE, never the issue-auto-close contract.
+    spec = TaskSpec(
+        repo="octocat/hello", text="https://github.com/octocat/hello/issues/42", source="issue"
+    )
+    p = build_prompt(spec)
+    assert "Closes #42" in p
+    assert "closing keyword" in p

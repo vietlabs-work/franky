@@ -50,7 +50,7 @@ PROFILE_PATH_VAR = "FRANKY_PROFILE_PATH"
 _DEFAULT_PROFILE_RELATIVE = Path(".franky") / "profile.toml"
 
 # The categories a profile.toml [profile] table may declare, in canonical order.
-PROFILE_FILE_CATEGORIES = ("skills", "instructions", "knowledge", "mcp_configs")
+PROFILE_FILE_CATEGORIES = ("skills", "instructions", "knowledge", "pr_template", "mcp_configs")
 PROFILE_VALUE_CATEGORIES = ("mcp_credentials", "mcp_domains")
 PROFILE_CATEGORIES = PROFILE_FILE_CATEGORIES + PROFILE_VALUE_CATEGORIES
 
@@ -62,6 +62,14 @@ _TOML_BARE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _CODEX_MCP_CONFIG = Path(".codex/franky-mcp.config.toml")
 _CLAUDE_MCP_CONFIG = Path(".claude/franky-mcp.json")
 CLAUDE_MCP_CONTAINER_PATH = "/home/franky/.claude/franky-mcp.json"
+
+# The operator's own PR-description spec (profile category `pr_template`). Packed at a FIXED
+# archive path - NOT the host-relative one every other category keeps - so the in-container
+# location is a compile-time constant `prompt.py` can name literally, no matter where the file
+# lives on the operator's machine (the same reason the MCP configs get engine-fixed paths).
+# Because the path is fixed, the category is capped at ONE file: two would silently collide.
+_PR_TEMPLATE_ARCNAME = Path(".franky") / "pr-template.md"
+PR_TEMPLATE_CONTAINER_PATH = "/home/franky/.franky/pr-template.md"
 _RESERVED_MCP_CREDENTIALS = frozenset(
     {
         "HOME",
@@ -129,13 +137,16 @@ class ProfileSpec:
     skills: list[Path] = field(default_factory=list)
     instructions: list[Path] = field(default_factory=list)
     knowledge: list[Path] = field(default_factory=list)
+    pr_template: list[Path] = field(default_factory=list)
     mcp_configs: list[Path] = field(default_factory=list)
     mcp_credentials: list[str] = field(default_factory=list)
     mcp_domains: list[str] = field(default_factory=list)
 
     def all_files(self) -> list[Path]:
         """All files across all categories, in declaration order."""
-        return self.skills + self.instructions + self.knowledge + self.mcp_configs
+        return (
+            self.skills + self.instructions + self.knowledge + self.pr_template + self.mcp_configs
+        )
 
 
 def profile_path(env: dict[str, str] | None = None) -> Path | None:
@@ -194,6 +205,7 @@ def load_profile(path: Path) -> ProfileSpec:
     - TOML parse error
     - A literal path that does not exist (glob non-matches are silently empty)
     - A non-string or non-list entry in the TOML
+    - More than one `pr_template` entry (it injects at a single fixed path)
     """
     try:
         import tomllib  # type: ignore[import-not-found]
@@ -226,8 +238,10 @@ def load_profile(path: Path) -> ProfileSpec:
                     f"profile.{category} entries must be strings, got {entry!r} in {path}"
                 )
             is_glob = any(c in entry for c in ("*", "?", "["))
-            if category == "mcp_configs" and is_glob:
-                raise ValueError("profile.mcp_configs entries must be explicit files, not globs")
+            # Both categories inject at a FIXED path, so a glob (which could expand to several
+            # files racing for the same destination) is refused rather than silently collapsed.
+            if category in ("mcp_configs", "pr_template") and is_glob:
+                raise ValueError(f"profile.{category} entries must be explicit files, not globs")
             paths = _expand_glob(entry)
             if not paths and not is_glob:
                 raise ValueError(f"profile file not found: {entry!r} (listed in {path})")
@@ -241,6 +255,12 @@ def load_profile(path: Path) -> ProfileSpec:
         if not all(isinstance(entry, str) for entry in raw_list):
             raise ValueError(f"profile.{category} entries must be strings in {path}")
         setattr(spec, category, list(raw_list))
+
+    if len(spec.pr_template) > 1:
+        raise ValueError(
+            "profile.pr_template must list at most one file - it is injected at the single "
+            f"fixed path {_PR_TEMPLATE_ARCNAME} (got {len(spec.pr_template)} entries)"
+        )
 
     for name in spec.mcp_credentials:
         if name.startswith("FRANKY_") or name in _RESERVED_MCP_CREDENTIALS:
@@ -732,7 +752,9 @@ def build_bundle(spec: ProfileSpec) -> str:
     on the operator's machine (e.g. ~/.claude/CLAUDE.md -> .claude/CLAUDE.md).
 
     Files whose path cannot be made relative to HOME fall back to a flat layout
-    under a top-level `profile/` directory inside HOME.
+    under a top-level `profile/` directory inside HOME.  The `pr_template` file is the
+    one exception to both rules: it always packs to `.franky/pr-template.md`, so the
+    prompt can name a constant in-container path regardless of its host location.
 
     Raises ValueError (fail-closed) if:
     - Any file cannot be read.
@@ -767,14 +789,21 @@ def build_bundle(spec: ProfileSpec) -> str:
                     "Remove the credential from the file before adding it to the profile."
                 )
 
-            try:
-                archive_path = (
-                    file_path.absolute() if file_path in spec.mcp_configs else file_path.resolve()
-                )
-                archive_home = declared_home if file_path in spec.mcp_configs else home
-                arcname = str(archive_path.relative_to(archive_home))
-            except ValueError:
-                arcname = f"profile/{file_path.name}"
+            if file_path in spec.pr_template:
+                # Fixed destination, ignoring where the file lives on the host, so prompt.py can
+                # name the in-container path literally (PR_TEMPLATE_CONTAINER_PATH).
+                arcname = str(_PR_TEMPLATE_ARCNAME)
+            else:
+                try:
+                    archive_path = (
+                        file_path.absolute()
+                        if file_path in spec.mcp_configs
+                        else file_path.resolve()
+                    )
+                    archive_home = declared_home if file_path in spec.mcp_configs else home
+                    arcname = str(archive_path.relative_to(archive_home))
+                except ValueError:
+                    arcname = f"profile/{file_path.name}"
 
             encoded = text.encode("utf-8")
             info = tarfile.TarInfo(name=arcname)

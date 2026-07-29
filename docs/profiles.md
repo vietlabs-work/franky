@@ -68,7 +68,43 @@ instructions = [
 knowledge = [
     "~/docs/architecture.md",
 ]
+
+# Your PR-description spec (at most ONE file) - see "PR-description template" below
+pr_template = ["~/.claude/commands/pr.md"]
 ```
+
+## PR-description template
+
+Franky's built-in PR convention is deliberately minimal: a conventional-commit title and a
+what / why / test-plan body. If you have your own house style for a PR description, declare it
+as `pr_template` and the in-container agent follows it instead.
+
+```toml
+[profile]
+pr_template = ["~/.claude/commands/pr.md"]
+```
+
+Unlike every other category - which lands at its HOME-relative path - this file always unpacks
+to the fixed path `~/.franky/pr-template.md` inside the container, so `prompt.py` can name it
+literally. That is why the category takes **at most one file** and rejects globs: two entries
+would collide on the one destination.
+
+Every PR-opening prompt (`build`, `job resume`, `job replay --open-pr`) then instructs the agent
+to read that path if it exists and follow it for the PR title and body, **overriding** the
+built-in shape wherever the two disagree. With no `pr_template` the file is absent and the
+built-in shape stands, so nothing changes for a profile-less run.
+
+Two things to know when you point this at a spec you wrote for an interactive tool (a Claude
+Code slash command, a Codex prompt):
+
+- The agent is told to take only the **title/body spec** and ignore workflow steps, tool names,
+  and approval gates in it. A "wait for approval before `gh pr create`" step would otherwise
+  stall an autonomous run into a `no_pr` failure.
+- A required closing keyword (`Closes #42`, so the issue auto-closes on merge) survives the
+  override - the template shapes the body, it does not opt out of that contract.
+
+`job resume` and `job replay` do not pack a profile bundle today, so a resumed or replayed run
+falls back to the built-in shape.
 
 ## MCP configuration
 

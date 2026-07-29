@@ -130,8 +130,9 @@ add an engine), so Codex, Cursor, pi, or Claude Code all start with the same con
    franky config list                  # view the file (secrets masked)
    franky config path                  # show where the file lives
    ```
-   To inject your own skills / instructions / knowledge or MCP config into the container, set up an
-   operator profile (see [docs/profiles.md](docs/profiles.md)):
+   To inject your own skills / instructions / knowledge, your own PR-description spec, or MCP
+   config into the container, set up an operator profile (see
+   [docs/profiles.md](docs/profiles.md)):
    ```
    franky profile init                 # interactive wizard -> ~/.franky/profile.toml
    franky profile check                # dry-run: files + MCP policy + secret scan

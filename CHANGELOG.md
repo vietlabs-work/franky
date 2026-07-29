@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Operator profiles accept a `pr_template` file: your own PR-description spec, injected at the
+  fixed container path `~/.franky/pr-template.md` and followed by the agent for the PR title and
+  body, overriding Franky's built-in what/why/test-plan shape. At most one file, no globs (the
+  destination path is fixed); a required `Closes #N` closing keyword survives the override, and
+  workflow steps or approval gates in a template written for an interactive tool are ignored so an
+  autonomous run cannot stall. No profile -> unchanged behavior.
+
 ## [0.1.1] - 2026-07-22
 
 ### Added
