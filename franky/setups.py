@@ -194,8 +194,20 @@ def _is_text(path: Path) -> bool:
     return True
 
 
-def _admissible(path: Path) -> bool:
-    """Deny gate, applied to the declared name AND to the symlink-resolved realpath."""
+def _admissible(path: Path, bases: tuple[Path, ...]) -> bool:
+    """Deny gate, applied to the declared name AND to the symlink-resolved realpath.
+
+    `bases` are the resolved sweep root and HOME. The denied-DIRECTORY check runs ONLY on the
+    part of the resolved path BELOW one of them - never on the absolute path. Components ABOVE
+    the root are ambient and none of our business: a machine whose setups live under a directory
+    named `tmp`, `cache`, or `log` (all DENY_DIRS entries) would otherwise sweep ZERO files and
+    say nothing about it. That is exactly what happened on Linux CI, where pytest's tmp_path is
+    `/tmp/...` while macOS uses `/private/var/folders/...` - the bug passed locally and failed
+    everywhere else.
+
+    A resolved path outside both bases means the operator symlinked out of their own tree; the
+    name deny still governs it, but "is it inside a directory we exclude" has no meaning there.
+    """
     if denied_name(path.name):
         return False
     try:
@@ -204,11 +216,17 @@ def _admissible(path: Path) -> bool:
         return False
     if denied_name(resolved.name):
         return False
-    # A symlink pointing INTO a denied directory (…/sessions/x.md) is denied too.
-    return not any(part in DENY_DIRS for part in resolved.parts)
+    for base in bases:
+        try:
+            rel = resolved.relative_to(base)
+        except ValueError:
+            continue
+        # A symlink pointing INTO a denied directory (…/.claude/sessions/x.md) is denied too.
+        return not any(part in DENY_DIRS for part in rel.parts)
+    return True
 
 
-def _walk_dir(root: Path, out: list[Path]) -> None:
+def _walk_dir(root: Path, out: list[Path], bases: tuple[Path, ...]) -> None:
     """Collect admissible text files under `root`, pruning denied dirs and symlink loops."""
     seen: set[str] = set()
     for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
@@ -222,7 +240,7 @@ def _walk_dir(root: Path, out: list[Path]) -> None:
         dirnames[:] = sorted(d for d in dirnames if d not in DENY_DIRS and not d.startswith(".git"))
         for name in sorted(filenames):
             path = Path(dirpath) / name
-            if not path.is_file() or not _admissible(path):
+            if not path.is_file() or not _admissible(path, bases):
                 continue
             out.append(path)
 
@@ -240,15 +258,19 @@ def expand_setup(kind: str, root: Path) -> SetupScan:
     if not root.is_dir():
         raise ValueError(f"setup {kind!r} root is not a directory: {root}")
 
+    # The bases the denied-DIRECTORY check is measured against: the sweep root, plus HOME so a
+    # symlink hopping to another setup (~/.claude/skills/x -> ~/.codex/sessions/y) is still caught.
+    bases = (root.resolve(), Path.home().resolve())
+
     candidates: list[Path] = []
     for name in manifest.files:
         path = root / name
-        if path.is_file() and _admissible(path):
+        if path.is_file() and _admissible(path, bases):
             candidates.append(path)
     for name in manifest.dirs:
         sub = root / name
         if sub.is_dir():
-            _walk_dir(sub, candidates)
+            _walk_dir(sub, candidates, bases)
 
     scan = SetupScan(kind=kind, root=root)
     for path in candidates:

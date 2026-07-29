@@ -1753,17 +1753,43 @@ def test_load_profile_bundle_applies_named_credential_egress_and_redaction(tmp_p
     cfg = Config(engine=PiEngine(), allowed_repos=["me/repo"])
     secrets = []
 
-    bundle = cli._load_profile_bundle(
+    bundle, setup_block = cli._load_profile_bundle(
         str(prof), {"LINEAR_API_KEY": "mcp-secret-value"}, secrets, cfg
     )
 
+    # Unpacked, not `assert bundle` on the tuple: a 2-tuple is truthy even when the bundle is
+    # None, which would make this assertion vacuous.
     assert bundle
+    assert setup_block == ""  # no [setups] declared
     assert cfg.passthrough_env == {"LINEAR_API_KEY": "mcp-secret-value"}
     assert cfg.extra_allowed_domains == ["mcp.linear.app"]
     assert secrets == ["mcp-secret-value"]
     argv = build_docker_argv("franky", cfg.passthrough_env, ["pi"])
     assert "LINEAR_API_KEY" in argv
     assert "mcp-secret-value" not in argv
+
+
+def test_load_profile_bundle_warns_when_a_declared_setup_swept_nothing(tmp_path, monkeypatch):
+    """A setup that matches no files must SAY so - injecting nothing silently is the one
+    failure the operator would not notice (they declared it precisely to have it there)."""
+    from franky.config import Config
+    from franky.engine import PiEngine
+
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    empty = tmp_path / ".claude"
+    empty.mkdir()
+    prof = tmp_path / "profile.toml"
+    prof.write_text(f'[setups]\nclaude = "{empty}"\n', encoding="utf-8")
+    cfg = Config(engine=PiEngine(), allowed_repos=["me/repo"])
+
+    runner = CliRunner()
+    with runner.isolation() as (_out, err, _):
+        bundle, block = cli._load_profile_bundle(str(prof), {}, [], cfg)
+        warning = err.getvalue().decode()
+
+    assert bundle is None
+    assert block == ""
+    assert "matched no files" in warning
 
 
 def test_build_does_not_accept_mcp_credential_loaded_from_franky_config(tmp_path, monkeypatch):

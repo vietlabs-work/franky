@@ -102,8 +102,13 @@ def test_expand_setup_denies_a_symlink_pointing_at_a_credential_file(tmp_path):
 
 
 def test_expand_setup_denies_a_symlink_into_a_denied_directory(tmp_path):
+    """A `.md` transcript is not caught by the name deny, so containment has to catch it.
+
+    The target sits under the setup root (`~/.claude/sessions/`), which is where these
+    directories actually live - and where the containment check is measured.
+    """
     root = _claude_setup(tmp_path / ".claude")
-    sessions = tmp_path / "sessions"
+    sessions = root / "sessions"
     sessions.mkdir()
     transcript = sessions / "chat.md"
     transcript.write_text("private conversation\n", encoding="utf-8")
@@ -112,6 +117,21 @@ def test_expand_setup_denies_a_symlink_into_a_denied_directory(tmp_path):
     scan = setups.expand_setup("claude", root)
 
     assert "reference.md" not in {p.name for p in scan.files}
+
+
+def test_expand_setup_ignores_denied_names_in_path_components_above_the_root(tmp_path):
+    """REGRESSION: the denied-DIRECTORY check must not look at components ABOVE the root.
+
+    It used to run over the whole absolute resolved path, so a setup living anywhere under a
+    directory named `tmp` / `cache` / `log` (all DENY_DIRS entries) swept ZERO files and said
+    nothing. Linux CI hit it immediately - pytest's tmp_path is `/tmp/...` - while macOS
+    (`/private/var/folders/...`) passed, which is exactly how it reached CI.
+    """
+    root = _claude_setup(tmp_path / "cache" / "tmp" / "logs" / ".claude")
+
+    scan = setups.expand_setup("claude", root)
+
+    assert {p.name for p in scan.files} == {"CLAUDE.md", "SKILL.md", "pr.md"}
 
 
 def test_expand_setup_follows_symlinked_skill_dirs(tmp_path):

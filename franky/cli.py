@@ -1085,6 +1085,17 @@ def _load_profile_bundle(
     elif cfg.engine.name == "claude":
         cfg.claude_mcp_config_path = claude_mcp_config_path(spec)
 
+    # A declared setup that sweeps to nothing is almost always a mistake (wrong directory, or a
+    # layout the manifest does not know). Say so: the operator asked for their setup to be in the
+    # container, and silently injecting nothing is the one failure they would not notice.
+    for kind, scan in spec.setup_scans.items():
+        if not scan.files:
+            click.echo(
+                f"franky: WARNING setup {kind!r} at {scan.root} matched no files - nothing from "
+                "it will be injected. Run `franky profile check` to see what it expanded to.",
+                err=True,
+            )
+
     setup_block = build_setup_block(spec)
     if not spec.all_files():
         return None, ""
