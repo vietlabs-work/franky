@@ -29,7 +29,7 @@ from pathlib import Path
 from . import egress, franky_version, snapshot
 from .config import redact
 from .engine import CODEX_AUTH_VOLUME, CODEX_SUBSCRIPTION_VAR
-from .profile import PROFILE_BUNDLE_VAR
+from .profile import CONTAINER_HOME, PROFILE_WAIT_VAR
 
 # Long agent runs: a full clone-build-test-PR cycle can take many minutes. 30 min cap.
 FALLBACK_TIMEOUT_SECS = 1800
@@ -168,7 +168,7 @@ def build_docker_argv(
     name: str | None = None,
     network: str | None = None,
     proxy_url: str | None = None,
-    profile_bundle: str | None = None,
+    profile_wait: bool = False,
     resume_wait: bool = False,
     auth_volume: str | None = None,
 ) -> list[str]:
@@ -185,12 +185,12 @@ def build_docker_argv(
     or resolve an off-allowlist host directly; proxied clients still work because Squid does
     the DNS resolution on their behalf. Existing call sites pass neither and are unchanged.
 
-    When `profile_bundle` is given (a base64-encoded gzip tar of curated prose files), it
-    is passed BY VALUE as FRANKY_PROFILE_BUNDLE.  This is correct and does not weaken the
-    secret-by-name discipline: the bundle is NOT a credential - it is curated, secret-scrubbed
-    operator content (Tier-1: static markdown/text only).  The entrypoint decodes and extracts
-    it into HOME before exec-ing the engine.  No bind mount is added; the hardening flags are
-    unchanged.
+    When `profile_wait` is True the container starts in profile-wait mode via
+    `-e FRANKY_PROFILE_WAIT=1` (by-value, non-secret - it carries policy, not content): the
+    entrypoint blocks until the host has streamed the operator's bundle into HOME and touched
+    the ready marker (see `deliver_profile`).  The bundle itself NEVER reaches the argv - a
+    swept setup runs to ~1 MB, which no single `-e` value can carry on Linux (128 KB
+    MAX_ARG_STRLEN), and keeping it off the argv also keeps it out of `ps`.
 
     When `resume_wait` is True (issue #71) the container is started in resume-wait mode via
     `-e FRANKY_RESUME_WAIT=1` (by-value, non-secret): the entrypoint blocks until the host
@@ -229,11 +229,10 @@ def build_docker_argv(
             "--dns",
             "127.0.0.1",
         ]
-    if profile_bundle:
-        # By-value (non-secret): curated prose, already secret-scrubbed on the host.
-        # The entrypoint unpacks this before exec-ing the engine; see profile.py and
-        # franky-dind-entrypoint.sh.
-        argv += ["-e", f"{PROFILE_BUNDLE_VAR}={profile_bundle}"]
+    if profile_wait:
+        # By-value (non-secret): puts the entrypoint into profile-wait mode. The content
+        # arrives later over `docker exec -i` stdin; see deliver_profile + the entrypoint.
+        argv += ["-e", f"{PROFILE_WAIT_VAR}=1"]
     if resume_wait:
         # By-value (non-secret): puts the entrypoint into resume-wait mode (issue #71).
         argv += ["-e", f"{snapshot.RESUME_WAIT_ENV}=1"]
@@ -506,6 +505,61 @@ def deliver_steer(
     return getattr(proc, "returncode", 1) == 0
 
 
+# The file the host touches (last, after a clean untar) to release the entrypoint's wait.
+PROFILE_READY_MARKER = f"{CONTAINER_HOME}/.franky-profile-ready"
+
+
+def deliver_profile(
+    task: str,
+    bundle: bytes,
+    runner=subprocess.run,
+    *,
+    ready_polls: int = 30,
+    poll_interval: float = 0.5,
+    timeout: float = 60.0,
+    sleeper=time.sleep,
+) -> bool:
+    """Stream the operator profile tar into a freshly launched container, then signal it.
+
+    Same channel and same reasoning as `snapshot.restore_into_container` (whose argv builders
+    are reused here, only with HOME as the extraction target): a `docker cp` INTO the
+    `--read-only` task container is refused by the daemon even for a tmpfs destination, so the
+    bytes are piped to `tar -xzf -` over `docker exec -i` stdin. Extraction runs as the image's
+    default uid 1001, which owns the HOME tmpfs, with `--no-same-owner` so no chown is needed
+    under `--cap-drop=ALL`.
+
+    The ready marker is touched LAST, only after a clean untar, so the entrypoint never execs
+    the engine on a half-unpacked profile: no marker means it exits nonzero and the run is
+    classified as a failure rather than silently proceeding without the operator's setup.
+    Returns True iff every step succeeded; never raises.
+    """
+    from . import snapshot
+
+    try:
+        for _ in range(ready_polls):
+            if container_running(task, runner):
+                break
+            sleeper(poll_interval)
+
+        untar = runner(
+            snapshot.build_untar_argv(task, target=CONTAINER_HOME),
+            input=bundle,
+            capture_output=True,
+            timeout=timeout,
+        )
+        if getattr(untar, "returncode", 1) != 0:
+            return False
+        marker = runner(
+            snapshot.build_marker_argv(task, marker=PROFILE_READY_MARKER),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return getattr(marker, "returncode", 1) == 0
+    except Exception:
+        return False
+
+
 def reap_run(run_id: str, runner=subprocess.run) -> bool:
     """Force-remove a run's task container and reap its proxy sidecar + internal network.
 
@@ -719,7 +773,7 @@ def run_in_container(
     env: dict[str, str] | None = None,
     sleeper=time.sleep,
     proxy_image: str = PROXY_IMAGE,
-    profile_bundle: str | None = None,
+    profile_bundle: bytes | None = None,
     progress=None,
     popen=subprocess.Popen,
     run_id: str | None = None,
@@ -825,8 +879,9 @@ def run_in_container(
         # only the popen path exposes. A no-op progress stand-in keeps the streaming loop working
         # when the caller passed none.
         resuming = resume_workspace is not None
+        injecting = profile_bundle is not None
         effective_progress = progress
-        if resuming and effective_progress is None:
+        if (resuming or injecting) and effective_progress is None:
             effective_progress = lambda _line: None  # noqa: E731 - tiny no-op for the stream loop
         argv = build_docker_argv(
             image,
@@ -835,7 +890,7 @@ def run_in_container(
             name=task,
             network=net,
             proxy_url=proxy_url(proxy),
-            profile_bundle=profile_bundle,
+            profile_wait=injecting,
             resume_wait=resuming,
             auth_volume=cfg.auth_volume,
         )
@@ -854,6 +909,12 @@ def run_in_container(
                     env=child_env,
                 )
                 task_launched = True
+                # Stream the operator profile in BEFORE draining stdout: the container is blocked
+                # on the ready marker in profile-wait mode. A False result is fine to proceed on -
+                # the entrypoint exits nonzero on its own (refusing to run without the operator's
+                # setup) and the run classifies as agent_error; do NOT abort the stream, drain it.
+                if profile_bundle is not None:
+                    deliver_profile(task, profile_bundle, runner, sleeper=sleeper)
                 # Restore the prior workspace into the just-launched container (issue #71) BEFORE
                 # draining stdout: the container is waiting on the ready marker in resume-wait
                 # mode. A False result is fine to proceed on - the entrypoint will exit 75 quickly

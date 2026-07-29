@@ -10,7 +10,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from . import container, profile
+from . import container
+from . import profile as _profile
 from .task import GH_ISSUE_RE, TaskSpec
 
 _PERSONA_PATH = Path(__file__).parent / "persona.md"
@@ -32,26 +33,61 @@ _STEER_CONVENTION = (
 )
 
 
-# Operator PR-description spec (profile category `pr_template`): the operator's own house style
-# for a PR body, injected by the profile bundle at a FIXED container path so the literal named
-# here can never drift from where the bundle unpacks it. Same register as _STEER_CONVENTION -
-# stated UNCONDITIONALLY, because with no profile (or no `pr_template` entry) the file simply does
-# not exist and the default shape above stands, so a run without one is unchanged. It has to
-# override rather than extend the default: the two describe the same artifact, and an agent handed
-# both without a precedence rule splits the difference. Carried by every PR-opening prompt (build,
-# replay --open-pr, resume); `job replay`/`job resume` do not pack a profile bundle today, so the
-# file is simply absent there and the default shape stands, exactly as for a profile-less build.
-_PR_TEMPLATE_CONVENTION = (
-    "- Before you write the PR, check whether the file "
-    f"`{profile.PR_TEMPLATE_CONTAINER_PATH}` exists and is non-empty. If it does, it is the "
-    "operator's own PR-description spec: read it and follow it for the PR title and body, "
-    "OVERRIDING the default title/body shape above wherever the two disagree (still include the "
-    "closing keyword if one was required above). Take ONLY its PR title/body spec: it was likely "
-    "written for an interactive tool, so ignore any workflow steps, tool names, or approval gates "
-    "in it - you are autonomous, nobody is there to approve a draft, and the conventions above "
-    "still decide when and how you open the PR. It will not exist unless the operator configured "
-    "one.\n"
-)
+def build_setup_block(spec) -> str:
+    """The operator-setup block: what was injected, and which rules win when it conflicts.
+
+    `spec` is a resolved `profile.ProfileSpec` (duck-typed so tests can pass a stub); "" when it
+    declares no `[setups]`, which keeps a profile-less prompt byte-identical to before.
+
+    WHY the precedence rules are not optional. An operator's global instruction file is written
+    for their INTERACTIVE local setup, and two classes of instruction in it actively break an
+    autonomous run rather than being harmlessly ignored:
+
+    - A plan-first / approval gate ("present the approach and wait for approval before editing")
+      makes the agent stop and wait for a human who is not there - the run then ends with no PR.
+    - Review-pass or subagent-dispatch protocols can genuinely fire (the claude engine has
+      subagents), burning a one-shot container's time and token budget on process.
+
+    Everything else - a tool, path, repo, or service that does not exist in the container -
+    self-neutralizes: the agent looks, finds nothing, moves on. So the block states three rules
+    (Franky's conventions win / never wait for approval / ignore what is not here) rather than
+    trying to filter the operator's prose host-side, which would be both lossy and endless.
+
+    The PR-description spec is named explicitly when one was discovered, because a slash command
+    is never auto-invoked by an engine: without a pointer the file would ship and go unread.
+    """
+    roots = spec.setup_roots()
+    if not roots:
+        return ""
+
+    listed = ", ".join(
+        f"`{_profile.container_path(root)}` ({kind})" for kind, root in sorted(roots.items())
+    )
+    pr_spec = spec.pr_spec()
+    pr_line = ""
+    if pr_spec is not None:
+        pr_line = (
+            "Their PR-description spec is "
+            f"`{_profile.container_path(pr_spec)}` - read it before you write the PR and follow "
+            "it for the PR title and body, OVERRIDING the default title/body shape above "
+            "wherever the two disagree (still include the closing keyword if one was required "
+            "above). Take only its title/body spec, not its workflow steps.\n"
+        )
+
+    return (
+        "\nOperator setup (injected):\n"
+        f"Your operator's own agentic-coding setup has been unpacked into {listed} - their "
+        "instructions, skills, commands, and agent definitions. Treat it as context on how they "
+        "like work done.\n"
+        f"{pr_line}"
+        "Three rules govern any conflict with it:\n"
+        "- The conventions in THIS prompt win wherever the two disagree.\n"
+        "- You are autonomous and headless. Never wait for approval, never stop to ask a "
+        "question, and never treat a plan-approval or review gate in those files as blocking - "
+        "there is nobody to answer. Finish the task and open the PR.\n"
+        "- Ignore anything naming a tool, path, repo, or service that does not exist here, and "
+        "skip process ceremony that only makes sense in an interactive local session.\n"
+    )
 
 
 def load_persona() -> str:
@@ -160,6 +196,7 @@ def build_prompt(
     *,
     branch: str | None = None,
     prior_failures: tuple[str, ...] | list[str] = (),
+    operator_setup: str = "",
 ) -> str:
     """Compose the build prompt, pinning the branch the agent must use.
 
@@ -171,6 +208,9 @@ def build_prompt(
     `prior_failures` (issue #64 #5) is the list of diagnosis `retry_hint`s from earlier failed
     attempts; when non-empty a learning-signal block is injected. Empty (the default) yields a
     byte-identical prompt to the pre-retry build.
+
+    `operator_setup` is `build_setup_block`'s output when the profile injected the operator's
+    agentic-coding setup; "" (the default) leaves the prompt exactly as it was.
     """
     persona = load_persona()
 
@@ -186,16 +226,18 @@ def build_prompt(
         "- The PR body must contain three sections: what (the change), why (the motivation), "
         "and a test-plan (how you verified it).\n"
         f"{close_line}"
-        f"{_PR_TEMPLATE_CONVENTION}"
         "- Open the PR with `gh pr create`. Do NOT merge it - a human reviews every change.\n"
         "- Keep commit messages and PR text professional; no persona flavor in the deliverables.\n"
         f"{_STEER_CONVENTION}"
     )
 
-    return f"{persona}\n\n{task_block}\n{_prior_failures_block(prior_failures)}{conventions}"
+    return (
+        f"{persona}\n\n{task_block}\n"
+        f"{_prior_failures_block(prior_failures)}{conventions}{operator_setup}"
+    )
 
 
-def build_iterate_prompt(spec: TaskSpec) -> str:
+def build_iterate_prompt(spec: TaskSpec, *, operator_setup: str = "") -> str:
     """Prompt for the `iterate` command: a FOLLOW-UP pass on an existing Franky PR.
 
     Standalone on purpose - it does NOT reuse `_task_block`/`_slug_hint` (which key on
@@ -244,7 +286,7 @@ def build_iterate_prompt(spec: TaskSpec) -> str:
         f"{_STEER_CONVENTION}"
     )
 
-    return f"{persona}\n\n{task_block}\n{conventions}"
+    return f"{persona}\n\n{task_block}\n{conventions}{operator_setup}"
 
 
 def build_replay_prompt(
@@ -253,6 +295,7 @@ def build_replay_prompt(
     branch: str,
     base_sha: str,
     open_pr: bool,
+    operator_setup: str = "",
 ) -> str:
     """Prompt for `franky job replay`: re-run a recorded task from its saved inputs (issue #70).
 
@@ -301,7 +344,6 @@ def build_replay_prompt(
             "- The PR body must contain three sections: what (the change), why (the "
             "motivation), and a test-plan (how you verified it).\n"
             f"{close_line}"
-            f"{_PR_TEMPLATE_CONVENTION}"
             "- Open the PR with `gh pr create`. Do NOT merge it - a human reviews every "
             "change.\n"
             "- Keep commit messages and PR text professional; no persona flavor in the "
@@ -320,10 +362,10 @@ def build_replay_prompt(
             f"{_STEER_CONVENTION}"
         )
 
-    return f"{persona}\n\n{task_block}\n{conventions}"
+    return f"{persona}\n\n{task_block}\n{conventions}{operator_setup}"
 
 
-def build_resume_prompt(spec: TaskSpec, *, branch: str) -> str:
+def build_resume_prompt(spec: TaskSpec, *, branch: str, operator_setup: str = "") -> str:
     """Prompt for `franky job resume`: continue a hung/timed-out/killed run's restored workspace.
 
     WHY this differs from a fresh build: resume restores the FILESYSTEM (the prior run's `/work`
@@ -355,13 +397,12 @@ def build_resume_prompt(spec: TaskSpec, *, branch: str) -> str:
         "- The PR body must contain three sections: what (the change), why (the motivation), "
         "and a test-plan (how you verified it).\n"
         f"{close_line}"
-        f"{_PR_TEMPLATE_CONVENTION}"
         "- Open the PR with `gh pr create`. Do NOT merge it - a human reviews every change.\n"
         "- Keep commit messages and PR text professional; no persona flavor in the deliverables.\n"
         f"{_STEER_CONVENTION}"
     )
 
-    return f"{persona}\n\n{task_block}\n{conventions}"
+    return f"{persona}\n\n{task_block}\n{conventions}{operator_setup}"
 
 
 def build_plan_prompt(spec: TaskSpec) -> str:

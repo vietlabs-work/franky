@@ -63,16 +63,30 @@ else
          "build/test steps will fail (see /tmp/dockerd.log inside the container)." >&2
 fi
 
-# Unpack operator profile bundle (skills/instructions/knowledge) into HOME if provided.
-# The bundle is a gzip-compressed tar of curated, secret-scrubbed prose files packed
-# with paths relative to HOME.  It is extracted here - before exec-ing the engine - so
-# the in-container agent finds the operator's skills/instructions as it would locally.
-# The var is unset after extraction so it does not leak into the agent environment.
-# WHY safe: the bundle is assembled host-side from an explicit allowlist and refused
-# (fail-closed) by the host if any credential pattern is detected (see franky/profile.py).
-if [ -n "${FRANKY_PROFILE_BUNDLE:-}" ]; then
-    printf '%s' "${FRANKY_PROFILE_BUNDLE}" | base64 -d | tar -xz -C "${HOME}"
-    unset FRANKY_PROFILE_BUNDLE
+# Operator profile (skills/instructions/commands/agent definitions, or a whole swept
+# `~/.claude`-style setup): the host streams a gzip tar of curated, secret-scrubbed files into
+# HOME over `docker exec -i` and touches the marker LAST, once the untar is clean. We only wait
+# for that marker here - the extraction is host-driven, because the bundle cannot ride the argv
+# (a swept setup is ~1 MB, past Linux's 128 KB per-argument limit) and `docker cp` into this
+# --read-only container is refused by the daemon.
+# Wait is capped (never unbounded). No marker means the profile is absent or half-unpacked, and
+# running the engine anyway would silently produce a build without the operator's setup - so we
+# exit nonzero and let the host classify it as a failure.
+# WHY safe: the bundle is assembled host-side from a bounded allowlist and refused (fail-closed)
+# if any credential pattern is detected (see franky/profile.py and franky/setups.py).
+if [ -n "${FRANKY_PROFILE_WAIT:-}" ]; then
+    ready=0
+    for _ in $(seq 1 120); do
+        if [ -f "${HOME}/.franky-profile-ready" ]; then ready=1; break; fi
+        sleep 1
+    done
+    if [ "${ready}" != 1 ]; then
+        echo "franky: operator profile was never injected (marker absent after 120s) -" \
+             "refusing to run without it" >&2
+        exit 78
+    fi
+    rm -f "${HOME}/.franky-profile-ready" 2>/dev/null || true
+    unset FRANKY_PROFILE_WAIT
 fi
 
 # Resume mode (issue #71): the host docker-cp's the prior workspace into this started

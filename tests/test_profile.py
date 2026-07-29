@@ -3,7 +3,6 @@
 All tests are hermetic: no real files outside of tmp_path, no network, no Docker.
 """
 
-import base64
 import io
 import json
 import tarfile
@@ -12,8 +11,10 @@ from pathlib import Path
 import pytest
 
 from franky.profile import (
-    PR_TEMPLATE_CONTAINER_PATH,
-    PROFILE_BUNDLE_VAR,
+    CLAUDE_MCP_CONTAINER_PATH,
+    CONTAINER_HOME,
+    PROFILE_WAIT_VAR,
+    container_path,
     PROFILE_PATH_VAR,
     ProfileSpec,
     build_bundle,
@@ -22,6 +23,7 @@ from franky.profile import (
     profile_file_path,
     profile_path,
     read_profile_raw,
+    read_setups_raw,
     resolve_mcp_credentials,
     scan_for_secrets,
     scan_profile_files,
@@ -507,12 +509,13 @@ def test_mcp_secret_scan_allows_declared_placeholder_but_not_other_literal_secre
 # ---------------------------------------------------------------------------
 
 
-def _decode_bundle(bundle: str) -> tarfile.TarFile:
-    raw = base64.b64decode(bundle)
-    return tarfile.open(fileobj=io.BytesIO(raw), mode="r:gz")
+def _decode_bundle(bundle: bytes) -> tarfile.TarFile:
+    """The bundle is raw gzip-tar bytes now - it is streamed over `docker exec` stdin, so
+    there is no base64 layer to strip."""
+    return tarfile.open(fileobj=io.BytesIO(bundle), mode="r:gz")
 
 
-def test_build_bundle_produces_valid_base64_gzip_tar(tmp_path):
+def test_build_bundle_produces_valid_gzip_tar_bytes(tmp_path):
     f = tmp_path / "skill.md"
     f.write_text("# Skill\n\nDo the thing.\n")
     spec = ProfileSpec(skills=[f])
@@ -598,66 +601,6 @@ def test_build_bundle_preserves_reserved_mcp_path_for_home_symlink(tmp_path, mon
     assert _decode_bundle(bundle).getnames() == [".claude/franky-mcp.json"]
 
 
-def test_build_bundle_pr_template_packs_at_the_fixed_path(tmp_path, monkeypatch):
-    """The PR template lands at the constant path prompt.py names, wherever it lives on the host.
-
-    Load-bearing: `prompt.py` tells the agent to read PR_TEMPLATE_CONTAINER_PATH literally, so the
-    arcname must NOT follow the host layout the way every other category does.
-    """
-    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
-    template = tmp_path / "somewhere" / "deep" / "my-pr-style.md"
-    template.parent.mkdir(parents=True)
-    template.write_text("# PR spec\n\nLead with a summary.\n", encoding="utf-8")
-
-    tf = _decode_bundle(build_bundle(ProfileSpec(pr_template=[template])))
-
-    assert tf.getnames() == [".franky/pr-template.md"]
-    assert PR_TEMPLATE_CONTAINER_PATH.endswith("/.franky/pr-template.md")
-    extracted = tf.extractfile(tf.getmembers()[0]).read().decode("utf-8")
-    assert "Lead with a summary." in extracted
-
-
-def test_build_bundle_pr_template_is_secret_scanned(tmp_path):
-    template = tmp_path / "pr.md"
-    template.write_text("GH_TOKEN=ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890ab\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="credential"):
-        build_bundle(ProfileSpec(pr_template=[template]))
-
-
-def test_load_profile_pr_template_resolves_and_joins_all_files(tmp_path):
-    template = tmp_path / "pr.md"
-    template.write_text("# PR spec\n", encoding="utf-8")
-    cfg = tmp_path / "profile.toml"
-    cfg.write_text(f'[profile]\npr_template = ["{template}"]\n', encoding="utf-8")
-
-    spec = load_profile(cfg)
-
-    assert spec.pr_template == [template]
-    assert template in spec.all_files()
-
-
-def test_load_profile_rejects_multiple_pr_templates(tmp_path):
-    """The fixed arcname means two entries would silently overwrite each other - fail closed."""
-    first = tmp_path / "a.md"
-    second = tmp_path / "b.md"
-    first.write_text("# a\n", encoding="utf-8")
-    second.write_text("# b\n", encoding="utf-8")
-    cfg = tmp_path / "profile.toml"
-    cfg.write_text(f'[profile]\npr_template = ["{first}", "{second}"]\n', encoding="utf-8")
-
-    with pytest.raises(ValueError, match="at most one"):
-        load_profile(cfg)
-
-
-def test_load_profile_rejects_pr_template_glob(tmp_path):
-    (tmp_path / "one.md").write_text("# a\n", encoding="utf-8")
-    cfg = tmp_path / "profile.toml"
-    cfg.write_text(f'[profile]\npr_template = ["{tmp_path}/*.md"]\n', encoding="utf-8")
-
-    with pytest.raises(ValueError, match="explicit files"):
-        load_profile(cfg)
-
-
 def test_build_bundle_arcname_fallback_for_outside_home(tmp_path, monkeypatch):
     """Files outside HOME get a flat fallback name under profile/."""
     monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path / "home"))
@@ -687,12 +630,19 @@ def test_build_bundle_unreadable_file_raises(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# PROFILE_BUNDLE_VAR constant
+# Injection-mode constants
 # ---------------------------------------------------------------------------
 
 
-def test_profile_bundle_var_constant():
-    assert PROFILE_BUNDLE_VAR == "FRANKY_PROFILE_BUNDLE"
+def test_profile_wait_var_constant():
+    # The entrypoint keys its wait loop on this exact name; content never rides the env.
+    assert PROFILE_WAIT_VAR == "FRANKY_PROFILE_WAIT"
+
+
+def test_container_home_matches_the_reserved_mcp_container_path():
+    # container_path() derives every in-container path from CONTAINER_HOME, so it must agree
+    # with the one path that was hardcoded before it existed.
+    assert CLAUDE_MCP_CONTAINER_PATH.startswith(CONTAINER_HOME + "/")
 
 
 # ---------------------------------------------------------------------------
@@ -860,3 +810,153 @@ def test_scan_profile_files_and_build_bundle_agree(tmp_path):
     good_spec = ProfileSpec(skills=[good])
     assert not any(r.findings for r in scan_profile_files(good_spec))
     build_bundle(good_spec)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# [setups]: whole-setup declaration by directory
+# ---------------------------------------------------------------------------
+
+
+def _setup_tree(home: Path) -> None:
+    claude = home / ".claude"
+    (claude / "skills" / "cook").mkdir(parents=True)
+    (claude / "commands").mkdir()
+    (claude / "CLAUDE.md").write_text("# instructions\n", encoding="utf-8")
+    (claude / "skills" / "cook" / "SKILL.md").write_text("# cook\n", encoding="utf-8")
+    (claude / "commands" / "pr.md").write_text("# PR spec\n", encoding="utf-8")
+
+
+def test_load_profile_expands_a_declared_setup(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    _setup_tree(tmp_path)
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text(f'[setups]\nclaude = "{tmp_path / ".claude"}"\n', encoding="utf-8")
+
+    spec = load_profile(cfg)
+
+    assert set(spec.setup_scans) == {"claude"}
+    assert {p.name for p in spec.setup_files} == {"CLAUDE.md", "SKILL.md", "pr.md"}
+    # A directory declaration is a shorthand for a file list: the swept files must flow into
+    # all_files(), which is what the fail-closed secret scan and the packer both consume.
+    assert set(spec.setup_files) <= set(spec.all_files())
+
+
+def test_load_profile_setup_files_are_secret_scanned_like_any_other(tmp_path, monkeypatch):
+    """The whole point of folding setups into all_files(): no laxer path for a swept file."""
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    _setup_tree(tmp_path)
+    (tmp_path / ".claude" / "skills" / "cook" / "leak.md").write_text(
+        "token: ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890ab\n", encoding="utf-8"
+    )
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text(f'[setups]\nclaude = "{tmp_path / ".claude"}"\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="credential"):
+        build_bundle(load_profile(cfg))
+
+
+def test_load_profile_setup_bundle_keeps_home_relative_paths(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    _setup_tree(tmp_path)
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text(f'[setups]\nclaude = "{tmp_path / ".claude"}"\n', encoding="utf-8")
+
+    names = sorted(_decode_bundle(build_bundle(load_profile(cfg))).getnames())
+
+    assert names == [
+        ".claude/CLAUDE.md",
+        ".claude/commands/pr.md",
+        ".claude/skills/cook/SKILL.md",
+    ]
+
+
+def test_load_profile_rejects_unknown_setup_kind(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    _setup_tree(tmp_path)
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text(f'[setups]\ncluade = "{tmp_path / ".claude"}"\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="unknown setup kind"):
+        load_profile(cfg)
+
+
+def test_load_profile_rejects_missing_setup_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text(f'[setups]\nclaude = "{tmp_path / "nope"}"\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="not found"):
+        load_profile(cfg)
+
+
+def test_load_profile_rejects_setup_dir_outside_home(tmp_path, monkeypatch):
+    """Bundle members are HOME-relative, so a root elsewhere has no in-container location."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: home))
+    outside = tmp_path / "elsewhere" / ".claude"
+    (outside / "skills").mkdir(parents=True)
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text(f'[setups]\nclaude = "{outside}"\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="under HOME"):
+        load_profile(cfg)
+
+
+def test_load_profile_rejects_non_string_setup_value(tmp_path):
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text("[setups]\nclaude = 42\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="directory path string"):
+        load_profile(cfg)
+
+
+def test_pr_spec_is_discovered_from_the_swept_setup(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    _setup_tree(tmp_path)
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text(f'[setups]\nclaude = "{tmp_path / ".claude"}"\n', encoding="utf-8")
+
+    assert load_profile(cfg).pr_spec() == tmp_path / ".claude" / "commands" / "pr.md"
+
+
+def test_pr_spec_is_none_without_a_setup(tmp_path):
+    f = tmp_path / "skill.md"
+    f.write_text("# skill\n", encoding="utf-8")
+    assert ProfileSpec(skills=[f]).pr_spec() is None
+
+
+def test_all_files_dedupes_a_file_listed_and_swept(tmp_path, monkeypatch):
+    """A tar with two members at one path would extract twice; dedup keeps one."""
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    _setup_tree(tmp_path)
+    cfg = tmp_path / "profile.toml"
+    claude_md = tmp_path / ".claude" / "CLAUDE.md"
+    cfg.write_text(
+        f'[profile]\ninstructions = ["{claude_md}"]\n\n'
+        f'[setups]\nclaude = "{tmp_path / ".claude"}"\n',
+        encoding="utf-8",
+    )
+
+    files = load_profile(cfg).all_files()
+
+    assert files.count(claude_md) == 1
+
+
+def test_container_path_maps_home_relative_onto_container_home(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    assert container_path(tmp_path / ".claude" / "commands" / "pr.md") == (
+        f"{CONTAINER_HOME}/.claude/commands/pr.md"
+    )
+
+
+def test_write_profile_round_trips_the_setups_table(tmp_path):
+    path = tmp_path / "profile.toml"
+    write_profile(path, {"skills": ["~/x.md"]}, {"codex": "~/.codex", "claude": "~/.claude"})
+
+    assert read_setups_raw(path) == {"claude": "~/.claude", "codex": "~/.codex"}
+    assert read_profile_raw(path)["skills"] == ["~/x.md"]
+
+
+def test_read_setups_raw_absent_file_is_empty(tmp_path):
+    assert read_setups_raw(tmp_path / "nope.toml") == {}

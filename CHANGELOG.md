@@ -8,12 +8,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- Operator profiles accept a `pr_template` file: your own PR-description spec, injected at the
-  fixed container path `~/.franky/pr-template.md` and followed by the agent for the PR title and
-  body, overriding Franky's built-in what/why/test-plan shape. At most one file, no globs (the
-  destination path is fixed); a required `Closes #N` closing keyword survives the override, and
-  workflow steps or approval gates in a template written for an interactive tool are ignored so an
-  autonomous run cannot stall. No profile -> unchanged behavior.
+- Operator profiles accept whole agentic-coding setups by directory: `[setups] claude =
+  "~/.claude"` (also `codex`, `opencode`, `pi`) instead of listing files one by one. Each
+  directory is swept through a per-kind allowlist (`CLAUDE.md`/`AGENTS.md`, `skills/`,
+  `commands/`, `prompts/`, `rules/`, `agents/`) so the in-container agent has the abilities it
+  has locally, and a deny gate keeps out everything else: conversation transcripts
+  (`projects/`, `sessions/`), plugin trees, caches, and credential-shaped files (`auth.json`,
+  `settings*.json`, `*.jsonl`, `*.sqlite`). Deny is matched on the symlink-RESOLVED path, only
+  UTF-8-decodable files ship (unscannable bytes are never injected blind), denied dirs are
+  pruned from the walk, and swept files join the same fail-closed secret scan as an explicitly
+  listed file. Bounded by file/byte guards. `franky profile init` now offers the setups it finds
+  on the machine (one confirm, no typing); `franky profile check` summarizes per setup and
+  reports what was skipped.
+- The PR-description spec now follows the injected setup instead of being configured: Franky
+  finds it by convention (a `pr` command / prompt / skill) and the prompt tells the agent to
+  follow it for the PR title and body, overriding Franky's built-in what/why/test-plan shape. A
+  required `Closes #N` survives the override. The same block pins three precedence rules -
+  Franky's conventions win on conflict, never wait for approval or treat a plan/review gate in
+  the operator's files as blocking (an autonomous run has nobody to answer and would end with no
+  PR), and ignore anything naming a tool or path absent in the container.
+
+### Changed
+- The profile bundle is streamed into the container over `docker exec -i` stdin (as raw
+  gzip-tar bytes, extracted into HOME by the host, entrypoint gated on a ready marker) instead
+  of riding the argv as a base64 `FRANKY_PROFILE_BUNDLE` env var. A swept setup is ~400 KB
+  gzipped, past Linux's 128 KB `MAX_ARG_STRLEN` for a single argument; streaming also keeps the
+  content out of `ps` and is the only channel that works into a `--read-only` container (the
+  same mechanism `job resume` uses). A failed inject refuses the run rather than silently
+  building without the operator's setup.
+
+### Security
+- A `[setups]` sweep never auto-enables MCP. `~/.codex/config.toml` and `~/.claude/settings.json`
+  are excluded outright; enabling a server would add a host to the default-deny egress proxy and
+  forward a credential, so it stays an explicit `mcp_configs` + `mcp_credentials` +
+  `mcp_domains` declaration. `franky profile check` reports what it noticed without acting on it.
+  Hooks and `settings*.json` are likewise never injected.
 
 ## [0.1.1] - 2026-07-22
 

@@ -55,6 +55,7 @@ from .engine import (
 from .github import run_gh
 from .idempotency import find_open_pr
 from .jira import JIRA_API_TOKEN_VAR, JIRA_EMAIL_VAR, fetch_jira_issue
+from . import setups
 from .profile import (
     PROFILE_CATEGORIES,
     PROFILE_FILE_CATEGORIES,
@@ -65,6 +66,7 @@ from .profile import (
     profile_file_path,
     profile_path,
     read_profile_raw,
+    read_setups_raw,
     resolve_mcp_credentials,
     scan_profile_files,
     validate_mcp_engine,
@@ -78,6 +80,7 @@ from .prompt import (
     build_prompt,
     build_replay_prompt,
     build_resume_prompt,
+    build_setup_block,
     task_slug,
 )
 from .result import (
@@ -425,7 +428,7 @@ def build(
 
         # Build the profile bundle (optional). Auto-discovers ~/.franky/profile.toml unless
         # overridden by --profile or FRANKY_PROFILE_PATH. Fails closed on detected credentials.
-        bundle = _load_profile_bundle(profile_path_opt, process_env, secrets, cfg)
+        bundle, setup_block = _load_profile_bundle(profile_path_opt, process_env, secrets, cfg)
 
         # Verbose mode: raw passthrough of agent output to stderr. Quiet (or --json) -> no
         # progress callback at all. Else distilled milestones (the default).
@@ -525,6 +528,7 @@ def build(
                 franky_img=franky_img,
                 proxy_img=proxy_img,
                 bundle=bundle,
+                setup_block=setup_block,
                 progress=progress,
                 timeout=max_duration,
                 secrets=secrets,
@@ -695,7 +699,7 @@ def iterate(
 
         franky_img, proxy_img = _ensure_images(os.environ)
 
-        bundle = _load_profile_bundle(None, process_env, secrets, cfg)
+        bundle, setup_block = _load_profile_bundle(None, process_env, secrets, cfg)
         verbose = verbose or bool(os.environ.get(FRANKY_VERBOSE_VAR))
         progress = None if (quiet and not verbose) else _make_progress(cfg.engine, verbose)
         # Register the run before it starts (issue #63), same as build - iterate has no
@@ -710,7 +714,7 @@ def iterate(
         diagnostics: dict = {}
         code, output, duration = _run_pass(
             cfg,
-            build_iterate_prompt(spec),
+            build_iterate_prompt(spec, operator_setup=setup_block),
             franky_img,
             proxy_img,
             bundle,
@@ -846,7 +850,7 @@ def plan(
         cfg, spec, _branch, secrets = _resolve_task_spec(task_input_str, repo, engine, os.environ)
 
         franky_img, proxy_img = _ensure_images(os.environ)
-        bundle = _load_profile_bundle(profile_path_opt, process_env, secrets, cfg)
+        bundle, _setup_block = _load_profile_bundle(profile_path_opt, process_env, secrets, cfg)
         progress = None if quiet else _make_progress(cfg.engine, False)
 
         # Per-run nonce fenced into the prompt + parser: a hostile issue body / repo file
@@ -985,7 +989,7 @@ def _run_pass(
     prompt: str,
     franky_img: str,
     proxy_img: str,
-    profile_bundle: str | None = None,
+    profile_bundle: bytes | None = None,
     progress=None,
     timeout: int | None = None,
     run_id: str | None = None,
@@ -1037,14 +1041,19 @@ def _load_profile_bundle(
     credential_env: dict,
     secrets: list[str],
     cfg: Config,
-) -> str | None:
-    """Load, scan, and pack the operator profile bundle; return None if no profile is found.
+) -> tuple[bytes | None, str]:
+    """Load, scan, and pack the operator profile; return (bundle_bytes, prompt_setup_block).
 
     Resolution order: --profile flag path > FRANKY_PROFILE_PATH env var > auto-discovered
     ~/.franky/profile.toml.  Fails closed (ConfigError, exit 3) on a detected credential or a
     malformed profile, so the failure stays inside the machine contract (right exit code + a
     JSON error object under --json) instead of a bare exit-1 ClickException.
-    An absent or empty profile is not an error; the caller treats None as "no bundle".
+    An absent or empty profile is not an error; the caller treats (None, "") as "no bundle".
+
+    The second element is the operator-setup prompt block (empty unless the profile declares
+    `[setups]`): the bundle puts the files in the container, and that block is what tells the
+    agent they are there, where its PR-description spec is, and which rules win on conflict.
+    Both come from the SAME resolved spec, so what the prompt names is always what shipped.
     """
     from pathlib import Path
 
@@ -1054,7 +1063,7 @@ def _load_profile_bundle(
         ppath = profile_path(dict(os.environ))
 
     if ppath is None:
-        return None
+        return None, ""
 
     try:
         spec = load_profile(ppath)
@@ -1076,11 +1085,12 @@ def _load_profile_bundle(
     elif cfg.engine.name == "claude":
         cfg.claude_mcp_config_path = claude_mcp_config_path(spec)
 
+    setup_block = build_setup_block(spec)
     if not spec.all_files():
-        return None
+        return None, ""
 
     try:
-        return build_bundle(spec)
+        return build_bundle(spec), setup_block
     except ValueError as exc:
         raise ConfigError(redact(str(exc), secrets)) from exc
 
@@ -1265,6 +1275,7 @@ def _build_once(
     source=None,
     task_full=None,
     base_sha=None,
+    setup_block="",
 ) -> dict:
     """Run ONE build attempt end to end and return its outcome (issue #64 #5).
 
@@ -1299,7 +1310,9 @@ def _build_once(
     snapshot_sink: dict = {"dest": str(snapshot.snapshot_path_for(job_id, env))}
     code, output, duration = _run_pass(
         cfg,
-        build_prompt(spec, branch=branch, prior_failures=prior_failures),
+        build_prompt(
+            spec, branch=branch, prior_failures=prior_failures, operator_setup=setup_block
+        ),
         franky_img,
         proxy_img,
         bundle,
@@ -3193,9 +3206,11 @@ def config_init() -> None:
 def _profile_init_wizard(env: dict[str, str]) -> None:
     """Interactive wizard: scaffold/merge ~/.franky/profile.toml.
 
-    Shared by `franky profile init` and the `config init` profile prompt. Prompts for
-    skills / instructions / knowledge globs with sensible defaults, then merge-not-clobbers
-    an existing file (union per category, order preserved). Honors FRANKY_PROFILE_PATH.
+    Shared by `franky profile init` and the `config init` profile prompt. Offers the agentic
+    setups it can actually find on this machine (one confirm, no typing), then asks for any
+    extra explicit skills / instructions / knowledge globs, then merge-not-clobbers an existing
+    file (union per category, existing setup dirs kept unless re-confirmed). Honors
+    FRANKY_PROFILE_PATH.
     """
     path = profile_file_path(env)
     click.echo(f"franky profile init - writing to {path}", err=True)
@@ -3210,20 +3225,45 @@ def _profile_init_wizard(env: dict[str, str]) -> None:
         raw = click.prompt(label, default=default, show_default=True)
         return [item.strip() for item in raw.split(",") if item.strip()]
 
+    # Whole-setup injection first: it is the high-value, zero-typing path. Only kinds whose
+    # default dir actually exists on this machine are offered, so the prompt names real paths
+    # instead of asking the operator to recall them.
+    detected = {
+        kind: manifest.default_root
+        for kind, manifest in setups.SETUP_MANIFESTS.items()
+        if Path(manifest.default_root).expanduser().is_dir()
+    }
+    chosen_setups: dict[str, str] = {}
+    if detected:
+        listed = ", ".join(f"{kind} ({root})" for kind, root in detected.items())
+        click.echo(f"Detected agentic setups: {listed}", err=True)
+        if click.confirm(
+            "Inject these setups (instructions, skills, commands, agent definitions)?",
+            default=True,
+            err=True,
+        ):
+            chosen_setups = dict(detected)
+
     new_table: dict[str, list[str]] = {
-        "skills": _prompt_list("Skills", "~/.claude/skills/*.md"),
-        "instructions": _prompt_list("Instructions", "~/.claude/CLAUDE.md"),
+        "skills": _prompt_list("Extra skills (beyond the setups above)", ""),
+        "instructions": _prompt_list("Extra instructions", ""),
         "knowledge": _prompt_list("Knowledge", ""),
     }
 
     # Merge with the existing file so we never clobber entries the user already curated.
     # A malformed existing file is treated as empty so the wizard can repair it.
     existing: dict[str, list[str]] = {}
+    existing_setups: dict[str, str] = {}
     if path.exists():
         try:
             existing = read_profile_raw(path)
         except ValueError:
             existing = {}
+        try:
+            existing_setups = read_setups_raw(path)
+        except ValueError:
+            existing_setups = {}
+    merged_setups = {**existing_setups, **chosen_setups}
 
     merged: dict[str, list[str]] = {}
     for category in PROFILE_CATEGORIES:
@@ -3234,12 +3274,12 @@ def _profile_init_wizard(env: dict[str, str]) -> None:
         if seen:
             merged[category] = seen
 
-    if not merged:
-        click.echo("franky: no paths entered - nothing written.", err=True)
+    if not merged and not merged_setups:
+        click.echo("franky: no setups or paths entered - nothing written.", err=True)
         return
 
     try:
-        write_profile(path, merged)
+        write_profile(path, merged, merged_setups)
     except ValueError as exc:
         raise click.ClickException(f"could not write profile: {exc}") from exc
     click.echo(f"wrote profile to {path}", err=True)
@@ -3287,6 +3327,18 @@ def profile_show() -> None:
     for category in PROFILE_FILE_CATEGORIES:
         for fp in getattr(spec, category):
             click.echo(f"  [{category}] {fp} ({fp.stat().st_size} bytes)", err=True)
+    # Swept setups are summarized, not enumerated: a real sweep is ~100 files, and the point of
+    # declaring a directory is not having to read the file list. `profile check` shows the same
+    # summary plus what was skipped.
+    for kind, scan in spec.setup_scans.items():
+        click.echo(
+            f"  [setups] {kind}: {scan.root} -> {len(scan.files)} file(s), "
+            f"{scan.total_bytes // 1024} KB",
+            err=True,
+        )
+    pr_spec = spec.pr_spec()
+    if pr_spec is not None:
+        click.echo(f"  [setups] PR-description spec: {pr_spec}", err=True)
 
 
 @profile_group.command("check")
@@ -3308,6 +3360,36 @@ def profile_check() -> None:
         resolve_mcp_credentials(spec, dict(os.environ))
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
+
+    # Setup summary FIRST: a swept setup can be ~100 files, so per-file lines below would bury
+    # the thing the operator actually wants to see (what each declaration expanded to, which PR
+    # spec was found, and what was deliberately left out).
+    setup_files = set(spec.setup_files)
+    for kind, scan in spec.setup_scans.items():
+        click.echo(
+            f"  setup  {kind}: {scan.root} -> {len(scan.files)} file(s), "
+            f"{scan.total_bytes // 1024} KB",
+            err=True,
+        )
+        if scan.skipped_binary:
+            click.echo(
+                f"           skipped {len(scan.skipped_binary)} non-text file(s) "
+                "(unscannable, never injected)",
+                err=True,
+            )
+        for hint in scan.mcp_hints:
+            click.echo(
+                f"           {hint} declares MCP servers - NOT injected. Enabling MCP stays "
+                "explicit (mcp_configs + mcp_credentials + mcp_domains): each server adds an "
+                "egress host and forwards a credential.",
+                err=True,
+            )
+    pr_spec = spec.pr_spec()
+    if spec.setup_scans:
+        click.echo(
+            f"  pr spec: {pr_spec if pr_spec else 'none found - Franky keeps its own PR shape'}",
+            err=True,
+        )
 
     results = scan_profile_files(spec)
     if not results:
@@ -3331,7 +3413,10 @@ def profile_check() -> None:
         if r.findings:
             click.echo(f"  SECRET {r.path}: {', '.join(r.findings)}", err=True)
             problems.append(f"{r.path} ({r.findings[0]})")
-        else:
+        elif r.path not in setup_files:
+            # Explicitly listed files are named one by one; clean setup-swept files are already
+            # accounted for in the per-setup summary above. Problems are ALWAYS named, whichever
+            # they came from.
             click.echo(f"  ok     {r.path} ({r.size} bytes)", err=True)
 
     if problems:

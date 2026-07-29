@@ -26,7 +26,7 @@ from franky.container import (
     codex_auth_logout,
 )
 from franky.engine import CODEX_AUTH_VOLUME, CodexEngine, OpenCodeEngine, PiEngine
-from franky.profile import PROFILE_BUNDLE_VAR
+from franky.profile import CONTAINER_HOME, PROFILE_WAIT_VAR
 
 SECRET = "sk-or-very-secret-9999"
 PR_URL = "https://github.com/me/repo/pull/3"
@@ -776,48 +776,101 @@ def test_run_in_container_threads_proxy_image():
 # ---------------------------------------------------------------------------
 
 
-def test_build_docker_argv_profile_bundle_injected_by_value():
-    bundle = "SGVsbG8gV29ybGQ="  # base64("Hello World")
-    argv = build_docker_argv("franky", {"GH_TOKEN": "x"}, ["pi"], profile_bundle=bundle)
-    assert f"{PROFILE_BUNDLE_VAR}={bundle}" in argv
+def test_build_docker_argv_profile_wait_flag_set():
+    argv = build_docker_argv("franky", {"GH_TOKEN": "x"}, ["pi"], profile_wait=True)
+    assert f"{PROFILE_WAIT_VAR}=1" in argv
 
 
-def test_build_docker_argv_no_profile_bundle_when_none():
+def test_build_docker_argv_no_profile_wait_by_default():
     argv = build_docker_argv("franky", {"GH_TOKEN": "x"}, ["pi"])
-    assert PROFILE_BUNDLE_VAR not in " ".join(argv)
+    assert PROFILE_WAIT_VAR not in " ".join(argv)
 
 
-def test_build_docker_argv_profile_bundle_before_passthrough_env():
-    """Profile bundle must appear before the passthrough name-only -e flags."""
-    bundle = "SGVsbG8="
-    argv = build_docker_argv(
-        "franky", {"GH_TOKEN": "x", "OPENROUTER_API_KEY": "y"}, ["pi"], profile_bundle=bundle
+def test_build_docker_argv_never_carries_bundle_content():
+    """The bundle must NEVER ride the argv - only the wait FLAG does.
+
+    Load-bearing: a swept operator setup runs to ~1 MB, past Linux's 128 KB per-argument
+    ceiling, and an argv is visible in `ps`. build_docker_argv has no bundle parameter at all
+    now, so there is nothing to regress; this asserts the flag is the whole footprint."""
+    argv = build_docker_argv("franky", {"GH_TOKEN": "x"}, ["pi"], profile_wait=True)
+    assert [a for a in argv if PROFILE_WAIT_VAR in a] == [f"{PROFILE_WAIT_VAR}=1"]
+    assert max(len(a) for a in argv) < 512
+
+
+def test_run_in_container_streams_bundle_in_after_launch():
+    """A bundle forces the streaming path, then untars over exec stdin and touches the marker.
+
+    Same channel as resume: no `docker cp` INTO the read-only container, extraction as the
+    image's own uid into HOME, marker LAST."""
+    calls = []
+    base_runner, _ = _orchestration_runner(
+        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
     )
-    bundle_idx = argv.index(f"{PROFILE_BUNDLE_VAR}={bundle}")
-    # Name-only -e flags come after the by-value bundle
-    name_only_idxs = [i for i, a in enumerate(argv) if a in ("GH_TOKEN", "OPENROUTER_API_KEY")]
-    assert name_only_idxs, "passthrough env not found"
-    assert all(bundle_idx < idx for idx in name_only_idxs)
+    stdin_seen = {}
 
+    def full_runner(argv, **kwargs):
+        calls.append(argv)
+        if argv[:3] == ["docker", "inspect", "-f"] and "{{.State.Running}}" in argv:
+            return subprocess.CompletedProcess(argv, 0, stdout="true", stderr="")
+        if argv[:2] == ["docker", "exec"]:
+            if "tar" in argv:
+                stdin_seen["input"] = kwargs.get("input")
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        return base_runner(argv, **kwargs)
 
-def test_run_in_container_threads_profile_bundle():
-    """run_in_container forwards profile_bundle to build_docker_argv."""
-    captured = {}
-
-    def task(argv, **kwargs):
-        captured["argv"] = argv
-        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
-
-    runner, _ = _orchestration_runner(task)
-    bundle = "dGVzdA=="
-    run_in_container(
-        _cfg(), ["pi"], runner=runner, env={}, sleeper=NOOP_SLEEP, profile_bundle=bundle
+    code, _out = run_in_container(
+        _cfg(),
+        ["pi"],
+        runner=full_runner,
+        env={},
+        sleeper=NOOP_SLEEP,
+        popen=_fake_popen_factory(["event\n"]),
+        run_id="beef00beef00",
+        profile_bundle=b"fake-gzip-tar",
     )
-    assert f"{PROFILE_BUNDLE_VAR}={bundle}" in captured["argv"]
+    untar = [c for c in calls if "tar" in c and "-xzf" in c]
+    assert untar, "bundle was never streamed in"
+    assert CONTAINER_HOME in untar[0], "bundle must extract into HOME, not /work"
+    assert stdin_seen["input"] == b"fake-gzip-tar"
+    assert not any(c[:2] == ["docker", "cp"] and "franky-run-beef00beef00:" in c[3] for c in calls)
+    assert any("touch" in c for c in calls)
 
 
-def test_run_in_container_no_bundle_by_default():
-    """Without profile_bundle, FRANKY_PROFILE_BUNDLE must not appear in the task argv."""
+def test_run_in_container_bundle_failure_does_not_change_result():
+    """A failed untar must not alter (code, output) - the entrypoint refuses on its own."""
+    base_runner, _ = _orchestration_runner(
+        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+    )
+    touched = []
+
+    def runner(argv, **kwargs):
+        if argv[:3] == ["docker", "inspect", "-f"] and "{{.State.Running}}" in argv:
+            return subprocess.CompletedProcess(argv, 0, stdout="true", stderr="")
+        if "tar" in argv and "-xzf" in argv:
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="untar boom")
+        if "touch" in argv:
+            touched.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        return base_runner(argv, **kwargs)
+
+    code, out = run_in_container(
+        _cfg(),
+        ["pi"],
+        runner=runner,
+        env={},
+        sleeper=NOOP_SLEEP,
+        popen=_fake_popen_factory(["streamed line\n"]),
+        profile_bundle=b"fake-gzip-tar",
+    )
+    assert code == 0
+    assert "streamed line" in out
+    # The marker is touched only after a CLEAN untar, so the entrypoint exits nonzero instead
+    # of running the engine on a half-unpacked profile.
+    assert not touched
+
+
+def test_run_in_container_no_profile_wait_by_default():
+    """Without a bundle, the wait flag must not appear in the task argv."""
     captured = {}
 
     def task(argv, **kwargs):
@@ -826,7 +879,7 @@ def test_run_in_container_no_bundle_by_default():
 
     runner, _ = _orchestration_runner(task)
     run_in_container(_cfg(), ["pi"], runner=runner, env={}, sleeper=NOOP_SLEEP)
-    assert PROFILE_BUNDLE_VAR not in " ".join(captured["argv"])
+    assert PROFILE_WAIT_VAR not in " ".join(captured["argv"])
 
 
 # ---------------------------------------------------------------------------

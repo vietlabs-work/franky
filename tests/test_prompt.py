@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from franky.prompt import (
     DIAGNOSE_TRANSCRIPT_TAIL_CHARS,
     build_decompose_prompt,
@@ -7,6 +9,7 @@ from franky.prompt import (
     build_prompt,
     build_replay_prompt,
     build_resume_prompt,
+    build_setup_block,
     load_persona,
     task_slug,
 )
@@ -440,45 +443,94 @@ def test_steer_convention_present_in_resume_prompt():
 
 
 # ---------------------------------------------------------------------------
-# Operator PR-template convention (profile category `pr_template`)
+# Operator-setup block (profile `[setups]`)
 # ---------------------------------------------------------------------------
 
 
-def test_pr_template_convention_path_matches_profile_container_path():
-    # The two literals can never drift: the prompt tells the agent to read EXACTLY the path
-    # build_bundle packs the operator's template to.
-    from franky.prompt import _PR_TEMPLATE_CONVENTION
+class _FakeSpec:
+    """Duck-typed stand-in for profile.ProfileSpec (only what build_setup_block reads)."""
 
-    assert profile.PR_TEMPLATE_CONTAINER_PATH in _PR_TEMPLATE_CONVENTION
-    # It must OVERRIDE the default shape, not sit alongside it ambiguously...
-    assert "OVERRIDING" in _PR_TEMPLATE_CONVENTION
-    # ...and an autonomous run must not stall on an approval gate the operator's spec carries,
-    # since those specs are typically written for an interactive tool.
-    assert "approval gates" in _PR_TEMPLATE_CONVENTION
+    def __init__(self, roots=None, pr=None):
+        self._roots = roots or {}
+        self._pr = pr
 
+    def setup_roots(self):
+        return self._roots
 
-def test_pr_template_convention_present_in_every_pr_opening_prompt():
-    spec = TaskSpec(repo="me/repo", text="add a --json flag", source="prose")
-    path = profile.PR_TEMPLATE_CONTAINER_PATH
-    assert path in build_prompt(spec)
-    assert path in build_replay_prompt(spec, branch="franky/t", base_sha="abc1234", open_pr=True)
-    assert path in build_resume_prompt(spec, branch="franky/add-json")
+    def pr_spec(self):
+        return self._pr
 
 
-def test_pr_template_convention_absent_from_prompts_that_open_no_pr():
-    # Nothing to shape a PR body for: the read-only passes and the reproduce-only replay.
-    spec = TaskSpec(repo="me/repo", text="add a --json flag", source="prose")
-    path = profile.PR_TEMPLATE_CONTAINER_PATH
-    assert path not in build_plan_prompt(spec)
-    assert path not in build_decompose_prompt(spec, "deadbeef")
-    assert path not in build_replay_prompt(spec, branch="franky/t", base_sha="abc", open_pr=False)
+def test_setup_block_empty_without_setups():
+    # No [setups] -> no block at all, so a profile-less prompt is byte-identical to before.
+    assert build_setup_block(_FakeSpec()) == ""
 
 
-def test_pr_template_convention_keeps_the_closing_keyword_for_an_issue():
-    # The template overrides the BODY SHAPE, never the issue-auto-close contract.
-    spec = TaskSpec(
-        repo="octocat/hello", text="https://github.com/octocat/hello/issues/42", source="issue"
+def test_setup_block_names_container_paths_not_host_paths(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    block = build_setup_block(_FakeSpec(roots={"claude": tmp_path / ".claude"}))
+    assert f"{profile.CONTAINER_HOME}/.claude" in block
+    assert str(tmp_path) not in block
+
+
+def test_setup_block_carries_the_three_precedence_rules(tmp_path, monkeypatch):
+    """The rules are the whole reason an interactive-tool instruction file is safe to inject."""
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    block = build_setup_block(_FakeSpec(roots={"claude": tmp_path / ".claude"}))
+    assert "conventions in THIS prompt win" in block
+    # The load-bearing one: a plan-approval gate in the operator's own instructions would
+    # otherwise stall an autonomous run into a no-PR failure.
+    assert "Never wait for approval" in block
+    assert "review gate" in block
+    assert "does not exist here" in block
+
+
+def test_setup_block_points_at_the_discovered_pr_spec(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    block = build_setup_block(
+        _FakeSpec(
+            roots={"claude": tmp_path / ".claude"},
+            pr=tmp_path / ".claude" / "commands" / "pr.md",
+        )
     )
-    p = build_prompt(spec)
-    assert "Closes #42" in p
-    assert "closing keyword" in p
+    assert f"{profile.CONTAINER_HOME}/.claude/commands/pr.md" in block
+    assert "OVERRIDING" in block
+    # A slash command is never auto-invoked, so the pointer is what makes the file matter.
+    assert "read it before you write the PR" in block
+
+
+def test_setup_block_omits_the_pr_line_when_no_spec_was_found(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    block = build_setup_block(_FakeSpec(roots={"codex": tmp_path / ".codex"}))
+    assert "PR-description spec" not in block
+
+
+def test_setup_block_lists_every_declared_setup(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    block = build_setup_block(
+        _FakeSpec(roots={"claude": tmp_path / ".claude", "codex": tmp_path / ".codex"})
+    )
+    assert "(claude)" in block and "(codex)" in block
+
+
+def test_operator_setup_threads_into_every_pr_opening_prompt():
+    spec = TaskSpec(repo="me/repo", text="add a --json flag", source="prose")
+    marker = "\nOperator setup (injected):\nMARKER\n"
+    assert marker in build_prompt(spec, operator_setup=marker)
+    assert marker in build_iterate_prompt(
+        TaskSpec(repo="me/repo", text="https://github.com/me/repo/pull/4", source="pr"),
+        operator_setup=marker,
+    )
+    assert marker in build_replay_prompt(
+        spec, branch="franky/t", base_sha="abc1234", open_pr=True, operator_setup=marker
+    )
+    assert marker in build_resume_prompt(spec, branch="franky/t", operator_setup=marker)
+
+
+def test_prompts_are_unchanged_without_an_operator_setup():
+    # The default "" must leave every prompt byte-identical to the pre-setups behavior.
+    spec = TaskSpec(repo="me/repo", text="add a --json flag", source="prose")
+    assert build_prompt(spec) == build_prompt(spec, operator_setup="")
+    assert build_resume_prompt(spec, branch="franky/t") == build_resume_prompt(
+        spec, branch="franky/t", operator_setup=""
+    )
