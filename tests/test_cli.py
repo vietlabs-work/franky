@@ -1753,17 +1753,43 @@ def test_load_profile_bundle_applies_named_credential_egress_and_redaction(tmp_p
     cfg = Config(engine=PiEngine(), allowed_repos=["me/repo"])
     secrets = []
 
-    bundle = cli._load_profile_bundle(
+    bundle, setup_block = cli._load_profile_bundle(
         str(prof), {"LINEAR_API_KEY": "mcp-secret-value"}, secrets, cfg
     )
 
+    # Unpacked, not `assert bundle` on the tuple: a 2-tuple is truthy even when the bundle is
+    # None, which would make this assertion vacuous.
     assert bundle
+    assert setup_block == ""  # no [setups] declared
     assert cfg.passthrough_env == {"LINEAR_API_KEY": "mcp-secret-value"}
     assert cfg.extra_allowed_domains == ["mcp.linear.app"]
     assert secrets == ["mcp-secret-value"]
     argv = build_docker_argv("franky", cfg.passthrough_env, ["pi"])
     assert "LINEAR_API_KEY" in argv
     assert "mcp-secret-value" not in argv
+
+
+def test_load_profile_bundle_warns_when_a_declared_setup_swept_nothing(tmp_path, monkeypatch):
+    """A setup that matches no files must SAY so - injecting nothing silently is the one
+    failure the operator would not notice (they declared it precisely to have it there)."""
+    from franky.config import Config
+    from franky.engine import PiEngine
+
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    empty = tmp_path / ".claude"
+    empty.mkdir()
+    prof = tmp_path / "profile.toml"
+    prof.write_text(f'[setups]\nclaude = "{empty}"\n', encoding="utf-8")
+    cfg = Config(engine=PiEngine(), allowed_repos=["me/repo"])
+
+    runner = CliRunner()
+    with runner.isolation() as (_out, err, _):
+        bundle, block = cli._load_profile_bundle(str(prof), {}, [], cfg)
+        warning = err.getvalue().decode()
+
+    assert bundle is None
+    assert block == ""
+    assert "matched no files" in warning
 
 
 def test_build_does_not_accept_mcp_credential_loaded_from_franky_config(tmp_path, monkeypatch):
@@ -1920,7 +1946,9 @@ def test_profile_init_writes_entered_globs(tmp_path, monkeypatch):
 
     prof = tmp_path / "profile.toml"
     monkeypatch.setenv("FRANKY_PROFILE_PATH", str(prof))
-    # skills, instructions, knowledge prompts
+    # Hermetic: HOME has no agentic setup dirs, so the setup confirm is never offered and the
+    # wizard asks only the three explicit-glob prompts.
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     wizard_input = "~/.claude/skills/*.md\n~/.claude/CLAUDE.md\n\n"
     res = CliRunner().invoke(cli.main, ["profile", "init"], input=wizard_input)
     assert res.exit_code == 0, res.output
@@ -1930,17 +1958,51 @@ def test_profile_init_writes_entered_globs(tmp_path, monkeypatch):
     assert "knowledge" not in raw
 
 
+def test_profile_init_offers_detected_setups(tmp_path, monkeypatch):
+    """The zero-typing path: a `~/.claude` on this machine becomes a [setups] entry on one y."""
+    from franky.profile import read_setups_raw
+
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    (home / ".codex").mkdir()
+    prof = tmp_path / "profile.toml"
+    monkeypatch.setenv("FRANKY_PROFILE_PATH", str(prof))
+    monkeypatch.setenv("HOME", str(home))
+
+    res = CliRunner().invoke(cli.main, ["profile", "init"], input="y\n\n\n\n")
+
+    assert res.exit_code == 0, res.output
+    assert read_setups_raw(prof) == {"claude": "~/.claude", "codex": "~/.codex"}
+
+
+def test_profile_init_declining_setups_writes_none(tmp_path, monkeypatch):
+    from franky.profile import read_setups_raw
+
+    home = tmp_path / "home"
+    (home / ".claude").mkdir(parents=True)
+    prof = tmp_path / "profile.toml"
+    monkeypatch.setenv("FRANKY_PROFILE_PATH", str(prof))
+    monkeypatch.setenv("HOME", str(home))
+
+    res = CliRunner().invoke(cli.main, ["profile", "init"], input="n\n~/x.md\n\n\n")
+
+    assert res.exit_code == 0, res.output
+    assert read_setups_raw(prof) == {}
+
+
 def test_profile_init_merges_existing(tmp_path, monkeypatch):
-    from franky.profile import read_profile_raw
+    from franky.profile import read_profile_raw, read_setups_raw
 
     prof = tmp_path / "profile.toml"
     prof.write_text(
         '[profile]\nskills = ["~/existing.md"]\n'
         'mcp_credentials = ["LINEAR_API_KEY"]\n'
-        'mcp_domains = ["mcp.linear.app"]\n',
+        'mcp_domains = ["mcp.linear.app"]\n'
+        '\n[setups]\ncodex = "~/.codex"\n',
         encoding="utf-8",
     )
     monkeypatch.setenv("FRANKY_PROFILE_PATH", str(prof))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     wizard_input = "~/new.md\n\n\n"  # add a skill, skip instructions + knowledge
     res = CliRunner().invoke(cli.main, ["profile", "init"], input=wizard_input)
     assert res.exit_code == 0, res.output
@@ -1948,6 +2010,8 @@ def test_profile_init_merges_existing(tmp_path, monkeypatch):
     assert raw["skills"] == ["~/existing.md", "~/new.md"]
     assert raw["mcp_credentials"] == ["LINEAR_API_KEY"]
     assert raw["mcp_domains"] == ["mcp.linear.app"]
+    # An existing setup declaration survives a wizard run that never offered it.
+    assert read_setups_raw(prof) == {"codex": "~/.codex"}
 
 
 def test_config_init_profile_prompt_yes_writes_both(tmp_path, monkeypatch):
@@ -1958,6 +2022,8 @@ def test_config_init_profile_prompt_yes_writes_both(tmp_path, monkeypatch):
     prof_path = tmp_path / "profile.toml"
     monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
     monkeypatch.setenv("FRANKY_PROFILE_PATH", str(prof_path))
+    # Hermetic HOME: no detected setups, so the profile wizard asks only its glob prompts.
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     # config init now fails fast in a non-TTY (never-hang, #50); driving the wizard via
     # CliRunner input simulates an interactive session, so mark stdin interactive.
     monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)

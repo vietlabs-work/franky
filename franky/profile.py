@@ -1,29 +1,32 @@
-"""Operator profile: inject curated files and MCP configuration into the container.
+"""Operator profile: inject the operator's agentic-coding setup + MCP config into the container.
 
-WHY this is safe: the bundle is assembled on the host from an explicit allowlist
-(no auto-discovery), secret-scanned before packing (fail-closed on any credential
-hit), and transmitted as a base64-encoded gzip tar that the entrypoint unpacks into
-the HOME tmpfs at container start.  No bind mount, no live config dir, no credential-
-bearing file ever enters the bundle.
+WHY this is safe: the bundle is assembled on the host from a bounded allowlist (explicit
+file lists, or a whole setup dir expanded through `setups.py`'s per-kind manifest - never
+"tar the directory"), secret-scanned before packing (fail-closed on any credential hit), and
+streamed into the container as a gzip tar that is unpacked into the HOME tmpfs before the
+engine starts.  No bind mount, no live config dir, no credential-bearing file ever enters the
+bundle.
 
-Injection mechanism: Option A (tmpfs-seed via entrypoint).  The base64 bundle is
-passed as a by-value environment variable FRANKY_PROFILE_BUNDLE; the DinD entrypoint
-decodes and extracts it into $HOME BEFORE exec-ing the engine.  This preserves the
-no-bind-mount invariant and the secret-by-name discipline:
+Injection mechanism: the tar bytes are piped into the started container over
+`docker exec -i` stdin (see container.deliver_profile) and extracted into HOME as uid 1001;
+the entrypoint blocks on a ready marker until that lands, then execs the engine.  This
+preserves the no-bind-mount invariant and the secret-by-name discipline:
   - No new bind mount (no host-FS path is ever mounted into the container).
-  - The bundle content is curated prose or validated MCP config containing credential
-    names only. It is NOT a secret value itself, so passing it by value (inline
-    -e KEY=VALUE) is correct - the same policy as proxy_url in container.py.
-  - The hardening flags (_HARDENING) are unchanged.
+  - Nothing rides the argv: the bundle content never appears in `ps`, and there is no
+    argv-size ceiling (a swept setup is ~1 MB - a single `-e` value would break
+    Linux's 128 KB MAX_ARG_STRLEN, which is why the earlier by-value env var is gone).
+  - The hardening flags (_HARDENING) are unchanged; a `docker cp` INTO the `--read-only`
+    task container is refused by the daemon, so stdin is also the only mechanism that
+    works here - the same one `snapshot.restore_into_container` uses for `job resume`.
 
 Security argument:
   - A malicious issue body cannot reach the profile bundle; the operator assembles it
-    host-side from an explicit allowlist before the task container ever starts.
+    host-side before the task container ever starts.
   - Secret scanning runs fail-closed: a single detected credential pattern aborts the
     entire run before any container is started.  The operator must explicitly review and
     fix the file before it can be injected.
-  - The bundle is NOT added to passthrough_env (which would make it a name-only -e flag
-    that the docker process inherits).  It is added by value, like proxy config.
+  - A setup sweep NEVER auto-enables MCP: each server would add an egress host to a
+    default-deny proxy and forward a credential, so that stays an explicit declaration.
 
 Tier-2 MCP files use the same bundle, but their named credentials and egress hosts are
 validated separately before the bundle is built.
@@ -31,7 +34,6 @@ validated separately before the bundle is built.
 
 from __future__ import annotations
 
-import base64
 import io
 import json
 import math
@@ -40,8 +42,16 @@ import tarfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# The environment variable the DinD entrypoint reads to unpack the profile.
-PROFILE_BUNDLE_VAR = "FRANKY_PROFILE_BUNDLE"
+from . import setups
+
+# The environment variable that puts the entrypoint into profile-wait mode: it blocks until the
+# host has streamed the bundle in and touched the ready marker. Name only carries policy, never
+# content (the bundle itself never touches the argv or the environment).
+PROFILE_WAIT_VAR = "FRANKY_PROFILE_WAIT"
+
+# HOME inside the task container: bundle members are HOME-relative, so this is the prefix that
+# turns a host path into the in-container path the prompt can name literally.
+CONTAINER_HOME = "/home/franky"
 
 # Override the default profile path (~/.franky/profile.toml) for testing and CI.
 PROFILE_PATH_VAR = "FRANKY_PROFILE_PATH"
@@ -53,6 +63,10 @@ _DEFAULT_PROFILE_RELATIVE = Path(".franky") / "profile.toml"
 PROFILE_FILE_CATEGORIES = ("skills", "instructions", "knowledge", "mcp_configs")
 PROFILE_VALUE_CATEGORIES = ("mcp_credentials", "mcp_domains")
 PROFILE_CATEGORIES = PROFILE_FILE_CATEGORIES + PROFILE_VALUE_CATEGORIES
+
+# The second top-level table: whole agentic-coding setups declared by directory,
+# `[setups] claude = "~/.claude"`. Expanded through setups.SETUP_MANIFESTS.
+SETUPS_TABLE = "setups"
 
 _ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 _PLACEHOLDER_RE = re.compile(r"^\$\{([A-Z_][A-Z0-9_]*)\}$")
@@ -124,6 +138,11 @@ class ProfileSpec:
 
     Each list contains concrete, existing Path objects (no globs, no ~).
     Populated by load_profile(); build_bundle() consumes it.
+
+    `setup_scans` holds the per-kind result of sweeping a declared `[setups]` directory (see
+    setups.py). Its files join `all_files()`, so they go through the SAME fail-closed secret
+    scan and the same HOME-relative packing as an explicitly listed file - a directory
+    declaration is a shorthand for a file list, never a second, laxer path.
     """
 
     skills: list[Path] = field(default_factory=list)
@@ -132,10 +151,43 @@ class ProfileSpec:
     mcp_configs: list[Path] = field(default_factory=list)
     mcp_credentials: list[str] = field(default_factory=list)
     mcp_domains: list[str] = field(default_factory=list)
+    setup_scans: dict[str, setups.SetupScan] = field(default_factory=dict)
+
+    @property
+    def setup_files(self) -> list[Path]:
+        """Every file swept from a declared setup, deduplicated, in kind-declaration order."""
+        seen: dict[Path, None] = {}
+        for scan in self.setup_scans.values():
+            for path in scan.files:
+                seen.setdefault(path, None)
+        return list(seen)
+
+    def setup_roots(self) -> dict[str, Path]:
+        """The declared setup roots by kind, for prompt text and `profile check` reporting."""
+        return {kind: scan.root for kind, scan in self.setup_scans.items()}
+
+    def pr_spec(self) -> Path | None:
+        """The operator's PR-description spec discovered in a swept setup, if any.
+
+        Deliberately derived from the setup rather than declared as its own profile key: the PR
+        spec is one file among the operator's commands, so it follows whatever setup they feed
+        Franky instead of being configured twice.
+        """
+        return setups.find_pr_spec(self.setup_files)
 
     def all_files(self) -> list[Path]:
-        """All files across all categories, in declaration order."""
-        return self.skills + self.instructions + self.knowledge + self.mcp_configs
+        """All files across all categories, in declaration order.
+
+        Explicit lists come first so that when a file is BOTH explicitly listed and swept from
+        a setup, the dedup below keeps one copy (a tar with two members at one path would
+        extract twice).
+        """
+        ordered = self.skills + self.instructions + self.knowledge + self.setup_files
+        seen: dict[Path, None] = {}
+        for path in ordered:
+            seen.setdefault(path, None)
+        # mcp_configs stay last and unmerged: they are packed at their own reserved paths.
+        return [p for p in seen if p not in set(self.mcp_configs)] + self.mcp_configs
 
 
 def profile_path(env: dict[str, str] | None = None) -> Path | None:
@@ -187,6 +239,56 @@ def _expand_glob(raw: str) -> list[Path]:
     return [expanded] if expanded.exists() else []
 
 
+def container_path(host_path: Path) -> str:
+    """Where a bundled host file lands inside the container.
+
+    Members are packed HOME-relative, so a host path under HOME maps onto CONTAINER_HOME.
+    Anything outside HOME falls back to the flat `profile/<name>` layout build_bundle uses.
+    """
+    try:
+        rel = host_path.resolve().relative_to(Path.home().resolve())
+    except ValueError:
+        return f"{CONTAINER_HOME}/profile/{host_path.name}"
+    return f"{CONTAINER_HOME}/{rel}"
+
+
+def _load_setups(raw, path: Path) -> dict[str, setups.SetupScan]:
+    """Parse and sweep the `[setups]` table: {kind: directory} -> {kind: SetupScan}.
+
+    Fail-closed on an unknown kind (a typo'd `cluade = ...` must not silently inject nothing),
+    a missing root, or a root outside HOME. The HOME rule is not cosmetic: bundle members are
+    packed HOME-relative so the engine finds them where it would locally, and a root elsewhere
+    has no such relative path.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError(f'[{SETUPS_TABLE}] in {path} must be a TOML table of kind = "dir"')
+
+    home = Path.home().resolve()
+    scans: dict[str, setups.SetupScan] = {}
+    for kind, value in raw.items():
+        if not isinstance(value, str):
+            raise ValueError(
+                f"{SETUPS_TABLE}.{kind} must be a directory path string in {path}, got {value!r}"
+            )
+        if kind not in setups.SETUP_MANIFESTS:
+            raise ValueError(
+                f"unknown setup kind {kind!r} in {path} - supported kinds: "
+                f"{', '.join(setups.SETUP_KINDS)}"
+            )
+        root = Path(value).expanduser()
+        if not root.exists():
+            raise ValueError(f"{SETUPS_TABLE}.{kind} directory not found: {value!r} (in {path})")
+        try:
+            root.resolve().relative_to(home)
+        except ValueError as exc:
+            raise ValueError(
+                f"{SETUPS_TABLE}.{kind} directory {root} must be under HOME ({home}) - the "
+                "bundle is unpacked relative to HOME inside the container"
+            ) from exc
+        scans[kind] = setups.expand_setup(kind, root)
+    return scans
+
+
 def load_profile(path: Path) -> ProfileSpec:
     """Parse a profile.toml and return the expanded, concrete file list.
 
@@ -194,6 +296,8 @@ def load_profile(path: Path) -> ProfileSpec:
     - TOML parse error
     - A literal path that does not exist (glob non-matches are silently empty)
     - A non-string or non-list entry in the TOML
+    - An unknown `[setups]` kind, a root that is missing / not a directory / outside HOME,
+      or a sweep over the size guards in setups.py
     """
     try:
         import tomllib  # type: ignore[import-not-found]
@@ -241,6 +345,8 @@ def load_profile(path: Path) -> ProfileSpec:
         if not all(isinstance(entry, str) for entry in raw_list):
             raise ValueError(f"profile.{category} entries must be strings in {path}")
         setattr(spec, category, list(raw_list))
+
+    spec.setup_scans = _load_setups(data.get(SETUPS_TABLE, {}), path)
 
     for name in spec.mcp_credentials:
         if name.startswith("FRANKY_") or name in _RESERVED_MCP_CREDENTIALS:
@@ -581,14 +687,47 @@ def _toml_escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
-def write_profile(path: Path, table: dict[str, list[str]]) -> None:
-    """Atomically write `table` as a [profile] TOML table to `path`.
+def read_setups_raw(path: Path) -> dict[str, str]:
+    """Return the RAW `[setups]` table (kind -> declared directory string), unexpanded.
+
+    The `[setups]` counterpart to read_profile_raw: no sweep, no existence check, so
+    `profile init` can merge-not-clobber what the operator already declared. Absent file or
+    absent table -> {}. Raises ValueError on malformed TOML or a non-string value.
+    """
+    if not path.exists():
+        return {}
+    try:
+        import tomllib  # type: ignore[import-not-found]
+    except ModuleNotFoundError:
+        import tomli as tomllib  # type: ignore[import-not-found,no-redef]
+
+    try:
+        data = tomllib.loads(path.read_bytes().decode("utf-8"))
+    except Exception as exc:
+        raise ValueError(f"malformed TOML in profile {path}: {exc}") from exc
+
+    table = data.get(SETUPS_TABLE, {})
+    if not isinstance(table, dict):
+        raise ValueError(f"[{SETUPS_TABLE}] in {path} must be a TOML table")
+    out: dict[str, str] = {}
+    for kind, value in table.items():
+        if not isinstance(value, str):
+            raise ValueError(f"{SETUPS_TABLE}.{kind} must be a string path in {path}")
+        out[kind] = value
+    return out
+
+
+def write_profile(
+    path: Path, table: dict[str, list[str]], setup_dirs: dict[str, str] | None = None
+) -> None:
+    """Atomically write `table` as a [profile] TOML table to `path`, plus an optional [setups].
 
     Mirrors userconfig.write_config_file but emits string ARRAYS (skills / instructions /
     knowledge) in the canonical PROFILE_CATEGORIES order so output is deterministic.
     Empty categories are omitted.  Rejects control chars in any entry (would corrupt the
-    file).  The file holds curated path lists, not credentials, so the final mode is 0644
-    (the parent ~/.franky is created 0700).
+    file).  `setup_dirs` becomes the `[setups]` table (kind = "dir"), written in
+    setups.SETUP_KINDS order for the same determinism.  The file holds curated path lists,
+    not credentials, so the final mode is 0644 (the parent ~/.franky is created 0700).
     """
     import os
     import tempfile
@@ -600,6 +739,12 @@ def write_profile(path: Path, table: dict[str, list[str]]) -> None:
                     f"profile entry {entry!r} in {category!r} contains a control character - "
                     "refusing to write (would corrupt the file)"
                 )
+    for kind, value in (setup_dirs or {}).items():
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in value):
+            raise ValueError(
+                f"setup dir {value!r} for {kind!r} contains a control character - "
+                "refusing to write (would corrupt the file)"
+            )
 
     parent = path.parent
     parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -613,6 +758,13 @@ def write_profile(path: Path, table: dict[str, list[str]]) -> None:
         for entry in entries:
             lines.append(f'    "{_toml_escape(entry)}",')
         lines.append("]")
+    if setup_dirs:
+        lines += ["", f"[{SETUPS_TABLE}]"]
+        for kind in setups.SETUP_KINDS:
+            if kind in setup_dirs:
+                lines.append(f'{kind} = "{_toml_escape(setup_dirs[kind])}"')
+        for kind in sorted(k for k in setup_dirs if k not in setups.SETUP_KINDS):
+            lines.append(f'{kind} = "{_toml_escape(setup_dirs[kind])}"')
     content = "\n".join(lines) + "\n"
 
     # Write atomically: temp file in the same dir -> os.replace, so the file is never
@@ -724,12 +876,16 @@ def scan_profile_files(spec: ProfileSpec) -> list[FileScanResult]:
     return results
 
 
-def build_bundle(spec: ProfileSpec) -> str:
-    """Collect, secret-scan, and pack the profile into a base64-encoded gzip tar.
+def build_bundle(spec: ProfileSpec) -> bytes:
+    """Collect, secret-scan, and pack the profile into gzip-tar BYTES.
 
-    The tar archive uses paths relative to HOME so the entrypoint can extract them
-    with `tar -xz -C $HOME` and they land in the same relative location as they are
-    on the operator's machine (e.g. ~/.claude/CLAUDE.md -> .claude/CLAUDE.md).
+    Raw bytes, not base64: the bundle is streamed into the container over `docker exec -i`
+    stdin (container.deliver_profile), so there is nothing to text-encode for an argv - and a
+    swept setup is ~1 MB, far past what a single `-e` value can carry on Linux.
+
+    The tar archive uses paths relative to HOME so the extraction (`tar -xzf - -C $HOME`)
+    lands each file in the same relative location as on the operator's machine
+    (e.g. ~/.claude/CLAUDE.md -> .claude/CLAUDE.md).
 
     Files whose path cannot be made relative to HOME fall back to a flat layout
     under a top-level `profile/` directory inside HOME.
@@ -781,4 +937,4 @@ def build_bundle(spec: ProfileSpec) -> str:
             info.size = len(encoded)
             tf.addfile(info, io.BytesIO(encoded))
 
-    return base64.b64encode(buf.getvalue()).decode("ascii")
+    return buf.getvalue()
