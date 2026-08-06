@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -53,7 +54,7 @@ from .engine import (
     resolve_engine,
 )
 from .github import run_gh
-from .idempotency import find_open_pr
+from .idempotency import fetch_pr_head_sha, find_open_pr
 from .jira import JIRA_API_TOKEN_VAR, JIRA_EMAIL_VAR, fetch_jira_issue
 from . import setups
 from .profile import (
@@ -80,11 +81,14 @@ from .prompt import (
     build_prompt,
     build_replay_prompt,
     build_resume_prompt,
+    build_review_pr_prompt,
     build_setup_block,
     task_slug,
 )
+from .reviewpr import build_review_findings, parse_review_findings, render_review_body, review_event
 from .result import (
     EXIT_AGENT,
+    EXIT_NETWORK,
     EXIT_SUCCESS,
     EXIT_TIMEOUT,
     EXIT_USAGE,
@@ -98,7 +102,7 @@ from .result import (
     build_result,
 )
 from .schema import build_schema
-from .task import PROSE_MAX_CHARS, TaskSpec, parse_pr_task, parse_task
+from .task import PROSE_MAX_CHARS, TaskSpec, parse_pr_task, parse_review_pr_task, parse_task
 from .update_check import force_update, maybe_auto_update
 from .userconfig import (
     SECRET_KEYS,
@@ -111,6 +115,11 @@ from .userconfig import (
     unset_value,
     write_config_file,
 )
+
+# Shape for `review-pr --expected-head-sha` - a bare git SHA, 7-40 hex chars (mirrors the
+# the bridge's own `_SHA_RE` shape check, which Franky re-validates independently since
+# this CLI is also reachable directly, not only via the bridge).
+_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
 
 TASKS_DIR = Path("tasks")
 FRANKY_VERBOSE_VAR = "FRANKY_VERBOSE"
@@ -264,6 +273,17 @@ def _emit_result(
         # on stderr so stdout stays pure. Suppressed under --quiet.
         click.echo(
             f"franky: iterate pass complete for {pr_url} - review the PR for the new commits",
+            err=True,
+        )
+    elif status == "review_published" and pr_url:
+        # The published review's URL, on stdout (mirrors pr_opened) - a caller scraping stdout
+        # (or a log tail) for a result gets exactly this URL.
+        click.echo(pr_url)
+    elif status == "review_complete" and not quiet:
+        # publish=False: nothing was written to GitHub; the findings live in the --json result
+        # or the redacted log. Labeled completion line on stderr, stdout stays pure.
+        click.echo(
+            f"franky: review complete for {pr_url} (publish=False - nothing written to GitHub)",
             err=True,
         )
 
@@ -765,6 +785,304 @@ def iterate(
             job_id=job_id,
         )
         _emit_result(result, as_json, secrets, pr_url=spec.text, status=status, quiet=quiet)
+        ctx.exit(exit_code)
+    except FrankyError as exc:
+        _emit_error(exc, as_json, secrets)
+        ctx.exit(exc.code)
+
+
+@main.command("review-pr")
+@click.argument("pr_url")
+@click.argument("instructions", required=False, default="")
+@click.option(
+    "--expected-head-sha",
+    "expected_head_sha",
+    default=None,
+    help="Refuse unless the PR's LIVE head SHA matches this (7-40 hex chars).",
+)
+@click.option(
+    "--no-publish",
+    "no_publish",
+    is_flag=True,
+    default=False,
+    help="Review but write nothing to GitHub; report findings only (default: publish a review).",
+)
+@click.option(
+    "--engine",
+    "engine",
+    default=None,
+    # Same registry-derived choice as `build` (see that command's note).
+    type=click.Choice(sorted(ENGINES)),
+    help="Engine override; else FRANKY_ENGINE, else pi.",
+)
+@click.option(
+    "-v",
+    "--verbose",
+    "verbose",
+    is_flag=True,
+    default=False,
+    help="Stream raw agent output to stderr during the run (also: FRANKY_VERBOSE=1).",
+)
+@click.option(
+    "--json", "as_json", is_flag=True, help="Emit a single JSON result/error object on stdout."
+)
+@click.option(
+    "-q",
+    "--quiet",
+    "quiet",
+    is_flag=True,
+    help="Suppress progress + the update hint (implied by --json).",
+)
+@click.option(
+    "--max-duration",
+    "max_duration",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Abort the run after N seconds (default 1800).",
+)
+@click.pass_context
+def review_pr(
+    ctx: click.Context,
+    pr_url: str,
+    instructions: str,
+    expected_head_sha: str | None,
+    no_publish: bool,
+    engine: str | None,
+    verbose: bool,
+    as_json: bool,
+    quiet: bool,
+    max_duration: int | None,
+) -> None:
+    """Independently REVIEW an existing pull request - read-only, never merges or approves.
+
+    Example:
+      franky review-pr https://github.com/you/repo/pull/42
+      franky review-pr --no-publish -- https://github.com/you/repo/pull/42 "focus on error handling"
+
+    Runs the SAME hardened, egress-controlled container as `build`/`iterate`, but the agent only
+    inspects the PR (diff, metadata, linked issue) and runs the repo's existing checks - it never
+    edits, commits, pushes, merges, approves, dismisses reviews, or resolves conversations here.
+    Franky itself (never the agent) posts the resulting GitHub review, and only ever as COMMENT
+    or REQUEST_CHANGES - it never auto-approves.
+
+    --expected-head-sha pins the PR head you last observed; a live head that disagrees (checked
+    BEFORE the pass starts, and again immediately BEFORE publishing) refuses rather than
+    reviewing or publishing stale state. --no-publish reviews without writing anything to
+    GitHub - read the findings from the --json result or the redacted log instead.
+
+    --json emits one machine-readable result/error object on stdout (status review_published or
+    review_complete on success, including reviewed_sha/findings_summary/checks and, once
+    published, review_url/review_id). Exit codes follow the documented taxonomy (0 ok, 2 usage,
+    3 config, 4 task, 5 auth, 6 docker, 7 agent, 8 net, 9 timeout).
+    """
+    quiet = quiet or as_json
+    secrets = cfg_secrets_safe()
+    process_env = dict(os.environ)
+    try:
+        if not quiet:
+            maybe_auto_update()
+
+        expected_head_sha = (expected_head_sha or "").strip().lower()
+        if expected_head_sha and not _SHA_RE.match(expected_head_sha):
+            raise FrankyError(
+                f"--expected-head-sha {expected_head_sha!r} is not a valid git SHA "
+                "(7-40 hex chars)",
+                code=EXIT_USAGE,
+                kind="usage_error",
+            )
+        instructions = (instructions or "").strip()[:PROSE_MAX_CHARS].strip()
+
+        # Same config-file injection as `build`/`iterate` (see build's WHY comment).
+        try:
+            load_config_file(os.environ)
+        except FrankyError:
+            raise
+        except ValueError as exc:
+            raise ConfigError(f"config file error: {exc}") from exc
+
+        try:
+            cfg = load_config(engine, os.environ)
+            secrets = cfg.secret_values()
+            repo, canonical_pr_url, pr_number = parse_review_pr_task(pr_url, cfg.allowed_repos)
+        except FrankyError:
+            raise
+        except ValueError as exc:
+            raise NetworkError(redact(str(exc), cfg_secrets_safe())) from exc
+
+        # Pin the LIVE head SHA before anything else runs - the review is grounded against
+        # exactly this commit. A caller-supplied --expected-head-sha must agree with it now, or
+        # we refuse rather than reviewing state the caller no longer expects (issue: review-pr
+        # MVP). Unlike find_open_pr's best-effort idempotency check, an unreachable/unparseable
+        # fetch here is fail-closed (NetworkError), not silently skipped.
+        live_sha = fetch_pr_head_sha(repo, pr_number, os.environ)
+        if live_sha is None:
+            raise NetworkError(
+                f"could not read {canonical_pr_url}'s live head commit via the GitHub API - "
+                "refusing"
+            )
+        if expected_head_sha and expected_head_sha != live_sha.lower():
+            raise TaskRejected(
+                f"expected head sha {expected_head_sha!r} does not match "
+                f"{canonical_pr_url}'s current head {live_sha!r} - refusing (head changed)",
+                kind="head_changed",
+            )
+        pinned_sha = live_sha
+
+        franky_img, proxy_img = _ensure_images(os.environ)
+        bundle, _setup_block = _load_profile_bundle(None, process_env, secrets, cfg)
+        verbose = verbose or bool(os.environ.get(FRANKY_VERBOSE_VAR))
+        progress = None if (quiet and not verbose) else _make_progress(cfg.engine, verbose)
+
+        # Per-run nonce fenced into the prompt + parser, same anti-injection register as `plan`
+        # (a hostile PR body/diff cannot plant a fixed sentinel to hijack the findings reported).
+        nonce = _make_nonce()
+        job_id = jobs.new_job_id()
+        _record_run_start(
+            job_id, command="review-pr", cfg=cfg, repo=repo, summary=canonical_pr_url, branch=None
+        )
+        if not quiet:
+            click.echo(f"franky: job {job_id} started", err=True)
+
+        diagnostics: dict = {}
+        code, output, duration = _run_pass(
+            cfg,
+            build_review_pr_prompt(repo, canonical_pr_url, instructions, nonce),
+            franky_img,
+            proxy_img,
+            bundle,
+            progress=progress,
+            timeout=max_duration,
+            run_id=job_id,
+            diagnostics_sink=diagnostics,
+        )
+
+        usage = _parse_usage_safe(output)
+        econ = _economics_line(usage, duration, secrets)
+        if not as_json:
+            click.echo(econ, err=True)
+        log_path = _write_log(output, secrets, footer=econ)
+
+        review_url: str | None = None
+        review_id: int | None = None
+        findings_summary: str | None = None
+        checks: list | None = None
+
+        # Timeout first (124 is nonzero) -> dedicated timeout contract, before generic agent_error.
+        if code == CONTAINER_TIMEOUT_CODE:
+            status, reason, exit_code = "timeout", "exceeded max-duration", EXIT_TIMEOUT
+        elif code != 0:
+            status, reason, exit_code = "agent_error", f"agent exited {code}", EXIT_AGENT
+        else:
+            try:
+                parsed = parse_review_findings(output, nonce)
+            except Exception:
+                parsed = None
+            if parsed is None:
+                status = "no_findings"
+                reason = (
+                    "agent produced no parseable review findings - see the redacted log in tasks/"
+                )
+                exit_code = EXIT_AGENT
+            else:
+                shaped = build_review_findings(parsed)
+                findings_summary = shaped["summary"]
+                checks = shaped["checks"]
+                if no_publish:
+                    status = "review_complete"
+                    reason = "review pass complete (publish=False, nothing written to GitHub)"
+                    exit_code = EXIT_SUCCESS
+                else:
+                    # Re-check the LIVE head immediately before publishing - never post a review
+                    # over a PR that moved on mid-run (same register as --expected-head-sha above).
+                    recheck_sha = fetch_pr_head_sha(repo, pr_number, os.environ)
+                    if recheck_sha is None or recheck_sha.lower() != pinned_sha.lower():
+                        status = "publish_blocked_stale_head"
+                        reason = (
+                            f"{canonical_pr_url}'s head changed since the review started "
+                            f"(reviewed {pinned_sha}) - refusing to publish a stale review"
+                        )
+                        exit_code = EXIT_AGENT
+                    else:
+                        event = review_event(shaped)  # COMMENT or REQUEST_CHANGES, never APPROVE
+                        body = render_review_body(shaped)
+                        try:
+                            gcode, gout, gerr = run_gh(
+                                [
+                                    "api",
+                                    f"repos/{repo}/pulls/{pr_number}/reviews",
+                                    "-f",
+                                    f"event={event}",
+                                    "-f",
+                                    f"body={body}",
+                                ],
+                                os.environ,
+                                timeout=_resolve_gh_timeout(os.environ),
+                            )
+                        except subprocess.TimeoutExpired as exc:
+                            raise FrankyError(
+                                f"publishing the review to {canonical_pr_url} exceeded "
+                                f"{int(exc.timeout)}s",
+                                code=EXIT_TIMEOUT,
+                                kind="timeout",
+                            ) from exc
+                        except OSError as exc:
+                            raise DockerError(
+                                "the `gh` CLI is not installed or not executable on the host - "
+                                "review-pr publishes via gh"
+                            ) from exc
+                        if gcode != 0:
+                            status = "publish_failed"
+                            reason = (
+                                "posting the GitHub review failed: "
+                                f"{redact(gerr.strip(), secrets)[:500]}"
+                            )
+                            exit_code = EXIT_NETWORK
+                        else:
+                            try:
+                                resp = json.loads(gout)
+                            except (ValueError, TypeError):
+                                resp = {}
+                            review_url = resp.get("html_url") if isinstance(resp, dict) else None
+                            review_id = resp.get("id") if isinstance(resp, dict) else None
+                            status = "review_published"
+                            reason = f"published a {event} review"
+                            exit_code = EXIT_SUCCESS
+
+        _record_run_end(
+            job_id,
+            status=status,
+            pr_url=review_url or canonical_pr_url,
+            usage=usage,
+            duration=duration,
+            exit_code=exit_code,
+            log_path=log_path,
+            diagnostics=diagnostics,
+        )
+        result = build_result(
+            status=status,
+            pr_url=canonical_pr_url,
+            reason=reason,
+            exit_code=exit_code,
+            usage=usage,
+            duration=duration,
+            log_path=str(log_path),
+            engine=cfg.engine.name,
+            repo=repo,
+            job_id=job_id,
+            reviewed_sha=pinned_sha,
+            findings_summary=findings_summary,
+            checks=checks,
+            review_url=review_url,
+            review_id=review_id,
+        )
+        _emit_result(
+            result,
+            as_json,
+            secrets,
+            pr_url=(review_url or canonical_pr_url),
+            status=status,
+            quiet=quiet,
+        )
         ctx.exit(exit_code)
     except FrankyError as exc:
         _emit_error(exc, as_json, secrets)

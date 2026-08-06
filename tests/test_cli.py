@@ -3314,3 +3314,365 @@ def test_job_attach_redacts_config_file_only_secret(monkeypatch, tmp_path):
     assert "ghp_fileonly_secret" not in res.output
     rec = jobs.read_record(job_id, env)
     assert "ghp_fileonly_secret" not in json.dumps(rec["steer_notes"])
+
+
+# ---------------------------------------------------------------------------
+# `franky review-pr` - independent, read-only PR review (bridge backend)
+# ---------------------------------------------------------------------------
+# Reuses the module-level PR_URL (https://github.com/me/repo/pull/11) - me/repo is allowlisted.
+
+REVIEW_NONCE = "feedfacecafe0002"
+REVIEW_PR_NUMBER = 11
+LIVE_SHA = "a" * 40
+REVIEW_URL = f"{PR_URL}#pullrequestreview-555"
+
+
+def _review_env():
+    return {
+        "FRANKY_ALLOWED_REPOS": "me/repo",
+        "GH_TOKEN": "ghp_fake",
+        "OPENROUTER_API_KEY": "sk-or-fake",
+    }
+
+
+def _fix_review_nonce(monkeypatch):
+    """Pin the per-run nonce so a fake container can echo a matching sentinel block."""
+    monkeypatch.setattr(cli.secrets, "token_hex", lambda *a, **k: REVIEW_NONCE)
+
+
+def _review_block(payload, nonce=REVIEW_NONCE):
+    return f"FRANKY_REVIEW_{nonce}_BEGIN{json.dumps(payload)}FRANKY_REVIEW_{nonce}_END"
+
+
+def _mc_review_setup(
+    monkeypatch,
+    *,
+    env=None,
+    live_sha=LIVE_SHA,
+    recheck_sha=None,
+    container=(0, None),
+    gh=(0, None),
+):
+    """Wire a hermetic review-pr: env, images present, live-head fetch + container + gh api all
+    mocked. `recheck_sha` defaults to `live_sha` (head unchanged); pass a different value to
+    simulate the PR moving between the pre-run pin and the pre-publish recheck.
+    """
+    env = dict(env) if env is not None else _review_env()
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+
+    shas = [live_sha, recheck_sha if recheck_sha is not None else live_sha]
+
+    def fake_fetch(repo, number, e, **k):
+        return shas.pop(0) if shas else (recheck_sha if recheck_sha is not None else live_sha)
+
+    monkeypatch.setattr(cli, "fetch_pr_head_sha", fake_fetch)
+
+    code, output = container
+    if output is None:
+        output = _review_block({"summary": "looks fine", "findings": [], "checks": []})
+    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: (code, output))
+
+    gcode, gout = gh
+    if gout is None:
+        gout = json.dumps({"html_url": REVIEW_URL, "id": 555})
+    seen_gh_calls = []
+
+    def fake_run_gh(args, e, **k):
+        seen_gh_calls.append(list(args))
+        return gcode, gout, ""
+
+    monkeypatch.setattr(cli, "run_gh", fake_run_gh)
+    return seen_gh_calls
+
+
+def test_review_pr_help_shows_no_publish_flag():
+    res = CliRunner().invoke(cli.main, ["review-pr", "--help"])
+    assert res.exit_code == 0
+    assert "--no-publish" in res.output
+    assert "--expected-head-sha" in res.output
+
+
+def test_review_pr_published_echoes_review_url_and_never_approves(monkeypatch):
+    """Contract: a clean run publishes exactly one COMMENT/REQUEST_CHANGES review (never
+    APPROVE) and reports its URL - both on stdout and in the --json result."""
+    _fix_review_nonce(monkeypatch)
+    calls = _mc_review_setup(monkeypatch)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["review-pr", PR_URL])
+    assert res.exit_code == 0, res.output
+    assert REVIEW_URL in res.output  # bare review URL on stdout, mirrors a bare PR URL on build
+    assert len(calls) == 1
+    args = calls[0]
+    assert args[0] == "api"
+    assert args[1] == f"repos/me/repo/pulls/{REVIEW_PR_NUMBER}/reviews"
+    event_field = next(a for a in args if a.startswith("event="))
+    assert event_field == "event=COMMENT"
+    assert "APPROVE" not in " ".join(args)
+
+
+def test_review_pr_json_success_reports_reviewed_sha_and_review_url(monkeypatch):
+    _fix_review_nonce(monkeypatch)
+    _mc_review_setup(
+        monkeypatch,
+        container=(
+            0,
+            _review_block(
+                {
+                    "summary": "solid change",
+                    "findings": [
+                        {"title": "nit: naming", "body": "minor", "severity": "nit"},
+                    ],
+                    "checks": [{"name": "pytest", "outcome": "pass", "detail": "120 passed"}],
+                }
+            ),
+        ),
+    )
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["review-pr", PR_URL, "--json"])
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.stdout)
+    assert data["status"] == "review_published"
+    assert data["reviewed_sha"] == LIVE_SHA
+    assert data["review_url"] == REVIEW_URL
+    assert data["review_id"] == 555
+    assert data["findings_summary"] == "solid change"
+    assert data["checks"] == [{"name": "pytest", "outcome": "pass", "detail": "120 passed"}]
+    assert data["repo"] == "me/repo"
+
+
+def test_review_pr_blocking_finding_requests_changes_never_approve(monkeypatch):
+    _fix_review_nonce(monkeypatch)
+    calls = _mc_review_setup(
+        monkeypatch,
+        container=(
+            0,
+            _review_block(
+                {
+                    "summary": "found a real bug",
+                    "findings": [
+                        {
+                            "title": "SQL injection",
+                            "body": "unsanitized input reaches the query",
+                            "severity": "blocking",
+                            "file": "app.py",
+                            "line": 42,
+                        }
+                    ],
+                    "checks": [],
+                }
+            ),
+        ),
+    )
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["review-pr", PR_URL, "--json"])
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.stdout)
+    assert data["status"] == "review_published"
+    event_field = next(a for a in calls[0] if a.startswith("event="))
+    assert event_field == "event=REQUEST_CHANGES"
+    assert "APPROVE" not in " ".join(calls[0])
+
+
+def test_review_pr_no_publish_makes_zero_github_writes(monkeypatch):
+    """publish=false (--no-publish) must never call the GitHub review API."""
+    _fix_review_nonce(monkeypatch)
+    calls = _mc_review_setup(monkeypatch)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["review-pr", "--no-publish", "--json", "--", PR_URL])
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.stdout)
+    assert data["status"] == "review_complete"
+    assert "review_url" not in data
+    assert "review_id" not in data
+    assert calls == []  # zero GitHub writes
+
+
+def test_review_pr_never_invokes_commit_push_merge(monkeypatch):
+    """The prompt handed to the agent explicitly FORBIDS commit/push/merge/approve/resolve (an
+    imperative prohibition, not merely a mention), and Franky's own host-side code performs
+    exactly one GitHub write - the review POST - never a merge/close/approve/dismiss call."""
+    _fix_review_nonce(monkeypatch)
+    seen = {}
+    gh_calls = []
+
+    def fake_run(cfg, inner_argv, *a, **k):
+        seen["argv"] = inner_argv
+        return 0, _review_block({"summary": "ok", "findings": [], "checks": []})
+
+    def fake_run_gh(a, e, **k):
+        gh_calls.append(list(a))
+        return 0, json.dumps({"html_url": REVIEW_URL, "id": 1}), ""
+
+    env = _review_env()
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    monkeypatch.setattr(cli, "fetch_pr_head_sha", lambda *a, **k: LIVE_SHA)
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+    monkeypatch.setattr(cli, "run_gh", fake_run_gh)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["review-pr", PR_URL])
+    assert res.exit_code == 0, res.output
+
+    # The prohibition must be an explicit imperative, not just a mention of the word.
+    prompt_text = str(seen["argv"])
+    for forbidden in (
+        "do NOT `git push`",
+        "do NOT create, merge, or close any branch or PR",
+        "do NOT run `gh pr review`, `gh pr merge`, `gh pr close`",
+    ):
+        assert forbidden in prompt_text, f"prompt must explicitly forbid: {forbidden!r}"
+    assert "read-only for this entire pass" in prompt_text
+
+    # Franky's own host code performs exactly ONE GitHub write - the review POST - never a
+    # merge/close/approve/dismiss call.
+    assert len(gh_calls) == 1
+    assert gh_calls[0][1] == f"repos/me/repo/pulls/{REVIEW_PR_NUMBER}/reviews"
+    joined = " ".join(gh_calls[0]).lower()
+    for forbidden in ("merge", "close", "approve", "dismiss"):
+        assert forbidden not in joined
+
+
+def test_review_pr_expected_head_mismatch_refuses_before_any_container_run(monkeypatch):
+    """Requirement: reject an expected-head mismatch, and never even start the container."""
+    env = _review_env()
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(cli, "fetch_pr_head_sha", lambda *a, **k: LIVE_SHA)
+
+    def boom(*a, **k):
+        raise AssertionError("the container must never run on a head-SHA mismatch")
+
+    monkeypatch.setattr(cli, "ensure_image_available", boom)
+    monkeypatch.setattr(cli, "run_in_container", boom)
+    monkeypatch.setattr(cli, "run_gh", boom)
+
+    stale_sha = "b" * 40
+    res = CliRunner().invoke(
+        cli.main, ["review-pr", "--expected-head-sha", stale_sha, "--json", "--", PR_URL]
+    )
+    assert res.exit_code == 4, res.output  # EXIT_TASK_REJECTED
+    data = json.loads(res.stdout)
+    assert data["error"]["code"] == 4
+    assert data["error"]["kind"] == "head_changed"
+    assert "head" in data["error"]["message"].lower()
+
+
+def test_review_pr_head_change_blocks_stale_publication(monkeypatch):
+    """Requirement: the head moving between the pre-run pin and the pre-publish recheck must
+    block publishing - the review still ran, but nothing is written to GitHub."""
+    _fix_review_nonce(monkeypatch)
+    moved_sha = "c" * 40
+    calls = _mc_review_setup(monkeypatch, live_sha=LIVE_SHA, recheck_sha=moved_sha)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["review-pr", PR_URL, "--json"])
+    assert res.exit_code == 7, res.output  # EXIT_AGENT
+    data = json.loads(res.stdout)
+    assert data["status"] == "publish_blocked_stale_head"
+    assert data["reviewed_sha"] == LIVE_SHA
+    assert "review_url" not in data
+    assert calls == []  # never posted despite publish defaulting True
+
+
+def test_review_pr_off_allowlist_refuses(monkeypatch):
+    monkeypatch.setattr(cli.os, "environ", _review_env())
+    res = CliRunner().invoke(
+        cli.main, ["review-pr", "https://github.com/stranger/repo/pull/1", "--json"]
+    )
+    assert res.exit_code == 4
+    data = json.loads(res.stdout)
+    assert data["error"]["code"] == 4
+
+
+def test_review_pr_missing_creds_clean_error_no_secret_leak(monkeypatch):
+    monkeypatch.setattr(cli.os, "environ", {})
+    res = CliRunner().invoke(cli.main, ["review-pr", PR_URL])
+    assert res.exit_code != 0
+    assert "ghp_fake" not in res.output
+
+
+def test_review_pr_invalid_expected_head_sha_exits_usage(monkeypatch):
+    monkeypatch.setattr(cli.os, "environ", _review_env())
+    res = CliRunner().invoke(
+        cli.main, ["review-pr", "--expected-head-sha", "not-a-sha", "--", PR_URL]
+    )
+    assert res.exit_code == 2  # EXIT_USAGE
+
+
+def test_review_pr_no_findings_exits_agent_error(monkeypatch):
+    _fix_review_nonce(monkeypatch)
+    _mc_review_setup(monkeypatch, container=(0, "agent said nothing structured"))
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["review-pr", PR_URL, "--json"])
+    assert res.exit_code == 7
+    data = json.loads(res.stdout)
+    assert data["status"] == "no_findings"
+
+
+def test_review_pr_timeout_maps_to_exit_9(monkeypatch):
+    _fix_review_nonce(monkeypatch)
+    _mc_review_setup(monkeypatch, container=(cli.CONTAINER_TIMEOUT_CODE, "timed out"))
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["review-pr", PR_URL, "--max-duration", "5", "--json"])
+    assert res.exit_code == 9
+    data = json.loads(res.stdout)
+    assert data["status"] == "timeout"
+
+
+def test_review_pr_matches_bridge_argv_contract(monkeypatch):
+    """Contract test: mirrors the bridge's `build_review_pr_argv`, which shapes
+    `franky review-pr [--expected-head-sha SHA] [--no-publish] -- <pr_url> [instructions]` and
+    reads the result back through `franky_status`. Build the SAME argv the bridge would dispatch
+    for a `franky_review_pr(pr_url, instructions, expected_head_sha, publish=True)` MCP call, and
+    assert the CLI's --json response carries everything the bridge's read_run needs: a
+    submitted-review URL matching `<pr_url>#pullrequestreview-<id>` (what franky_status reports
+    as "review finished and published"), plus the grounded reviewed_sha/findings/checks."""
+    _fix_review_nonce(monkeypatch)
+    _mc_review_setup(monkeypatch, live_sha=LIVE_SHA)
+
+    # Mirrors bridge/franky.py::build_review_pr_argv EXACTLY (minus the franky binary itself) -
+    # the bridge never adds --json, so the real dispatch is plain-text.
+    expected_head_sha = LIVE_SHA
+    instructions = "focus on error handling"
+    publish = True
+    argv = ["review-pr"]
+    if expected_head_sha:
+        argv += ["--expected-head-sha", expected_head_sha]
+    if not publish:
+        argv.append("--no-publish")
+    argv += ["--", PR_URL]
+    if instructions:
+        argv.append(instructions)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, argv)
+    assert res.exit_code == 0, res.output
+    # This is exactly what the bridge's read_run/_parse_review_url regex scans the combined
+    # stdout+stderr log for to report "review finished and published" via franky_status.
+    assert REVIEW_URL in res.output
+    assert REVIEW_URL.startswith(PR_URL + "#pullrequestreview-")
+
+    # Same request, --json, for the structured envelope requirement (9): reviewed SHA, findings
+    # summary, check outcomes, and review URL/ID when published.
+    runner2 = CliRunner()
+    with runner2.isolated_filesystem():
+        res2 = runner2.invoke(cli.main, ["review-pr", "--json", *argv[1:]])
+    assert res2.exit_code == 0, res2.output
+    data = json.loads(res2.stdout)
+    assert data["status"] == "review_published"
+    assert data["reviewed_sha"] == LIVE_SHA
+    assert data["review_url"] == REVIEW_URL
+    assert data["review_id"] == 555
+    assert data["repo"] == "me/repo"
+    assert isinstance(data["job_id"], str) and data["job_id"]

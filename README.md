@@ -206,6 +206,35 @@ anything, and to stop otherwise. This is a prompt-level guard in the same regist
 "never merge" rule (the agent is autonomous); the hard bounds remain the repo allowlist, the
 egress cage, and PR-not-merge. See the Security section.
 
+## Reviewing a PR (`franky review-pr`)
+
+`franky review-pr` gets Franky's independent opinion on an existing pull request -
+grounded findings, without changing anything:
+
+```
+franky review-pr https://github.com/you/repo/pull/42
+franky review-pr --no-publish -- https://github.com/you/repo/pull/42 "focus on error handling"
+franky review-pr --expected-head-sha <sha> -- https://github.com/you/repo/pull/42
+```
+
+It runs the **same hardened, egress-controlled container** as `build`/`iterate`, but the
+agent only inspects the PR's diff/metadata/linked issue and runs the repo's existing
+checks - it never edits, commits, pushes, merges, approves, dismisses reviews, or resolves
+conversations. Franky itself (never the agent) posts the resulting GitHub review, and only
+ever as `COMMENT` or `REQUEST_CHANGES` - it never auto-approves.
+
+`--expected-head-sha` pins the PR head you last observed; a live head that disagrees (checked
+before the pass starts, and again immediately before publishing) refuses rather than
+reviewing or publishing stale state. `--no-publish` reviews without writing anything to
+GitHub - read the findings from the `--json` result or the redacted log instead.
+
+`--json` reports `reviewed_sha`, `findings_summary`, and `checks` always, plus `review_url`/
+`review_id` once a review is actually published:
+
+```json
+{"status": "review_published", "reviewed_sha": "…", "review_url": "https://github.com/you/repo/pull/42#pullrequestreview-1", "findings_summary": "…", "checks": [{"name": "pytest", "outcome": "pass", "detail": "…"}]}
+```
+
 ## Querying GitHub with Franky's token (`franky gh`)
 
 Franky's caller is usually an agent in a sandbox with **no `gh` CLI and no GitHub token** - so

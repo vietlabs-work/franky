@@ -120,6 +120,11 @@ def build_result(
     attempts: list | None = None,
     replay_of: str | None = None,
     resumed_from: str | None = None,
+    reviewed_sha: str | None = None,
+    findings_summary: str | None = None,
+    checks: list | None = None,
+    review_url: str | None = None,
+    review_id: int | None = None,
 ) -> dict:
     """Shape the success/agent-result object emitted on stdout under `--json`.
 
@@ -145,6 +150,15 @@ def build_result(
     `resumed_from` (issue #71) is the job id of the original run a `franky job resume` restored
     the workspace of; included ONLY when not None (same pattern as `replay_of`). A resume reuses
     the build statuses (pr_opened | no_pr | agent_error | timeout | already_open).
+
+    `reviewed_sha`/`findings_summary`/`checks`/`review_url`/`review_id` are `review-pr`-only
+    fields, each included ONLY when not None (same "absent, not null" pattern as `attempts`), so
+    build/iterate emit the exact same keys as before. `reviewed_sha` is the PR head commit the
+    review is grounded against (pinned before the pass, re-checked before publishing);
+    `findings_summary`/`checks` summarize the agent's grounded findings and the repo checks it
+    ran; `review_url`/`review_id` identify the GitHub review Franky posted, present only when
+    `publish=True` actually posted one (never on a `--no-publish` run, which writes nothing to
+    GitHub - see the `review-pr` command).
     """
     result = {
         "status": status,
@@ -169,6 +183,16 @@ def build_result(
         result["replay_of"] = replay_of
     if resumed_from is not None:
         result["resumed_from"] = resumed_from
+    if reviewed_sha is not None:
+        result["reviewed_sha"] = reviewed_sha
+    if findings_summary is not None:
+        result["findings_summary"] = findings_summary
+    if checks is not None:
+        result["checks"] = checks
+    if review_url is not None:
+        result["review_url"] = review_url
+    if review_id is not None:
+        result["review_id"] = review_id
     return result
 
 
