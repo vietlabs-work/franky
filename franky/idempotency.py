@@ -68,3 +68,47 @@ def find_open_pr(
         return None
     html_url = first.get("html_url")
     return html_url if isinstance(html_url, str) and html_url else None
+
+
+def fetch_pr_head_sha(
+    repo: str,
+    number: int,
+    env: Mapping[str, str],
+    *,
+    opener: Callable = urllib.request.urlopen,
+    timeout: float = _FETCH_TIMEOUT,
+) -> str | None:
+    """Return the LIVE head commit SHA of PR `number` in `repo`, or None on any failure.
+
+    GitHub REST: GET /repos/{repo}/pulls/{number}. Same opener-injection + degrade-to-None
+    style as find_open_pr. UNLIKE find_open_pr (a best-effort idempotency convenience), the
+    `review-pr` caller treats a None here as FAIL-CLOSED - it refuses rather than reviewing or
+    publishing against an unconfirmed head, since this is the ground truth a review is pinned
+    to (both before the pass starts and again immediately before publishing). The leniency is
+    the caller's policy, not this function's - it always just degrades to None on any error.
+    """
+    url = f"https://api.github.com/repos/{repo}/pulls/{number}"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "franky-idempotency",
+    }
+    token = env.get("GH_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with opener(req, timeout=timeout) as resp:
+            if getattr(resp, "status", None) != 200:
+                return None
+            data = json.load(resp)
+    except Exception:
+        return None
+
+    if not isinstance(data, dict):
+        return None
+    head = data.get("head")
+    if not isinstance(head, dict):
+        return None
+    sha = head.get("sha")
+    return sha if isinstance(sha, str) and sha else None

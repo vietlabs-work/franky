@@ -289,6 +289,71 @@ def build_iterate_prompt(spec: TaskSpec, *, operator_setup: str = "") -> str:
     return f"{persona}\n\n{task_block}\n{conventions}{operator_setup}"
 
 
+def build_review_pr_prompt(repo: str, pr_url: str, instructions: str, nonce: str) -> str:
+    """Prompt for the `review-pr` command: an INDEPENDENT, READ-ONLY review of an existing PR.
+
+    Standalone like `build_iterate_prompt` - a review has no branch/PR of its own to open, so it
+    does not reuse `_task_block`. The agent inspects the PR (read-only) and ends its response
+    with EXACTLY ONE `FRANKY_REVIEW_<nonce>` sentinel block (mirrors `build_decompose_prompt`'s
+    anti-injection register: a hostile PR body/diff cannot plant a fixed sentinel to hijack the
+    findings Franky reports).
+
+    Franky's own host process is the ONLY thing that ever posts a GitHub review (COMMENT or
+    REQUEST_CHANGES, NEVER APPROVE - see reviewpr.review_event) - the agent itself must never
+    write to the repo or to GitHub, so every mutating action is spelled out as forbidden here.
+    """
+    persona = load_persona()
+
+    instructions_line = (
+        f"Focus instructions from the operator: {instructions}\n" if instructions else ""
+    )
+    task_block = (
+        f"Repo: {repo}\n"
+        f"Task: independently review this existing pull request - {pr_url}. Read its diff, "
+        "metadata, and any linked issue; run the repository's existing checks; report grounded "
+        "findings. Do NOT change anything.\n"
+        f"{instructions_line}"
+    )
+
+    begin = f"FRANKY_REVIEW_{nonce}_BEGIN"
+    end = f"FRANKY_REVIEW_{nonce}_END"
+
+    conventions = (
+        "REVIEW MODE - this is a READ-ONLY review pass, NOT execution:\n"
+        f"- Check out the PR in an isolated, disposable workspace: `gh pr checkout {pr_url}` "
+        "(or clone the repo and fetch the PR's ref). Do NOT create a branch of your own.\n"
+        f"- Inspect the PR metadata (`gh pr view {pr_url}`), the full diff (`gh pr diff "
+        f"{pr_url}`), its commits, and any linked issue.\n"
+        "- Run the repository's existing fast/default checks (its normal test suite and any "
+        "lint/type-check it runs in CI) and record the outcome of each - do not skip this.\n"
+        "- Review for correctness, security, regressions, concurrency/error handling, "
+        "compatibility, maintainability, and test coverage. Every finding must be grounded in "
+        "the actual diff/checks you observed - never invent a file, line, or behavior you did "
+        "not verify.\n"
+        "- ABSOLUTE RULE: you are read-only for this entire pass. Do NOT edit, stage, or commit "
+        "any file; do NOT `git push`; do NOT create, merge, or close any branch or PR; do NOT "
+        "run `gh pr review`, `gh pr merge`, `gh pr close`, or resolve/dismiss anything on "
+        "GitHub. Franky's own host process posts the review afterward from your findings below "
+        "- you never post anything yourself.\n"
+        "- END your response with EXACTLY ONE machine-readable block and NO text after it, in "
+        "this exact form (a single line, compact JSON, no surrounding code fence):\n"
+        # The middle segment carries LITERAL braces, so it cannot be an f-string; the explicit
+        # `+` concatenation around it is intentional (not a typo).
+        f"  {begin}" + "{<compact ONE-LINE JSON>}" + f"{end}\n"
+        "  where the JSON is exactly this shape:\n"
+        '  {"summary": "...", "findings": [{"title": "...", "body": "...", '
+        '"severity": "<blocking|normal|nit>", "file": "path/or/null", "line": <int-or-null>}], '
+        '"checks": [{"name": "...", "outcome": "<pass|fail|skipped>", "detail": "..."}]}\n'
+        '- Use "blocking" severity ONLY for a verified, must-fix defect; use "normal"/"nit" '
+        "otherwise. Franky decides whether to request changes from this - you never approve or "
+        "request changes yourself.\n"
+        f"- Output ONLY the sentinel block as the FINAL content of your response; add no text "
+        f"after `{end}`.\n"
+    )
+
+    return f"{persona}\n\n{task_block}\n{conventions}"
+
+
 def build_replay_prompt(
     spec: TaskSpec,
     *,

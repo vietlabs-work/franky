@@ -90,6 +90,30 @@ def parse_task(raw_input: str, repo_flag: str | None, allowed: list[str]) -> Tas
     return spec
 
 
+def parse_review_pr_task(raw_input: str, allowed: list[str]) -> tuple[str, str, int]:
+    """Parse a GitHub PR URL for the `review-pr` command into (repo, canonical_url, pr_number).
+
+    Same anchored shape + allowlist gate as `parse_pr_task` (review-pr is also read-only about
+    which repo it may act on), but additionally returns the PR number: `review-pr` needs it to
+    ground the head-SHA check and to post the review via the GitHub API, neither of which
+    `iterate` (branch-based) needs. The canonical URL is reconstructed from the validated capture
+    groups, never the raw input, for the same reason `parse_pr_task` does: no trailing path/query
+    can smuggle a different target past the allowlist gate.
+    """
+    text_in = (raw_input or "").strip()
+    m = GH_PR_RE.match(text_in)
+    if not m:
+        raise TaskRejected(
+            "review-pr needs a GitHub PR URL like https://github.com/owner/repo/pull/123"
+        )
+    repo = f"{m.group('owner')}/{m.group('repo')}"
+    if not repo_allowed(repo, allowed):
+        raise TaskRejected(f"repo '{repo}' is not in the allowlist - refusing")
+    number = int(m.group("number"))
+    canonical = f"https://github.com/{repo}/pull/{number}"
+    return repo, canonical, number
+
+
 def parse_pr_task(raw_input: str, allowed: list[str]) -> TaskSpec:
     """Parse a GitHub PR URL into a TaskSpec for the `iterate` command.
 
