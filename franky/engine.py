@@ -44,8 +44,9 @@ CODEX_AUTH_VOLUME = "franky-codex-auth"
 FRANKY_CODEX_AUTH_VOLUME_VAR = "FRANKY_CODEX_AUTH_VOLUME"
 
 # Docker's own volume-name rule (`docker volume create` accepts this shape; anything else is
-# rejected by the daemon before it ever runs).
-_VOLUME_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]+$")
+# rejected by the daemon before it ever runs). fullmatch (not search/match) so a trailing
+# newline or any other trailing junk cannot sneak an otherwise-valid-looking prefix past it.
+_VOLUME_NAME_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.-]+")
 
 
 def codex_auth_volume(env: Mapping[str, str]) -> str:
@@ -56,15 +57,19 @@ def codex_auth_volume(env: Mapping[str, str]) -> str:
     Franky instances on one machine can each point FRANKY_CODEX_AUTH_VOLUME at their own volume
     and never touch each other's live Codex session. Fail-closed: an override that does not
     match Docker's own volume-name rule raises rather than reaching `docker volume create` with
-    a name Docker itself would refuse.
+    a name Docker itself would refuse. Unset -> the default; set-but-empty or set-but-malformed
+    (including a stray trailing newline from a sourced env file) both raise - only a genuinely
+    absent var falls back.
     """
-    name = env.get(FRANKY_CODEX_AUTH_VOLUME_VAR) or CODEX_AUTH_VOLUME
-    if not _VOLUME_NAME_RE.match(name):
+    raw = env.get(FRANKY_CODEX_AUTH_VOLUME_VAR)
+    if raw is None:
+        return CODEX_AUTH_VOLUME
+    if not _VOLUME_NAME_RE.fullmatch(raw):
         raise ValueError(
-            f"{FRANKY_CODEX_AUTH_VOLUME_VAR}={name!r} is not a valid Docker volume name "
+            f"{FRANKY_CODEX_AUTH_VOLUME_VAR}={raw!r} is not a valid Docker volume name "
             "(must match ^[a-zA-Z0-9][a-zA-Z0-9_.-]+$)"
         )
-    return name
+    return raw
 
 
 # Which network host each provider cred talks to. WHY this is SEPARATE from required_env:

@@ -1,7 +1,10 @@
 import json
 import os
+import stat
 import subprocess
 from pathlib import Path
+
+import pytest
 
 import franky.cli as cli
 import franky.jobs as jobs
@@ -508,6 +511,56 @@ def test_write_log_same_second_distinct_run_ids_never_clobber(tmp_path, monkeypa
     assert p1 != p2
     assert p1.read_text(encoding="utf-8") == "one\n"
     assert p2.read_text(encoding="utf-8") == "two\n"
+
+
+def test_write_log_without_run_id_uses_microsecond_suffix(tmp_path):
+    # The `plan`/plan-first passes have no job_id yet - the microsecond fallback still keeps
+    # same-second logs from two such passes distinct.
+    env = {"FRANKY_RUNS_DIR": str(tmp_path / "caller-runs")}
+    path = cli._write_log("hello", [], env=env)
+    suffix = path.stem.rsplit("-", 1)[-1]
+    assert suffix.isdigit() and len(suffix) == 6
+
+
+def test_write_log_creates_dirs_0700_and_file_0600(tmp_path):
+    runs_dir = tmp_path / "caller-runs"
+    env = {"FRANKY_RUNS_DIR": str(runs_dir)}
+    path = cli._write_log("hello", [], run_id="abc123", env=env)
+    assert stat.S_IMODE(runs_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE((runs_dir / "tasks").stat().st_mode) == 0o700
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_write_log_unwritable_runs_dir_raises_config_error(tmp_path):
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root bypasses directory permission checks")
+    runs_dir = tmp_path / "locked"
+    runs_dir.mkdir(mode=0o500)
+    env = {"FRANKY_RUNS_DIR": str(runs_dir)}
+    with pytest.raises(cli.ConfigError, match=str(runs_dir / "tasks")):
+        cli._write_log("hello", [], env=env)
+
+
+def test_build_honors_config_file_runs_dir_for_transcript(tmp_path, monkeypatch):
+    # A config-file FRANKY_RUNS_DIR (not in the process env) must govern the transcript
+    # location exactly like it governs the job registry - the process-env snapshot taken
+    # before load_config_file injects it must never be what _write_log sees.
+    cfg_path = tmp_path / "config"
+    runs_dir = tmp_path / "from-config-file"
+    cli.write_config_file(cfg_path, {"FRANKY_RUNS_DIR": str(runs_dir)})
+    env = _build_env()
+    env["FRANKY_CONFIG_FILE"] = str(cfg_path)
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: (0, f"opened {PR_URL}"))
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo"])
+    assert res.exit_code == 0, res.output
+    logs = list((runs_dir / "tasks").glob("*.log"))
+    assert logs, "transcript not written under the config-file FRANKY_RUNS_DIR"
 
 
 # ---------------------------------------------------------------------------
@@ -1156,6 +1209,16 @@ def test_auth_status_codex_uses_persisted_volume(tmp_path, monkeypatch):
     assert "ready" in res.output
 
 
+def test_auth_status_codex_rejects_invalid_auth_volume_override(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "config"
+    cli.write_config_file(cfg_path, {"FRANKY_CODEX_SUBSCRIPTION": "1"})
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setenv("FRANKY_CODEX_AUTH_VOLUME", "bad name!")
+    res = CliRunner().invoke(cli.main, ["auth", "status", "codex"])
+    assert res.exit_code != 0
+    assert "FRANKY_CODEX_AUTH_VOLUME" in res.output
+
+
 def test_auth_status_codex_requires_enabled_marker(tmp_path, monkeypatch):
     monkeypatch.setenv("FRANKY_CONFIG_FILE", str(tmp_path / "config"))
     monkeypatch.setattr(cli, "_codex_auth_image", lambda: "franky:test")
@@ -1173,6 +1236,18 @@ def test_auth_logout_codex_removes_marker_after_volume(tmp_path, monkeypatch):
     res = CliRunner().invoke(cli.main, ["auth", "logout", "codex"])
     assert res.exit_code == 0, res.output
     assert cli.read_config_file(cfg_path) == {"FRANKY_ENGINE": "codex"}
+
+
+def test_auth_logout_codex_rejects_invalid_auth_volume_override(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "config"
+    cli.write_config_file(cfg_path, {"FRANKY_CODEX_SUBSCRIPTION": "1"})
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setenv("FRANKY_CODEX_AUTH_VOLUME", "bad name!")
+    res = CliRunner().invoke(cli.main, ["auth", "logout", "codex"])
+    assert res.exit_code != 0
+    assert "FRANKY_CODEX_AUTH_VOLUME" in res.output
+    # Resolution fails BEFORE the marker is cleared - nothing should be mutated on refusal.
+    assert cli.read_config_file(cfg_path).get("FRANKY_CODEX_SUBSCRIPTION") == "1"
 
 
 def test_auth_logout_codex_keeps_marker_cleared_when_volume_removal_fails(tmp_path, monkeypatch):

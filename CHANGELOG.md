@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the caller's working directory changed between runs (e.g. a redeployed release dir).
 - `franky jobs --stats` now counts `review-pr` outcomes: `review_published`/`review_complete`
   as success, `no_findings`/`publish_blocked_stale_head`/`publish_failed` as failure.
+- The transcript's runs dir and `tasks/` subdir are created `0700` and the transcript file
+  `0600`, mirroring the job registry's records, instead of the process umask default.
+- `auth login`/`auth status`/`auth logout` and the redacted transcript now resolve
+  `FRANKY_CODEX_AUTH_VOLUME`/`FRANKY_RUNS_DIR` from the config file too, not just the process
+  env, matching the container mount and the job registry.
 
 ## [0.1.2] - 2026-07-29
 

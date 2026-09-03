@@ -4,9 +4,11 @@ import pytest
 
 from franky.engine import (
     CLAUDE_TOKEN_VAR,
+    CODEX_AUTH_VOLUME,
     CODEX_PROVIDER_VARS,
     DEFAULT_ENGINE,
     ENGINES,
+    FRANKY_CODEX_AUTH_VOLUME_VAR,
     OPENCODE_PROVIDERS,
     PI_PROVIDER_VARS,
     PR_URL_RE,
@@ -16,6 +18,7 @@ from franky.engine import (
     OpenCodeEngine,
     PiEngine,
     _fallback_pr_url,
+    codex_auth_volume,
     opencode_provider,
     resolve_engine,
 )
@@ -615,3 +618,26 @@ def test_pi_claude_codex_all_support_steering():
     assert PiEngine().supports_steering is True
     assert ClaudeEngine().supports_steering is True
     assert CodexEngine().supports_steering is True
+
+
+# --- codex_auth_volume (per-instance override, FRANKY_CODEX_AUTH_VOLUME) ---
+
+
+def test_codex_auth_volume_unset_returns_default():
+    assert codex_auth_volume({}) == CODEX_AUTH_VOLUME
+
+
+def test_codex_auth_volume_accepts_valid_override():
+    assert codex_auth_volume({FRANKY_CODEX_AUTH_VOLUME_VAR: "franky-team-codex-auth"}) == (
+        "franky-team-codex-auth"
+    )
+
+
+def test_codex_auth_volume_rejects_empty_string():
+    with pytest.raises(ValueError, match=FRANKY_CODEX_AUTH_VOLUME_VAR):
+        codex_auth_volume({FRANKY_CODEX_AUTH_VOLUME_VAR: ""})
+
+
+def test_codex_auth_volume_rejects_trailing_newline():
+    with pytest.raises(ValueError, match=FRANKY_CODEX_AUTH_VOLUME_VAR):
+        codex_auth_volume({FRANKY_CODEX_AUTH_VOLUME_VAR: "myvol\n"})

@@ -145,7 +145,7 @@ def test_codex_subscription_mounts_only_fixed_named_volume():
 
 
 def test_codex_auth_scrub_keeps_only_auth_json_and_has_no_network():
-    argv = build_codex_auth_scrub_argv("franky", require_auth=True)
+    argv = build_codex_auth_scrub_argv("franky", require_auth=True, auth_volume=CODEX_AUTH_VOLUME)
     joined = " ".join(argv)
     assert "--network none" in joined
     assert "auth.json" in joined
@@ -165,7 +165,7 @@ def test_codex_auth_ready_checks_volume_before_scrubbing():
             return subprocess.CompletedProcess(argv, 1, stdout="", stderr="No such volume")
         raise AssertionError("missing volume must fail before docker run")
 
-    assert not codex_auth_ready("franky", runner=runner)
+    assert not codex_auth_ready("franky", runner=runner, auth_volume=CODEX_AUTH_VOLUME)
     assert len(calls) == 1
 
 
@@ -177,7 +177,7 @@ def test_codex_auth_ready_rejects_malformed_json():
             return subprocess.CompletedProcess(argv, 0, stdout="not-json", stderr="")
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-    assert not codex_auth_ready("franky", runner=runner)
+    assert not codex_auth_ready("franky", runner=runner, auth_volume=CODEX_AUTH_VOLUME)
 
 
 def test_codex_auth_ready_rejects_oversized_json():
@@ -190,7 +190,7 @@ def test_codex_auth_ready_rejects_oversized_json():
             )
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-    assert not codex_auth_ready("franky", runner=runner)
+    assert not codex_auth_ready("franky", runner=runner, auth_volume=CODEX_AUTH_VOLUME)
 
 
 def test_codex_auth_status_uses_read_only_volume_and_no_network():
@@ -204,7 +204,7 @@ def test_codex_auth_status_uses_read_only_volume_and_no_network():
             )
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-    assert codex_auth_status("franky", runner=runner)
+    assert codex_auth_status("franky", runner=runner, auth_volume=CODEX_AUTH_VOLUME)
     status_argv = calls[-1]
     assert status_argv[-2:] == ["login", "status"]
     assert "--network" in status_argv and "none" in status_argv
@@ -222,13 +222,13 @@ def test_codex_auth_login_is_device_flow_and_logout_removes_fixed_volume():
             )
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-    assert codex_auth_login("franky", runner=runner)
+    assert codex_auth_login("franky", runner=runner, auth_volume=CODEX_AUTH_VOLUME)
     login_argv = next(argv for argv in calls if "--device-auth" in argv)
     assert 'cli_auth_credentials_store="file"' in login_argv
     assert "--mount" in login_argv and CODEX_AUTH_VOLUME in " ".join(login_argv)
     assert "--network" not in login_argv  # trusted operator flow needs OpenAI egress
     calls.clear()
-    assert codex_auth_logout(runner=runner)
+    assert codex_auth_logout(runner=runner, auth_volume=CODEX_AUTH_VOLUME)
     assert calls == [["docker", "volume", "rm", CODEX_AUTH_VOLUME]]
 
 

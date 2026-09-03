@@ -28,7 +28,7 @@ from pathlib import Path
 
 from . import egress, franky_version, snapshot
 from .config import redact
-from .engine import CODEX_AUTH_VOLUME, CODEX_SUBSCRIPTION_VAR
+from .engine import CODEX_SUBSCRIPTION_VAR
 from .profile import CONTAINER_HOME, PROFILE_WAIT_VAR
 
 # Long agent runs: a full clone-build-test-PR cycle can take many minutes. 30 min cap.
@@ -251,7 +251,7 @@ def _codex_auth_argv(
     user: str = f"{_RUN_UID}:{_RUN_GID}",
     readonly_volume: bool = False,
     extra: list[str] | None = None,
-    auth_volume: str = CODEX_AUTH_VOLUME,
+    auth_volume: str,
 ) -> list[str]:
     """The one hardened shape used by trusted fixed-volume auth helpers."""
     mount = f"type=volume,src={auth_volume},dst={CODEX_AUTH_HOME}"
@@ -280,9 +280,7 @@ def _codex_auth_argv(
     ]
 
 
-def build_codex_auth_scrub_argv(
-    image: str, *, require_auth: bool, auth_volume: str = CODEX_AUTH_VOLUME
-) -> list[str]:
+def build_codex_auth_scrub_argv(image: str, *, require_auth: bool, auth_volume: str) -> list[str]:
     """Build a networkless helper that keeps only auth.json in persistent CODEX_HOME."""
     auth_file = f"{CODEX_AUTH_HOME}/auth.json"
     check = (
@@ -297,23 +295,19 @@ def build_codex_auth_scrub_argv(
     return _codex_auth_argv(image, "sh", ["-c", command], auth_volume=auth_volume)
 
 
-def _codex_auth_volume_exists(runner, auth_volume: str = CODEX_AUTH_VOLUME) -> bool:
+def _codex_auth_volume_exists(runner, *, auth_volume: str) -> bool:
     proc = _run(runner, ["docker", "volume", "inspect", auth_volume])
     return proc is not None and getattr(proc, "returncode", 1) == 0
 
 
-def codex_auth_ready(
-    image: str, runner=subprocess.run, auth_volume: str = CODEX_AUTH_VOLUME
-) -> bool:
+def codex_auth_ready(image: str, runner=subprocess.run, *, auth_volume: str) -> bool:
     """Scrub persistent state and require a bounded, valid Codex credential."""
-    return _codex_auth_state(image, runner, auth_volume) is not None
+    return _codex_auth_state(image, runner, auth_volume=auth_volume) is not None
 
 
-def _codex_auth_state(
-    image: str, runner=subprocess.run, auth_volume: str = CODEX_AUTH_VOLUME
-) -> list[str] | None:
+def _codex_auth_state(image: str, runner=subprocess.run, *, auth_volume: str) -> list[str] | None:
     """Return auth strings for in-memory redaction, never logging or persisting them."""
-    if not _codex_auth_volume_exists(runner, auth_volume):
+    if not _codex_auth_volume_exists(runner, auth_volume=auth_volume):
         return None
     scrub_argv = build_codex_auth_scrub_argv(image, require_auth=True, auth_volume=auth_volume)
     proc = _run(runner, scrub_argv)
@@ -359,16 +353,12 @@ def _codex_auth_state(
     return secrets
 
 
-def codex_auth_status(
-    image: str, runner=subprocess.run, auth_volume: str = CODEX_AUTH_VOLUME
-) -> bool:
+def codex_auth_status(image: str, runner=subprocess.run, *, auth_volume: str) -> bool:
     """Ask Codex to recognize the scrubbed credential without granting network access."""
-    return _codex_auth_state(image, runner, auth_volume) is not None
+    return _codex_auth_state(image, runner, auth_volume=auth_volume) is not None
 
 
-def codex_auth_login(
-    image: str, runner=subprocess.run, auth_volume: str = CODEX_AUTH_VOLUME
-) -> bool:
+def codex_auth_login(image: str, runner=subprocess.run, *, auth_volume: str) -> bool:
     """Run trusted browserless Codex login, persisting only file-backed credentials."""
     create = _run(runner, ["docker", "volume", "create", auth_volume])
     if create is None or getattr(create, "returncode", 1) != 0:
@@ -401,10 +391,10 @@ def codex_auth_login(
         return False
     if getattr(proc, "returncode", 1) != 0:
         return False
-    return codex_auth_ready(image, runner, auth_volume)
+    return codex_auth_ready(image, runner, auth_volume=auth_volume)
 
 
-def codex_auth_logout(runner=subprocess.run, auth_volume: str = CODEX_AUTH_VOLUME) -> bool:
+def codex_auth_logout(runner=subprocess.run, *, auth_volume: str) -> bool:
     """Remove the fixed auth volume; missing state is already logged out."""
     proc = _run(runner, ["docker", "volume", "rm", auth_volume])
     if proc is None:
@@ -858,7 +848,7 @@ def run_in_container(
 
     try:
         if cfg.auth_volume:
-            auth_secrets = _codex_auth_state(image, runner, cfg.auth_volume)
+            auth_secrets = _codex_auth_state(image, runner, auth_volume=cfg.auth_volume)
             if auth_secrets is None:
                 raise _AbortRun(
                     "franky: Codex subscription login is missing or invalid - "

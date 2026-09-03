@@ -68,10 +68,11 @@ franky auth status codex
 franky auth logout codex
 ```
 
-The credential file stays in the fixed `franky-codex-auth` Docker named volume, never in
-the host's `~/.codex`. Franky reads its bounded token strings into memory only so terminal
-and transcript output can be redacted. If `CODEX_API_KEY` is also set, the API key takes
-precedence.
+The credential file stays in a dedicated Docker named volume (default `franky-codex-auth`,
+override with `FRANKY_CODEX_AUTH_VOLUME` so two Franky instances on one machine keep separate
+Codex logins), never in the host's `~/.codex`. Franky reads its bounded token strings into
+memory only so terminal and transcript output can be redacted. If `CODEX_API_KEY` is also set,
+the API key takes precedence.
 
 ## Install
 
@@ -164,7 +165,8 @@ add an engine), so Codex, Cursor, pi, or Claude Code all start with the same con
    franky build <gh-issue-url | jira KEY | "prose" | -> [--repo owner/repo] [--engine pi|claude|codex|opencode] [--plan-first] [--json] [-q] [-y]
    ```
 
-Each run writes a redacted log to `tasks/<timestamp>.log` and prints the PR URL.
+Each run writes a redacted log to `<FRANKY_RUNS_DIR>/tasks/<timestamp>-<run_id>.log`
+(default `~/.franky/runs/tasks/`) and prints the PR URL.
 Pass `-` as the task to read the prose task from stdin. For scripting / agent callers,
 see [Machine / scripting interface](#machine--scripting-interface) (`--json`, exit codes).
 
@@ -198,7 +200,7 @@ there is no `--repo` flag, and the repo allowlist gates it exactly like `build`.
 Unlike `build` (which prints the new PR URL to stdout), `iterate` opens no new PR - on a
 clean run it writes only an economics summary and a labeled completion line to stderr, and
 nothing to stdout. Review the existing PR for the new commits. The redacted transcript still
-lands in `tasks/<timestamp>.log`.
+lands under `<FRANKY_RUNS_DIR>/tasks/<timestamp>-<run_id>.log`.
 
 `iterate` is intended for Franky's **own** PRs. As a guardrail it is instructed to confirm
 the PR's head branch is a `franky/*` branch in the same repo (not a fork) before touching
@@ -278,7 +280,9 @@ Requires the `gh` CLI on the host.
 
 Every `build` / `iterate` run is recorded in a small registry (`~/.franky/runs/<job_id>.json`)
 so you can see what happened to it afterwards - or observe and stop one that is stuck. Each run
-prints its `job_id` at start (and it appears as `job_id` in `--json` output).
+prints its `job_id` at start (and it appears as `job_id` in `--json` output). Override the
+registry root with `FRANKY_RUNS_DIR` (default `~/.franky/runs`); each run's redacted transcript
+lives alongside it, under `<FRANKY_RUNS_DIR>/tasks/`.
 
 ```
 franky jobs                    # recent runs, newest first: id, command, status, age, repo
@@ -477,7 +481,7 @@ Success / agent result:
   "reason": "PR opened",
   "exit_code": 0,
   "economics": {"tokens_in": 1200, "tokens_out": 340, "cost_usd": 0.0123, "duration_s": 47.5},
-  "log_path": "tasks/20260625-101500.log",
+  "log_path": "/home/you/.franky/runs/tasks/20260625-101500-1a2b3c4d5e6f.log",
   "engine": "pi",
   "repo": "you/repo" }
 ```
@@ -573,9 +577,9 @@ and join the redactor; native JSON/TOML config reaches HOME through the existing
 bundle. Franky recognizes only the reserved Codex and Claude MCP files; Pi requires a
 profile-injected MCP extension. See [Profiles](docs/profiles.md#mcp-configuration).
 
-Codex subscription auth is the narrow persistence exception: only the fixed Docker named
-volume `franky-codex-auth` is mounted at `/home/franky/.codex`, and only for subscription
-runs. Before every autonomous run a trusted networkless helper deletes every entry except
+Codex subscription auth is the narrow persistence exception: only one Docker named volume
+(default `franky-codex-auth`, per-instance via `FRANKY_CODEX_AUTH_VOLUME`) is mounted at
+`/home/franky/.codex`, and only for subscription runs. Before every autonomous run a trusted networkless helper deletes every entry except
 `auth.json`, rejects malformed or unsafe-shaped state, and loads token values only into the
 in-memory redactor; Codex also runs with `--ignore-user-config`. A validated
 `~/.codex/franky-mcp.config.toml` is parsed on the host and supplied only as explicit `-c`
