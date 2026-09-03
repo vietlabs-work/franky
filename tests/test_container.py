@@ -232,6 +232,58 @@ def test_codex_auth_login_is_device_flow_and_logout_removes_fixed_volume():
     assert calls == [["docker", "volume", "rm", CODEX_AUTH_VOLUME]]
 
 
+def test_codex_auth_login_status_logout_honor_custom_auth_volume():
+    # FRANKY_CODEX_AUTH_VOLUME (resolved by the caller) must reach every docker call, not just
+    # the default - two Franky instances must never touch each other's volume.
+    custom = "franky-team-codex-auth"
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        if "--entrypoint" in argv and argv[argv.index("--entrypoint") + 1] == "cat":
+            return subprocess.CompletedProcess(
+                argv, 0, stdout='{"access_token":"subscription-token"}', stderr=""
+            )
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    assert codex_auth_login("franky", runner=runner, auth_volume=custom)
+    assert calls[0] == ["docker", "volume", "create", custom]
+    login_argv = next(argv for argv in calls if "--device-auth" in argv)
+    assert custom in " ".join(login_argv)
+    assert CODEX_AUTH_VOLUME not in " ".join(login_argv)
+
+    calls.clear()
+    assert codex_auth_status("franky", runner=runner, auth_volume=custom)
+    assert custom in " ".join(calls[-1])
+
+    calls.clear()
+    assert codex_auth_logout(runner=runner, auth_volume=custom)
+    assert calls == [["docker", "volume", "rm", custom]]
+
+
+def test_run_in_container_codex_auth_gate_uses_configured_auth_volume():
+    # The pre-run scrub/read gate must key off cfg.auth_volume (resolved from
+    # FRANKY_CODEX_AUTH_VOLUME), not the hardcoded CODEX_AUTH_VOLUME default.
+    custom = "franky-team-codex-auth"
+    cfg = Config(
+        engine=CodexEngine(),
+        allowed_repos=["me/repo"],
+        passthrough_env={"GH_TOKEN": "ghp_fake"},
+        auth_volume=custom,
+    )
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        if argv[:3] == ["docker", "volume", "inspect"]:
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="no such volume")
+        raise AssertionError(argv)
+
+    code, out = run_in_container(cfg, ["codex", "exec"], runner=runner, env={})
+    assert code != 0
+    assert calls == [["docker", "volume", "inspect", custom]]
+
+
 def test_run_in_container_fails_closed_when_codex_auth_scrub_fails():
     calls = []
     cfg = Config(

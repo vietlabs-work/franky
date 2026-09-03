@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `franky review-pr <pr_url> [instructions]` gets Franky's independent opinion on an existing
+  pull request in the same hardened, egress-controlled container as `build`/`iterate`: the
+  agent only inspects the diff/metadata/linked issue and runs the repo's existing checks, never
+  editing, committing, pushing, merging, approving, dismissing reviews, or resolving
+  conversations. Franky's host process (never the agent) posts the resulting review, capped to
+  `COMMENT`/`REQUEST_CHANGES` - `APPROVE` is never reachable. `--expected-head-sha` pins the PR
+  head and refuses a stale publish if it moved; `--no-publish` reviews with zero GitHub writes.
+- `FRANKY_CODEX_AUTH_VOLUME` overrides the name of the Codex subscription auth volume (default
+  `franky-codex-auth`), so two Franky instances on one machine can each keep their own Codex
+  login instead of sharing (and scrubbing) one volume.
+
+### Fixed
+- The redacted per-run transcript is now written under `FRANKY_RUNS_DIR/tasks` (with the run id
+  in the file name) instead of a CWD-relative `tasks/` directory, which orphaned logs whenever
+  the caller's working directory changed between runs (e.g. a redeployed release dir).
+- `franky jobs --stats` now counts `review-pr` outcomes: `review_published`/`review_complete`
+  as success, `no_findings`/`publish_blocked_stale_head`/`publish_failed` as failure.
+
 ## [0.1.2] - 2026-07-29
 
 ### Added

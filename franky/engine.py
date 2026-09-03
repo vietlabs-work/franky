@@ -41,6 +41,31 @@ CODEX_PROVIDER_HOST = "api.openai.com"
 CODEX_SUBSCRIPTION_HOSTS = ("chatgpt.com", "auth.openai.com")
 CODEX_SUBSCRIPTION_VAR = "FRANKY_CODEX_SUBSCRIPTION"
 CODEX_AUTH_VOLUME = "franky-codex-auth"
+FRANKY_CODEX_AUTH_VOLUME_VAR = "FRANKY_CODEX_AUTH_VOLUME"
+
+# Docker's own volume-name rule (`docker volume create` accepts this shape; anything else is
+# rejected by the daemon before it ever runs).
+_VOLUME_NAME_RE = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]+$")
+
+
+def codex_auth_volume(env: Mapping[str, str]) -> str:
+    """Resolve the Codex subscription auth volume name (default `franky-codex-auth`).
+
+    Every reader of the volume name - the container mount, `auth login`/`status`/`logout`, and
+    the pre-run scrub - MUST call this instead of touching CODEX_AUTH_VOLUME directly, so two
+    Franky instances on one machine can each point FRANKY_CODEX_AUTH_VOLUME at their own volume
+    and never touch each other's live Codex session. Fail-closed: an override that does not
+    match Docker's own volume-name rule raises rather than reaching `docker volume create` with
+    a name Docker itself would refuse.
+    """
+    name = env.get(FRANKY_CODEX_AUTH_VOLUME_VAR) or CODEX_AUTH_VOLUME
+    if not _VOLUME_NAME_RE.match(name):
+        raise ValueError(
+            f"{FRANKY_CODEX_AUTH_VOLUME_VAR}={name!r} is not a valid Docker volume name "
+            "(must match ^[a-zA-Z0-9][a-zA-Z0-9_.-]+$)"
+        )
+    return name
+
 
 # Which network host each provider cred talks to. WHY this is SEPARATE from required_env:
 # required_env is about cred gating (do we have a key at all), this is about the egress

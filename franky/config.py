@@ -14,9 +14,9 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 
 from .engine import (
-    CODEX_AUTH_VOLUME,
     CODEX_SUBSCRIPTION_VAR,
     Engine,
+    codex_auth_volume,
     opencode_provider,
     resolve_engine,
 )
@@ -189,12 +189,19 @@ def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
     raw_extra = env.get(EXTRA_ALLOWED_DOMAINS_VAR, "") or ""
     extra_domains = [d.strip() for d in raw_extra.split(",") if d.strip()]
 
+    auth_volume: str | None = None
+    if subscription_auth:
+        try:
+            auth_volume = codex_auth_volume(env)
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
+
     return Config(
         engine=engine,
         allowed_repos=allowed,
         passthrough_env=passthrough,
         extra_allowed_domains=extra_domains,
-        auth_volume=CODEX_AUTH_VOLUME if subscription_auth else None,
+        auth_volume=auth_volume,
         model=model,
     )
 

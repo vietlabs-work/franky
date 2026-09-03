@@ -56,8 +56,25 @@ STALE_RUNNING_SECS = 24 * 3600
 # a build success nor failure, exactly like the diagnose statuses below it. A `--open-pr` replay
 # instead reuses `pr_opened`/`no_pr` and so folds into pass-rate exactly as `iterate` already
 # does - deliberate, not an oversight.
-_SUCCESS_STATUSES = frozenset({"pr_opened", "iterate_complete"})
-_FAILURE_STATUSES = frozenset({"no_pr", "agent_error", "timeout", "killed"})
+# `review_published`/`review_complete` (review-pr) are the review analogs of a successful
+# build/iterate pass. `no_findings` is a FAILURE, not a neutral outcome: it exits with
+# EXIT_AGENT (7) exactly like `agent_error`, and is the review analog of `no_pr` (already a
+# failure status). `publish_blocked_stale_head`/`publish_failed` are review-pr failures too -
+# the review ran but its outcome could not reach the PR.
+_SUCCESS_STATUSES = frozenset(
+    {"pr_opened", "iterate_complete", "review_published", "review_complete"}
+)
+_FAILURE_STATUSES = frozenset(
+    {
+        "no_pr",
+        "agent_error",
+        "timeout",
+        "killed",
+        "no_findings",
+        "publish_blocked_stale_head",
+        "publish_failed",
+    }
+)
 
 
 def runs_dir(env: Mapping[str, str] | None = None) -> Path:

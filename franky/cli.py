@@ -50,6 +50,7 @@ from .engine import (
     CODEX_SUBSCRIPTION_VAR,
     ENGINES,
     PI_PROVIDER_VARS,
+    codex_auth_volume,
     opencode_provider,
     resolve_engine,
 )
@@ -121,7 +122,6 @@ from .userconfig import (
 # this CLI is also reachable directly, not only via the bridge).
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
 
-TASKS_DIR = Path("tasks")
 FRANKY_VERBOSE_VAR = "FRANKY_VERBOSE"
 # `franky gh` subprocess watchdog. A default cap honors the never-hang guarantee for the
 # autonomous agent caller (a stalled `gh api` or a `gh run watch` must not wedge the caller
@@ -476,7 +476,7 @@ def build(
                 progress=progress,
                 timeout=max_duration,
             )
-            _write_log(output, secrets)
+            _write_log(output, secrets, env=process_env)
             if not quiet:
                 click.echo("franky: --- plan (read-only, nothing written yet) ---", err=True)
                 click.echo(output, err=True)
@@ -748,7 +748,7 @@ def iterate(
         econ = _economics_line(usage, duration, secrets)
         if not as_json:
             click.echo(econ, err=True)
-        log_path = _write_log(output, secrets, footer=econ)
+        log_path = _write_log(output, secrets, footer=econ, run_id=job_id, env=process_env)
 
         # iterate produces NO new PR; the existing PR gains commits. The PR URL is reported as
         # the input PR (not a fresh success artifact) - exit 0 means the pass ran, not that a
@@ -960,7 +960,7 @@ def review_pr(
         econ = _economics_line(usage, duration, secrets)
         if not as_json:
             click.echo(econ, err=True)
-        log_path = _write_log(output, secrets, footer=econ)
+        log_path = _write_log(output, secrets, footer=econ, run_id=job_id, env=process_env)
 
         review_url: str | None = None
         review_id: int | None = None
@@ -1190,7 +1190,7 @@ def plan(
         econ = _economics_line(usage, duration, secrets)
         if not as_json:
             click.echo(econ, err=True)
-        _write_log(output, secrets, footer=econ)
+        _write_log(output, secrets, footer=econ, env=process_env)
 
         # Timeout first (124 is nonzero) -> dedicated timeout contract, before generic agent.
         if code == CONTAINER_TIMEOUT_CODE:
@@ -1657,7 +1657,7 @@ def _build_once(
     econ = _economics_line(usage, duration, secrets)
     if not as_json:
         click.echo(econ, err=True)
-    log_path = _write_log(output, secrets, footer=econ)
+    log_path = _write_log(output, secrets, footer=econ, run_id=job_id, env=env)
 
     # Scope PR-URL detection to the task's own repo so a hostile issue body cannot make Franky
     # report a PR URL for some other (attacker) repo. Timeout is checked FIRST: a timed-out run
@@ -1752,7 +1752,7 @@ def _diagnose(
     econ = _economics_line(usage, duration, secrets)
     if not as_json:
         click.echo(econ, err=True)
-    log_path = _write_log(output, secrets, footer=econ)
+    log_path = _write_log(output, secrets, footer=econ, run_id=job_id, env=env)
 
     def _finish(status: str, exit_code: int) -> None:
         _record_run_end(
@@ -1804,19 +1804,39 @@ def _format_diagnosis(d: dict) -> list[str]:
     return lines
 
 
-def _write_log(output: str, secrets: list[str], footer: str | None = None) -> Path:
-    """Write the REDACTED agent output to tasks/<timestamp>.log and return its Path.
+def _tasks_dir(env: Mapping[str, str] | None = None) -> Path:
+    """Redacted-transcript directory, under the same overridable root as the job registry
+    (FRANKY_RUNS_DIR) - so a redeployed/CWD-swapped caller (e.g. two Franky instances on one
+    machine) never orphans its logs the way a CWD-relative tasks/ dir would."""
+    return jobs.runs_dir(env) / "tasks"
 
-    When `footer` is given, it is appended after the transcript (also redacted) separated
-    by a newline so the economics summary lands in the same timestamped file. The returned
-    Path is surfaced as `log_path` in the JSON result.
+
+def _write_log(
+    output: str,
+    secrets: list[str],
+    footer: str | None = None,
+    *,
+    run_id: str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> Path:
+    """Write the REDACTED agent output under `_tasks_dir(env)` and return its absolute Path.
+
+    The file name is `<timestamp>-<suffix>.log`: `suffix` is the caller's run id when it has
+    one (ties the transcript to its job record), else the current microsecond, so two logs
+    started in the same second never clobber each other. When `footer` is given, it is
+    appended after the transcript (also redacted) separated by a newline so the economics
+    summary lands in the same file. The returned Path is surfaced as `log_path` in the JSON
+    result and stored (absolute) in the run record.
     """
-    TASKS_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    directory = _tasks_dir(env)
+    directory.mkdir(parents=True, exist_ok=True)
+    now = datetime.now()
+    stamp = now.strftime("%Y%m%d-%H%M%S")
+    suffix = run_id or now.strftime("%f")
     body = redact(output, secrets) + "\n"
     if footer is not None:
         body += redact(footer, secrets) + "\n"
-    path = TASKS_DIR / f"{stamp}.log"
+    path = (directory / f"{stamp}-{suffix}.log").resolve()
     path.write_text(body, encoding="utf-8")
     return path
 
@@ -2713,7 +2733,7 @@ def job_replay(
         econ = _economics_line(usage, duration, secrets)
         if not as_json:
             click.echo(econ, err=True)
-        log_path = _write_log(output, secrets, footer=econ)
+        log_path = _write_log(output, secrets, footer=econ, run_id=new_id, env=os.environ)
 
         pr_url = None
         if code == CONTAINER_TIMEOUT_CODE:
@@ -2986,7 +3006,7 @@ def job_resume(
         econ = _economics_line(usage, duration, secrets)
         if not as_json:
             click.echo(econ, err=True)
-        log_path = _write_log(output, secrets, footer=econ)
+        log_path = _write_log(output, secrets, footer=econ, run_id=new_id, env=os.environ)
 
         # Classify (reusing build statuses). Timeout first (124 is nonzero); then nonzero as
         # agent_error - note the entrypoint's exit 75 on a FAILED restore surfaces here as
@@ -3269,13 +3289,21 @@ def auth_group() -> None:
     """Manage persistent engine subscription authentication."""
 
 
+def _resolve_codex_auth_volume() -> str:
+    try:
+        return codex_auth_volume(dict(os.environ))
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
 @auth_group.command("login")
 @click.argument("engine", type=click.Choice(["codex"]))
 def auth_login(engine: str) -> None:
     """Log in once from a browserless container using a code opened elsewhere."""
     image = _codex_auth_image()
+    auth_volume = _resolve_codex_auth_volume()
     _clear_codex_auth_marker()
-    if not codex_auth_login(image):
+    if not codex_auth_login(image, auth_volume=auth_volume):
         raise click.ClickException("Codex subscription login failed")
     path = config_file_path(dict(os.environ))
     try:
@@ -3291,7 +3319,8 @@ def auth_status(engine: str) -> None:
     """Check that the persistent Codex credential is present and validly shaped."""
     if not _codex_auth_marker_enabled():
         raise click.ClickException("Codex subscription login is not enabled")
-    if not codex_auth_status(_codex_auth_image()):
+    auth_volume = _resolve_codex_auth_volume()
+    if not codex_auth_status(_codex_auth_image(), auth_volume=auth_volume):
         raise click.ClickException("Codex subscription login is not ready")
     click.echo("Codex subscription login is ready.")
 
@@ -3300,8 +3329,9 @@ def auth_status(engine: str) -> None:
 @click.argument("engine", type=click.Choice(["codex"]))
 def auth_logout(engine: str) -> None:
     """Delete the persistent Codex credential volume and disable subscription auth."""
+    auth_volume = _resolve_codex_auth_volume()
     _clear_codex_auth_marker()
-    if not codex_auth_logout():
+    if not codex_auth_logout(auth_volume=auth_volume):
         raise click.ClickException(
             "Codex subscription disabled, but the credential volume could not be removed"
         )
