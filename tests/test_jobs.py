@@ -620,6 +620,21 @@ def test_compute_stats_hangs_counts_timeout_and_stale_running():
     assert stats["failed"] == 1  # timeout is a terminal failure
 
 
+def test_compute_stats_classifies_review_pr_statuses():
+    # review_published/review_complete are review-pr successes; no_findings,
+    # publish_blocked_stale_head, and publish_failed are review-pr failures (#F7/#F8/#F9).
+    records = [
+        _rec_econ("dd0001", "review_published"),
+        _rec_econ("dd0002", "review_complete"),
+        _rec_econ("dd0003", "no_findings"),
+        _rec_econ("dd0004", "publish_blocked_stale_head"),
+        _rec_econ("dd0005", "publish_failed"),
+    ]
+    stats = jobs.compute_stats(records)
+    assert stats["success"] == 2
+    assert stats["failed"] == 3
+
+
 def test_compute_stats_breakdown_by_engine_and_repo():
     records = [
         _rec_econ("cc0001", "pr_opened", engine="pi", repo="o/r", dur=10.0, cost=1.0),

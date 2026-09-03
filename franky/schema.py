@@ -34,8 +34,8 @@ _RESULT_SCHEMA: dict = {
         "duration_s": "wall-clock seconds for the container pass (float); 0 for already_open "
         "(no run)",
     },
-    "log_path": "path to the redacted task log under tasks/; empty string for already_open "
-    "(no run)",
+    "log_path": "absolute path to the redacted task log under FRANKY_RUNS_DIR/tasks/; empty "
+    "string for already_open (no run)",
     "engine": "the resolved engine name (e.g. pi | claude | codex | opencode)",
     "repo": "the target owner/repo",
     "job_id": "the run handle (issue #63); use with `franky job status|logs|kill`. null when no "
@@ -106,7 +106,8 @@ _JOB_RECORD_SCHEMA: dict = {
     "started_at": "ISO-8601 UTC timestamp when the run was registered",
     "ended_at": "ISO-8601 UTC timestamp when the run finished, or null while running",
     "pr_url": "the PR URL (string) or null when none was produced",
-    "log_path": "path to the redacted transcript under tasks/, or empty string before it exists",
+    "log_path": "absolute path to the redacted transcript under FRANKY_RUNS_DIR/tasks/, or "
+    "empty string before it exists",
     "economics": _RESULT_SCHEMA["economics"],
     "exit_code": "the process exit code this run finished with, or null while running",
     "diagnostics": "best-effort runtime signals captured host-side just before container "

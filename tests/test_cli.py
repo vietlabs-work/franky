@@ -1,7 +1,10 @@
 import json
 import os
+import stat
 import subprocess
 from pathlib import Path
+
+import pytest
 
 import franky.cli as cli
 import franky.jobs as jobs
@@ -477,6 +480,90 @@ def test_build_image_no_docker_clean_message(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# _write_log (redacted transcript location, issue: tasks/ moved under FRANKY_RUNS_DIR)
+# ---------------------------------------------------------------------------
+
+
+def test_write_log_lands_under_runs_dir_tasks_with_run_id_in_name(tmp_path):
+    runs_dir = tmp_path / "caller-runs"
+    env = {"FRANKY_RUNS_DIR": str(runs_dir)}
+    path = cli._write_log("hello", [], run_id="abc123def456", env=env)
+    assert path.is_absolute()
+    assert path.parent == (runs_dir / "tasks").resolve()
+    assert path.name.endswith("-abc123def456.log")
+    assert path.read_text(encoding="utf-8") == "hello\n"
+
+
+def test_write_log_same_second_distinct_run_ids_never_clobber(tmp_path, monkeypatch):
+    import datetime as dt_mod
+
+    frozen = dt_mod.datetime(2026, 1, 1, 12, 0, 0)
+
+    class _FrozenDateTime(dt_mod.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return frozen
+
+    monkeypatch.setattr(cli, "datetime", _FrozenDateTime)
+    env = {"FRANKY_RUNS_DIR": str(tmp_path / "caller-runs")}
+    p1 = cli._write_log("one", [], run_id="run1", env=env)
+    p2 = cli._write_log("two", [], run_id="run2", env=env)
+    assert p1 != p2
+    assert p1.read_text(encoding="utf-8") == "one\n"
+    assert p2.read_text(encoding="utf-8") == "two\n"
+
+
+def test_write_log_without_run_id_uses_microsecond_suffix(tmp_path):
+    # The `plan`/plan-first passes have no job_id yet - the microsecond fallback still keeps
+    # same-second logs from two such passes distinct.
+    env = {"FRANKY_RUNS_DIR": str(tmp_path / "caller-runs")}
+    path = cli._write_log("hello", [], env=env)
+    suffix = path.stem.rsplit("-", 1)[-1]
+    assert suffix.isdigit() and len(suffix) == 6
+
+
+def test_write_log_creates_dirs_0700_and_file_0600(tmp_path):
+    runs_dir = tmp_path / "caller-runs"
+    env = {"FRANKY_RUNS_DIR": str(runs_dir)}
+    path = cli._write_log("hello", [], run_id="abc123", env=env)
+    assert stat.S_IMODE(runs_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE((runs_dir / "tasks").stat().st_mode) == 0o700
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_write_log_unwritable_runs_dir_raises_config_error(tmp_path):
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root bypasses directory permission checks")
+    runs_dir = tmp_path / "locked"
+    runs_dir.mkdir(mode=0o500)
+    env = {"FRANKY_RUNS_DIR": str(runs_dir)}
+    with pytest.raises(cli.ConfigError, match=str(runs_dir / "tasks")):
+        cli._write_log("hello", [], env=env)
+
+
+def test_build_honors_config_file_runs_dir_for_transcript(tmp_path, monkeypatch):
+    # A config-file FRANKY_RUNS_DIR (not in the process env) must govern the transcript
+    # location exactly like it governs the job registry - the process-env snapshot taken
+    # before load_config_file injects it must never be what _write_log sees.
+    cfg_path = tmp_path / "config"
+    runs_dir = tmp_path / "from-config-file"
+    cli.write_config_file(cfg_path, {"FRANKY_RUNS_DIR": str(runs_dir)})
+    env = _build_env()
+    env["FRANKY_CONFIG_FILE"] = str(cfg_path)
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: (0, f"opened {PR_URL}"))
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo"])
+    assert res.exit_code == 0, res.output
+    logs = list((runs_dir / "tasks").glob("*.log"))
+    assert logs, "transcript not written under the config-file FRANKY_RUNS_DIR"
+
+
+# ---------------------------------------------------------------------------
 # update command (wiring only - force_update logic is covered in test_update_check)
 # ---------------------------------------------------------------------------
 
@@ -610,10 +697,9 @@ def test_build_prints_economics_line_and_writes_to_log(monkeypatch):
         assert res.exit_code == 0, res.output
         # Economics line must appear in the combined output.
         assert "economics" in res.output
-        # The log file must also contain the economics text.
-        from pathlib import Path
-
-        logs = list(Path("tasks").glob("*.log"))
+        # The log file must also contain the economics text (now under FRANKY_RUNS_DIR/tasks,
+        # patched to a tmp dir by the autouse _hermetic_runs_dir fixture).
+        logs = list((jobs.runs_dir() / "tasks").glob("*.log"))
         assert logs, "no log file written"
         log_text = logs[0].read_text()
         assert "economics" in log_text
@@ -680,9 +766,7 @@ def test_build_prints_economics_even_when_agent_exits_nonzero(monkeypatch):
         assert res.exit_code != 0
         # ...but the economics line was still emitted (and logged) before the failure.
         assert "franky: economics" in res.output
-        from pathlib import Path
-
-        logs = list(Path("tasks").glob("*.log"))
+        logs = list((jobs.runs_dir() / "tasks").glob("*.log"))
         assert logs and "economics" in logs[0].read_text()
 
 
@@ -725,7 +809,7 @@ def test_iterate_reaches_completion_and_economics(monkeypatch):
         assert "iterate pass complete" in res.output
         assert PR_URL in res.output
         assert "franky: economics" in res.output
-        logs = list(Path("tasks").glob("*.log"))
+        logs = list((jobs.runs_dir() / "tasks").glob("*.log"))
         assert logs and "economics" in logs[0].read_text()
 
 
@@ -821,7 +905,7 @@ def test_iterate_nonzero_exit_emits_economics_and_writes_log(monkeypatch):
         res = runner.invoke(cli.main, ["iterate", PR_URL])
         assert res.exit_code != 0
         assert "franky: economics" in res.output
-        logs = list(Path("tasks").glob("*.log"))
+        logs = list((jobs.runs_dir() / "tasks").glob("*.log"))
         assert logs and "economics" in logs[0].read_text()
 
 
@@ -1076,17 +1160,28 @@ def test_auth_login_codex_persists_marker_after_success(tmp_path, monkeypatch):
     cfg_path = tmp_path / "config"
     monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
     monkeypatch.setattr(cli, "_codex_auth_image", lambda: "franky:test")
-    monkeypatch.setattr(cli, "codex_auth_login", lambda image: True)
+    monkeypatch.setattr(cli, "codex_auth_login", lambda image, **_kw: True)
     res = CliRunner().invoke(cli.main, ["auth", "login", "codex"])
     assert res.exit_code == 0, res.output
     assert cli.read_config_file(cfg_path)["FRANKY_CODEX_SUBSCRIPTION"] == "1"
+
+
+def test_auth_login_codex_rejects_invalid_auth_volume_override(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "config"
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setenv("FRANKY_CODEX_AUTH_VOLUME", "bad name!")
+    monkeypatch.setattr(cli, "_codex_auth_image", lambda: "franky:test")
+    res = CliRunner().invoke(cli.main, ["auth", "login", "codex"])
+    assert res.exit_code != 0
+    assert "FRANKY_CODEX_AUTH_VOLUME" in res.output
+    assert not cfg_path.exists()
 
 
 def test_auth_login_codex_does_not_persist_marker_on_failure(tmp_path, monkeypatch):
     cfg_path = tmp_path / "config"
     monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
     monkeypatch.setattr(cli, "_codex_auth_image", lambda: "franky:test")
-    monkeypatch.setattr(cli, "codex_auth_login", lambda image: False)
+    monkeypatch.setattr(cli, "codex_auth_login", lambda image, **_kw: False)
     res = CliRunner().invoke(cli.main, ["auth", "login", "codex"])
     assert res.exit_code != 0
     assert not cfg_path.exists()
@@ -1097,7 +1192,7 @@ def test_auth_login_codex_clears_stale_marker_before_failure(tmp_path, monkeypat
     cli.write_config_file(cfg_path, {"FRANKY_CODEX_SUBSCRIPTION": "1"})
     monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
     monkeypatch.setattr(cli, "_codex_auth_image", lambda: "franky:test")
-    monkeypatch.setattr(cli, "codex_auth_login", lambda image: False)
+    monkeypatch.setattr(cli, "codex_auth_login", lambda image, **_kw: False)
     res = CliRunner().invoke(cli.main, ["auth", "login", "codex"])
     assert res.exit_code != 0
     assert "FRANKY_CODEX_SUBSCRIPTION" not in cli.read_config_file(cfg_path)
@@ -1108,16 +1203,26 @@ def test_auth_status_codex_uses_persisted_volume(tmp_path, monkeypatch):
     cli.write_config_file(cfg_path, {"FRANKY_CODEX_SUBSCRIPTION": "1"})
     monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
     monkeypatch.setattr(cli, "_codex_auth_image", lambda: "franky:test")
-    monkeypatch.setattr(cli, "codex_auth_status", lambda image: True)
+    monkeypatch.setattr(cli, "codex_auth_status", lambda image, **_kw: True)
     res = CliRunner().invoke(cli.main, ["auth", "status", "codex"])
     assert res.exit_code == 0
     assert "ready" in res.output
 
 
+def test_auth_status_codex_rejects_invalid_auth_volume_override(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "config"
+    cli.write_config_file(cfg_path, {"FRANKY_CODEX_SUBSCRIPTION": "1"})
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setenv("FRANKY_CODEX_AUTH_VOLUME", "bad name!")
+    res = CliRunner().invoke(cli.main, ["auth", "status", "codex"])
+    assert res.exit_code != 0
+    assert "FRANKY_CODEX_AUTH_VOLUME" in res.output
+
+
 def test_auth_status_codex_requires_enabled_marker(tmp_path, monkeypatch):
     monkeypatch.setenv("FRANKY_CONFIG_FILE", str(tmp_path / "config"))
     monkeypatch.setattr(cli, "_codex_auth_image", lambda: "franky:test")
-    monkeypatch.setattr(cli, "codex_auth_status", lambda image: True)
+    monkeypatch.setattr(cli, "codex_auth_status", lambda image, **_kw: True)
     res = CliRunner().invoke(cli.main, ["auth", "status", "codex"])
     assert res.exit_code != 0
     assert "not enabled" in res.output
@@ -1127,17 +1232,29 @@ def test_auth_logout_codex_removes_marker_after_volume(tmp_path, monkeypatch):
     cfg_path = tmp_path / "config"
     cli.write_config_file(cfg_path, {"FRANKY_CODEX_SUBSCRIPTION": "1", "FRANKY_ENGINE": "codex"})
     monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
-    monkeypatch.setattr(cli, "codex_auth_logout", lambda: True)
+    monkeypatch.setattr(cli, "codex_auth_logout", lambda **_kw: True)
     res = CliRunner().invoke(cli.main, ["auth", "logout", "codex"])
     assert res.exit_code == 0, res.output
     assert cli.read_config_file(cfg_path) == {"FRANKY_ENGINE": "codex"}
+
+
+def test_auth_logout_codex_rejects_invalid_auth_volume_override(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "config"
+    cli.write_config_file(cfg_path, {"FRANKY_CODEX_SUBSCRIPTION": "1"})
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setenv("FRANKY_CODEX_AUTH_VOLUME", "bad name!")
+    res = CliRunner().invoke(cli.main, ["auth", "logout", "codex"])
+    assert res.exit_code != 0
+    assert "FRANKY_CODEX_AUTH_VOLUME" in res.output
+    # Resolution fails BEFORE the marker is cleared - nothing should be mutated on refusal.
+    assert cli.read_config_file(cfg_path).get("FRANKY_CODEX_SUBSCRIPTION") == "1"
 
 
 def test_auth_logout_codex_keeps_marker_cleared_when_volume_removal_fails(tmp_path, monkeypatch):
     cfg_path = tmp_path / "config"
     cli.write_config_file(cfg_path, {"FRANKY_CODEX_SUBSCRIPTION": "1"})
     monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
-    monkeypatch.setattr(cli, "codex_auth_logout", lambda: False)
+    monkeypatch.setattr(cli, "codex_auth_logout", lambda **_kw: False)
     res = CliRunner().invoke(cli.main, ["auth", "logout", "codex"])
     assert res.exit_code != 0
     assert "FRANKY_CODEX_SUBSCRIPTION" not in cli.read_config_file(cfg_path)

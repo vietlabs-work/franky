@@ -145,7 +145,7 @@ def test_codex_subscription_mounts_only_fixed_named_volume():
 
 
 def test_codex_auth_scrub_keeps_only_auth_json_and_has_no_network():
-    argv = build_codex_auth_scrub_argv("franky", require_auth=True)
+    argv = build_codex_auth_scrub_argv("franky", require_auth=True, auth_volume=CODEX_AUTH_VOLUME)
     joined = " ".join(argv)
     assert "--network none" in joined
     assert "auth.json" in joined
@@ -165,7 +165,7 @@ def test_codex_auth_ready_checks_volume_before_scrubbing():
             return subprocess.CompletedProcess(argv, 1, stdout="", stderr="No such volume")
         raise AssertionError("missing volume must fail before docker run")
 
-    assert not codex_auth_ready("franky", runner=runner)
+    assert not codex_auth_ready("franky", runner=runner, auth_volume=CODEX_AUTH_VOLUME)
     assert len(calls) == 1
 
 
@@ -177,7 +177,7 @@ def test_codex_auth_ready_rejects_malformed_json():
             return subprocess.CompletedProcess(argv, 0, stdout="not-json", stderr="")
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-    assert not codex_auth_ready("franky", runner=runner)
+    assert not codex_auth_ready("franky", runner=runner, auth_volume=CODEX_AUTH_VOLUME)
 
 
 def test_codex_auth_ready_rejects_oversized_json():
@@ -190,7 +190,7 @@ def test_codex_auth_ready_rejects_oversized_json():
             )
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-    assert not codex_auth_ready("franky", runner=runner)
+    assert not codex_auth_ready("franky", runner=runner, auth_volume=CODEX_AUTH_VOLUME)
 
 
 def test_codex_auth_status_uses_read_only_volume_and_no_network():
@@ -204,7 +204,7 @@ def test_codex_auth_status_uses_read_only_volume_and_no_network():
             )
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-    assert codex_auth_status("franky", runner=runner)
+    assert codex_auth_status("franky", runner=runner, auth_volume=CODEX_AUTH_VOLUME)
     status_argv = calls[-1]
     assert status_argv[-2:] == ["login", "status"]
     assert "--network" in status_argv and "none" in status_argv
@@ -222,14 +222,66 @@ def test_codex_auth_login_is_device_flow_and_logout_removes_fixed_volume():
             )
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
-    assert codex_auth_login("franky", runner=runner)
+    assert codex_auth_login("franky", runner=runner, auth_volume=CODEX_AUTH_VOLUME)
     login_argv = next(argv for argv in calls if "--device-auth" in argv)
     assert 'cli_auth_credentials_store="file"' in login_argv
     assert "--mount" in login_argv and CODEX_AUTH_VOLUME in " ".join(login_argv)
     assert "--network" not in login_argv  # trusted operator flow needs OpenAI egress
     calls.clear()
-    assert codex_auth_logout(runner=runner)
+    assert codex_auth_logout(runner=runner, auth_volume=CODEX_AUTH_VOLUME)
     assert calls == [["docker", "volume", "rm", CODEX_AUTH_VOLUME]]
+
+
+def test_codex_auth_login_status_logout_honor_custom_auth_volume():
+    # FRANKY_CODEX_AUTH_VOLUME (resolved by the caller) must reach every docker call, not just
+    # the default - two Franky instances must never touch each other's volume.
+    custom = "franky-team-codex-auth"
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        if "--entrypoint" in argv and argv[argv.index("--entrypoint") + 1] == "cat":
+            return subprocess.CompletedProcess(
+                argv, 0, stdout='{"access_token":"subscription-token"}', stderr=""
+            )
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    assert codex_auth_login("franky", runner=runner, auth_volume=custom)
+    assert calls[0] == ["docker", "volume", "create", custom]
+    login_argv = next(argv for argv in calls if "--device-auth" in argv)
+    assert custom in " ".join(login_argv)
+    assert CODEX_AUTH_VOLUME not in " ".join(login_argv)
+
+    calls.clear()
+    assert codex_auth_status("franky", runner=runner, auth_volume=custom)
+    assert custom in " ".join(calls[-1])
+
+    calls.clear()
+    assert codex_auth_logout(runner=runner, auth_volume=custom)
+    assert calls == [["docker", "volume", "rm", custom]]
+
+
+def test_run_in_container_codex_auth_gate_uses_configured_auth_volume():
+    # The pre-run scrub/read gate must key off cfg.auth_volume (resolved from
+    # FRANKY_CODEX_AUTH_VOLUME), not the hardcoded CODEX_AUTH_VOLUME default.
+    custom = "franky-team-codex-auth"
+    cfg = Config(
+        engine=CodexEngine(),
+        allowed_repos=["me/repo"],
+        passthrough_env={"GH_TOKEN": "ghp_fake"},
+        auth_volume=custom,
+    )
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        if argv[:3] == ["docker", "volume", "inspect"]:
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="no such volume")
+        raise AssertionError(argv)
+
+    code, out = run_in_container(cfg, ["codex", "exec"], runner=runner, env={})
+    assert code != 0
+    assert calls == [["docker", "volume", "inspect", custom]]
 
 
 def test_run_in_container_fails_closed_when_codex_auth_scrub_fails():

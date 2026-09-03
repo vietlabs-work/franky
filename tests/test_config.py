@@ -5,6 +5,7 @@ from franky.config import Config, load_config, redact, repo_allowed, validate_al
 from franky.engine import (
     CODEX_AUTH_VOLUME,
     CODEX_SUBSCRIPTION_VAR,
+    FRANKY_CODEX_AUTH_VOLUME_VAR,
     ClaudeEngine,
     CodexEngine,
     OpenCodeEngine,
@@ -146,6 +147,24 @@ def test_load_config_codex_api_key_takes_precedence_over_subscription():
     cfg = load_config("codex", env)
     assert cfg.auth_volume is None
     assert cfg.passthrough_env["CODEX_API_KEY"] == "sk-codex-fake"
+
+
+def test_load_config_codex_subscription_honors_auth_volume_override():
+    # Two Franky instances on one machine each point FRANKY_CODEX_AUTH_VOLUME at their own
+    # volume so `auth status`/`login`/`logout` never touch the other instance's live volume.
+    env = _env(
+        **{CODEX_SUBSCRIPTION_VAR: "1", FRANKY_CODEX_AUTH_VOLUME_VAR: "franky-team-codex-auth"}
+    )
+    cfg = load_config("codex", env)
+    assert cfg.auth_volume == "franky-team-codex-auth"
+
+
+def test_load_config_codex_subscription_rejects_invalid_auth_volume_override():
+    # Fail closed on an override Docker's own volume-name rule would reject, rather than
+    # reaching `docker volume create` with a name the daemon refuses.
+    env = _env(**{CODEX_SUBSCRIPTION_VAR: "1", FRANKY_CODEX_AUTH_VOLUME_VAR: "bad name!"})
+    with pytest.raises(ConfigError, match="FRANKY_CODEX_AUTH_VOLUME"):
+        load_config("codex", env)
 
 
 def test_fail_closed_allowlist_unset():

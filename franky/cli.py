@@ -15,6 +15,7 @@ import json
 import os
 import re
 import secrets
+import stat
 import subprocess
 import sys
 import tarfile
@@ -50,6 +51,7 @@ from .engine import (
     CODEX_SUBSCRIPTION_VAR,
     ENGINES,
     PI_PROVIDER_VARS,
+    codex_auth_volume,
     opencode_provider,
     resolve_engine,
 )
@@ -121,7 +123,6 @@ from .userconfig import (
 # this CLI is also reachable directly, not only via the bridge).
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
 
-TASKS_DIR = Path("tasks")
 FRANKY_VERBOSE_VAR = "FRANKY_VERBOSE"
 # `franky gh` subprocess watchdog. A default cap honors the never-hang guarantee for the
 # autonomous agent caller (a stalled `gh api` or a `gh run watch` must not wedge the caller
@@ -266,7 +267,9 @@ def _emit_result(
         click.echo(pr_url)
     elif status == "no_pr":
         click.echo(
-            "franky: no PR URL found in agent output - see the redacted log in tasks/", err=True
+            "franky: no PR URL found in agent output - see the redacted log "
+            f"({result.get('log_path')})",
+            err=True,
         )
     elif status == "iterate_complete" and not quiet:
         # iterate opens no new PR; report a labeled completion line (never a bare success URL)
@@ -476,7 +479,7 @@ def build(
                 progress=progress,
                 timeout=max_duration,
             )
-            _write_log(output, secrets)
+            plan_log_path = _write_log(output, secrets, env=os.environ)
             if not quiet:
                 click.echo("franky: --- plan (read-only, nothing written yet) ---", err=True)
                 click.echo(output, err=True)
@@ -490,7 +493,8 @@ def build(
                 )
             if code != 0:
                 raise FrankyError(
-                    f"planning pass exited non-zero ({code}) - see the redacted log in tasks/",
+                    f"planning pass exited non-zero ({code}) - see the redacted log "
+                    f"({plan_log_path})",
                     code=EXIT_AGENT,
                     kind="agent_error",
                 )
@@ -748,7 +752,7 @@ def iterate(
         econ = _economics_line(usage, duration, secrets)
         if not as_json:
             click.echo(econ, err=True)
-        log_path = _write_log(output, secrets, footer=econ)
+        log_path = _write_log(output, secrets, footer=econ, run_id=job_id, env=os.environ)
 
         # iterate produces NO new PR; the existing PR gains commits. The PR URL is reported as
         # the input PR (not a fresh success artifact) - exit 0 means the pass ran, not that a
@@ -960,7 +964,7 @@ def review_pr(
         econ = _economics_line(usage, duration, secrets)
         if not as_json:
             click.echo(econ, err=True)
-        log_path = _write_log(output, secrets, footer=econ)
+        log_path = _write_log(output, secrets, footer=econ, run_id=job_id, env=os.environ)
 
         review_url: str | None = None
         review_id: int | None = None
@@ -980,7 +984,8 @@ def review_pr(
             if parsed is None:
                 status = "no_findings"
                 reason = (
-                    "agent produced no parseable review findings - see the redacted log in tasks/"
+                    f"agent produced no parseable review findings - see the redacted log "
+                    f"({log_path})"
                 )
                 exit_code = EXIT_AGENT
             else:
@@ -1190,7 +1195,7 @@ def plan(
         econ = _economics_line(usage, duration, secrets)
         if not as_json:
             click.echo(econ, err=True)
-        _write_log(output, secrets, footer=econ)
+        decompose_log_path = _write_log(output, secrets, footer=econ, env=os.environ)
 
         # Timeout first (124 is nonzero) -> dedicated timeout contract, before generic agent.
         if code == CONTAINER_TIMEOUT_CODE:
@@ -1201,7 +1206,7 @@ def plan(
             )
         if code != 0:
             raise FrankyError(
-                f"plan pass exited {code} - see the redacted log in tasks/",
+                f"plan pass exited {code} - see the redacted log ({decompose_log_path})",
                 code=EXIT_AGENT,
                 kind="agent_error",
             )
@@ -1216,7 +1221,7 @@ def plan(
         if parsed is None:
             # No partial object - route through the shared error envelope (exit 7).
             raise FrankyError(
-                "agent produced no parseable plan - see the redacted log in tasks/",
+                f"agent produced no parseable plan - see the redacted log ({decompose_log_path})",
                 code=EXIT_AGENT,
                 kind="no_plan",
             )
@@ -1476,7 +1481,9 @@ def cfg_secrets_safe() -> list[str]:
     when load_config raised before cfg was assigned, and on the host-side JIRA fetch path
     which never reaches passthrough_env. Falls back gracefully (empty list) when the vars
     are absent - load_config/parse_task/fetch_jira_issue messages are already value-free,
-    so this is a defensive backstop.
+    so this is a defensive backstop. One carve-out: a `codex_auth_volume` refusal message
+    names the invalid FRANKY_CODEX_AUTH_VOLUME value verbatim - that value is a volume NAME
+    (policy, like an allowlist entry), never a credential, so it is deliberately not redacted.
     """
     return [v for v in (os.environ.get(JIRA_API_TOKEN_VAR), os.environ.get(JIRA_EMAIL_VAR)) if v]
 
@@ -1657,7 +1664,7 @@ def _build_once(
     econ = _economics_line(usage, duration, secrets)
     if not as_json:
         click.echo(econ, err=True)
-    log_path = _write_log(output, secrets, footer=econ)
+    log_path = _write_log(output, secrets, footer=econ, run_id=job_id, env=env)
 
     # Scope PR-URL detection to the task's own repo so a hostile issue body cannot make Franky
     # report a PR URL for some other (attacker) repo. Timeout is checked FIRST: a timed-out run
@@ -1752,7 +1759,7 @@ def _diagnose(
     econ = _economics_line(usage, duration, secrets)
     if not as_json:
         click.echo(econ, err=True)
-    log_path = _write_log(output, secrets, footer=econ)
+    log_path = _write_log(output, secrets, footer=econ, run_id=job_id, env=env)
 
     def _finish(status: str, exit_code: int) -> None:
         _record_run_end(
@@ -1804,20 +1811,50 @@ def _format_diagnosis(d: dict) -> list[str]:
     return lines
 
 
-def _write_log(output: str, secrets: list[str], footer: str | None = None) -> Path:
-    """Write the REDACTED agent output to tasks/<timestamp>.log and return its Path.
+def _tasks_dir(env: Mapping[str, str] | None = None) -> Path:
+    """Redacted-transcript directory, under the same overridable root as the job registry
+    (FRANKY_RUNS_DIR) - so a redeployed/CWD-swapped caller (e.g. two Franky instances on one
+    machine) never orphans its logs the way a CWD-relative tasks/ dir would."""
+    return jobs.runs_dir(env) / "tasks"
 
-    When `footer` is given, it is appended after the transcript (also redacted) separated
-    by a newline so the economics summary lands in the same timestamped file. The returned
-    Path is surfaced as `log_path` in the JSON result.
+
+def _write_log(
+    output: str,
+    secrets: list[str],
+    footer: str | None = None,
+    *,
+    run_id: str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> Path:
+    """Write the REDACTED agent output under `_tasks_dir(env)` and return its absolute Path.
+
+    The file name is `<timestamp>-<suffix>.log`: `suffix` is the caller's run id when it has
+    one (ties the transcript to its job record), else the current microsecond, so two logs
+    started in the same second never clobber each other. When `footer` is given, it is
+    appended after the transcript (also redacted) separated by a newline so the economics
+    summary lands in the same file. The returned Path is surfaced as `log_path` in the JSON
+    result and stored (absolute) in the run record.
+
+    The runs dir and the `tasks` subdir are created 0700, and the transcript file 0600 -
+    mirroring `jobs.write_record` - because the transcript can carry redacted-but-still
+    task-shaped content. An unwritable runs dir surfaces as a clean ConfigError naming the
+    path, not a raw traceback.
     """
-    TASKS_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    directory = _tasks_dir(env)
+    now = datetime.now()
+    stamp = now.strftime("%Y%m%d-%H%M%S")
+    suffix = run_id or now.strftime("%f")
     body = redact(output, secrets) + "\n"
     if footer is not None:
         body += redact(footer, secrets) + "\n"
-    path = TASKS_DIR / f"{stamp}.log"
-    path.write_text(body, encoding="utf-8")
+    path = (directory / f"{stamp}-{suffix}.log").resolve()
+    try:
+        directory.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory.mkdir(mode=0o700, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+        path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+    except OSError as exc:
+        raise ConfigError(f"could not write the run transcript under {directory}") from exc
     return path
 
 
@@ -2241,7 +2278,8 @@ def job_status(ctx: click.Context, job_id: str, as_json: bool) -> None:
 @click.argument("job_id")
 @click.pass_context
 def job_logs(ctx: click.Context, job_id: str) -> None:
-    """Print a run's redacted transcript (the tasks/<ts>.log written when the pass finishes).
+    """Print a run's redacted transcript (the FRANKY_RUNS_DIR/tasks/<ts>-<run_id>.log written
+    when the pass finishes).
 
     The transcript is written at the END of a run, so a still-running job has no log yet - that
     is reported cleanly, not as a file-not-found trace. For a live view use `franky build -v`.
@@ -2478,7 +2516,7 @@ def job_diagnose(
                     "diagnose pass exceeded its time budget", code=EXIT_TIMEOUT, kind="timeout"
                 )
             raise FrankyError(
-                "agent produced no parseable diagnosis - see the redacted log in tasks/",
+                "agent produced no parseable diagnosis - see the redacted log (log_path)",
                 code=EXIT_AGENT,
                 kind="no_diagnosis",
             )
@@ -2713,7 +2751,7 @@ def job_replay(
         econ = _economics_line(usage, duration, secrets)
         if not as_json:
             click.echo(econ, err=True)
-        log_path = _write_log(output, secrets, footer=econ)
+        log_path = _write_log(output, secrets, footer=econ, run_id=new_id, env=os.environ)
 
         pr_url = None
         if code == CONTAINER_TIMEOUT_CODE:
@@ -2770,12 +2808,12 @@ def job_replay(
             click.echo(pr_url)
         elif status == "replay_complete" and not quiet:
             click.echo(
-                f"franky: replay of {job_id} complete (job {new_id}) - see the log in tasks/",
+                f"franky: replay of {job_id} complete (job {new_id}) - see `franky job logs {new_id}`",
                 err=True,
             )
         elif status == "no_pr":
             click.echo(
-                "franky: no PR URL found in agent output - see the redacted log in tasks/",
+                f"franky: no PR URL found in agent output - see the redacted log ({log_path})",
                 err=True,
             )
         ctx.exit(exit_code)
@@ -2986,7 +3024,7 @@ def job_resume(
         econ = _economics_line(usage, duration, secrets)
         if not as_json:
             click.echo(econ, err=True)
-        log_path = _write_log(output, secrets, footer=econ)
+        log_path = _write_log(output, secrets, footer=econ, run_id=new_id, env=os.environ)
 
         # Classify (reusing build statuses). Timeout first (124 is nonzero); then nonzero as
         # agent_error - note the entrypoint's exit 75 on a FAILED restore surfaces here as
@@ -3038,7 +3076,7 @@ def job_resume(
             click.echo(pr_url)
         elif status == "no_pr":
             click.echo(
-                "franky: no PR URL found in agent output - see the redacted log in tasks/",
+                f"franky: no PR URL found in agent output - see the redacted log ({log_path})",
                 err=True,
             )
         ctx.exit(exit_code)
@@ -3269,13 +3307,26 @@ def auth_group() -> None:
     """Manage persistent engine subscription authentication."""
 
 
+def _resolve_codex_auth_volume() -> str:
+    """Resolve FRANKY_CODEX_AUTH_VOLUME from the same env the run paths use (process env,
+    then the config file) so `auth login/status/logout` honour a config-file override the
+    same way the container mount does."""
+    try:
+        env = dict(os.environ)
+        load_config_file(env)
+        return codex_auth_volume(env)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
 @auth_group.command("login")
 @click.argument("engine", type=click.Choice(["codex"]))
 def auth_login(engine: str) -> None:
     """Log in once from a browserless container using a code opened elsewhere."""
     image = _codex_auth_image()
+    auth_volume = _resolve_codex_auth_volume()
     _clear_codex_auth_marker()
-    if not codex_auth_login(image):
+    if not codex_auth_login(image, auth_volume=auth_volume):
         raise click.ClickException("Codex subscription login failed")
     path = config_file_path(dict(os.environ))
     try:
@@ -3291,7 +3342,8 @@ def auth_status(engine: str) -> None:
     """Check that the persistent Codex credential is present and validly shaped."""
     if not _codex_auth_marker_enabled():
         raise click.ClickException("Codex subscription login is not enabled")
-    if not codex_auth_status(_codex_auth_image()):
+    auth_volume = _resolve_codex_auth_volume()
+    if not codex_auth_status(_codex_auth_image(), auth_volume=auth_volume):
         raise click.ClickException("Codex subscription login is not ready")
     click.echo("Codex subscription login is ready.")
 
@@ -3300,8 +3352,9 @@ def auth_status(engine: str) -> None:
 @click.argument("engine", type=click.Choice(["codex"]))
 def auth_logout(engine: str) -> None:
     """Delete the persistent Codex credential volume and disable subscription auth."""
+    auth_volume = _resolve_codex_auth_volume()
     _clear_codex_auth_marker()
-    if not codex_auth_logout():
+    if not codex_auth_logout(auth_volume=auth_volume):
         raise click.ClickException(
             "Codex subscription disabled, but the credential volume could not be removed"
         )
