@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-09-04
+
 ### Added
 - `franky review-pr <pr_url> [instructions]` gets Franky's independent opinion on an existing
   pull request in the same hardened, egress-controlled container as `build`/`iterate`: the
