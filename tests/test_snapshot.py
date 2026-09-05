@@ -8,7 +8,11 @@ values redacted, git object content decompress-scanned, and a fail-closed refusa
 """
 
 import subprocess
+import sys
 import tarfile
+import tracemalloc
+
+import pytest
 
 from franky import snapshot
 
@@ -130,6 +134,29 @@ def test_scrub_workspace_never_raises_on_empty_tree(tmp_path):
     snapshot.scrub_workspace(tmp_path, [])
 
 
+def test_scrub_preserves_invalid_utf8_in_git_config(tmp_path):
+    git_dir = tmp_path / ".git"
+    git_dir.mkdir()
+    config = git_dir / "config"
+    contents = b"# original bytes: \xff\xfe\n[core]\n\tbare = false\n"
+    config.write_bytes(contents)
+    snapshot.scrub_workspace(tmp_path, [])
+    assert config.read_bytes() == contents
+
+
+def test_scrub_clean_files_avoids_temporary_copies(tmp_path, monkeypatch):
+    path = tmp_path / "clean.bin"
+    contents = b"\xff\x00" * 65536
+    path.write_bytes(contents)
+
+    def refuse_tempfile(*args, **kwargs):
+        pytest.fail("clean files must not create temporary copies")
+
+    monkeypatch.setattr(snapshot.tempfile, "TemporaryFile", refuse_tempfile)
+    snapshot.scrub_workspace(tmp_path, [SECRET, "another-secret"])
+    assert path.read_bytes() == contents
+
+
 # ---------------------------------------------------------------------------
 # verify_no_secrets (fail-closed)
 # ---------------------------------------------------------------------------
@@ -139,6 +166,9 @@ def _clean_git_runner(stdout=b""):
     """A runner that satisfies the `git cat-file` verification with the given (secret-free) stdout."""
 
     def runner(argv, **kwargs):
+        if "stdout" in kwargs:
+            kwargs["stdout"].write(stdout)
+            return subprocess.CompletedProcess(argv, 0)
         return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr=b"")
 
     return runner
@@ -164,6 +194,17 @@ def test_verify_flags_fresh_token_via_scan_for_secrets(tmp_path):
     (tmp_path / "note.txt").write_text(f"minted {fresh}\n", encoding="utf-8")
     findings = snapshot.verify_no_secrets(tmp_path, [], runner=_clean_git_runner())
     assert findings
+
+
+@pytest.mark.parametrize("directory", [".git", ".git/modules/libfoo"])
+def test_verify_refuses_fresh_token_in_git_config(tmp_path, directory):
+    git_dir = tmp_path / directory
+    git_dir.mkdir(parents=True)
+    (git_dir / "config").write_text(
+        "[http]\n\textraHeader = Authorization: Bearer ghp_" + "a" * 36 + "\n"
+    )
+    findings = snapshot.verify_no_secrets(tmp_path, [], runner=_clean_git_runner())
+    assert any("credential pattern" in finding for finding in findings)
 
 
 def test_verify_flags_known_value_in_git_object_content(tmp_path):
@@ -199,6 +240,9 @@ def test_verify_scans_submodule_object_store(tmp_path):
         if "--git-dir" in argv:
             gd = argv[argv.index("--git-dir") + 1]
             if "modules" in gd:
+                if "stdout" in kwargs:
+                    kwargs["stdout"].write(f"blob {SECRET}".encode("utf-8"))
+                    return subprocess.CompletedProcess(argv, 0)
                 return subprocess.CompletedProcess(
                     argv, 0, stdout=f"blob {SECRET}".encode("utf-8"), stderr=b""
                 )
@@ -276,6 +320,159 @@ def test_finalize_snapshot_clean_writes_secret_free_tar(tmp_path):
                 # Deterministic host-free metadata.
                 assert m.mode == 0o600 and m.mtime == 0 and m.uid == 0 and m.uname == ""
     assert not src.exists()  # cleaned up
+
+
+def test_large_snapshot_has_bounded_memory_and_redacts_chunk_boundaries(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    path = src / "large.bin"
+    block = b"x" * (64 * 1024 - 1) + b"\n"
+    with path.open("wb") as stream:
+        for _ in range(256):
+            stream.write(block)
+        stream.write(b"\xff" + b"a" * 65530 + b"long-secret-value\nshort-secret\n")
+    dest = tmp_path / "snapshot.tar.gz"
+    tracemalloc.start()
+    try:
+        result = snapshot.finalize_snapshot(
+            src, dest, ["long-secret", "long-secret-value", "short-secret"]
+        )
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert result == str(dest)
+    assert peak < 8 * 1024 * 1024
+    with tarfile.open(dest) as tar:
+        with tar.extractfile("large.bin") as stream:
+            stream.seek(-100, 2)
+            assert stream.read().endswith(b"[REDACTED]\n[REDACTED]\n")
+
+
+def test_verify_git_output_streams_to_private_file_and_checks_chunk_boundaries(tmp_path):
+    (tmp_path / ".git").mkdir()
+    outputs = []
+
+    def runner(argv, **kwargs):
+        output = kwargs.get("stdout")
+        assert output is not None
+        assert kwargs["timeout"] == 20.0
+        outputs.append(output)
+        output.write(b"a" * 65530 + SECRET.encode())
+        return subprocess.CompletedProcess(argv, 0)
+
+    findings = snapshot.verify_no_secrets(tmp_path, [SECRET], runner=runner)
+    assert any("secret value in git object content" in finding for finding in findings)
+    assert outputs and all(output.closed for output in outputs)
+
+
+def test_verify_git_launcher_sets_file_limit_before_exec(tmp_path, monkeypatch):
+    import os
+    import resource
+
+    (tmp_path / ".git").mkdir()
+    actions = []
+
+    def runner(argv, **kwargs):
+        assert argv[:2] == [sys.executable, "-c"]
+        assert "preexec_fn" not in kwargs
+        with monkeypatch.context() as patch:
+            patch.setattr(sys, "argv", ["-c", *argv[3:]])
+            patch.setattr(resource, "setrlimit", lambda *args: actions.append(("limit", args)))
+            patch.setattr(os, "execvp", lambda *args: actions.append(("exec", args)))
+            exec(argv[2])
+        return subprocess.CompletedProcess(argv, 0)
+
+    assert snapshot.verify_no_secrets(tmp_path, [], runner=runner) == []
+    assert actions[0] == (
+        "limit",
+        (resource.RLIMIT_FSIZE, (snapshot._MAX_TREE_BYTES, snapshot._MAX_TREE_BYTES)),
+    )
+    assert actions[1] == (
+        "exec",
+        (
+            "git",
+            [
+                "git",
+                "--git-dir",
+                str(tmp_path / ".git"),
+                "cat-file",
+                "--batch-all-objects",
+                "--unordered",
+                "--batch",
+            ],
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [b"GH_TOKEN\n \n=\n \nvalue\n", b"z" * (4 * 1024 * 1024 + 1)],
+    ids=["multiline-assignment", "oversized-line"],
+)
+def test_verify_refuses_multiline_credentials_or_unbounded_pattern_lines(tmp_path, contents):
+    (tmp_path / "input").write_bytes(contents)
+    assert snapshot.verify_no_secrets(tmp_path, [])
+
+
+def test_verify_unreadable_file_refuses_snapshot(tmp_path, monkeypatch):
+    path = tmp_path / "input"
+    path.write_bytes(b"contents")
+    original = type(path).open
+
+    def unreadable(self, *args, **kwargs):
+        if self == path:
+            raise PermissionError("unreadable")
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(type(path), "open", unreadable)
+    assert snapshot.verify_no_secrets(tmp_path, [])
+
+
+@pytest.mark.parametrize("limit", ["_MAX_FILE_BYTES", "_MAX_TREE_BYTES", "_MAX_ENTRIES"])
+def test_snapshot_refuses_oversized_workspace_and_cleans_up(tmp_path, monkeypatch, limit):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "a").write_bytes(b"abcd\n")
+    (src / "b").write_bytes(b"abcd\n")
+    monkeypatch.setattr(snapshot, limit, 1)
+    dest = tmp_path / "snapshot.tar.gz"
+    assert snapshot.finalize_snapshot(src, dest, []) is None
+    assert not src.exists() and not dest.exists()
+
+
+def test_snapshot_never_follows_directory_or_file_symlinks(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret_file = outside / "secret"
+    secret_file.write_text(SECRET)
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "linked-dir").symlink_to(outside, target_is_directory=True)
+    (src / "linked-file").symlink_to(secret_file)
+    (src / "clean").write_text("safe\n")
+    dest = tmp_path / "snapshot.tar.gz"
+    assert snapshot.finalize_snapshot(src, dest, [SECRET]) == str(dest)
+    with tarfile.open(dest) as tar:
+        assert tar.getnames() == ["clean"]
+    assert secret_file.read_text() == SECRET
+
+
+def test_verify_large_git_output_uses_bounded_memory(tmp_path):
+    (tmp_path / ".git").mkdir()
+
+    def runner(argv, **kwargs):
+        block = b"x" * 65536
+        for _ in range(512):
+            kwargs["stdout"].write(block)
+        return subprocess.CompletedProcess(argv, 0)
+
+    tracemalloc.start()
+    try:
+        assert snapshot.verify_no_secrets(tmp_path, [SECRET], runner=runner) == []
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 2 * 1024 * 1024
 
 
 # ---------------------------------------------------------------------------

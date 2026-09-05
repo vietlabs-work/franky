@@ -7,7 +7,6 @@ from franky.container import (
     FRANKY_PROXY_IMAGE_VAR,
     GHCR_REPO_VAR,
     STEER_FILE,
-    _HOME_TMPFS_SIZE,
     build_docker_argv,
     build_codex_auth_scrub_argv,
     build_network_argv,
@@ -19,7 +18,7 @@ from franky.container import (
     ensure_image_available,
     image_exists,
     resolve_image,
-    run_in_container,
+    run_in_container as _run_in_container,
     codex_auth_ready,
     codex_auth_status,
     codex_auth_login,
@@ -32,6 +31,17 @@ SECRET = "sk-or-very-secret-9999"
 PR_URL = "https://github.com/me/repo/pull/3"
 
 NOOP_SLEEP = lambda *_a, **_k: None  # noqa: E731 - tiny test helper
+
+
+def run_in_container(*args, **kwargs):
+    """Materialize small fixture transcripts for historical output assertions."""
+    from franky.transcript import Transcript
+
+    code, output = _run_in_container(*args, **kwargs)
+    if isinstance(output, Transcript):
+        with output:
+            output = "".join(output.chunks())
+    return code, output
 
 
 def _cfg():
@@ -84,14 +94,13 @@ def test_build_docker_argv_hardening_flags():
     assert "--cap-drop=ALL" in argv
     assert "--read-only" in argv
     assert "--rm" in argv
-    # /work and HOME are both writable tmpfs, owned by the non-root run uid so git/gh work
-    # under --read-only. (Verified against the real image: bare /work:exec is root-owned and
-    # a non-root agent cannot write to it; uid= fixes that.)
-    tmpfs_specs = [argv[i + 1] for i, t in enumerate(argv) if t == "--tmpfs"]
-    work = next(s for s in tmpfs_specs if s.startswith("/work:"))
-    home = next(s for s in tmpfs_specs if s.startswith("/home/franky:"))
-    assert "exec" in work and "uid=1001" in work and "gid=1001" in work
-    assert "exec" in home and "uid=1001" in home and "gid=1001" in home
+    # Anonymous volumes keep build files off RAM and never share a bot's workspace.
+    mounts = [argv[i + 1] for i, t in enumerate(argv) if t == "--mount"]
+    assert mounts == [
+        "type=volume,dst=/work",
+        "type=volume,dst=/home/franky",
+        "type=volume,dst=/tmp",
+    ]
 
 
 def test_build_docker_argv_dind_relaxations():
@@ -109,27 +118,22 @@ def test_build_docker_argv_dind_relaxations():
     # slirp4netns tap device for the nested daemon's network.
     assert "--device" in argv
     assert "/dev/net/tun" in argv
-    # Raised limits: dockerd+containerd+nested procs need headroom; tmpfs image storage is RAM,
-    # capped with no swap blow-up.
+    # Two jobs fit within a 4.25 GiB container budget, including their proxies.
     assert "--pids-limit=2048" in argv
-    assert "--memory=8g" in argv
-    assert "--memory-swap=8g" in argv
-    # HOME tmpfs is size-capped (holds the rootless docker data root) so a huge pull ENOSPCs
-    # before the --memory cap OOM-kills dockerd. The XDG runtime dir holds docker.sock.
+    assert "--memory=2048m" in argv
+    assert "--memory-swap=2048m" in argv
+    assert "--log-driver=none" in argv
     tmpfs_specs = [argv[i + 1] for i, t in enumerate(argv) if t == "--tmpfs"]
-    home = next(s for s in tmpfs_specs if s.startswith("/home/franky:"))
-    assert f"size={_HOME_TMPFS_SIZE}" in home
     assert any(s.startswith("/run/user/1001:") and "uid=1001" in s for s in tmpfs_specs)
-    # rootless dockerd + rootlesskit also write under /run and /tmp (bare tmpfs).
-    assert "/run:exec" in tmpfs_specs
-    assert "/tmp:exec" in tmpfs_specs
+    assert all("size=" in s for s in tmpfs_specs)
+    assert "FRANKY_DISK_MB=8192" in argv
 
 
 def test_build_docker_argv_no_mounts_or_socket():
     argv = build_docker_argv("franky", {"GH_TOKEN": "x"}, ["pi"])
     joined = " ".join(argv)
     assert "-v" not in argv
-    assert "--mount" not in argv
+    assert "type=bind" not in joined
     assert "docker.sock" not in joined
     assert "/var/run/docker.sock" not in joined
 
@@ -138,8 +142,10 @@ def test_codex_subscription_mounts_only_fixed_named_volume():
     argv = build_docker_argv(
         "franky", {"GH_TOKEN": "x"}, ["codex", "exec"], auth_volume=CODEX_AUTH_VOLUME
     )
-    mount = argv[argv.index("--mount") + 1]
-    assert mount == f"type=volume,src={CODEX_AUTH_VOLUME},dst={CODEX_AUTH_HOME}"
+    named_mounts = [
+        argv[i + 1] for i, t in enumerate(argv) if t == "--mount" and "src=" in argv[i + 1]
+    ]
+    assert named_mounts == [f"type=volume,src={CODEX_AUTH_VOLUME},dst={CODEX_AUTH_HOME}"]
     assert "type=bind" not in " ".join(argv)
     assert "docker.sock" not in " ".join(argv)
 
@@ -358,7 +364,7 @@ def test_build_docker_argv_only_passthrough_env_as_e_flags():
     passthrough = {"GH_TOKEN": "x", "OPENROUTER_API_KEY": "y"}
     argv = build_docker_argv("franky", passthrough, ["pi"])
     e_values = [argv[i + 1] for i, t in enumerate(argv) if t == "-e"]
-    assert sorted(e_values) == ["GH_TOKEN", "OPENROUTER_API_KEY"]
+    assert sorted(e_values) == ["FRANKY_DISK_MB=8192", "GH_TOKEN", "OPENROUTER_API_KEY"]
     # only the var NAME appears, never the value
     assert "x" not in argv
     assert "y" not in argv
@@ -400,7 +406,7 @@ def test_opencode_config_emits_only_name_only_selected_credentials():
     cfg = load_config("opencode", secret_values)
     argv = build_docker_argv("franky", cfg.passthrough_env, ["opencode", "run"])
     e_values = [argv[i + 1] for i, token in enumerate(argv) if token == "-e"]
-    assert sorted(e_values) == ["GH_TOKEN", "OPENROUTER_API_KEY"]
+    assert sorted(e_values) == ["FRANKY_DISK_MB=8192", "GH_TOKEN", "OPENROUTER_API_KEY"]
     assert all(value not in argv for value in secret_values.values())
 
 
@@ -556,13 +562,15 @@ def test_build_proxy_argv_shape_and_hardening():
     assert "--read-only" in argv
     assert "--security-opt=no-new-privileges" in argv
     assert "--rm" in argv
-    assert "--memory=1g" in argv
+    assert "--memory=128m" in argv
+    assert "--memory-swap=128m" in argv
+    assert "--ulimit=nofile=4096:4096" in argv
     # squid's writable tmpfs dirs, pinned to squid's `proxy` uid/gid (13) so it can write
     # them under --read-only (a bare --tmpfs mounts root-owned; squid crashes otherwise).
     tmpfs_specs = [argv[i + 1] for i, t in enumerate(argv) if t == "--tmpfs"]
-    assert "/run:exec,uid=13,gid=13" in tmpfs_specs
-    assert "/var/log/squid:uid=13,gid=13" in tmpfs_specs
-    assert "/var/spool/squid:uid=13,gid=13" in tmpfs_specs
+    assert "/run:exec,uid=13,gid=13,size=16m" in tmpfs_specs
+    assert "/var/log/squid:uid=13,gid=13,size=1m" in tmpfs_specs
+    assert "/var/spool/squid:uid=13,gid=13,size=1m" in tmpfs_specs
     # allowlist passed BY VALUE (joined domains appear in the argv), image last
     assert "FRANKY_ALLOWED_DOMAINS=github.com,api.anthropic.com" in argv
     assert argv[-1] == "franky-proxy"
@@ -1011,6 +1019,45 @@ def test_run_in_container_streaming_accumulates_output():
     assert out == "event one\nevent two\n"
 
 
+def test_quiet_run_spools_secret_across_byte_chunks_before_progress(tmp_path):
+    import io
+    from franky.transcript import Transcript
+
+    secret = "secret\nacross-chunks"
+    cfg = _cfg()
+    cfg.passthrough_env["OPENROUTER_API_KEY"] = secret
+    runner, _ = _orchestration_runner(lambda argv, **kwargs: None)
+    proc = _FakePopen([])
+    proc.stdout = io.BytesIO(("before " + secret + " after\n").encode())
+    code, output = _run_in_container(
+        cfg, ["pi"], runner=runner, popen=lambda *a, **k: proc, sleeper=NOOP_SLEEP, env={}
+    )
+    assert code == 0
+    assert isinstance(output, Transcript)
+    with output:
+        output.persist(tmp_path / "transcript")
+        assert "".join(output.chunks()) == "before ***REDACTED*** after\n"
+
+
+def test_stream_timeout_keeps_redacted_partial_output():
+    runner, _ = _orchestration_runner(lambda argv, **kwargs: None)
+    code, output = _run_in_container(
+        _cfg(),
+        ["pi"],
+        runner=runner,
+        popen=_fake_popen_factory([f"partial {SECRET}\n"]),
+        timeout=0,
+        sleeper=NOOP_SLEEP,
+        env={},
+    )
+    with output:
+        text = "".join(output.chunks())
+    assert code == 124
+    assert "partial ***REDACTED***" in text
+    assert "container timed out" in text
+    assert SECRET not in text
+
+
 def test_run_in_container_streaming_redacts_before_progress():
     """The progress callback must receive per-line redacted output (never the raw secret)."""
     lines = [f"token {SECRET}\n"]
@@ -1436,10 +1483,10 @@ def test_build_docker_argv_resume_wait_adds_env_and_keeps_hardening():
     assert "--security-opt=systempaths=unconfined" in argv
     assert "--device" in argv and "/dev/net/tun" in argv
     assert "--pids-limit=2048" in argv
-    assert "--memory=8g" in argv and "--memory-swap=8g" in argv
+    assert "--memory=2048m" in argv and "--memory-swap=2048m" in argv
     # No host bind mount / no docker socket even in resume mode.
     joined = " ".join(argv)
-    assert "-v" not in argv and "--mount" not in argv
+    assert "-v" not in argv and "type=bind" not in joined
     assert "docker.sock" not in joined
 
 

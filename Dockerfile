@@ -102,6 +102,8 @@ RUN npm install -g \
 # file-capability model (what Alpine's docker:dind-rootless ships, mode 755 + cap_setuid=ep)
 # works. So drop the setuid bit and grant the exact file caps - matching the proven Alpine setup.
 RUN useradd --uid 1001 --create-home --shell /bin/bash franky \
+    && mkdir -p /work \
+    && chown 1001:1001 /work \
     && printf 'franky:100000:65536\n' > /etc/subuid \
     && printf 'franky:100000:65536\n' > /etc/subgid \
     && setcap cap_setuid+ep /usr/bin/newuidmap \

@@ -453,10 +453,14 @@ def export_bundle(record: dict, dest: Path) -> dict:
         log_path = record.get("log_path") or ""
         if log_path and Path(log_path).exists():
             try:
-                log_bytes = Path(log_path).read_bytes()
+                source = Path(log_path).open("rb")
             except OSError:
-                log_bytes = None
-            if log_bytes is not None:
-                _add_bytes(tar, "transcript.log", log_bytes)
-                included.append("transcript.log")
+                source = None
+            if source is not None:
+                with source:
+                    info = tarfile.TarInfo("transcript.log")
+                    info.size = os.fstat(source.fileno()).st_size
+                    info.mode = 0o600
+                    tar.addfile(info, source)
+                    included.append("transcript.log")
     return {"output_path": str(dest), "bytes": dest.stat().st_size, "included": included}

@@ -15,7 +15,6 @@ import json
 import os
 import re
 import secrets
-import stat
 import subprocess
 import sys
 import tarfile
@@ -28,6 +27,7 @@ from pathlib import Path
 import click
 
 from . import baseref, franky_version
+from .transcript import Transcript, Redactor, chunks, open_secure
 from ._install import detect_install
 from .config import GH_TOKEN_VAR, Config, load_config, redact, repo_allowed
 from .decompose import build_plan_result, parse_decomposition
@@ -482,7 +482,9 @@ def build(
             plan_log_path = _write_log(output, secrets, env=os.environ)
             if not quiet:
                 click.echo("franky: --- plan (read-only, nothing written yet) ---", err=True)
-                click.echo(output, err=True)
+                for chunk in chunks(output):
+                    click.echo(chunk, err=True, nl=False)
+                click.echo(err=True)
             # A timed-out planning pass returns the 124 sentinel; map it to the dedicated
             # timeout contract (exit 9) rather than the generic agent_error, same as PHASE 2.
             if code == CONTAINER_TIMEOUT_CODE:
@@ -1844,16 +1846,22 @@ def _write_log(
     now = datetime.now()
     stamp = now.strftime("%Y%m%d-%H%M%S")
     suffix = run_id or now.strftime("%f")
-    body = redact(output, secrets) + "\n"
-    if footer is not None:
-        body += redact(footer, secrets) + "\n"
+    suffix_text = "\n" + (redact(footer, secrets) + "\n" if footer is not None else "")
     path = (directory / f"{stamp}-{suffix}.log").resolve()
     try:
         directory.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         directory.mkdir(mode=0o700, exist_ok=True)
-        path.write_text(body, encoding="utf-8")
-        path.chmod(stat.S_IRUSR | stat.S_IWUSR)
+        if isinstance(output, Transcript):
+            output.persist(path, suffix_text)
+        else:
+            with open_secure(path) as target:
+                stream = Redactor(secrets)
+                for chunk in chunks(output):
+                    target.write(stream.feed(chunk))
+                target.write(stream.feed("", final=True) + suffix_text)
     except OSError as exc:
+        if isinstance(output, Transcript):
+            output.close()
         raise ConfigError(f"could not write the run transcript under {directory}") from exc
     return path
 
@@ -2295,7 +2303,8 @@ def job_logs(ctx: click.Context, job_id: str) -> None:
                 hint="the transcript is written when the pass finishes; see `franky job status`",
             )
         # The on-disk log was written via _write_log and is ALREADY redacted; print verbatim.
-        click.echo(Path(log_path).read_text(encoding="utf-8"), nl=False)
+        for chunk in Transcript(Path(log_path)).chunks():
+            click.echo(chunk, nl=False)
     except FrankyError as exc:
         _emit_error(exc, False, [])
         ctx.exit(exc.code)
@@ -2478,7 +2487,7 @@ def job_diagnose(
                 kind="log_unavailable",
                 hint="the transcript is written when the pass finishes; see `franky job status`",
             )
-        transcript = Path(log_path).read_text(encoding="utf-8")
+        transcript = Transcript(Path(log_path))
 
         # Same config-file merge as build (a config-file token/engine must work here too).
         try:

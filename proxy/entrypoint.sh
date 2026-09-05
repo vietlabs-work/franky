@@ -33,6 +33,7 @@ http_access allow allowed_domains
 http_access deny all
 http_port 3128
 cache deny all
+cache_mem 0 MB
 access_log stdio:/run/squid-access.log
 cache_log /run/squid-cache.log
 pid_filename /run/squid.pid

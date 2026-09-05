@@ -7,7 +7,7 @@
 # the SAME mechanics against a different target (HOME instead of /work), so it can trip the same
 # class of failure:
 #   1. `docker cp` INTO a `--read-only` container is refused ("container rootfs is marked
-#      read-only") even when the destination is a writable tmpfs - hence stdin.
+#      read-only") even when the destination is a writable volume - hence stdin.
 #   2. extracting as in-container root fails under `--cap-drop=ALL` (no CAP_DAC_OVERRIDE/CAP_CHOWN
 #      for the uid-1001-owned HOME tmpfs) - hence extracting as uid 1001 with --no-same-owner.
 #   3. a bundle big enough to matter (a swept ~/.claude + ~/.codex is ~400 KB gzipped) must pass
@@ -26,32 +26,22 @@
 set -uo pipefail
 
 FRANKY_IMG="${FRANKY_IMG:-franky}"
-TASK="smoke-profile-task"
-TASK_REFUSE="smoke-profile-refuse"
+TASK="smoke-profile-task-$$"
+TASK_REFUSE="smoke-profile-refuse-$$"
 WORKDIR="$(mktemp -d)"
 BUNDLE="$WORKDIR/profile.tar.gz"
-HOME_SIZE="$(python3 -c 'from franky.container import _HOME_TMPFS_SIZE; print(_HOME_TMPFS_SIZE)')"
 MARKER="$(python3 -c 'from franky.container import PROFILE_READY_MARKER; print(PROFILE_READY_MARKER)')"
 CHOME="$(python3 -c 'from franky.profile import CONTAINER_HOME; print(CONTAINER_HOME)')"
 
 cleanup() {
-  docker rm -f "$TASK" "$TASK_REFUSE" >/dev/null 2>&1 || true
+  docker rm -f -v "$TASK" "$TASK_REFUSE" >/dev/null 2>&1 || true
   rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
 fail() { echo "PROFILE SMOKE FAIL: $*" >&2; exit 1; }
 
 start_task() {  # $1 = container name, $2 = inner command
-  docker run -d --name "$1" \
-    -e FRANKY_PROFILE_WAIT=1 \
-    --cap-drop=ALL --cap-add=SETUID --cap-add=SETGID \
-    --security-opt=systempaths=unconfined --device /dev/net/tun --read-only \
-    --tmpfs /work:exec,uid=1001,gid=1001 \
-    --tmpfs "$CHOME:exec,uid=1001,gid=1001,size=$HOME_SIZE" \
-    --tmpfs /run/user/1001:exec,uid=1001,gid=1001 \
-    --tmpfs /run:exec --tmpfs /tmp:exec \
-    --pids-limit=2048 --memory=4g --memory-swap=4g \
-    "$FRANKY_IMG" sh -c "$2" >/dev/null
+  python3 scripts/smoke-task.py "$FRANKY_IMG" "$1" profile sh -c "$2" >/dev/null
 }
 
 echo "== build a bundle shaped like a real sweep (HOME-relative members, ~400 KB gzipped) =="
@@ -80,7 +70,7 @@ echo "   bundle: ${BUNDLE_KB} KB gzipped"
 
 echo "== start the franky image in profile-wait mode (real task _HARDENING profile) =="
 docker rm -f "$TASK" >/dev/null 2>&1 || true
-start_task "$TASK" 'echo PROFILE_ENGINE_RAN; sleep 10' || fail "container did not start"
+start_task "$TASK" 'touch /tmp/profile-engine-ran; sleep 30' || fail "container did not start"
 sleep 3   # let the entrypoint reach the profile-wait loop
 
 echo "== 1. pipe the bundle over 'docker exec -i tar -xzf -' stdin into HOME, as uid 1001 =="
@@ -101,19 +91,19 @@ echo "== 3. touch the marker; the profile-wait entrypoint must proceed and exec 
 docker exec "$TASK" touch "$MARKER" || fail "marker touch failed"
 ran=0
 for _ in $(seq 1 15); do
-  docker logs "$TASK" 2>&1 | grep -q PROFILE_ENGINE_RAN && { ran=1; break; }
+  docker exec "$TASK" test -f /tmp/profile-engine-ran && { ran=1; break; }
   sleep 1
 done
-[ "$ran" = 1 ] || { docker logs "$TASK" 2>&1 | tail -20; fail "engine never ran (profile-wait stuck)"; }
+[ "$ran" = 1 ] || fail "engine never ran (profile-wait stuck)"
 echo "   OK (engine ran after injection)"
 
 echo "== 4. fail-closed: with NO marker the entrypoint must refuse, not run a profile-less build =="
 # The entrypoint caps its wait at 120s; we only need to prove it has not exec'd the engine and is
 # still waiting (a full 120s wait would make this gate needlessly slow).
 docker rm -f "$TASK_REFUSE" >/dev/null 2>&1 || true
-start_task "$TASK_REFUSE" 'echo SHOULD_NOT_RUN; sleep 5' || fail "refuse-case container did not start"
+start_task "$TASK_REFUSE" 'touch /tmp/profile-engine-ran; sleep 30' || fail "refuse-case container did not start"
 sleep 8
-docker logs "$TASK_REFUSE" 2>&1 | grep -q SHOULD_NOT_RUN \
+docker exec "$TASK_REFUSE" test -f /tmp/profile-engine-ran \
   && fail "engine ran WITHOUT the profile - the fail-closed wait is broken"
 docker inspect -f '{{.State.Running}}' "$TASK_REFUSE" | grep -q true \
   || fail "container exited early for some other reason (expected: still waiting)"

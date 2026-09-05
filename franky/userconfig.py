@@ -35,7 +35,7 @@ try:
 except ModuleNotFoundError:
     import tomli as tomllib  # type: ignore[import-not-found,no-redef]
 
-from .config import GH_TOKEN_VAR, MODEL_VAR
+from .config import DISK_MB_VAR, GH_TOKEN_VAR, MEMORY_MB_VAR, MODEL_VAR
 from .engine import (
     CLAUDE_TOKEN_VAR,
     CODEX_PROVIDER_VARS,
@@ -82,6 +82,8 @@ _NON_SECRET_SETTABLE_KEYS: frozenset[str] = frozenset(
     {
         "FRANKY_ENGINE",
         MODEL_VAR,
+        MEMORY_MB_VAR,
+        DISK_MB_VAR,
         "FRANKY_ALLOWED_REPOS",
         "FRANKY_EXTRA_ALLOWED_DOMAINS",
         _OLLAMA_HOST,

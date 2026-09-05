@@ -350,8 +350,8 @@ def test_reap_run_targets_all_three_by_id():
 
     assert container.reap_run("abc123", runner=runner) is True
     flat = [" ".join(a) for a in calls]
-    assert any("rm -f franky-run-abc123" in c for c in flat)
-    assert any("rm -f franky-proxy-abc123" in c for c in flat)
+    assert any("rm -f -v franky-run-abc123" in c for c in flat)
+    assert any("rm -f -v franky-proxy-abc123" in c for c in flat)
     assert any("network rm franky-net-abc123" in c for c in flat)
 
 

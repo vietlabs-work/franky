@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -27,9 +28,10 @@ import uuid
 from pathlib import Path
 
 from . import egress, franky_version, snapshot
-from .config import redact
+from .config import DEFAULT_DISK_MB, DEFAULT_MEMORY_MB, redact
 from .engine import CODEX_SUBSCRIPTION_VAR
 from .profile import CONTAINER_HOME, PROFILE_WAIT_VAR
+from .transcript import CHUNK_SIZE, MAX_EVENT_CHARS, Redactor, Transcript, chunks
 
 # Long agent runs: a full clone-build-test-PR cycle can take many minutes. 30 min cap.
 FALLBACK_TIMEOUT_SECS = 1800
@@ -40,10 +42,8 @@ FALLBACK_TIMEOUT_SECS = 1800
 CONTAINER_TIMEOUT_CODE = 124
 CONTAINER_TIMEOUT_MSG = "franky: container timed out after {timeout}s"
 
-# The non-root user baked into the image (Dockerfile: useradd --uid 1001 franky). The writable
-# tmpfs mounts are owned by this uid/gid so the agent can actually clone, commit, and write its
-# HOME config under a --read-only root. (The --tmpfs PATH:opts short form silently ignores
-# mode=, but honours uid=/gid=, which is what makes the dirs writable by a non-root user.)
+# The image owns build directories as uid 1001. Docker volume copy-up preserves ownership.
+# Small runtime tmpfs mounts need explicit uid/gid to remain writable by the non-root agent.
 _RUN_UID = 1001
 _RUN_GID = 1001
 _HOME = "/home/franky"
@@ -52,17 +52,11 @@ _CODEX_AUTH_MAX_BYTES = 64 * 1024
 # XDG_RUNTIME_DIR for the always-on rootless Docker daemon: it puts docker.sock + runtime state
 # here (dockerd-rootless.sh defaults to /run/user/<uid>).
 _XDG_RUNTIME = f"/run/user/{_RUN_UID}"
-# HOME tmpfs size cap. HOME holds git/gh config AND the rootless Docker data root
-# ($HOME/.local/share/docker - images/layers live here, in RAM). Capping it BELOW --memory
-# means a runaway or huge `docker pull` hits a clean tmpfs ENOSPC (the pull fails) instead of
-# OOM-killing dockerd and taking the whole task down with it.
-_HOME_TMPFS_SIZE = "6g"
-
 # Hardening flags applied to every run. No bind mounts, no docker socket: the repo is cloned
 # INSIDE the container and so is everything the always-on rootless Docker daemon does, so the
-# agent never touches the host filesystem. Root FS is read-only; only the tmpfs paths below are
-# writable, all owned by the non-root run user so git/gh and rootless dockerd work under
-# --read-only.
+# agent cannot access host paths. Docker creates private anonymous volumes for build data.
+# --rm and the forced reaper remove them. Disk blocks can retain data after removal, so this
+# is disposable storage, not secure erasure. The image owns /work and HOME as uid 1001.
 #
 # WHY this profile is RELAXED vs a non-DinD container: franky runs a rootless Docker daemon
 # inside this container (always on - see Dockerfile + franky-dind-entrypoint.sh) so a task can
@@ -93,24 +87,18 @@ _HARDENING = [
     "--device",
     "/dev/net/tun",
     "--read-only",
+    "--mount",
+    "type=volume,dst=/work",
+    "--mount",
+    f"type=volume,dst={_HOME}",
+    "--mount",
+    "type=volume,dst=/tmp",
     "--tmpfs",
-    f"/work:exec,uid={_RUN_UID},gid={_RUN_GID}",
+    f"{_XDG_RUNTIME}:exec,uid={_RUN_UID},gid={_RUN_GID},size=16m",
     "--tmpfs",
-    f"{_HOME}:exec,uid={_RUN_UID},gid={_RUN_GID},size={_HOME_TMPFS_SIZE}",
-    "--tmpfs",
-    f"{_XDG_RUNTIME}:exec,uid={_RUN_UID},gid={_RUN_GID}",
-    # rootlesskit + dockerd also write under /run and /tmp (root-owned bare tmpfs is fine; they
-    # create their own subdirs).
-    "--tmpfs",
-    "/run:exec",
-    "--tmpfs",
-    "/tmp:exec",
+    "/run:exec,size=16m",
     # dockerd + containerd + nested containers spawn many processes - 512 is too tight.
     "--pids-limit=2048",
-    # tmpfs image storage is RAM; the cap sits above the 6g HOME tmpfs with headroom, and
-    # --memory-swap=--memory forbids swap so a hostile workload cannot balloon past the cap.
-    "--memory=8g",
-    "--memory-swap=8g",
 ]
 
 # The Squid proxy image (built from proxy/) and the port it listens on inside the net.
@@ -130,7 +118,7 @@ FRANKY_PROXY_IMAGE_VAR = "FRANKY_PROXY_IMAGE"
 # franky-proxy image) writes its rendered config, pid, and logs there under a --read-only
 # root. A bare --tmpfs mounts root-owned and `mode=` is silently ignored by the short form
 # (see _HARDENING note), so we MUST pin uid=/gid= to squid's user or it cannot write and
-# crashes on start. The proxy is light (no clone/build), so 1g is plenty.
+# crashes on start. CONNECT tunneling does not require a large response cache.
 _PROXY_UID = 13
 _PROXY_GID = 13
 _PROXY_HARDENING = [
@@ -139,13 +127,17 @@ _PROXY_HARDENING = [
     "--security-opt=no-new-privileges",
     "--read-only",
     "--tmpfs",
-    f"/run:exec,uid={_PROXY_UID},gid={_PROXY_GID}",
+    f"/run:exec,uid={_PROXY_UID},gid={_PROXY_GID},size=16m",
     "--tmpfs",
-    f"/var/log/squid:uid={_PROXY_UID},gid={_PROXY_GID}",
+    f"/var/log/squid:uid={_PROXY_UID},gid={_PROXY_GID},size=1m",
     "--tmpfs",
-    f"/var/spool/squid:uid={_PROXY_UID},gid={_PROXY_GID}",
+    f"/var/spool/squid:uid={_PROXY_UID},gid={_PROXY_GID},size=1m",
     "--pids-limit=512",
-    "--memory=1g",
+    "--memory=128m",
+    "--memory-swap=128m",
+    # Squid sizes descriptor tables from this limit. Docker's million-fd default
+    # OOMs before readiness at 128 MiB; one task needs far fewer connections.
+    "--ulimit=nofile=4096:4096",
 ]
 
 # Readiness poll for the proxy's HEALTHCHECK. 30 * 0.5s = 15s ceiling before we fail-closed.
@@ -153,7 +145,7 @@ PROXY_READY_POLLS = 30
 PROXY_READY_INTERVAL = 0.5
 
 # The mid-run steering mailbox (issue #72, `franky job attach`). HOME (/home/franky) is one of
-# the writable tmpfs mounts under --read-only (see _HARDENING above), so a file written there by
+# the writable volumes under --read-only (see _HARDENING above), so a file written there by
 # a host-side `docker exec` is a plain filesystem write - no bind mount, no new writable surface.
 # The prompt (see prompt.py's _STEER_CONVENTION) tells the running agent to poll this exact path
 # before each new sub-task; delivery here is guaranteed, incorporation is best-effort (the agent
@@ -171,6 +163,8 @@ def build_docker_argv(
     profile_wait: bool = False,
     resume_wait: bool = False,
     auth_volume: str | None = None,
+    memory_mb: int = DEFAULT_MEMORY_MB,
+    disk_mb: int = DEFAULT_DISK_MB,
 ) -> list[str]:
     """Build the full `docker run` argv. Pure - no docker invoked.
 
@@ -201,7 +195,19 @@ def build_docker_argv(
     It is never a caller-supplied path or bind mount.
     """
     container_name = name or f"franky-run-{uuid.uuid4().hex[:12]}"
-    argv = ["docker", "run", *_HARDENING, "--name", container_name]
+    argv = [
+        "docker",
+        "run",
+        *_HARDENING,
+        f"--memory={memory_mb}m",
+        f"--memory-swap={memory_mb}m",
+        "--name",
+        container_name,
+        "-e",
+        f"FRANKY_DISK_MB={disk_mb}",
+        # Attached stdout still streams; Docker must not persist raw pre-redaction bytes.
+        "--log-driver=none",
+    ]
     if auth_volume:
         argv += [
             "--mount",
@@ -693,13 +699,28 @@ def capture_diagnostics(
     # somehow did we leave both keys at their safe defaults (dind_ready=None, tmpfs_full=False)
     # rather than one absent and one defaulted.
     try:
-        if "rootless dockerd did not become ready" in transcript:
+        signals = {
+            s: False
+            for s in (
+                "rootless dockerd did not become ready",
+                "rootless dockerd ready",
+                "No space left on device",
+                "ENOSPC",
+            )
+        }
+        overlap = ""
+        for chunk in chunks(transcript):
+            text = overlap + chunk
+            for signal in signals:
+                signals[signal] |= signal in text
+            overlap = text[-64:]
+        if signals["rootless dockerd did not become ready"]:
             diag["dind_ready"] = False
-        elif "rootless dockerd ready" in transcript:
+        elif signals["rootless dockerd ready"]:
             diag["dind_ready"] = True
         else:
             diag["dind_ready"] = None
-        diag["tmpfs_full"] = "No space left on device" in transcript or "ENOSPC" in transcript
+        diag["tmpfs_full"] = signals["No space left on device"] or signals["ENOSPC"]
     except Exception:
         diag["dind_ready"] = None
         diag["tmpfs_full"] = False
@@ -713,10 +734,14 @@ def _reap(name: str, runner) -> bool:
     original outcome - but a failure is reported (see run_in_container) because a surviving
     container still holds the injected tokens in its env."""
     try:
-        proc = runner(["docker", "rm", "-f", name], capture_output=True, text=True)
+        proc = runner(
+            ["docker", "rm", "-f", "-v", name], capture_output=True, text=True, timeout=10
+        )
     except Exception:
         return False
-    return getattr(proc, "returncode", 1) == 0
+    return getattr(proc, "returncode", 1) == 0 or (
+        f"no such container: {name}" in (getattr(proc, "stderr", "") or "").lower()
+    )
 
 
 def _reap_network(net_name: str, runner) -> bool:
@@ -727,6 +752,110 @@ def _reap_network(net_name: str, runner) -> bool:
     except Exception:
         return False
     return getattr(proc, "returncode", 1) == 0
+
+
+def _storage_sample(task: str | None, image: str, runner) -> tuple[int, int]:
+    """Read allocated KiB and free KiB without trusting the autonomous task's tools.
+
+    Nested Docker files use mapped uids. A trusted, networkless helper needs DAC_READ_SEARCH
+    to count them. It mounts only this task's data volumes, read-only, and receives no secrets.
+    The named subscription volume is excluded. Raw helper errors never leave this function.
+    """
+    helper = f"{task}-disk" if task else f"franky-disk-{uuid.uuid4().hex[:12]}"
+    volumes = []
+    argv = [
+        "docker",
+        "run",
+        "--rm",
+        "--name",
+        helper,
+        "--network=none",
+        "--read-only",
+        "--cap-drop=ALL",
+        "--cap-add=DAC_READ_SEARCH",
+        "--security-opt=no-new-privileges",
+        "--user=0",
+        "--pids-limit=32",
+        "--memory=64m",
+        "--memory-swap=64m",
+        "--entrypoint=bash",
+    ]
+    if task:
+        inspected = runner(
+            ["docker", "inspect", "-f", "{{json .Mounts}}", task],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        destinations = {"/work": "work", _HOME: "home", "/tmp": "tmp"}
+        mounts = json.loads(inspected.stdout)
+        found = set()
+        for mount in mounts:
+            dest = mount.get("Destination")
+            if dest not in destinations or mount.get("Type") != "volume":
+                continue
+            name = mount.get("Name", "")
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
+                raise ValueError("invalid task storage")
+            found.add(dest)
+            volumes.append(name)
+            argv += ["--mount", f"type=volume,src={name},dst=/data/{destinations[dest]},readonly"]
+        if found != set(destinations):
+            raise ValueError("task storage is missing")
+        script = (
+            "set -eo pipefail\n"
+            "du -skx /data/work /data/home /data/tmp | awk '{n += $1} END {print n}'\n"
+            "df -Pk /data/home | awk 'NR==2 {print $4}'"
+        )
+    else:
+        script = "set -eo pipefail\nprintf '0\\n'\ndf -Pk / | awk 'NR==2 {print $4}'"
+    try:
+        proc = runner(argv + [image, "-c", script], capture_output=True, text=True, timeout=10)
+        values = proc.stdout.split()
+        if proc.returncode or len(values) != 2 or not all(v.isdigit() for v in values):
+            raise ValueError("could not measure task storage")
+        return int(values[0]), int(values[1])
+    finally:
+        _reap(helper, runner)
+        # An auto-removing task can exit while the helper still holds its volumes.
+        # Remove only those exact volumes after releasing the helper; Docker refuses
+        # removal if another container still uses them, including a stopped task.
+        if volumes and not container_running(task, runner):
+            try:
+                runner(["docker", "volume", "rm", *volumes], capture_output=True, timeout=10)
+            except Exception:
+                pass
+
+
+def _watch_storage(task: str, image: str, disk_mb: int, runner, stop, failures: list[str]) -> None:
+    """Stop excess disk use. This five-second watchdog is not a filesystem quota.
+
+    Keep 1 GiB free for other containers. A fast writer can overshoot between samples;
+    the Docker VM disk limit remains the final disk boundary.
+    """
+    # Let docker run create its container before the first inspect.
+    if stop.wait(1):
+        return
+    while not stop.is_set():
+        try:
+            used, free = _storage_sample(task, image, runner)
+            message = (
+                "franky: task exceeded its disk budget"
+                if used > disk_mb * 1024
+                else "franky: Docker has less than 1 GiB free disk"
+                if free < 1024 * 1024
+                else ""
+            )
+        except Exception:
+            if stop.is_set() or not container_running(task, runner):
+                return
+            message = "franky: could not verify task disk usage - stopping the run"
+        if message and not stop.is_set():
+            failures.append(message)
+            _reap(task, runner)
+            return
+        if stop.wait(5):
+            return
 
 
 def _wait_proxy_ready(proxy_name: str, runner, sleeper=time.sleep) -> bool:
@@ -788,7 +917,7 @@ def run_in_container(
     diagnostics_sink: dict | None = None,
     snapshot_sink: dict | None = None,
     resume_workspace: str | None = None,
-) -> tuple[int, str]:
+) -> tuple[int, str | Transcript]:
     """Run the inner engine in a hardened, egress-controlled container; return
     (returncode, redacted_output).
 
@@ -819,10 +948,10 @@ def run_in_container(
     PROXY gets NO cred env. `runner`/`sleeper` are injectable so tests run fakes and never
     touch real docker. All returned output is scrubbed of secret values.
 
-    When `progress` is given, it is called with each redacted output line as it arrives so
-    the caller can stream live feedback to stderr. The returned output still contains the
-    full accumulated transcript (redacted) for end-of-run processing. `popen` is the
-    injectable Popen-compatible callable used by the streaming path (tests pass a fake).
+    Production always drains Popen in bounded chunks into a redacted disk transcript.
+    The caller must persist or close that transcript. Progress receives redacted lines,
+    or bounded fragments when a line exceeds the parser limit. Injected runner-only callers
+    retain their string result; injected Popen callers use the same disk path as production.
     """
     # Names derive from run_id so the CLI can register them up front and later target the same
     # container/net/proxy for `job status`/`kill` (issue #63). None -> a fresh id (unchanged
@@ -845,8 +974,18 @@ def run_in_container(
     proxy_launched = False
     task_launched = False  # an OSError on spawn means docker never created the container
     code, output = 1, ""
+    storage_stop = threading.Event()
+    storage_failures: list[str] = []
+    storage_thread = None
 
     try:
+        if runner is subprocess.run:
+            try:
+                _, free = _storage_sample(None, image, runner)
+            except Exception:
+                raise _AbortRun("franky: could not verify Docker free disk - refusing to run")
+            if free < 1024 * 1024:
+                raise _AbortRun("franky: Docker has less than 1 GiB free disk - refusing to run")
         if cfg.auth_volume:
             auth_secrets = _codex_auth_state(image, runner, auth_volume=cfg.auth_volume)
             if auth_secrets is None:
@@ -882,14 +1021,14 @@ def run_in_container(
             )
 
         # 5. The task container: on the internal net, all traffic forced through the proxy.
-        # Resume (issue #71) forces the streaming (popen) path even without a progress callback:
-        # the workspace restore must run AFTER the container is up but BEFORE it completes, which
-        # only the popen path exposes. A no-op progress stand-in keeps the streaming loop working
-        # when the caller passed none.
+        # Production always streams, including quiet runs. Runner-only test doubles keep
+        # their injected capture boundary; profile/restore and injected Popen use streaming.
         resuming = resume_workspace is not None
         injecting = profile_bundle is not None
         effective_progress = progress
-        if (resuming or injecting) and effective_progress is None:
+        if (
+            resuming or injecting or runner is subprocess.run or popen is not subprocess.Popen
+        ) and effective_progress is None:
             effective_progress = lambda _line: None  # noqa: E731 - tiny no-op for the stream loop
         argv = build_docker_argv(
             image,
@@ -901,22 +1040,43 @@ def run_in_container(
             profile_wait=injecting,
             resume_wait=resuming,
             auth_volume=cfg.auth_volume,
+            memory_mb=cfg.memory_mb,
+            disk_mb=cfg.disk_mb,
         )
         if effective_progress is not None:
-            # Streaming path: iterate stdout/stderr line by line, redact per line, call
-            # progress(), and accumulate raw lines for the end-of-run full-buffer redact.
-            # WHY raw accumulation: a secret that spans a line boundary (unlikely for JSONL
-            # but theoretically possible) is caught by the final redact() call below.
+            # Redact before disk and callbacks, retaining only bounded unfinished fragments.
+            output = Transcript()
+            stream = Redactor(secrets)
+            progress_pending = ""
+
+            def emit(text, *, final=False):
+                nonlocal progress_pending
+                clean = stream.feed(text, final=final)
+                output.write(clean)
+                progress_pending += clean
+                while "\n" in progress_pending:
+                    line, progress_pending = progress_pending.split("\n", 1)
+                    effective_progress(line + "\n")
+                if len(progress_pending) > MAX_EVENT_CHARS or final:
+                    if progress_pending:
+                        effective_progress(progress_pending)
+                    progress_pending = ""
+
             try:
                 proc = popen(
                     argv,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    text=True,
-                    errors="replace",
                     env=child_env,
                 )
                 task_launched = True
+                if runner is subprocess.run:
+                    storage_thread = threading.Thread(
+                        target=_watch_storage,
+                        args=(task, image, cfg.disk_mb, runner, storage_stop, storage_failures),
+                        daemon=True,
+                    )
+                    storage_thread.start()
                 # Stream the operator profile in BEFORE draining stdout: the container is blocked
                 # on the ready marker in profile-wait mode. A False result is fine to proceed on -
                 # the entrypoint exits nonzero on its own (refusing to run without the operator's
@@ -932,7 +1092,6 @@ def run_in_container(
                     snapshot.restore_into_container(
                         task, Path(resume_workspace), runner, sleeper=sleeper
                     )
-                raw_lines: list[str] = []
                 t_start = time.monotonic()
                 timed_out = False
                 # HARD wall-clock watchdog (never-hang): the per-line elapsed check below only
@@ -955,7 +1114,17 @@ def run_in_container(
                 watchdog.daemon = True
                 watchdog.start()
                 try:
-                    for line in proc.stdout:
+                    import codecs
+
+                    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+                    reader = getattr(proc.stdout, "read1", None) or getattr(
+                        proc.stdout, "read", None
+                    )
+                    source = iter(lambda: reader(CHUNK_SIZE), b"") if reader else iter(proc.stdout)
+                    for line in source:
+                        if not line:
+                            break
+                        emit(decoder.decode(line) if isinstance(line, bytes) else line)
                         # Belt-and-suspenders: the per-line elapsed check still catches a slow
                         # trickle of output between deadline checks; the watchdog above catches a
                         # total silence.
@@ -963,8 +1132,6 @@ def run_in_container(
                             proc.kill()
                             timed_out = True
                             break
-                        effective_progress(redact(line, secrets))
-                        raw_lines.append(line)
                 finally:
                     watchdog.cancel()
                     proc.stdout.close()
@@ -972,18 +1139,21 @@ def run_in_container(
                     try:
                         proc.wait(timeout=remaining)
                     except subprocess.TimeoutExpired:
+                        timed_out = True
                         proc.kill()
-                        proc.wait()
+                        proc.wait(timeout=5)
+                    emit(decoder.decode(b"", final=True), final=True)
                 if timed_out or watchdog_hit.is_set():
-                    code, output = (
-                        CONTAINER_TIMEOUT_CODE,
-                        CONTAINER_TIMEOUT_MSG.format(timeout=timeout),
-                    )
+                    code = CONTAINER_TIMEOUT_CODE
+                    output.write("\n" + CONTAINER_TIMEOUT_MSG.format(timeout=timeout))
                 else:
                     code = proc.returncode
-                    output = "".join(raw_lines)
             except OSError as exc:
-                code, output = 1, f"franky: could not launch docker ({exc})"
+                code = 1
+                emit(f"franky: could not launch docker ({exc})", final=True)
+            except BaseException:
+                output.close()
+                raise
         else:
             # Blocking path (original): capture all output then return.
             try:
@@ -1011,6 +1181,16 @@ def run_in_container(
         # its warnings append to THIS output, which the single return below surfaces.
         code, output = 1, abort.message
     finally:
+        storage_stop.set()
+        if storage_thread is not None:
+            storage_thread.join(timeout=40)
+        if storage_failures:
+            code = code or 1
+            message = "\n" + storage_failures[0]
+            if isinstance(output, Transcript):
+                output.write(message)
+            else:
+                output += message
         # Capture-before-reap diagnostics (issue #69): MUST run before the reaps below - once
         # `_reap` fires the container is gone and there is nothing left to inspect. Opt-in
         # (sink is None for every pre-#69 caller) and fully isolated: any exception here is
@@ -1050,11 +1230,23 @@ def run_in_container(
         # TASK container is surfaced at full severity because it holds the injected creds. A
         # proxy/net reap failure is a lower-severity resource leak (the proxy holds NO creds).
         if task_launched and not _reap(task, runner):
-            output += f"\nfranky: WARNING container {task} may not have been removed - check `docker ps -a`"
+            message = f"\nfranky: WARNING container {task} may not have been removed - check `docker ps -a`"
+            if isinstance(output, Transcript):
+                output.write(redact(message, secrets))
+            else:
+                output += message
         if proxy_launched and not _reap(proxy, runner):
-            output += f"\nfranky: WARNING egress proxy {proxy} may not have been removed (resource leak, no creds) - check `docker ps -a`"
+            message = f"\nfranky: WARNING egress proxy {proxy} may not have been removed (resource leak, no creds) - check `docker ps -a`"
+            if isinstance(output, Transcript):
+                output.write(redact(message, secrets))
+            else:
+                output += message
         if net_created and not _reap_network(net, runner):
-            output += f"\nfranky: WARNING egress network {net} may not have been removed (resource leak) - check `docker network ls`"
+            message = f"\nfranky: WARNING egress network {net} may not have been removed (resource leak) - check `docker network ls`"
+            if isinstance(output, Transcript):
+                output.write(redact(message, secrets))
+            else:
+                output += message
         # Finalize the snapshot AFTER the reap (scrub + fail-closed verify + pack), so the
         # container is already gone and this potentially-slower step never delays teardown.
         if _snapshot_tmp is not None:
@@ -1067,7 +1259,7 @@ def run_in_container(
             except Exception:
                 pass
 
-    return code, redact(output, secrets)
+    return code, output if isinstance(output, Transcript) else redact(output, secrets)
 
 
 def image_exists(image: str = "franky", runner=subprocess.run) -> bool:
