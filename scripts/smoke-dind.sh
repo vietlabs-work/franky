@@ -17,28 +17,26 @@ set -euo pipefail
 
 FRANKY_IMG="${FRANKY_IMG:-franky}"
 PROXY_IMG="${PROXY_IMG:-franky-proxy}"
-NET="smoke-dind-net"
-PROXY="smoke-dind-proxy"
-TASK="smoke-dind-task"
-# Derive the proxy allowlist + HOME tmpfs size straight from the source modules (run from the
-# repo root) so this gate can never drift from franky/egress.py and franky/container.py.
+NET="smoke-dind-net-$$"
+PROXY="smoke-dind-proxy-$$"
+TASK="smoke-dind-task-$$"
+# Derive policy from the production modules.
 ALLOW="$(python3 -c 'from franky.egress import DOCKER_REGISTRY_DOMAINS, GITHUB_DOMAINS; print(",".join(DOCKER_REGISTRY_DOMAINS + GITHUB_DOMAINS))')"
-HOME_SIZE="$(python3 -c 'from franky.container import _HOME_TMPFS_SIZE; print(_HOME_TMPFS_SIZE)')"
 
-cleanup() { docker rm -f "$TASK" "$PROXY" >/dev/null 2>&1 || true; docker network rm "$NET" >/dev/null 2>&1 || true; }
+cleanup() { docker rm -f -v "$TASK" "$PROXY" >/dev/null 2>&1 || true; docker network rm "$NET" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 fail() { echo "SMOKE FAIL: $*" >&2; exit 1; }
 
 echo "== build images =="
-docker build -t "$FRANKY_IMG" .
-docker build -t "$PROXY_IMG" proxy/
+if [ "${SMOKE_SKIP_BUILD:-0}" != 1 ]; then
+  docker build -t "$FRANKY_IMG" .
+  docker build -t "$PROXY_IMG" proxy/
+fi
 
 echo "== stand up the egress cage =="
 cleanup
 docker network create --internal --driver bridge "$NET" >/dev/null
-docker run -d --name "$PROXY" \
-  --tmpfs /run:exec,uid=13,gid=13 --tmpfs /var/log/squid:uid=13,gid=13 --tmpfs /var/spool/squid:uid=13,gid=13 \
-  -e FRANKY_ALLOWED_DOMAINS="$ALLOW" "$PROXY_IMG" >/dev/null
+python3 scripts/smoke-task.py "$PROXY_IMG" "$PROXY" proxy "$ALLOW" >/dev/null
 docker network connect "$NET" "$PROXY"
 for _ in $(seq 1 20); do
   [ "$(docker inspect -f '{{.State.Health.Status}}' "$PROXY" 2>/dev/null)" = healthy ] && break; sleep 1
@@ -46,19 +44,8 @@ done
 [ "$(docker inspect -f '{{.State.Health.Status}}' "$PROXY" 2>/dev/null)" = healthy ] || fail "proxy not healthy"
 
 echo "== run the franky image (real _HARDENING profile) in the cage =="
-docker run -d --name "$TASK" \
-  --network "$NET" --dns 127.0.0.1 \
-  -e HTTP_PROXY="http://$PROXY:3128" -e HTTPS_PROXY="http://$PROXY:3128" \
-  -e http_proxy="http://$PROXY:3128" -e https_proxy="http://$PROXY:3128" \
-  -e NO_PROXY=localhost,127.0.0.1 -e no_proxy=localhost,127.0.0.1 \
-  --cap-drop=ALL --cap-add=SETUID --cap-add=SETGID \
-  --security-opt=systempaths=unconfined --device /dev/net/tun --read-only \
-  --tmpfs /work:exec,uid=1001,gid=1001 \
-  --tmpfs "/home/franky:exec,uid=1001,gid=1001,size=$HOME_SIZE" \
-  --tmpfs /run/user/1001:exec,uid=1001,gid=1001 \
-  --tmpfs /run:exec --tmpfs /tmp:exec \
-  --pids-limit=2048 --memory=8g --memory-swap=8g \
-  "$FRANKY_IMG" sleep infinity >/dev/null
+SMOKE_NETWORK="$NET" SMOKE_PROXY_URL="http://$PROXY:3128" \
+  python3 scripts/smoke-task.py "$FRANKY_IMG" "$TASK" normal sleep 300 >/dev/null
 
 echo "== 1. rootless dockerd readiness =="
 ready=0

@@ -5,7 +5,7 @@
 # rule - see CLAUDE.md), so it mocks the docker runner and CANNOT catch daemon-level refusals. Two
 # such refusals shipped in the original #71 and were only caught here:
 #   1. `docker cp` INTO a `--read-only` container is refused ("container rootfs is marked
-#      read-only") even when the destination is a writable tmpfs.
+#      read-only") even when the destination is a writable volume.
 #   2. extracting/chowning as in-container root fails under `--cap-drop=ALL` (root has no
 #      CAP_DAC_OVERRIDE/CAP_CHOWN to write the uid-1001-owned /work tmpfs).
 # Run this gate before merging any change to franky/snapshot.py's restore path, the resume-wait
@@ -22,13 +22,10 @@
 set -uo pipefail
 
 FRANKY_IMG="${FRANKY_IMG:-franky}"
-TASK="smoke-resume-task"
+TASK="smoke-resume-task-$$"
 WORKDIR="$(mktemp -d)"
 TARBALL="$WORKDIR/ws.tar.gz"
-# Derive HOME tmpfs size from the source module so this gate can't drift from container.py.
-HOME_SIZE="$(python3 -c 'from franky.container import _HOME_TMPFS_SIZE; print(_HOME_TMPFS_SIZE)')"
-
-cleanup() { docker rm -f "$TASK" >/dev/null 2>&1 || true; rm -rf "$WORKDIR"; }
+cleanup() { docker rm -f -v "$TASK" >/dev/null 2>&1 || true; rm -rf "$WORKDIR"; }
 trap cleanup EXIT
 fail() { echo "RESUME SMOKE FAIL: $*" >&2; exit 1; }
 
@@ -41,17 +38,8 @@ tar -czf "$TARBALL" -C "$SRC" .
 chmod 0600 "$TARBALL"   # snapshot tars are 0600 - the crux the cp-in + root-untar path tripped on
 
 echo "== start the franky image in resume-wait mode (real task _HARDENING profile) =="
-docker rm -f "$TASK" >/dev/null 2>&1 || true
-docker run -d --name "$TASK" \
-  -e FRANKY_RESUME_WAIT=1 \
-  --cap-drop=ALL --cap-add=SETUID --cap-add=SETGID \
-  --security-opt=systempaths=unconfined --device /dev/net/tun --read-only \
-  --tmpfs /work:exec,uid=1001,gid=1001 \
-  --tmpfs "/home/franky:exec,uid=1001,gid=1001,size=$HOME_SIZE" \
-  --tmpfs /run/user/1001:exec,uid=1001,gid=1001 \
-  --tmpfs /run:exec --tmpfs /tmp:exec \
-  --pids-limit=2048 --memory=4g --memory-swap=4g \
-  "$FRANKY_IMG" sh -c 'echo RESUME_ENGINE_RAN; sleep 10' >/dev/null \
+python3 scripts/smoke-task.py "$FRANKY_IMG" "$TASK" resume \
+  sh -c 'touch /tmp/resume-engine-ran; sleep 30' >/dev/null \
   || fail "container did not start"
 sleep 3   # let the entrypoint enter the resume-wait loop
 
@@ -72,10 +60,10 @@ echo "== 3. touch the marker; the resume-wait entrypoint must proceed and exec t
 docker exec "$TASK" touch /work/.franky-resume-ready || fail "marker touch failed"
 ran=0
 for _ in $(seq 1 15); do
-  docker logs "$TASK" 2>&1 | grep -q RESUME_ENGINE_RAN && { ran=1; break; }
+  docker exec "$TASK" test -f /tmp/resume-engine-ran && { ran=1; break; }
   sleep 1
 done
-[ "$ran" = 1 ] || { docker logs "$TASK" 2>&1 | tail -20; fail "engine never ran after marker (resume-wait stuck)"; }
+[ "$ran" = 1 ] || fail "engine never ran after marker (resume-wait stuck)"
 echo "   OK (engine ran after restore)"
 
 echo "SMOKE PASS: resume restore works into the real hardened container (stdin untar as uid 1001)."

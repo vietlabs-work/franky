@@ -318,7 +318,8 @@ members carry no host uid/username/timestamp.
 
 `franky job status <id>` also shows a `diagnostics:` block: the task's exit code, whether it was
 OOM-killed, its final container state, whether the nested rootless Docker daemon came up
-(`dind_ready`), a tmpfs-full heuristic, and any hosts the egress proxy denied (with counts).
+(`dind_ready`), a storage-full heuristic, and any hosts the egress proxy denied (with counts).
+The storage field retains its legacy name, `tmpfs_full`, for API compatibility.
 These are captured host-side, best-effort, right before the task/proxy containers are reaped -
 for a wedged run, `job kill` captures them too (before it reaps). `--json` includes the same
 `diagnostics` object (see `franky schema` -> `job_record_schema`).
@@ -549,6 +550,40 @@ result/error object shapes (including the distinct `plan_result_schema`), and th
 table - machine introspection so an agent can discover the contract instead of parsing
 `--help`.
 
+## Memory and concurrent jobs
+
+Franky uses disposable disk volumes for `/work`, `/home/franky`, and `/tmp`.
+Clones, build caches, and nested Docker images no longer require RAM-backed storage.
+Only small runtime directories use tmpfs. Disk page cache remains reclaimable under memory pressure.
+
+| Resource | Default | Configuration |
+|----------|---------|---------------|
+| Task, including nested containers | 2 GiB RAM, no swap | `FRANKY_MEMORY_MB`, 256..8192 MiB |
+| Egress proxy | 128 MiB RAM, no swap | Fixed per task |
+| Task disk data | 8 GiB soft budget | `FRANKY_DISK_MB`, 1024..32768 MiB |
+| Disk inspection helper | 64 MiB RAM, no network | Short-lived per task |
+
+Set budgets with `franky config set FRANKY_MEMORY_MB 2048` and `franky config set FRANKY_DISK_MB 8192`.
+Franky checks free disk before launch and task disk use approximately every five seconds.
+It stops the task when the budget is exceeded or Docker has less than 1 GiB free.
+This watchdog is not a filesystem quota: fast writers can overshoot between samples.
+
+For two jobs on a 16 GiB Mac, start with a 6 GiB Docker Desktop memory allocation.
+Two task/proxy limits total 4.25 GiB, leaving room for Docker, gateways, and inspection helpers.
+Limits are ceilings, not reservations. Large builds can still exceed the task limit.
+Limit each caller to one active job, for two jobs total. Franky does not enforce a global queue.
+Keep each instance's config, run directory, profile, and Codex auth volume separate.
+
+Run `make smoke-memory` after building both images. It runs two credential-free jobs through the production runner.
+Each job holds 256 MiB of process memory, writes 512 MiB of disk data, and creates 10,000 files.
+This checks runner overhead, cleanup, and VM headroom. It does not replace a canary against your largest repository.
+
+Host transcript and snapshot processing uses bounded buffers and private temporary files.
+Docker task logging is disabled, so Docker does not keep a second, unredacted stdout log.
+Use `franky job logs` for the completed redacted transcript; use `--verbose` for live output.
+JSONL events and structured payloads have a 1 MiB character limit; oversized events remain in the full redacted log.
+Snapshot scans refuse unscannable or oversized content, including lines/windows above 4 MiB, instead of saving unchecked data.
+
 ## Security
 
 Read this before pointing Franky at anything.
@@ -562,8 +597,7 @@ container with:
 
 - `--cap-drop=ALL`, then adds back only `CAP_SETUID`/`CAP_SETGID` (needed by the
   rootless Docker daemon - see "Docker-in-Docker" below)
-- `--read-only` root filesystem; writable paths only via `--tmpfs` (the clone, the
-  agent's HOME, and the rootless Docker data root, each owned by the non-root uid)
+- `--read-only` root filesystem; private anonymous volumes hold build data, while small runtime directories use tmpfs
 - `--pids-limit` and `--memory` caps (with `--memory-swap` = `--memory`, no swap)
 - a non-root user (uid 1001) baked into the image
 - **no Docker socket mount and no host bind mounts** - the repo is cloned inside
@@ -576,6 +610,11 @@ egress destinations. Credential values reach Docker only through name-only `-e N
 and join the redactor; native JSON/TOML config reaches HOME through the existing profile
 bundle. Franky recognizes only the reserved Codex and Claude MCP files; Pi requires a
 profile-injected MCP extension. See [Profiles](docs/profiles.md#mcp-configuration).
+
+Docker removes anonymous volumes when the task exits. The forced cleanup path also requests volume removal.
+These volumes are disposable storage, not secure erasure: deleted disk blocks can retain data.
+A trusted, networkless inspection helper mounts only the current task's data volumes, read-only, to measure disk use.
+It uses `DAC_READ_SEARCH` to count nested Docker files with mapped owners. It receives no credentials or auth-volume mount.
 
 Codex subscription auth is the narrow persistence exception: only one Docker named volume
 (default `franky-codex-auth`, per-instance via `FRANKY_CODEX_AUTH_VOLUME`) is mounted at
@@ -664,8 +703,7 @@ not inert. Two consequences of always-on DinD specifically:
   GH_TOKEN ...`). The egress allowlist still bounds *where* anything can go and
   PR-not-merge still bounds the damage, but the secret is no longer confined to a
   single process. There is also no per-inner-container resource limit and no
-  cross-task concurrency cap - the outer `--memory`/`--pids` cap (~8 GB, tmpfs image
-  storage is RAM) bounds one task's whole container tree.
+  cross-task concurrency cap. The outer memory limit (2 GiB by default) and process limit bound the whole task container tree.
 
 v0 mitigations, still in force:
 

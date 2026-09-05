@@ -28,6 +28,10 @@ GH_TOKEN_VAR = "GH_TOKEN"
 ALLOWED_REPOS_VAR = "FRANKY_ALLOWED_REPOS"
 EXTRA_ALLOWED_DOMAINS_VAR = "FRANKY_EXTRA_ALLOWED_DOMAINS"
 MODEL_VAR = "FRANKY_MODEL"
+MEMORY_MB_VAR = "FRANKY_MEMORY_MB"
+DISK_MB_VAR = "FRANKY_DISK_MB"
+DEFAULT_MEMORY_MB = 2048
+DEFAULT_DISK_MB = 8192
 
 # Valid allowlist entry pattern: the literal "*" (match any repo) OR exactly one "/"
 # with GitHub-compatible owner/name segments (alphanumeric, dash, underscore, dot).
@@ -72,6 +76,8 @@ class Config:
     codex_mcp_overrides: list[str] = field(default_factory=list)
     claude_mcp_config_path: str | None = None
     model: str | None = None
+    memory_mb: int = DEFAULT_MEMORY_MB
+    disk_mb: int = DEFAULT_DISK_MB
 
     def secret_values(self) -> list[str]:
         """Secret strings known to the host and therefore available for output redaction.
@@ -203,7 +209,16 @@ def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
         extra_allowed_domains=extra_domains,
         auth_volume=auth_volume,
         model=model,
+        memory_mb=_resource_budget(env, MEMORY_MB_VAR, DEFAULT_MEMORY_MB, 256, 8192),
+        disk_mb=_resource_budget(env, DISK_MB_VAR, DEFAULT_DISK_MB, 1024, 32768),
     )
+
+
+def _resource_budget(env: Mapping[str, str], key: str, default: int, low: int, high: int) -> int:
+    raw = env.get(key, str(default))
+    if not re.fullmatch(r"[0-9]{1,5}", raw or "") or not low <= int(raw) <= high:
+        raise ConfigError(f"{key} must be an integer from {low} to {high} (MiB)")
+    return int(raw)
 
 
 def repo_allowed(repo: str, allowed: list[str]) -> bool:

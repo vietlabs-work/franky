@@ -41,21 +41,25 @@ def parse_usage(output: str) -> Usage:
     """
     # Candidates: (is_terminal, event_dict) pairs for usage and cost separately.
     # We pick the last terminal candidate, else the last any candidate.
-    usage_candidates: list[tuple[bool, dict]] = []
-    cost_candidates: list[tuple[bool, dict]] = []
+    usage_best = (False, (None, None))
+    cost_best = (False, None)
     opencode_input: int | None = None
     opencode_output: int | None = None
     opencode_cost: float | None = None
     opencode_cost_overflowed = False
     opencode_found = False
 
-    for line in output.splitlines():
+    from .transcript import lines
+
+    for line in lines(output):
+        if line is None:
+            continue
         line = line.strip()
         if not line:
             continue
         try:
             event = json.loads(line)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             continue  # not JSON - skip, never raise
         if not isinstance(event, dict):
             continue
@@ -83,12 +87,14 @@ def parse_usage(output: str) -> Usage:
         is_terminal = isinstance(event_type, str) and event_type in _TERMINAL_TYPES
 
         # Check for a recognizable usage block.
-        if _extract_tokens(event) != (None, None):
-            usage_candidates.append((is_terminal, event))
+        tokens = _extract_tokens(event)
+        if tokens != (None, None) and (is_terminal or not usage_best[0]):
+            usage_best = (is_terminal, tokens)
 
         # Check for a recognizable cost field.
-        if _extract_cost(event) is not None:
-            cost_candidates.append((is_terminal, event))
+        cost = _extract_cost(event)
+        if cost is not None and (is_terminal or not cost_best[0]):
+            cost_best = (is_terminal, cost)
 
     if opencode_found:
         return Usage(
@@ -98,25 +104,10 @@ def parse_usage(output: str) -> Usage:
         )
 
     # For each dimension: prefer the last terminal candidate, else the last any candidate.
-    usage_event = _pick_best(usage_candidates)
-    cost_event = _pick_best(cost_candidates)
-
-    input_tokens, output_tokens = _extract_tokens(usage_event) if usage_event else (None, None)
-    cost_usd = _extract_cost(cost_event) if cost_event else None
+    input_tokens, output_tokens = usage_best[1]
+    cost_usd = cost_best[1]
 
     return Usage(input_tokens=input_tokens, output_tokens=output_tokens, cost_usd=cost_usd)
-
-
-def _pick_best(candidates: list[tuple[bool, dict]]) -> dict | None:
-    """Return the last terminal candidate, or the last candidate if none are terminal."""
-    if not candidates:
-        return None
-    # Walk in reverse: first terminal found is the last terminal overall.
-    for is_terminal, event in reversed(candidates):
-        if is_terminal:
-            return event
-    # No terminal candidate - fall back to the last candidate.
-    return candidates[-1][1]
 
 
 def _extract_tokens(event: dict | None) -> tuple[int | None, int | None]:

@@ -1,7 +1,7 @@
 """Workspace snapshot + restore for `franky job resume` (issue #71).
 
 WHY this exists: a hung/timed-out/killed run throws away everything the agent did inside the
-container's tmpfs `/work` (the repo clone + its branch state). `franky job resume` lets a fresh
+container's disposable `/work` (the repo clone + its branch state). `franky job resume` lets a fresh
 engine CONTINUE that work instead of restarting from scratch. To do that we must capture `/work`
 off the container before it is reaped, store it host-side, and later restore it into a freshly
 launched (still fully hardened) container.
@@ -9,7 +9,7 @@ launched (still fully hardened) container.
 WHY it does NOT touch the container hardening: the snapshot is taken with host-side
 `docker cp`/`docker exec` only - no bind mount, no host docker socket, no relaxation of
 `_HARDENING`. The restore does NOT `docker cp` the tar back IN (the daemon refuses a `cp` into a
-`--read-only` container, even to a tmpfs target); instead it pipes the tar to `tar -xzf -` over
+`--read-only` container, even to a writable target); instead it pipes the tar to `tar -xzf -` over
 `docker exec -i` stdin, extracted as the run uid (1001) which owns `/work`, and the container
 waits for a marker file (an env flag) before running the engine. The safety boundary is unchanged.
 
@@ -32,12 +32,16 @@ trivially unit-testable without real docker.
 
 from __future__ import annotations
 
-import io
+import os
 import re
+import shutil
+import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
 import time
+from collections import deque
 from pathlib import Path
 
 from . import jobs
@@ -45,7 +49,7 @@ from .profile import scan_for_secrets
 
 # The container-side marker the host touches (via `docker exec`) once the workspace tar has been
 # copied in and extracted; the entrypoint waits for it before exec-ing the engine (see
-# franky-dind-entrypoint.sh). Living under /work means it lands on the writable tmpfs.
+# franky-dind-entrypoint.sh). Living under /work means it lands on the writable volume.
 SNAPSHOT_MARKER = ".franky-resume-ready"
 
 # Env flag that puts the entrypoint into resume-wait mode (by-value, non-secret). build_docker_argv
@@ -68,10 +72,127 @@ _CRED_FILENAMES = {
 
 # Strips URL userinfo from any line: `https://x-access-token:TOKEN@github.com` -> `https://github.com`.
 # `[^/@\s]*` stops at the first `/`, `@`, or whitespace so only the authority's userinfo is removed.
-_GIT_URL_USERINFO_RE = re.compile(r"://[^/@\s]*@")
+_GIT_URL_USERINFO_RE = re.compile(rb"://[^/@\s]*@")
 
 # The bytes we substitute a matched secret VALUE with when redacting non-.git files in the tree.
 _REDACTED = b"[REDACTED]"
+
+_CHUNK_BYTES = 64 * 1024
+_MAX_SCAN_BYTES = 4 * 1024 * 1024
+_MAX_ENTRIES = 100_000
+_MAX_FILE_BYTES = 4 * 1024**3
+_MAX_TREE_BYTES = 16 * 1024**3
+
+# Set the native output-file limit in a fresh process; preexec_fn is unsafe with host threads.
+_GIT_LIMITED_EXEC = (
+    "import os,resource,sys; cap=int(sys.argv[1]); "
+    "resource.setrlimit(resource.RLIMIT_FSIZE,(cap,cap)); "
+    "os.execvp('git',['git',*sys.argv[2:]])"
+)
+
+
+def _tree_paths(root: Path):
+    """Bound traversal and refuse unreadable trees; never follow symbolic links."""
+    count = total = 0
+
+    def walk(directory, depth):
+        nonlocal count, total
+        if depth > 128:
+            raise ValueError("snapshot directory depth exceeded")
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                count += 1
+                if count > _MAX_ENTRIES:
+                    raise ValueError("snapshot entry limit exceeded")
+                info = entry.stat(follow_symlinks=False)
+                if stat.S_ISLNK(info.st_mode):
+                    continue
+                path = Path(entry.path)
+                if stat.S_ISREG(info.st_mode):
+                    total += info.st_size
+                    if info.st_size > _MAX_FILE_BYTES or total > _MAX_TREE_BYTES:
+                        raise ValueError("snapshot size limit exceeded")
+                    yield path
+                elif stat.S_ISDIR(info.st_mode):
+                    yield path
+                    yield from walk(path, depth + 1)
+
+    yield from walk(root, 0)
+
+
+def _contains_values(stream, values):
+    overlap = max((len(value) for value in values), default=1) - 1
+    if overlap > _MAX_SCAN_BYTES:
+        raise ValueError("snapshot secret length exceeded")
+    pending = b""
+    total = 0
+    while chunk := stream.read(_CHUNK_BYTES):
+        total += len(chunk)
+        if total > _MAX_TREE_BYTES:
+            raise ValueError("snapshot object size exceeded")
+        data = pending + chunk
+        if any(value in data for value in values):
+            return True
+        pending = data[-overlap:] if overlap else b""
+    return False
+
+
+def _has_pattern(stream):
+    # All current patterns are line-local except NAME whitespace = whitespace VALUE.
+    # Three nonempty lines cover that assignment, including intervening blank lines.
+    # ponytail: refuse windows over 4 MiB; use an incremental regex parser if needed.
+    lines = deque()
+    size = 0
+    nonempty = 0
+    while line := stream.readline(_MAX_SCAN_BYTES + 1):
+        size += len(line)
+        if size > _MAX_SCAN_BYTES or len(lines) >= _MAX_ENTRIES:
+            raise ValueError("snapshot pattern window exceeded")
+        text = line.decode("utf-8", errors="replace")
+        lines.append((text, len(line)))
+        if not text.strip():
+            continue
+        nonempty += 1
+        if scan_for_secrets("".join(text for text, _ in lines)):
+            return True
+        if nonempty == 3:
+            while lines:
+                old, length = lines.popleft()
+                size -= length
+                if old.strip():
+                    nonempty -= 1
+                    break
+    return bool(scan_for_secrets("".join(text for text, _ in lines)))
+
+
+def _redact_file(path, values):
+    with path.open("rb") as source:
+        if not _contains_values(source, values):
+            return
+    # One bounded disk pass per value preserves longest-first bytes.replace semantics.
+    for value in values:
+        if len(value) > _MAX_SCAN_BYTES:
+            raise ValueError("snapshot secret length exceeded")
+        with path.open("rb") as source, tempfile.TemporaryFile() as output:
+            pending = b""
+            changed = False
+            while chunk := source.read(_CHUNK_BYTES):
+                data = pending + chunk
+                end = max(0, len(data) - len(value) + 1)
+                start = 0
+                while (index := data.find(value, start)) >= 0 and index < end:
+                    output.write(data[start:index])
+                    output.write(_REDACTED)
+                    start = index + len(value)
+                    changed = True
+                end = max(end, start)
+                output.write(data[start:end])
+                pending = data[end:]
+            output.write(pending)
+            if changed:
+                output.seek(0)
+                with path.open("wb") as target:
+                    shutil.copyfileobj(output, target, _CHUNK_BYTES)
 
 
 # ---------------------------------------------------------------------------
@@ -93,10 +214,10 @@ def build_untar_argv(task: str, target: str = "/work") -> list[str]:
     WHY the tar arrives on STDIN and not via `docker cp` + a file: the resume container runs
     `--read-only` (part of `_HARDENING`), and `docker cp` INTO a read-only container is refused by
     the daemon outright ("container rootfs is marked read-only") even when the destination is a
-    writable tmpfs. So we never copy a file in - we pipe the snapshot bytes straight to `tar -xzf -`
+    writable volume. So we never copy a file in - we pipe the snapshot bytes straight to `tar -xzf -`
     through `docker exec -i` (the same stdin channel `deliver_steer` uses for steering).
 
-    WHY as the image's default uid 1001, NOT root: the `/work` tmpfs is owned by uid 1001, and the
+    WHY as the image's default uid 1001, NOT root: the `/work` volume is owned by uid 1001, and the
     task profile is `--cap-drop=ALL` (only SETUID/SETGID added back), so root inside the container
     has NO `CAP_DAC_OVERRIDE`/`CAP_CHOWN` and cannot even write into a 1001-owned dir. Extracting as
     uid 1001 (which owns `/work`) writes freely; `--no-same-owner` makes `tar` ignore the archived
@@ -156,7 +277,9 @@ def _iter_git_dirs(root: Path):
 
     A `.git` that is itself a SYMLINK is skipped (`is_dir()` follows symlinks, so a symlinked
     `.git` could point outside `root`) - consistent with the symlink guards on the file walks."""
-    for path in root.rglob(".git"):
+    for path in _tree_paths(root):
+        if path.name != ".git":
+            continue
         if path.is_symlink():
             continue
         if path.is_dir():
@@ -171,31 +294,20 @@ def _scrub_git_config(config_path: Path) -> None:
     line would otherwise carry a live credential into the snapshot. Push still works after this:
     the resume container re-authenticates from GH_TOKEN, so a bare `https://github.com/...` remote
     is fine."""
-    try:
-        text = config_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return
-    out_lines = []
-    changed = False
-    for line in text.splitlines(keepends=True):
-        stripped = line.strip()
-        # Drop any credential-helper line (a helper = <program> config directive) wholesale.
-        if stripped.startswith("helper =") or stripped.startswith("helper="):
-            changed = True
-            continue
-        new_line = _GIT_URL_USERINFO_RE.sub("://", line)
-        if new_line != line:
-            changed = True
-        out_lines.append(new_line)
-    if changed:
-        try:
-            config_path.write_text("".join(out_lines), encoding="utf-8")
-        except OSError:
-            pass
+    with config_path.open("rb") as source, tempfile.TemporaryFile() as output:
+        while data := source.readline(_MAX_SCAN_BYTES + 1):
+            if len(data) > _MAX_SCAN_BYTES:
+                raise ValueError("snapshot config line exceeded")
+            if data.strip().startswith((b"helper =", b"helper=")):
+                continue
+            output.write(_GIT_URL_USERINFO_RE.sub(b"://", data))
+        output.seek(0)
+        with config_path.open("wb") as target:
+            shutil.copyfileobj(output, target, _CHUNK_BYTES)
 
 
 def scrub_workspace(root: Path, secrets: list[str]) -> None:
-    """Best-effort, in-place scrub of a snapshot tree before it is packed. Never raises.
+    """Scrub a snapshot tree before packing. Errors refuse the snapshot at the caller.
 
     Three actions:
       1. DELETE known credential files (`_CRED_FILENAMES`, any `*.pem`) and the resume marker,
@@ -212,49 +324,24 @@ def scrub_workspace(root: Path, secrets: list[str]) -> None:
     values = sorted({s for s in secrets if s}, key=len, reverse=True)
 
     # 1. Delete cred files + marker.
-    try:
-        for path in root.rglob("*"):
-            if path.is_symlink() or not path.is_file():
-                continue
-            name = path.name
-            if name in _CRED_FILENAMES or name.endswith(".pem") or name == SNAPSHOT_MARKER:
-                try:
-                    path.unlink()
-                except OSError:
-                    pass
-    except OSError:
-        pass
+    for path in _tree_paths(root):
+        if not path.is_file():
+            continue
+        name = path.name
+        if name in _CRED_FILENAMES or name.endswith(".pem") or name == SNAPSHOT_MARKER:
+            path.unlink()
 
     # 2. Rewrite .git/config files (recursively, to catch submodule module configs too).
-    for git_dir in _iter_git_dirs(root):
-        for config_path in git_dir.rglob("config"):
-            if config_path.is_file() and not config_path.is_symlink():
-                _scrub_git_config(config_path)
+    for path in _tree_paths(root):
+        if path.name == "config" and path.is_file() and _is_under_git(path, root):
+            _scrub_git_config(path)
 
     # 3. Redact known secret values in non-.git files (bytes in, bytes out).
     if values:
         value_bytes = [v.encode("utf-8") for v in values]
-        try:
-            for path in root.rglob("*"):
-                if path.is_symlink() or not path.is_file():
-                    continue
-                if _is_under_git(path, root):
-                    continue
-                try:
-                    data = path.read_bytes()
-                except OSError:
-                    continue
-                new_data = data
-                for vb in value_bytes:
-                    if vb in new_data:
-                        new_data = new_data.replace(vb, _REDACTED)
-                if new_data != data:
-                    try:
-                        path.write_bytes(new_data)
-                    except OSError:
-                        pass
-        except OSError:
-            pass
+        for path in _tree_paths(root):
+            if path.is_file() and not _is_under_git(path, root):
+                _redact_file(path, value_bytes)
 
 
 def _iter_object_stores(root: Path):
@@ -271,7 +358,7 @@ def _iter_object_stores(root: Path):
         modules = git_dir / "modules"
         if not modules.is_dir() or modules.is_symlink():
             continue
-        for sub in modules.rglob("*"):
+        for sub in _tree_paths(modules):
             if sub.is_symlink() or not sub.is_dir():
                 continue
             objects = sub / "objects"
@@ -291,10 +378,9 @@ def verify_no_secrets(root: Path, secrets: list[str], runner=subprocess.run) -> 
       `.git/logs/*`, `.git/packed-refs`, `.git/COMMIT_EDITMSG`), a source file, anything - is a
       finding. (We do NOT skip `.git` here: the earlier decision to skip it was the fail-closed
       gap - only the byte-mutating SCRUB skips `.git`, never this read-only value scan.)
-    - PATTERN scan (`profile.scan_for_secrets`) over NON-`.git` files only, catching a FRESH
-      token the agent minted (a new `ghp_...`/`sk-ant-...` not in `secrets`). Kept off `.git`
-      deliberately: a committed test fixture could legitimately hold a token-shaped string, and
-      pattern-flagging it would make every such repo unresumable.
+    - PATTERN scan (`profile.scan_for_secrets`) over non-`.git` files and git config files,
+      catching a fresh token the agent minted (a new `ghp_...`/`sk-ant-...` not in `secrets`).
+      Other git internals can contain committed token-shaped test fixtures, so they stay exempt.
     - OBJECT-CONTENT scan: git objects are zlib-compressed, so the byte scan above is blind to
       them. For each object store (top-level `.git` AND every submodule `.git/modules/*`) we run
       `git cat-file --batch-all-objects --unordered --batch` and scan its stdout BYTES for known
@@ -305,54 +391,50 @@ def verify_no_secrets(root: Path, secrets: list[str], runner=subprocess.run) -> 
     findings: list[str] = []
     value_bytes = [s.encode("utf-8") for s in secrets if s]
 
-    # Value scan over the full packed file set (INCLUDING .git); pattern scan on non-.git only.
+    # Scan all raw values; scan patterns in working files and git configuration.
     try:
-        for path in sorted(root.rglob("*")):
+        for path in _tree_paths(root):
             if path.is_symlink() or not path.is_file():
                 continue
-            try:
-                data = path.read_bytes()
-            except OSError:
-                continue
             rel = str(path.relative_to(root))
-            if any(vb in data for vb in value_bytes):
-                findings.append(f"secret value survived in {rel}")
-                continue
-            if _is_under_git(path, root):
-                continue  # pattern scan is non-.git only (fixture false positives)
-            text = data.decode("utf-8", errors="replace")
-            if scan_for_secrets(text):
-                findings.append(f"credential pattern in {rel}")
-    except OSError:
-        pass
+            with path.open("rb") as stream:
+                if _contains_values(stream, value_bytes):
+                    return [f"secret value survived in {rel}"]
+                if not _is_under_git(path, root) or path.name == "config":
+                    stream.seek(0)
+                    if _has_pattern(stream):
+                        return [f"credential pattern in {rel}"]
+    except (OSError, ValueError):
+        return ["workspace verification failed"]
 
     # Object-content scan (decompress via git) over every store. Any failure is a finding.
-    for label, git_dir in _iter_object_stores(root):
-        try:
-            proc = runner(
-                [
-                    "git",
-                    "--git-dir",
-                    str(git_dir),
-                    "cat-file",
-                    "--batch-all-objects",
-                    "--unordered",
-                    "--batch",
-                ],
-                capture_output=True,
-                timeout=20.0,
-            )
-        except Exception:
-            findings.append(f"git object verification failed for {label}")
-            continue
-        if getattr(proc, "returncode", 1) != 0:
-            findings.append(f"git object verification errored for {label}")
-            continue
-        stdout = getattr(proc, "stdout", b"") or b""
-        if isinstance(stdout, str):
-            stdout = stdout.encode("utf-8", errors="replace")
-        if any(vb in stdout for vb in value_bytes):
-            findings.append(f"secret value in git object content ({label})")
+    try:
+        for label, git_dir in _iter_object_stores(root):
+            with tempfile.TemporaryFile() as output:
+                proc = runner(
+                    [
+                        sys.executable,
+                        "-c",
+                        _GIT_LIMITED_EXEC,
+                        str(_MAX_TREE_BYTES),
+                        "--git-dir",
+                        str(git_dir),
+                        "cat-file",
+                        "--batch-all-objects",
+                        "--unordered",
+                        "--batch",
+                    ],
+                    stdout=output,
+                    stderr=subprocess.DEVNULL,
+                    timeout=20.0,
+                )
+                if getattr(proc, "returncode", 1) != 0:
+                    return [f"git object verification errored for {label}"]
+                output.seek(0)
+                if _contains_values(output, value_bytes):
+                    return [f"secret value in git object content ({label})"]
+    except Exception:
+        return ["git object verification failed"]
 
     return findings
 
@@ -362,17 +444,17 @@ def verify_no_secrets(root: Path, secrets: list[str], runner=subprocess.run) -> 
 # ---------------------------------------------------------------------------
 
 
-def _add_file(tar: tarfile.TarFile, arcname: str, data: bytes) -> None:
-    """Add `data` as `arcname` with fixed, host-free metadata (mode 0600, mtime 0, uid/gid 0,
+def _add_file(tar: tarfile.TarFile, arcname: str, stream) -> None:
+    """Add a file with fixed, host-free metadata (mode 0600, mtime 0, uid/gid 0,
     empty uname/gname) so the tar members leak no host username/timestamps and pack
     deterministically - same discipline as jobs._add_bytes for the forensic export."""
     info = tarfile.TarInfo(name=arcname)
-    info.size = len(data)
+    info.size = os.fstat(stream.fileno()).st_size
     info.mode = 0o600
     info.mtime = 0
     info.uid = info.gid = 0
     info.uname = info.gname = ""
-    tar.addfile(info, io.BytesIO(data))
+    tar.addfile(info, stream)
 
 
 def _pack_dir(src_dir: Path, dest_tar: Path) -> None:
@@ -382,15 +464,12 @@ def _pack_dir(src_dir: Path, dest_tar: Path) -> None:
     skipped (a snapshot is a plain file tree). `tar -xzf ... -C /work` recreates the parent dirs
     on restore, so we need not store directory entries."""
     with tarfile.open(dest_tar, "w:gz") as tar:
-        for path in sorted(src_dir.rglob("*")):
+        for path in sorted(_tree_paths(src_dir)):
             if path.is_symlink() or not path.is_file():
                 continue
-            try:
-                data = path.read_bytes()
-            except OSError:
-                continue
             arcname = str(path.relative_to(src_dir))
-            _add_file(tar, arcname, data)
+            with path.open("rb") as stream:
+                _add_file(tar, arcname, stream)
 
 
 # ---------------------------------------------------------------------------
@@ -480,7 +559,7 @@ def restore_into_container(
     appears, so we first poll `container_running` (up to `ready_polls`) to confirm it is up, then:
     untar-from-stdin as uid 1001 (`-i --no-same-owner`) -> touch marker, in that order. WHY stdin,
     not `docker cp` the tar in: the resume container is `--read-only`, and the daemon refuses a `cp`
-    INTO a read-only container even for a tmpfs target, so a cp-based restore fails on every resume;
+    INTO a read-only container even for a writable target, so a cp-based restore fails on every resume;
     piping the bytes to `tar -xzf -` avoids the cp entirely. WHY extract as uid 1001, not root +
     chown: the task profile is `--cap-drop=ALL`, so in-container root lacks the caps to write into
     the 1001-owned `/work` or to chown - extracting as 1001 (which owns `/work`) with

@@ -568,6 +568,10 @@ def build_diagnose_prompt(record: dict, transcript: str, nonce: str) -> str:
     """
     persona = load_persona()
 
+    from .transcript import Transcript
+
+    if isinstance(transcript, Transcript):
+        transcript = transcript.tail(DIAGNOSE_TRANSCRIPT_TAIL_CHARS + 1)
     if len(transcript) > DIAGNOSE_TRANSCRIPT_TAIL_CHARS:
         tail = transcript[-DIAGNOSE_TRANSCRIPT_TAIL_CHARS:]
         note = f" (last {DIAGNOSE_TRANSCRIPT_TAIL_CHARS} chars; earlier output omitted)"

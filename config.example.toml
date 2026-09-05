@@ -17,6 +17,13 @@
 #   codex  - OpenAI Codex (codex exec), ChatGPT subscription or API-key auth
 FRANKY_ENGINE = "pi"
 
+# --- Per-job resource budgets (OPTIONAL, MiB) ------------------------------
+# The task limit includes the engine, builds, and nested Docker containers.
+# Memory: 256..8192 MiB. Each proxy has a separate fixed 128 MiB limit.
+# Disk: 1024..32768 MiB. A five-second watchdog stops excess use; it is not a quota.
+# FRANKY_MEMORY_MB = "2048"
+# FRANKY_DISK_MB = "8192"
+
 # --- Trusted-repo allowlist (REQUIRED, fail-closed) -------------------------
 # Comma-separated owner/repo entries Franky is permitted to act on. Supports
 # glob patterns per segment:

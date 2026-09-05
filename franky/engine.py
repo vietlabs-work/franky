@@ -133,8 +133,15 @@ def _pr_url_pattern(repo: str | None) -> re.Pattern[str]:
 def _fallback_pr_url(output: str, pattern: re.Pattern[str]) -> str | None:
     """Return the LAST PR URL matching `pattern` in plain text, or None. Used when
     structured per-line parsing yields nothing."""
-    matches = pattern.findall(output)
-    return matches[-1] if matches else None
+    from .transcript import lines
+
+    found = None
+    for line in lines(output):
+        if line is None:
+            return None
+        for match in pattern.finditer(line):
+            found = match.group(0)
+    return found
 
 
 def _scan_jsonl_for_pr_url(output: str, repo: str | None = None) -> str | None:
@@ -149,13 +156,17 @@ def _scan_jsonl_for_pr_url(output: str, repo: str | None = None) -> str | None:
     """
     pattern = _pr_url_pattern(repo)
     found: str | None = None
-    for line in output.splitlines():
+    from .transcript import lines
+
+    for line in lines(output):
+        if line is None:
+            return None
         line = line.strip()
         if not line:
             continue
         try:
             event = json.loads(line)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             continue  # not JSON (banner, log line) - skip, never raise
         match = pattern.search(json.dumps(event))
         if match:

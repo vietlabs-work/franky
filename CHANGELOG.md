@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Move workspace, HOME, temporary files, and nested Docker data from RAM-backed mounts to disposable disk volumes.
+- Default to a 2 GiB task memory limit and a 128 MiB proxy limit. Configure tasks with `FRANKY_MEMORY_MB`.
+- Bound Squid file-descriptor tables to prevent high startup memory use.
+- Stream redacted transcripts, parser input, exports, and snapshots instead of loading whole artifacts into memory.
+- Refuse oversized snapshot scans and parser events. Full redacted output remains in the run log.
+
+### Added
+
+- `FRANKY_DISK_MB` sets a per-job disk budget, checked every five seconds. This watchdog is not a filesystem quota.
+- `make smoke-memory` checks two concurrent production runners without credentials or model calls.
+
 ## [0.1.3] - 2026-09-04
 
 ### Added

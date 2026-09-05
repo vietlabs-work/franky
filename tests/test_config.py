@@ -50,6 +50,30 @@ def test_load_config_happy_path_pi():
     assert cfg.passthrough_env["OPENROUTER_API_KEY"] == "sk-or-fake"
 
 
+def test_resource_budgets_flow_to_container():
+    from franky.container import build_docker_argv
+
+    cfg = load_config(None, _env(FRANKY_MEMORY_MB="3072", FRANKY_DISK_MB="4096"))
+    argv = build_docker_argv(
+        "franky", cfg.passthrough_env, ["pi"], memory_mb=cfg.memory_mb, disk_mb=cfg.disk_mb
+    )
+    assert "--memory=3072m" in argv and "--memory-swap=3072m" in argv
+    assert "FRANKY_DISK_MB=4096" in argv
+    assert "FRANKY_MEMORY_MB" not in cfg.passthrough_env
+
+
+@pytest.mark.parametrize("value", ["", "0", "255", "8193", "2g", "1.5", " 2048", "-1"])
+def test_invalid_memory_budget_fails_closed(value):
+    with pytest.raises(ConfigError, match="FRANKY_MEMORY_MB"):
+        load_config(None, _env(FRANKY_MEMORY_MB=value))
+
+
+@pytest.mark.parametrize("value", ["", "1023", "32769", "bad"])
+def test_invalid_disk_budget_fails_closed(value):
+    with pytest.raises(ConfigError, match="FRANKY_DISK_MB"):
+        load_config(None, _env(FRANKY_DISK_MB=value))
+
+
 def test_load_config_engine_resolution_claude():
     env = _env(CLAUDE_CODE_OAUTH_TOKEN="oauth-fake")
     cfg = load_config("claude", env)
