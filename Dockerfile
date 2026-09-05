@@ -1,5 +1,5 @@
-# Franky build image: one image bundles all coding-agent engines AND
-# an always-on rootless Docker daemon (issue #12) so a task can build/test repos whose suites
+# Franky build image: release variants bundle one coding-agent engine; the default bundles all.
+# Every image has an always-on rootless Docker daemon (issue #12), so tasks can test repos whose suites
 # need local infra (docker compose, testcontainers, `docker build`). Hardened at run time (see
 # franky/container.py); the image pre-bakes the toolchain so no task needs runtime root apt.
 #
@@ -16,7 +16,7 @@ ARG DOCKER_VERSION=27.3.1
 ARG BUILDX_VERSION=v0.17.1
 ARG COMPOSE_VERSION=v2.29.7
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl tar \
+    && apt-get install -y --no-install-recommends binutils ca-certificates curl tar \
     && rm -rf /var/lib/apt/lists/*
 RUN set -eux; \
     arch="$(dpkg --print-architecture)"; \
@@ -30,13 +30,21 @@ RUN set -eux; \
         | tar -xz -C /tmp; \
     curl -fsSL "https://download.docker.com/linux/static/stable/${dockerarch}/docker-rootless-extras-${DOCKER_VERSION}.tgz" \
         | tar -xz -C /tmp; \
-    cp /tmp/docker/* /out/bin/; \
-    cp /tmp/docker-rootless-extras/* /out/bin/; \
+    cp /tmp/docker/containerd /tmp/docker/containerd-shim-runc-v2 \
+        /tmp/docker/docker /tmp/docker/docker-init /tmp/docker/docker-proxy \
+        /tmp/docker/dockerd /tmp/docker/runc /out/bin/; \
+    cp /tmp/docker-rootless-extras/dockerd-rootless-setuptool.sh \
+        /tmp/docker-rootless-extras/dockerd-rootless.sh \
+        /tmp/docker-rootless-extras/rootlesskit \
+        /tmp/docker-rootless-extras/rootlesskit-docker-proxy /out/bin/; \
     curl -fsSL "https://github.com/docker/buildx/releases/download/${BUILDX_VERSION}/buildx-${BUILDX_VERSION}.linux-${plugarch}" \
         -o /out/cli-plugins/docker-buildx; \
     curl -fsSL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-${dockerarch}" \
         -o /out/cli-plugins/docker-compose; \
-    chmod +x /out/bin/* /out/cli-plugins/*
+    chmod +x /out/bin/* /out/cli-plugins/*; \
+    strip /out/bin/docker /out/bin/dockerd /out/bin/docker-proxy /out/bin/runc \
+        /out/bin/rootlesskit /out/bin/rootlesskit-docker-proxy \
+        /out/cli-plugins/docker-compose
 
 # ---- stage 2: the franky runtime image -------------------------------------------------------
 FROM node:22-slim
@@ -77,18 +85,23 @@ RUN apt-get update \
 COPY --from=docker-dl /out/bin/ /usr/local/bin/
 COPY --from=docker-dl /out/cli-plugins/ /usr/local/lib/docker/cli-plugins/
 
-# All engines are node CLIs, so one npm install bundles them.
+# Select one engine for release variants. The default preserves the full local-development image.
 #   pi     -> @earendil-works/pi-coding-agent  (bin: pi)
 #   claude -> @anthropic-ai/claude-code        (bin: claude)
 #   codex  -> @openai/codex                    (bin: codex)
 #   opencode -> opencode-ai                    (bin: opencode)
 # Clean the npm cache in the SAME layer - otherwise ~100MB of /root/.npm download
 # cache commits into the image (it is dead weight at runtime; npm refetches on demand).
-RUN npm install -g \
-        @earendil-works/pi-coding-agent \
-        @anthropic-ai/claude-code \
-        @openai/codex \
-        opencode-ai \
+ARG FRANKY_ENGINE=all
+RUN case "$FRANKY_ENGINE" in \
+        pi) packages="@earendil-works/pi-coding-agent" ;; \
+        claude) packages="@anthropic-ai/claude-code" ;; \
+        codex) packages="@openai/codex" ;; \
+        opencode) packages="opencode-ai" ;; \
+        all) packages="@earendil-works/pi-coding-agent @anthropic-ai/claude-code @openai/codex opencode-ai" ;; \
+        *) echo "unsupported FRANKY_ENGINE" >&2; exit 2 ;; \
+    esac \
+    && npm install -g $packages \
     && npm cache clean --force
 
 # Non-root: the agent (and the rootless Docker daemon) run as this unprivileged user inside the

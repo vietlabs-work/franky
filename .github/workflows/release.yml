@@ -89,9 +89,33 @@ jobs:
           - name: franky
             context: .
             dockerfile: Dockerfile
+            engine: all
+            suffix: ""
+          - name: franky
+            context: .
+            dockerfile: Dockerfile
+            engine: pi
+            suffix: -pi
+          - name: franky
+            context: .
+            dockerfile: Dockerfile
+            engine: claude
+            suffix: -claude
+          - name: franky
+            context: .
+            dockerfile: Dockerfile
+            engine: codex
+            suffix: -codex
+          - name: franky
+            context: .
+            dockerfile: Dockerfile
+            engine: opencode
+            suffix: -opencode
           - name: franky-proxy
             context: proxy
             dockerfile: proxy/Dockerfile
+            engine: all
+            suffix: ""
     steps:
       - uses: actions/checkout@v5
       - uses: docker/setup-qemu-action@v3
@@ -112,13 +136,14 @@ jobs:
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
+          build-args: FRANKY_ENGINE=${{ matrix.engine }}
           platforms: ${{ github.event_name == 'push' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
           push: ${{ github.event_name == 'push' }}
           # Namespace tracks the repo's owning org, so moving the repo retargets the images
           # with no edit. The CLI's DEFAULT_GHCR_REPO (franky/container.py) must match that org.
           tags: |
-            ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}:${{ env.VERSION }}
-            ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}:latest
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}:${{ env.VERSION }}${{ matrix.suffix }}
+            ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}:latest${{ matrix.suffix }}
 
   # GitHub Release is created last - its existence implies the wheel + PyPI + images shipped.
   release:

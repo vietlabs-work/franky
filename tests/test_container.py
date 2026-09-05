@@ -1,6 +1,8 @@
 import subprocess
 
 import franky.container as container_mod
+import pytest
+from franky import franky_version
 from franky.config import Config, load_config
 from franky.container import (
     CODEX_AUTH_HOME,
@@ -726,6 +728,17 @@ def test_resolve_image_default_is_versioned_ghcr():
     assert not ref.endswith(":latest")
 
 
+@pytest.mark.parametrize("engine", ["pi", "claude", "codex", "opencode"])
+def test_engine_image_tag(engine):
+    assert resolve_image({}, engine=engine).endswith(f":{franky_version()}-{engine}")
+    assert resolve_image({"FRANKY_IMAGE": "local:test"}, engine=engine) == "local:test"
+
+
+def test_resolve_image_rejects_unknown_engine():
+    with pytest.raises(ValueError, match="unknown image engine"):
+        resolve_image({}, engine="bogus")
+
+
 def test_resolve_image_proxy_uses_proxy_var():
     ref = resolve_image({}, FRANKY_PROXY_IMAGE_VAR, "franky-proxy")
     assert ref.startswith("ghcr.io/vietlabs-work/franky-proxy:")
@@ -736,6 +749,9 @@ def test_resolve_image_ghcr_repo_override():
     # while the per-image FRANKY_IMAGE override still wins outright.
     ref = resolve_image({GHCR_REPO_VAR: "ghcr.io/acme"})
     assert ref.startswith("ghcr.io/acme/franky:")
+    assert resolve_image({GHCR_REPO_VAR: "ghcr.io/acme"}, engine="codex").startswith(
+        "ghcr.io/acme/franky:"
+    )
     assert resolve_image({GHCR_REPO_VAR: "ghcr.io/acme", "FRANKY_IMAGE": "local"}) == "local"
 
 

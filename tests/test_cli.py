@@ -81,6 +81,7 @@ def test_version_json_has_required_keys(monkeypatch):
     assert "resolved" in data["engine"]
     assert "host_binary_version" in data["engine"]
     assert "image" in data
+    assert data["image"].endswith(f":{__version__}-pi")
 
 
 def test_version_json_franky_image_override(monkeypatch):
@@ -104,6 +105,7 @@ def test_version_bad_engine_exits_zero_and_unresolved(monkeypatch):
     data = json.loads(res.output)
     assert data["engine"]["resolved"] is False
     assert "bogus" in data["engine"]["name"]
+    assert data["image"].endswith(f":{__version__}")
 
 
 def test_version_bad_engine_text_mentions_name_and_unresolved(monkeypatch):
@@ -221,13 +223,13 @@ def test_build_engine_flag_selects_engine(monkeypatch):
     }
     monkeypatch.setattr(cli.os, "environ", env)
     monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
-    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
 
     seen = {}
 
     def fake_run(cfg, inner_argv, *a, **k):
         seen["engine"] = cfg.engine.name
         seen["argv0"] = inner_argv[0]
+        seen["image"] = k["image"]
         return 0, f"opened {PR_URL}"
 
     monkeypatch.setattr(cli, "run_in_container", fake_run)
@@ -238,6 +240,7 @@ def test_build_engine_flag_selects_engine(monkeypatch):
     assert res.exit_code == 0, res.output
     assert seen["engine"] == "claude"
     assert seen["argv0"] == "claude"
+    assert seen["image"].endswith(f":{__version__}-claude")
 
 
 def test_build_scopes_pr_url_to_target_repo(monkeypatch):
@@ -828,31 +831,33 @@ def test_iterate_invokes_auto_update_hint(monkeypatch):
     assert seen["called"] is True
 
 
-def test_iterate_engine_flag_selects_engine(monkeypatch):
+def test_iterate_engine_environment_selects_engine_image(monkeypatch):
     env = {
         "FRANKY_ALLOWED_REPOS": "me/repo",
         "GH_TOKEN": "ghp_fake",
         "CLAUDE_CODE_OAUTH_TOKEN": "oauth-fake",
+        "FRANKY_ENGINE": "claude",
     }
     monkeypatch.setattr(cli.os, "environ", env)
     monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
-    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
 
     seen = {}
 
     def fake_run(cfg, inner_argv, *a, **k):
         seen["engine"] = cfg.engine.name
         seen["argv0"] = inner_argv[0]
+        seen["image"] = k["image"]
         return 0, "ok"
 
     monkeypatch.setattr(cli, "run_in_container", fake_run)
 
     runner = CliRunner()
     with runner.isolated_filesystem():
-        res = runner.invoke(cli.main, ["iterate", PR_URL, "--engine", "claude"])
+        res = runner.invoke(cli.main, ["iterate", PR_URL])
     assert res.exit_code == 0, res.output
     assert seen["engine"] == "claude"
     assert seen["argv0"] == "claude"
+    assert seen["image"].endswith(f":{__version__}-claude")
 
 
 def test_iterate_off_allowlist_clean_error(monkeypatch):
@@ -924,6 +929,19 @@ def test_iterate_image_no_docker_clean_message(monkeypatch):
     assert res.exit_code != 0
     assert "docker is not available" in res.output
     assert ran["container"] is False
+
+
+def test_engine_image_pull_failure_does_not_try_full_image(monkeypatch):
+    images = []
+
+    def unavailable(image):
+        images.append(image)
+        return False, "pull-failed"
+
+    monkeypatch.setattr(cli, "ensure_image_available", unavailable)
+    with pytest.raises(cli.DockerError):
+        cli._ensure_images({}, "pi")
+    assert images == [f"ghcr.io/vietlabs-work/franky:{__version__}-pi"]
 
 
 # ---------------------------------------------------------------------------
@@ -1164,6 +1182,19 @@ def test_auth_login_codex_persists_marker_after_success(tmp_path, monkeypatch):
     res = CliRunner().invoke(cli.main, ["auth", "login", "codex"])
     assert res.exit_code == 0, res.output
     assert cli.read_config_file(cfg_path)["FRANKY_CODEX_SUBSCRIPTION"] == "1"
+
+
+def test_codex_auth_uses_codex_image_when_default_engine_is_pi(monkeypatch):
+    monkeypatch.setattr(cli.os, "environ", {})
+    images = []
+
+    def available(image):
+        images.append(image)
+        return True, ""
+
+    monkeypatch.setattr(cli, "ensure_image_available", available)
+    assert cli._codex_auth_image().endswith(f":{__version__}-codex")
+    assert images == [f"ghcr.io/vietlabs-work/franky:{__version__}-codex"]
 
 
 def test_auth_login_codex_rejects_invalid_auth_volume_override(tmp_path, monkeypatch):
@@ -2735,13 +2766,19 @@ def test_build_retry_rejects_out_of_range(monkeypatch):
     assert res.exit_code == 2  # IntRange(max=5) rejects it
 
 
-def _diag_setup(monkeypatch, tmp_path, container_result, nonce="fixednonce"):
+def _diag_setup(monkeypatch, tmp_path, container_result, nonce="fixednonce", captured=None):
     env = _build_env()
     env["FRANKY_RUNS_DIR"] = str(tmp_path / "runs")
+    env["FRANKY_CONFIG_FILE"] = str(tmp_path / "config")
     monkeypatch.setattr(cli.os, "environ", env)
     monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
-    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
-    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: container_result)
+
+    def fake_run(*a, **k):
+        if captured is not None:
+            captured.update(k)
+        return container_result
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
     monkeypatch.setattr(cli, "_make_nonce", lambda: nonce)
     return env
 
@@ -2774,7 +2811,8 @@ def test_job_diagnose_emits_diagnosis(monkeypatch, tmp_path):
         '"retry_hint": "make the tests pass first", "confidence": "high"}'
     )
     output = f"analysis...\nFRANKY_DIAG_{nonce}_BEGIN{diag}FRANKY_DIAG_{nonce}_END"
-    env = _diag_setup(monkeypatch, tmp_path, (0, output), nonce)
+    captured = {}
+    env = _diag_setup(monkeypatch, tmp_path, (0, output), nonce, captured)
     job_id = _write_failed_run(env, tmp_path)
     res = CliRunner().invoke(cli.main, ["job", "diagnose", job_id, "--json"])
     assert res.exit_code == 0, res.output
@@ -2782,6 +2820,7 @@ def test_job_diagnose_emits_diagnosis(monkeypatch, tmp_path):
     assert data["root_cause"] == "tests were red"
     assert data["category"] == "test_failure" and data["retryable"] is True
     assert data["job_id"] == job_id
+    assert captured["image"].endswith(f":{__version__}-pi")
 
 
 def test_job_diagnose_not_found_exits_2(monkeypatch, tmp_path):
@@ -2889,23 +2928,30 @@ def _write_replayable_run(
     return job_id
 
 
-def _replay_env(monkeypatch, tmp_path, container_result, allowed_repos="me/repo"):
+def _replay_env(monkeypatch, tmp_path, container_result, allowed_repos="me/repo", captured=None):
     env = {
         "FRANKY_ALLOWED_REPOS": allowed_repos,
         "GH_TOKEN": "ghp_fake",
         "OPENROUTER_API_KEY": "sk-or-fake",
         "FRANKY_RUNS_DIR": str(tmp_path / "runs"),
+        "FRANKY_CONFIG_FILE": str(tmp_path / "config"),
     }
     monkeypatch.setattr(cli.os, "environ", env)
     monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
-    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
-    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: container_result)
+
+    def fake_run(*a, **k):
+        if captured is not None:
+            captured.update(k)
+        return container_result
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
     monkeypatch.setattr(cli.baseref, "commit_exists", lambda *a, **k: True)
     return env
 
 
 def test_job_replay_reproduce_only_happy_path(monkeypatch, tmp_path):
-    env = _replay_env(monkeypatch, tmp_path, (0, "reproduced the failure"))
+    captured = {}
+    env = _replay_env(monkeypatch, tmp_path, (0, "reproduced the failure"), captured=captured)
     job_id = _write_replayable_run(env, tmp_path)
     res = CliRunner().invoke(cli.main, ["job", "replay", job_id, "--json"])
     assert res.exit_code == 0, res.output
@@ -2918,6 +2964,20 @@ def test_job_replay_reproduce_only_happy_path(monkeypatch, tmp_path):
     assert rec["command"] == "replay"
     assert rec["replay_of"] == job_id
     assert rec["base_sha"] == "abc1234"
+    assert captured["image"].endswith(f":{__version__}-pi")
+
+
+def test_job_replay_engine_flag_uses_new_engine_image(monkeypatch, tmp_path):
+    captured = {}
+    env = _replay_env(monkeypatch, tmp_path, (0, "reproduced"), captured=captured)
+    env.pop("OPENROUTER_API_KEY")
+    env["CLAUDE_CODE_OAUTH_TOKEN"] = "oauth-fake"
+    job_id = _write_replayable_run(env, tmp_path, job_id="c1055e01")
+
+    res = CliRunner().invoke(cli.main, ["job", "replay", job_id, "--engine", "claude", "--json"])
+
+    assert res.exit_code == 0, res.output
+    assert captured["image"].endswith(f":{__version__}-claude")
 
 
 def test_job_replay_open_pr_opens_pr(monkeypatch, tmp_path):
@@ -3097,10 +3157,10 @@ def _resume_env(monkeypatch, tmp_path, container_result, allowed_repos="me/repo"
         "GH_TOKEN": "ghp_fake",
         "OPENROUTER_API_KEY": "sk-or-fake",
         "FRANKY_RUNS_DIR": str(tmp_path / "runs"),
+        "FRANKY_CONFIG_FILE": str(tmp_path / "config"),
     }
     monkeypatch.setattr(cli.os, "environ", env)
     monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
-    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
     monkeypatch.setattr(cli, "find_open_pr", lambda *a, **k: None)
 
     def fake_run(*a, **k):
@@ -3144,6 +3204,7 @@ def test_job_resume_happy_path(monkeypatch, tmp_path):
     assert rec["resumed_from"] == job_id
     # resume_workspace was threaded through to run_in_container, pointing at the snapshot tar.
     assert captured["resume_workspace"] == str(jobs.runs_dir(env) / f"{job_id}.snapshot.tar.gz")
+    assert captured["image"].endswith(f":{__version__}-pi")
 
 
 def test_job_resume_off_allowlist_now_exits_4(monkeypatch, tmp_path):

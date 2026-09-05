@@ -3,6 +3,7 @@
 Hermetic: every setup tree is built under tmp_path. No network, no Docker, no real ~/.claude.
 """
 
+import tracemalloc
 from pathlib import Path
 
 import pytest
@@ -194,6 +195,113 @@ def test_expand_setup_refuses_a_sweep_over_the_byte_cap(tmp_path, monkeypatch):
     (root / "commands" / "big.md").write_text("x" * 5000, encoding="utf-8")
 
     with pytest.raises(ValueError, match="limit"):
+        setups.expand_setup("claude", root)
+
+
+def test_bounded_reader_does_not_allocate_the_remaining_budget_for_a_small_file(tmp_path):
+    source = tmp_path / "small.md"
+    source.write_bytes(b"x")
+    budget = setups.ReadBudget(max_files=5000, max_bytes=20 * 1024 * 1024)
+
+    tracemalloc.start()
+    try:
+        assert setups.read_bounded(source, budget) == b"x"
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert peak < 1024 * 1024
+
+
+def test_expand_setup_rejects_oversized_manifest_before_open(tmp_path, monkeypatch):
+    monkeypatch.setattr(setups, "MAX_SWEEP_BYTES", 8)
+    root = tmp_path / ".claude"
+    root.mkdir()
+    manifest = root / "CLAUDE.md"
+    manifest.write_text("ninebytes", encoding="utf-8")
+    real_open = Path.open
+
+    def guarded_open(path, *args, **kwargs):
+        if path == manifest:
+            raise AssertionError("oversized manifest was opened")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+
+    with pytest.raises(ValueError, match="size limit"):
+        setups.expand_setup("claude", root)
+
+
+def test_expand_setup_stops_scandir_before_a_wide_directory_is_materialized(tmp_path, monkeypatch):
+    monkeypatch.setattr(setups, "MAX_SWEEP_FILES", 2)
+    root = tmp_path / ".claude"
+    commands = root / "commands"
+    commands.mkdir(parents=True)
+    calls = 0
+
+    class Entry:
+        def __init__(self, name):
+            self.name = name
+            self.path = str(commands / name)
+
+        def is_dir(self, *, follow_symlinks=True):
+            return False
+
+        def is_file(self, *, follow_symlinks=True):
+            return True
+
+    class Scan:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            nonlocal calls
+            calls += 1
+            if calls > 3:
+                raise AssertionError("scandir continued after the enumeration limit")
+            return Entry(f"candidate-{calls}.md")
+
+    monkeypatch.setattr(setups.os, "scandir", lambda _path: Scan())
+
+    with pytest.raises(ValueError, match="enumeration.*limit 2"):
+        setups.expand_setup("claude", root)
+    assert calls == 3
+
+
+def test_expand_setup_charges_unreadable_candidates_to_the_file_budget(tmp_path, monkeypatch):
+    monkeypatch.setattr(setups, "MAX_SWEEP_FILES", 1)
+    root = tmp_path / ".claude"
+    commands = root / "commands"
+    commands.mkdir(parents=True)
+    unreadable = root / "CLAUDE.md"
+    unreadable.write_text("x", encoding="utf-8")
+    (commands / "b.md").write_text("x", encoding="utf-8")
+    real_open = Path.open
+
+    def guarded_open(path, *args, **kwargs):
+        if path == unreadable:
+            raise OSError("unreadable")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+
+    with pytest.raises(ValueError, match="file limit"):
+        setups.expand_setup("claude", root)
+
+
+def test_expand_setup_bounds_visited_empty_directories(tmp_path, monkeypatch):
+    monkeypatch.setattr(setups, "MAX_SWEEP_FILES", 2)
+    root = tmp_path / ".claude"
+    commands = root / "commands"
+    (commands / "one" / "two").mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="traversal.*limit 2"):
         setups.expand_setup("claude", root)
 
 

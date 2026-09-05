@@ -29,7 +29,7 @@ from pathlib import Path
 
 from . import egress, franky_version, snapshot
 from .config import DEFAULT_DISK_MB, DEFAULT_MEMORY_MB, redact
-from .engine import CODEX_SUBSCRIPTION_VAR
+from .engine import CODEX_SUBSCRIPTION_VAR, ENGINES
 from .profile import CONTAINER_HOME, PROFILE_WAIT_VAR
 from .transcript import CHUNK_SIZE, MAX_EVENT_CHARS, Redactor, Transcript, chunks
 
@@ -1276,7 +1276,13 @@ def image_exists(image: str = "franky", runner=subprocess.run) -> bool:
     return proc.returncode == 0
 
 
-def resolve_image(env: dict, var: str = FRANKY_IMAGE_VAR, name: str = "franky") -> str:
+def resolve_image(
+    env: dict,
+    var: str = FRANKY_IMAGE_VAR,
+    name: str = "franky",
+    *,
+    engine: str | None = None,
+) -> str:
     """Return the image ref to use. If the per-image env var is set and truthy, return it
     (dev override). Otherwise return the version-pinned GHCR ref, with the GHCR namespace
     taken from FRANKY_GHCR_REPO when set, else DEFAULT_GHCR_REPO. NEVER resolves to :latest."""
@@ -1284,7 +1290,12 @@ def resolve_image(env: dict, var: str = FRANKY_IMAGE_VAR, name: str = "franky") 
     if override:
         return override
     repo = env.get(GHCR_REPO_VAR) or DEFAULT_GHCR_REPO
-    return f"{repo}/{name}:{franky_version()}"
+    tag = franky_version()
+    if engine is not None:
+        if engine not in ENGINES:
+            raise ValueError("unknown image engine")
+        tag = f"{tag}-{engine}"
+    return f"{repo}/{name}:{tag}"
 
 
 def ensure_image_available(image: str, runner=subprocess.run) -> tuple[bool, str]:

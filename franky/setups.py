@@ -20,8 +20,8 @@ Three properties are load-bearing:
 - **Only UTF-8-decodable files ship.** Binary assets are skipped, never injected blind: the
   fail-closed secret scan in `profile.py` can only inspect text, so shipping bytes it cannot
   read would be an unscanned hole (and a PNG helps no agent anyway).
-- **Denied directories are PRUNED, not filtered.** `os.walk` never descends into `projects/`
-  or `sessions/`, so a sweep of a 1 GB dir stays fast instead of stat-ing a million files.
+- **Denied directories are PRUNED, not filtered.** The bounded scanner never descends into
+  `projects/` or `sessions/`, so a sweep stays fast instead of stat-ing a million files.
 """
 
 from __future__ import annotations
@@ -31,11 +31,80 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
-# Sanity ceiling on one sweep. Not a transport limit (the bundle is streamed into the container
-# over `docker exec` stdin, which has no argv-size ceiling) - it is a guard against a mistake,
-# e.g. a setup root pointed at HOME itself. Generous: a real full setup measured ~1 MB of text.
+# One combined profile ceiling. A standalone setup sweep receives the same full budget.
+# The bundle uses stdin, so these values guard host memory and configuration mistakes.
 MAX_SWEEP_BYTES = 20 * 1024 * 1024
 MAX_SWEEP_FILES = 5000
+
+
+@dataclass
+class ReadBudget:
+    """Shared file-count, byte, and enumeration budget for one profile operation."""
+
+    max_files: int
+    max_bytes: int
+    files: int = 0
+    bytes: int = 0
+    entries: int = 0
+
+    @property
+    def remaining_bytes(self) -> int:
+        return self.max_bytes - self.bytes
+
+    def add(self, size: int) -> None:
+        if self.files >= self.max_files:
+            raise ValueError(f"profile exceeds file limit {self.max_files}")
+        if size > self.remaining_bytes:
+            raise ValueError(f"profile exceeds size limit {self.max_bytes} bytes")
+        self.files += 1
+        self.bytes += size
+
+    def visit_entry(self) -> None:
+        if self.entries >= self.max_files:
+            raise ValueError(f"profile enumeration exceeds entry limit {self.max_files}")
+        self.entries += 1
+
+
+def profile_budget() -> ReadBudget:
+    """Return a budget that uses the current profile limits."""
+    return ReadBudget(MAX_SWEEP_FILES, MAX_SWEEP_BYTES)
+
+
+def claim_file(path: Path, budget: ReadBudget) -> None:
+    """Charge a file from metadata, before a caller accumulates its path or content."""
+    budget.add(path.stat().st_size)
+
+
+def read_bounded(path: Path, budget: ReadBudget) -> bytes:
+    """Read one file without allocating beyond the remaining profile budget."""
+    size = path.stat().st_size
+    if budget.files >= budget.max_files:
+        raise ValueError(f"profile exceeds file limit {budget.max_files}")
+    if size > budget.remaining_bytes:
+        raise ValueError(f"profile exceeds size limit {budget.max_bytes} bytes")
+    try:
+        with path.open("rb") as source:
+            raw = source.read(size + 1)
+            if len(raw) > budget.remaining_bytes:
+                raise ValueError(f"profile exceeds size limit {budget.max_bytes} bytes")
+            extra = source.read(1)
+            if extra:
+                chunks = [raw, extra]
+                total = len(raw) + 1
+                while True:
+                    chunk = source.read(min(64 * 1024, budget.remaining_bytes - total + 1))
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > budget.remaining_bytes:
+                        raise ValueError(f"profile exceeds size limit {budget.max_bytes} bytes")
+                    chunks.append(chunk)
+                raw = b"".join(chunks)
+    except OSError:
+        budget.add(size)
+        raise
+    budget.add(len(raw))
+    return raw
 
 
 @dataclass(frozen=True)
@@ -185,13 +254,17 @@ def denied_name(name: str) -> bool:
     return any(fnmatch.fnmatch(lowered, pattern) for pattern in DENY_NAMES)
 
 
-def _is_text(path: Path) -> bool:
-    """True iff the file decodes as UTF-8, i.e. the secret scan can actually read it."""
+def _scandir_bounded(root: Path, budget: ReadBudget) -> list[os.DirEntry[str]]:
+    """Return sorted directory entries without reading past the shared entry limit."""
+    entries: list[os.DirEntry[str]] = []
     try:
-        path.read_bytes().decode("utf-8")
-    except (OSError, UnicodeDecodeError):
-        return False
-    return True
+        with os.scandir(root) as iterator:
+            for entry in iterator:
+                budget.visit_entry()
+                entries.append(entry)
+    except OSError:
+        pass
+    return sorted(entries, key=lambda entry: entry.name)
 
 
 def _admissible(path: Path, bases: tuple[Path, ...]) -> bool:
@@ -226,31 +299,67 @@ def _admissible(path: Path, bases: tuple[Path, ...]) -> bool:
     return True
 
 
-def _walk_dir(root: Path, out: list[Path], bases: tuple[Path, ...]) -> None:
-    """Collect admissible text files under `root`, pruning denied dirs and symlink loops."""
-    seen: set[str] = set()
-    for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
+def _admissible_dir(path: Path, bases: tuple[Path, ...]) -> bool:
+    """Return whether traversal may enter a directory, including through a symlink."""
+    if path.name in DENY_DIRS or path.name.startswith(".git"):
+        return False
+    try:
+        resolved = path.resolve()
+    except OSError:
+        return False
+    for base in bases:
+        try:
+            relative = resolved.relative_to(base)
+        except ValueError:
+            continue
+        return not any(part in DENY_DIRS or part.startswith(".git") for part in relative.parts)
+    return True
+
+
+def _walk_dir(
+    root: Path,
+    bases: tuple[Path, ...],
+    visited: set[str],
+    budget: ReadBudget,
+):
+    """Yield admissible files under `root`, pruning denied dirs and symlink loops."""
+    pending = [root]
+    while pending:
+        directory = pending.pop()
         # Symlinked dirs are followed (operators symlink skills in from plugin checkouts), so a
         # cycle is possible - remember realpaths and never revisit one.
-        real = os.path.realpath(dirpath)
-        if real in seen:
-            dirnames[:] = []
+        real = os.path.realpath(directory)
+        if real in visited:
             continue
-        seen.add(real)
-        dirnames[:] = sorted(d for d in dirnames if d not in DENY_DIRS and not d.startswith(".git"))
-        for name in sorted(filenames):
-            path = Path(dirpath) / name
-            if not path.is_file() or not _admissible(path, bases):
+        if len(visited) >= budget.max_files:
+            raise ValueError(f"setup traversal exceeds entry limit {budget.max_files}")
+        visited.add(real)
+
+        child_dirs: list[Path] = []
+        for entry in _scandir_bounded(directory, budget):
+            path = Path(entry.path)
+            try:
+                if entry.is_dir(follow_symlinks=True):
+                    if _admissible_dir(path, bases):
+                        child_dirs.append(path)
+                    continue
+                is_file = entry.is_file(follow_symlinks=True)
+            except OSError:
                 continue
-            out.append(path)
+            if not is_file or not _admissible(path, bases):
+                continue
+            yield path
+
+        if len(pending) + len(child_dirs) > budget.max_files:
+            raise ValueError(f"setup traversal exceeds entry limit {budget.max_files}")
+        pending.extend(reversed(child_dirs))
 
 
-def expand_setup(kind: str, root: Path) -> SetupScan:
+def expand_setup(kind: str, root: Path, budget: ReadBudget | None = None) -> SetupScan:
     """Sweep one setup directory into the concrete files that may be injected.
 
-    Raises ValueError for an unknown kind, a root that is not a directory, or a sweep that
-    blows MAX_SWEEP_FILES / MAX_SWEEP_BYTES (fail-closed: better a clear refusal naming the
-    limit than a multi-megabyte surprise streamed into every container).
+    Raises ValueError for an unknown kind, a non-directory root, or a profile limit breach.
+    `load_profile` supplies its shared budget. A direct call gets the full profile budget.
     """
     manifest = SETUP_MANIFESTS.get(kind)
     if manifest is None:
@@ -262,45 +371,46 @@ def expand_setup(kind: str, root: Path) -> SetupScan:
     # symlink hopping to another setup (~/.claude/skills/x -> ~/.codex/sessions/y) is still caught.
     bases = (root.resolve(), Path.home().resolve())
 
-    candidates: list[Path] = []
+    budget = budget or profile_budget()
+    scan = SetupScan(kind=kind, root=root)
+    visited: set[str] = set()
+
+    def add(path: Path) -> None:
+        try:
+            raw = read_bounded(path, budget)
+        except OSError:
+            scan.skipped_binary.append(path)
+            return
+        try:
+            raw.decode("utf-8")
+        except UnicodeDecodeError:
+            scan.skipped_binary.append(path)
+            return
+        scan.files.append(path)
+
     for name in manifest.files:
         path = root / name
         if path.is_file() and _admissible(path, bases):
-            candidates.append(path)
+            add(path)
     for name in manifest.dirs:
         sub = root / name
         if sub.is_dir():
-            _walk_dir(sub, candidates, bases)
-
-    scan = SetupScan(kind=kind, root=root)
-    for path in candidates:
-        (scan.files if _is_text(path) else scan.skipped_binary).append(path)
+            for path in _walk_dir(sub, bases, visited, budget):
+                add(path)
 
     for name in manifest.mcp_hints:
         hint = root / name
         if hint.is_file() and _declares_mcp(hint):
             scan.mcp_hints.append(hint)
 
-    if len(scan.files) > MAX_SWEEP_FILES:
-        raise ValueError(
-            f"setup {kind!r} at {root} swept {len(scan.files)} files "
-            f"(limit {MAX_SWEEP_FILES}) - point it at the tool's config dir, not a parent"
-        )
-    total = scan.total_bytes
-    if total > MAX_SWEEP_BYTES:
-        raise ValueError(
-            f"setup {kind!r} at {root} swept {total // 1024} KB "
-            f"(limit {MAX_SWEEP_BYTES // 1024} KB) - point it at the tool's config dir, "
-            "not a parent"
-        )
     return scan
 
 
 def _declares_mcp(path: Path) -> bool:
     """Cheap text probe for an MCP server declaration in a config file we do NOT inject."""
     try:
-        text = path.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
+        text = read_bounded(path, profile_budget()).decode("utf-8")
+    except (OSError, UnicodeDecodeError, ValueError):
         return False
     return "mcp_servers" in text or "mcpServers" in text
 
