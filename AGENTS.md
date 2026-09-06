@@ -31,6 +31,7 @@ franky version
 
 # Full manual real-Docker gates. The dedicated footprint CI uses only fixed credential-free loads.
 make smoke-dind        # always-on rootless DinD
+make smoke-security    # explicit filters, capability limits, denied operations
 make smoke-resume      # `job resume` workspace restore
 make smoke-profile     # operator-profile injection ([setups]/[profile])
 make smoke-memory      # 2 concurrent runners by default; ARGS="--jobs 1..8"
@@ -106,6 +107,9 @@ Module responsibilities:
 - Profile metadata is checked before file reads. Bounded reads reject files that grow past the remaining budget.
 - Snapshot scans stream with fail-closed ceilings. Never restore whole-file reads or skip unreadable data during secret verification.
 - Re-run all four real-Docker smoke gates after changing storage or container resource limits.
+- Every Docker run selects a packaged seccomp profile. Never rely on the daemon default or use `seccomp=unconfined`.
+- Task-only seccomp exceptions must pass the pinned-policy delta test, `make smoke-security`, and `make smoke-dind`.
+- Helpers and proxies use the pinned Moby default policy, without task-only exceptions.
 - Proxy diagnostics read at most 64 KiB plus one sentinel byte before host capture.
 - `proxy_log_truncated` marks excluded records. Denial counts are recent observations, not guaranteed lifetime totals.
 - Keep proxy uid/gid 13 stable across image bases. Alpine runs with numeric `USER 13:13`.

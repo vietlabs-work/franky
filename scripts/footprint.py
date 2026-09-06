@@ -18,6 +18,7 @@ import time
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_SECCOMP = ROOT / "franky/security-default.json"
 FIXTURE_VERSION = "1"
 HOST_WORKLOADS = ("parser", "redaction", "profile", "snapshot")
 FULL = {"host", "images", "runtime"}
@@ -199,6 +200,23 @@ def check_runtime(
     for key in ("architecture", "python", "source_sha"):
         if not isinstance(metadata.get(key), str) or not metadata[key]:
             raise FootprintError(f"missing or malformed runtime metadata.{key}")
+    sandbox = metadata.get("sandbox")
+    if (
+        not isinstance(sandbox, dict)
+        or sandbox.get("mode") != "algorithm_comparison_shared_security"
+        or not isinstance(sandbox.get("compatibility_applied"), bool)
+    ):
+        raise FootprintError("missing or malformed runtime metadata.sandbox")
+    profiles = sandbox.get("profile_sha256")
+    if not isinstance(profiles, dict) or set(profiles) != {"default", "task"}:
+        raise FootprintError("missing or malformed runtime metadata.sandbox.profile_sha256")
+    for digest in profiles.values():
+        if (
+            not isinstance(digest, str)
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            raise FootprintError("missing or malformed runtime metadata.sandbox.profile_sha256")
     for name in ("task", "proxy"):
         image = metadata.get("images", {}).get(name)
         if (
@@ -293,6 +311,18 @@ def compare_runtime_reports(base: list[dict], head: list[dict], budgets: dict) -
         )
     for report in head:
         check_runtime(report, budgets)
+    sandboxes = [report["metadata"]["sandbox"] for report in base + head]
+    signatures = {
+        (sandbox["mode"], tuple(sorted(sandbox["profile_sha256"].items()))) for sandbox in sandboxes
+    }
+    if len(signatures) != 1:
+        raise FootprintError("shared security profile drift makes runtime comparison unresolved")
+    if len({report["metadata"]["sandbox"]["compatibility_applied"] for report in base}) != 1:
+        raise FootprintError(
+            "base compatibility metadata drift makes runtime comparison unresolved"
+        )
+    if any(report["metadata"]["sandbox"]["compatibility_applied"] for report in head):
+        raise FootprintError("head runtime required compatibility adaptation")
     for base_report, head_report in zip(base, head, strict=True):
         if base_report["metadata"]["architecture"] != head_report["metadata"]["architecture"]:
             raise FootprintError("architecture drift makes runtime comparison unresolved")
@@ -467,6 +497,7 @@ def probe_image(image: str, command: list[str] | tuple[str, ...]):
                 "--read-only",
                 "--cap-drop=ALL",
                 "--security-opt=no-new-privileges",
+                f"--security-opt=seccomp={DEFAULT_SECCOMP}",
                 "--pids-limit=64",
                 "--memory=256m",
                 "--memory-swap=256m",

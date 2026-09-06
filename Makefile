@@ -5,7 +5,7 @@
 # The `\#` is escaped: a bare `#` would start a Make comment and eat the `)`.
 VERSION ?= $(shell for kv in $(MAKEOVERRIDES); do n=$${kv%%=*}; l=$$(printf '%s' "$$n" | tr A-Z a-z); if [ "$$l" = version ] || [ "$$l" = v ]; then printf '%s' "$${kv\#*=}"; break; fi; done)
 
-.PHONY: footprint smoke-dind smoke-resume smoke-profile smoke-memory eval release release-dry
+.PHONY: footprint smoke-security smoke-dind smoke-resume smoke-profile smoke-memory eval release release-dry
 
 # Credential-free host CPU and memory comparison against BASE. Real-Docker runtime checks stay
 # in smoke-memory; CI also builds and checks every release image variant.
@@ -24,6 +24,9 @@ footprint:
 # franky-dind-entrypoint.sh, container.py's _HARDENING, or egress.py.
 smoke-dind:
 	bash scripts/smoke-dind.sh
+
+smoke-security:
+	python3 scripts/smoke-security.py $(ARGS)
 
 # Manual gate for the `franky job resume` restore path (#71). Needs real Docker + the `franky`
 # image; not in CI. Run before merging changes to franky/snapshot.py's restore path, the

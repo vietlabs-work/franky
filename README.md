@@ -678,6 +678,24 @@ container with:
   touches your filesystem or your host's Docker daemon
 - only the selected engine's required env vars passed in; nothing else
 
+Franky explicitly selects packaged seccomp policies. It does not trust the Docker daemon's default profile.
+This keeps syscall filtering active when a Docker Desktop daemon has an unconfined default.
+
+| Container | Seccomp policy | Task-only permissions |
+|-----------|----------------|-----------------------|
+| Task | Pinned Moby default plus tested rootless exceptions | Namespace creation, mount operations, and nested hostname setup |
+| Proxy | Pinned Moby default | None |
+| Storage, auth, and version helpers | Pinned Moby default | None |
+
+The task policy restricts `clone` and `unshare` flags. It does not add outer capabilities.
+It blocks keyring access with `ENOSYS`, which lets runc continue without a session keyring.
+Other blocked calls, including BPF without its capability, remain blocked inside the user namespace.
+Missing policy files cause Docker startup to fail. No unconfined fallback exists.
+
+Run `make smoke-security` and `make smoke-dind` after policy changes.
+The first checks active filters, capability limits, exact policies, and denied operations.
+The second checks Compose, a real build, explicit proxy denials, and blocked direct egress.
+
 MCP profiles can add explicitly named process-environment credentials and hostname-only
 egress destinations. Credential values reach Docker only through name-only `-e NAME` flags
 and join the redactor; native JSON/TOML config reaches HOME through the existing profile
@@ -711,7 +729,7 @@ it is always available.
 This is rootless DinD (a daemon running as the non-root `franky` user inside its
 own user namespace), **not** a mounted host Docker socket and **not** `--privileged`.
 It needs a few specific, minimal relaxations of the locked profile, applied to every
-task and verified on Docker Desktop for Mac:
+task:
 
 - `--security-opt=no-new-privileges` is **dropped** (it blocks the setuid uid-map
   helpers rootless Docker needs to start),
@@ -719,6 +737,9 @@ task and verified on Docker Desktop for Mac:
   mount it for inner containers - far narrower than `--privileged`/`seccomp=unconfined`),
 - `CAP_SETUID`/`CAP_SETGID` added back on top of `--cap-drop=ALL`, and `/dev/net/tun`
   for the rootless network stack.
+
+The packaged task seccomp policy permits only the tested additions described above.
+Native Linux also applies its host security policy. A host denial is a failed gate, not a reason to disable security.
 
 The blast radius stays bounded by everything else (rootless user namespace, read-only
 root, the egress cage below, no host FS, repo allowlist, PR-not-merge). The nested

@@ -7,6 +7,9 @@ the runner budget, not the memory needs of an arbitrary repository's test suite.
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+import hashlib
+import importlib
 import json
 import os
 from pathlib import Path
@@ -18,6 +21,8 @@ import time
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_SECCOMP = ROOT / "franky/security-default.json"
+TASK_SECCOMP = ROOT / "franky/security-task.json"
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from footprint import probe_image  # noqa: E402
@@ -70,6 +75,103 @@ for _ in range(10):
 assert len(held) == 256 * 1024 * 1024
 print('WORKLOAD PASSED', flush=True)
 """
+
+
+def _adapt_docker_run(argv, task_names, images):
+    """Apply one shared seccomp policy without changing the benchmarked command."""
+    if not isinstance(argv, (list, tuple)) or list(argv[:2]) != ["docker", "run"]:
+        return argv, False
+    try:
+        image_index = next(index for index in range(2, len(argv)) if argv[index] in images)
+    except StopIteration as exc:
+        raise RuntimeError("benchmark adapter could not identify the docker run image") from exc
+    name = None
+    for index, token in enumerate(argv[2:image_index], start=2):
+        if token == "--name" and index + 1 < image_index:
+            name = argv[index + 1]
+            break
+        if isinstance(token, str) and token.startswith("--name="):
+            name = token.split("=", 1)[1]
+            break
+    profile = TASK_SECCOMP if name in task_names else DEFAULT_SECCOMP
+    expected = f"seccomp={profile}"
+    current = []
+    options = []
+    index = 2
+    while index < image_index:
+        token = argv[index]
+        if token == "--security-opt" and index + 1 < image_index:
+            value = argv[index + 1]
+            if isinstance(value, str) and value.startswith("seccomp="):
+                current.append(value)
+                index += 2
+                continue
+        if isinstance(token, str) and token.startswith("--security-opt=seccomp="):
+            current.append(token.removeprefix("--security-opt="))
+            index += 1
+            continue
+        options.append(token)
+        index += 1
+    if current == [expected]:
+        return argv, False
+    return [*argv[:2], *options, f"--security-opt={expected}", *argv[image_index:]], True
+
+
+@contextmanager
+def _shared_security_profiles(task_names, images):
+    """Give base and head the same policies while retaining subprocess identity checks."""
+    try:
+        profile_sha256 = {
+            "default": hashlib.sha256(DEFAULT_SECCOMP.read_bytes()).hexdigest(),
+            "task": hashlib.sha256(TASK_SECCOMP.read_bytes()).hexdigest(),
+        }
+    except OSError as exc:
+        raise RuntimeError(f"benchmark security profile is unavailable: {exc}") from exc
+    metadata = {
+        "mode": "algorithm_comparison_shared_security",
+        "profile_sha256": profile_sha256,
+        "compatibility_applied": False,
+    }
+    original_popen = subprocess.Popen
+
+    def popen(argv, *args, **kwargs):
+        adapted_argv, adapted = _adapt_docker_run(argv, task_names, images)
+        if adapted:
+            metadata["compatibility_applied"] = True
+        return original_popen(adapted_argv, *args, **kwargs)
+
+    subprocess.Popen = popen
+    try:
+        yield metadata
+    finally:
+        subprocess.Popen = original_popen
+
+
+def _load_runtime_modules(repo):
+    """Import Franky only from the repository selected on the command line."""
+    repo = repo.resolve()
+    sys.path.insert(0, str(repo))
+    package = importlib.import_module("franky")
+    try:
+        package_root = Path(package.__file__).resolve().parent.parent
+    except (AttributeError, TypeError):
+        package_root = None
+    if package_root != repo:
+        sys.path.pop(0)
+        raise RuntimeError(f"loaded franky from {package_root}, not selected repository {repo}")
+    modules = {
+        name: importlib.import_module(f"franky.{name}")
+        for name in ("config", "container", "engine", "transcript")
+    }
+    if any(Path(module.__file__).resolve().parent.parent != repo for module in modules.values()):
+        raise RuntimeError("a runtime module did not come from the selected repository")
+    return (
+        modules["config"].Config,
+        modules["container"].run_in_container,
+        modules["container"].run_names,
+        modules["engine"].PiEngine,
+        modules["transcript"].Transcript,
+    )
 
 
 def parse_cgroup_metrics(text):
@@ -269,24 +371,9 @@ def _image_metadata(image, proxy=False):
     }
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--repo", type=Path, default=ROOT)
-    parser.add_argument("--source-sha")
-    parser.add_argument("--allow-missing-helper", action="store_true")
-    parser.add_argument("--image", default="franky")
-    parser.add_argument("--proxy-image", default="franky-proxy")
-    parser.add_argument("--jobs", type=int, choices=range(1, 9), default=2)
-    parser.add_argument("--output")
-    args = parser.parse_args()
-    repo = args.repo.resolve()
-    sys.path.insert(0, str(repo))
-    from franky.config import Config
-    from franky.container import run_in_container, run_names
-    from franky.engine import PiEngine
-    from franky.transcript import Transcript
-
-    ids = [uuid.uuid4().hex[:12] for _ in range(args.jobs)]
+def _run_benchmark(args, repo, ids, task_names, sandbox):
+    Config, run_in_container, run_names, PiEngine, Transcript = _load_runtime_modules(repo)
+    task_names.update(run_names(job_id)[2] for job_id in ids)
     usage_before = _rusage()
     daemon_before = _native_daemon_cpu()
     source_sha = (
@@ -364,6 +451,7 @@ def main():
                 "task_image": args.image,
                 "proxy_image": args.proxy_image,
                 "images": {"task": task_image, "proxy": proxy_image},
+                "sandbox": sandbox,
             },
             "elapsed_seconds": elapsed,
             "throughput": {
@@ -399,6 +487,23 @@ def main():
     }
     assert not set(names).intersection(owned), "a smoke container remains"
     print(f"SMOKE PASS: {args.jobs} jobs completed with disk-backed data and no task OOM.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo", type=Path, default=ROOT)
+    parser.add_argument("--source-sha")
+    parser.add_argument("--allow-missing-helper", action="store_true")
+    parser.add_argument("--image", default="franky")
+    parser.add_argument("--proxy-image", default="franky-proxy")
+    parser.add_argument("--jobs", type=int, choices=range(1, 9), default=2)
+    parser.add_argument("--output")
+    args = parser.parse_args()
+    repo = args.repo.resolve()
+    ids = [uuid.uuid4().hex[:12] for _ in range(args.jobs)]
+    task_names = set()
+    with _shared_security_profiles(task_names, {args.image, args.proxy_image}) as sandbox:
+        _run_benchmark(args, repo, ids, task_names, sandbox)
 
 
 if __name__ == "__main__":

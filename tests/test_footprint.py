@@ -220,6 +220,11 @@ def _runtime(jobs=2, helper_peak=8.0):
             "architecture": "arm64",
             "python": "3.12.5",
             "source_sha": "a" * 40,
+            "sandbox": {
+                "mode": "algorithm_comparison_shared_security",
+                "profile_sha256": {"default": "d" * 64, "task": "e" * 64},
+                "compatibility_applied": False,
+            },
             "images": {
                 "task": {
                     "id": "sha256:a",
@@ -288,6 +293,15 @@ def test_check_runtime_rejects_helper_over_absolute_budget():
         footprint.check_runtime(_runtime(helper_peak=17), budgets)
 
 
+def test_check_runtime_rejects_missing_shared_security_metadata():
+    report = _runtime()
+    del report["metadata"]["sandbox"]
+    budgets = footprint._read_json(str(footprint.ROOT / "scripts/footprint-budgets.json"))
+
+    with pytest.raises(footprint.FootprintError, match="sandbox"):
+        footprint.check_runtime(report, budgets)
+
+
 def test_check_runtime_rejects_oom_and_missing_metrics():
     report = _runtime()
     report["scopes"]["proxy"]["oom_kills"] = 1
@@ -344,6 +358,7 @@ def test_compare_runtime_uses_three_repeat_cpu_medians_and_allows_historical_hel
     base = [_runtime() for _ in range(3)]
     head = [_runtime() for _ in range(3)]
     for report in base:
+        report["metadata"]["sandbox"]["compatibility_applied"] = True
         report["scopes"]["helper"] = {
             "status": "unavailable_historical",
             "cpu_seconds": None,
@@ -356,6 +371,27 @@ def test_compare_runtime_uses_three_repeat_cpu_medians_and_allows_historical_hel
 
     assert result["task"]["status"] == "pass"
     assert result["helper"]["status"] == "absolute_only"
+
+
+def test_compare_runtime_rejects_shared_security_profile_drift():
+    budgets = footprint._read_json(str(footprint.ROOT / "scripts/footprint-budgets.json"))
+    base = [_runtime() for _ in range(3)]
+    head = [_runtime() for _ in range(3)]
+    head[1]["metadata"]["sandbox"]["profile_sha256"]["task"] = "f" * 64
+
+    with pytest.raises(footprint.FootprintError, match="shared security profile drift"):
+        footprint.compare_runtime_reports(base, head, budgets)
+
+
+def test_compare_runtime_rejects_adapter_on_head():
+    budgets = footprint._read_json(str(footprint.ROOT / "scripts/footprint-budgets.json"))
+    base = [_runtime() for _ in range(3)]
+    head = [_runtime() for _ in range(3)]
+    for report in head:
+        report["metadata"]["sandbox"]["compatibility_applied"] = True
+
+    with pytest.raises(footprint.FootprintError, match="head runtime required compatibility"):
+        footprint.compare_runtime_reports(base, head, budgets)
 
 
 def test_compare_runtime_rejects_cpu_regression():

@@ -31,6 +31,7 @@ from . import egress, franky_version, snapshot
 from .config import DEFAULT_DISK_MB, DEFAULT_MEMORY_MB, redact
 from .engine import CODEX_SUBSCRIPTION_VAR, ENGINES
 from .profile import CONTAINER_HOME, PROFILE_WAIT_VAR
+from .security import DEFAULT_SECCOMP, TASK_SECCOMP
 from .transcript import CHUNK_SIZE, MAX_EVENT_CHARS, Redactor, Transcript, chunks
 
 # Long agent runs: a full clone-build-test-PR cycle can take many minutes. 30 min cap.
@@ -76,6 +77,7 @@ _HARDENING = [
     # cannot mount over -> "mounting proc: operation not permitted"). This ONLY lifts the /proc
     # path masking; it is NOT --privileged and NOT seccomp=unconfined.
     "--security-opt=systempaths=unconfined",
+    f"--security-opt=seccomp={TASK_SECCOMP}",
     # NOTE: --security-opt=no-new-privileges is DELIBERATELY ABSENT (it used to be here). It
     # blocks the setuid escalation newuidmap/newgidmap rely on, so rootless dockerd cannot set
     # up its uid map and refuses to start - even WITH CAP_SETUID/SETGID added. It is incompatible
@@ -127,6 +129,7 @@ _PROXY_HARDENING = [
     "--rm",
     "--cap-drop=ALL",
     "--security-opt=no-new-privileges",
+    f"--security-opt=seccomp={DEFAULT_SECCOMP}",
     "--read-only",
     "--tmpfs",
     f"/run:exec,uid={_PROXY_UID},gid={_PROXY_GID},size=16m",
@@ -274,6 +277,7 @@ def _codex_auth_argv(
         *(["--network", "none"] if networkless else []),
         "--cap-drop=ALL",
         "--security-opt=no-new-privileges",
+        f"--security-opt=seccomp={DEFAULT_SECCOMP}",
         "--read-only",
         "--pids-limit=128",
         "--memory=512m",
@@ -812,6 +816,7 @@ def _storage_sample(task: str | None, image: str, runner) -> tuple[int, int]:
         "--cap-drop=ALL",
         "--cap-add=DAC_READ_SEARCH",
         "--security-opt=no-new-privileges",
+        f"--security-opt=seccomp={DEFAULT_SECCOMP}",
         "--user=0",
         "--pids-limit=32",
         "--memory=64m",
@@ -872,6 +877,7 @@ def _storage_helper_argv(task: str, image: str, volumes: list[str], lifetime: in
         "--cap-drop=ALL",
         "--cap-add=DAC_READ_SEARCH",
         "--security-opt=no-new-privileges",
+        f"--security-opt=seccomp={DEFAULT_SECCOMP}",
         "--user=0",
         "--pids-limit=32",
         "--memory=64m",

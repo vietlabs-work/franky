@@ -23,6 +23,8 @@ CONF=/run/squid.conf
 # blind-CONNECT property that keeps creds opaque to the proxy. Default-deny order: deny
 # non-443 ports, deny CONNECT to non-443, ALLOW the allowlist, then deny everything else.
 cat > "$CONF" <<EOF
+# Skip hostname discovery and its repeated DNS probes during startup.
+visible_hostname franky-proxy
 acl allowed_domains dstdomain $DOMAINS
 acl SSL_ports port 443
 acl Safe_ports port 443

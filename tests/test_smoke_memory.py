@@ -5,6 +5,8 @@ import io
 import os
 from pathlib import Path
 import subprocess
+import sys
+import types
 
 import pytest
 
@@ -19,6 +21,141 @@ def load_smoke_memory():
 
 
 smoke_memory = load_smoke_memory()
+
+
+def test_shared_security_adapter_changes_only_docker_policy_options(tmp_path, monkeypatch):
+    default_profile = tmp_path / "default.json"
+    task_profile = tmp_path / "task.json"
+    default_profile.write_bytes(b"default-profile\n")
+    task_profile.write_bytes(b"task-profile\n")
+    monkeypatch.setattr(smoke_memory, "DEFAULT_SECCOMP", default_profile)
+    monkeypatch.setattr(smoke_memory, "TASK_SECCOMP", task_profile)
+    calls = []
+
+    def original_popen(argv, *args, **kwargs):
+        calls.append((argv, args, kwargs))
+        return "process"
+
+    monkeypatch.setattr(subprocess, "Popen", original_popen)
+    task_name = "franky-run-abc123"
+    command_policy = "--security-opt=seccomp=/command-argument.json"
+    task = [
+        "docker",
+        "run",
+        "--rm",
+        "--name",
+        task_name,
+        "--security-opt=seccomp=/old.json",
+        "--memory=2g",
+        "task-image",
+        "command",
+        command_policy,
+    ]
+    helper = [
+        "docker",
+        "run",
+        "--name",
+        f"{task_name}-disk",
+        "--security-opt",
+        "seccomp=/old.json",
+        "task-image",
+        "sleep",
+        "infinity",
+    ]
+    ordinary = ["docker", "inspect", task_name]
+
+    with smoke_memory._shared_security_profiles(
+        {task_name}, {"task-image", "proxy-image"}
+    ) as metadata:
+        imported_default = subprocess.Popen
+        assert imported_default(task, cwd="/tmp") == "process"
+        assert subprocess.Popen(helper) == "process"
+        assert subprocess.Popen(ordinary) == "process"
+        assert imported_default is subprocess.Popen
+
+    assert subprocess.Popen is original_popen
+    assert calls == [
+        (
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--name",
+                task_name,
+                "--memory=2g",
+                f"--security-opt=seccomp={task_profile}",
+                "task-image",
+                "command",
+                command_policy,
+            ],
+            (),
+            {"cwd": "/tmp"},
+        ),
+        (
+            [
+                "docker",
+                "run",
+                "--name",
+                f"{task_name}-disk",
+                f"--security-opt=seccomp={default_profile}",
+                "task-image",
+                "sleep",
+                "infinity",
+            ],
+            (),
+            {},
+        ),
+        (ordinary, (), {}),
+    ]
+    assert metadata == {
+        "mode": "algorithm_comparison_shared_security",
+        "profile_sha256": {
+            "default": "07d81f383304754105b34fc4ddb4684da6e89d1f7964beb085a2d823ce9529e1",
+            "task": "31eaf5474b53bce546b5ecae76ff67db4378a7ec34330ce896e65ca9dd1123b2",
+        },
+        "compatibility_applied": True,
+    }
+
+
+def test_shared_security_adapter_leaves_matching_policy_unadapted(tmp_path, monkeypatch):
+    default_profile = tmp_path / "default.json"
+    task_profile = tmp_path / "task.json"
+    default_profile.write_text("default", encoding="utf-8")
+    task_profile.write_text("task", encoding="utf-8")
+    monkeypatch.setattr(smoke_memory, "DEFAULT_SECCOMP", default_profile)
+    monkeypatch.setattr(smoke_memory, "TASK_SECCOMP", task_profile)
+    calls = []
+
+    def original_popen(argv, *args, **kwargs):
+        calls.append(argv)
+        return "process"
+
+    monkeypatch.setattr(subprocess, "Popen", original_popen)
+    argv = [
+        "docker",
+        "run",
+        "--name",
+        "franky-run-abc123",
+        f"--security-opt=seccomp={task_profile}",
+        "task-image",
+        "command",
+    ]
+    with smoke_memory._shared_security_profiles(
+        {"franky-run-abc123"}, {"task-image", "proxy-image"}
+    ) as metadata:
+        subprocess.Popen(argv)
+
+    assert calls == [argv]
+    assert metadata["compatibility_applied"] is False
+
+
+def test_runtime_imports_fail_when_cached_franky_is_not_selected_repo(tmp_path, monkeypatch):
+    cached = types.ModuleType("franky")
+    cached.__file__ = str(smoke_memory.ROOT / "franky/__init__.py")
+    monkeypatch.setitem(sys.modules, "franky", cached)
+
+    with pytest.raises(RuntimeError, match="selected repository"):
+        smoke_memory._load_runtime_modules(tmp_path)
 
 
 def test_workload_checks_nested_docker_before_using_resources(monkeypatch):

@@ -9,8 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Select pinned seccomp policies explicitly for tasks, proxies, and helpers, including Docker Desktop with an unconfined daemon default.
+- Test active syscall filters and real nested builds. Keep keyring access blocked while supporting rootless runc startup.
 - Reuse one bounded, read-only disk helper per task instead of creating a container for every disk check.
 - Replace recurring proxy health probes with a bounded, fail-closed HTTPS CONNECT startup gate.
+- Set the proxy display hostname explicitly to remove startup DNS discovery.
 - Scan PR output once and skip impossible JSON decoding in output and usage parsers.
 - Use Alpine for the Squid proxy while preserving its numeric user and default-deny policy.
 - Share a stripped Node toolchain across engine images without retaining the original Node layer or build caches.

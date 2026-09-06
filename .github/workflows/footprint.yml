@@ -149,6 +149,12 @@ jobs:
               --output /tmp/footprint-images.json
           fi
           if [[ "$CHECKS" == *runtime* ]]; then
+            python3 scripts/smoke-security.py \
+              --image "$RUN_TAG:pi" --proxy-image "$RUN_TAG:proxy"
+            FRANKY_IMG="$RUN_TAG:pi" PROXY_IMG="$RUN_TAG:proxy" SMOKE_SKIP_BUILD=1 \
+              bash scripts/smoke-dind.sh
+            FRANKY_IMG="$RUN_TAG:pi" bash scripts/smoke-resume.sh
+            FRANKY_IMG="$RUN_TAG:pi" bash scripts/smoke-profile.sh
             compare_runtime() {
               for jobs in 2 4; do
                 base_args=()
