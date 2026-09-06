@@ -1,7 +1,9 @@
 """Hermetic tests for the concurrent memory smoke script."""
 
 import importlib.util
+import os
 from pathlib import Path
+import subprocess
 
 import pytest
 
@@ -16,6 +18,25 @@ def load_smoke_memory():
 
 
 smoke_memory = load_smoke_memory()
+
+
+def test_workload_checks_nested_docker_before_using_resources(monkeypatch):
+    class CheckedDocker(Exception):
+        pass
+
+    def check(argv, **kwargs):
+        assert argv == ["docker", "info"]
+        assert kwargs["check"] is True
+        assert kwargs["timeout"] == 5
+        raise CheckedDocker
+
+    def unexpected_write(*args, **kwargs):
+        pytest.fail("workload started before the nested Docker check")
+
+    monkeypatch.setattr(subprocess, "run", check)
+    monkeypatch.setattr(os, "mkdir", unexpected_write)
+    with pytest.raises(CheckedDocker):
+        exec(smoke_memory.WORKLOAD, {})
 
 
 @pytest.mark.parametrize("jobs", ["0", "9"])

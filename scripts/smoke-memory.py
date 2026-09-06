@@ -23,7 +23,9 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from footprint import probe_image  # noqa: E402
 
 WORKLOAD = r"""
-import json, os, pathlib, time
+import json, os, pathlib, subprocess, time
+subprocess.run(['docker', 'info'], check=True, stdout=subprocess.DEVNULL,
+               stderr=subprocess.PIPE, timeout=5)
 block = b'x' * (1024 * 1024)
 os.mkdir('/work/sources')
 for index in range(10000):

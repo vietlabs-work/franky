@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "reason": "Initial ARM64 image and sampled-memory caps use 2026-09-06 measurements plus headroom. The 1024 MiB task cgroup-peak cap covers write-cache peaks until native calibration. AMD64 caps allow architecture variance until native calibration.",
+  "reason": "ARM64 image and sampled-memory caps use 2026-09-06 measurements plus headroom. Native CI parser medians were 2.098s base and 0.325s head; its 0.5s CPU ceiling allows runner variance while the 15% relative gate remains fixed. The 1024 MiB task peak covers write-cache peaks until native calibration. AMD64 image caps remain provisional.",
   "cpu": {
     "maximum_ratio": 1.15,
     "minimum_delta_seconds": 0.05,
@@ -8,8 +8,8 @@
   },
   "host": {
     "parser": {
-      "maximum_elapsed_seconds": 0.3,
-      "maximum_cpu_seconds": 0.2,
+      "maximum_elapsed_seconds": 0.75,
+      "maximum_cpu_seconds": 0.5,
       "maximum_peak_mib": 64,
       "minimum_throughput_per_second": 250000
     },
