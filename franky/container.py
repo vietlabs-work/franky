@@ -31,7 +31,7 @@ from . import egress, franky_version, snapshot
 from .config import DEFAULT_DISK_MB, DEFAULT_MEMORY_MB, redact
 from .engine import CODEX_SUBSCRIPTION_VAR, ENGINES
 from .profile import CONTAINER_HOME, PROFILE_WAIT_VAR
-from .security import DEFAULT_SECCOMP, TASK_SECCOMP
+from .security import DEFAULT_SECCOMP, TASK_SECCOMP, SecurityPolicyError, select_task_apparmor
 from .transcript import CHUNK_SIZE, MAX_EVENT_CHARS, Redactor, Transcript, chunks
 
 # Long agent runs: a full clone-build-test-PR cycle can take many minutes. 30 min cap.
@@ -172,6 +172,7 @@ def build_docker_argv(
     auth_volume: str | None = None,
     memory_mb: int = DEFAULT_MEMORY_MB,
     disk_mb: int = DEFAULT_DISK_MB,
+    apparmor_profile: str | None = None,
 ) -> list[str]:
     """Build the full `docker run` argv. Pure - no docker invoked.
 
@@ -206,6 +207,7 @@ def build_docker_argv(
         "docker",
         "run",
         *_HARDENING,
+        *([f"--security-opt=apparmor={apparmor_profile}"] if apparmor_profile is not None else []),
         f"--memory={memory_mb}m",
         f"--memory-swap={memory_mb}m",
         "--name",
@@ -1085,6 +1087,7 @@ def run_in_container(
     diagnostics_sink: dict | None = None,
     snapshot_sink: dict | None = None,
     resume_workspace: str | None = None,
+    apparmor_selector=select_task_apparmor,
 ) -> tuple[int, str | Transcript]:
     """Run the inner engine in a hardened, egress-controlled container; return
     (returncode, redacted_output).
@@ -1147,6 +1150,10 @@ def run_in_container(
     storage_thread = None
 
     try:
+        try:
+            apparmor_profile = apparmor_selector(runner)
+        except SecurityPolicyError as exc:
+            raise _AbortRun(f"franky: {exc} - refusing to run") from exc
         if runner is subprocess.run:
             try:
                 _, free = _storage_sample(None, image, runner)
@@ -1210,6 +1217,7 @@ def run_in_container(
             auth_volume=cfg.auth_volume,
             memory_mb=cfg.memory_mb,
             disk_mb=cfg.disk_mb,
+            apparmor_profile=apparmor_profile,
         )
         if effective_progress is not None:
             # Redact before disk and callbacks, retaining only bounded unfinished fragments.
@@ -1355,6 +1363,25 @@ def run_in_container(
                 )
             except OSError as exc:
                 code, output = 1, f"franky: could not launch docker ({exc})"
+        tail = output.tail(4096) if isinstance(output, Transcript) else output[-4096:]
+        if (
+            code
+            and apparmor_profile
+            and "apparmor" in tail.lower()
+            and apparmor_profile.lower() in tail.lower()
+            and any(marker in tail.lower() for marker in ("not found", "not loaded"))
+        ):
+            hint = (
+                "\nfranky: the AppArmor task profile is not loaded. Run:\n"
+                "`franky apparmor-profile > franky-task.apparmor && "
+                "sudo /usr/sbin/apparmor_parser -K -r franky-task.apparmor && "
+                "sudo /usr/bin/install -m 0644 franky-task.apparmor "
+                "/etc/apparmor.d/franky-task`"
+            )
+            if isinstance(output, Transcript):
+                output.write(hint)
+            else:
+                output += hint
     except _AbortRun as abort:
         # A pre-task step failed. code/output set here; teardown still runs in `finally` and
         # its warnings append to THIS output, which the single return below surfaces.

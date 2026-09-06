@@ -39,6 +39,7 @@ def run_in_container(*args, **kwargs):
     """Materialize small fixture transcripts for historical output assertions."""
     from franky.transcript import Transcript
 
+    kwargs.setdefault("apparmor_selector", lambda _runner: None)
     code, output = _run_in_container(*args, **kwargs)
     if isinstance(output, Transcript):
         with output:
@@ -67,6 +68,8 @@ def _orchestration_runner(task_proc_fn, *, fail_step=None, reap_fn=None):
 
     def runner(argv, **kwargs):
         calls.append(argv)
+        if argv[:3] == ["docker", "info", "--format"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="[]", stderr="")
         if argv[:3] == ["docker", "rm", "-f"] and reap_fn is not None:
             return reap_fn(argv, **kwargs)
         if argv[:2] == ["docker", "exec"] and "curl" in argv:
@@ -131,6 +134,23 @@ def test_build_docker_argv_dind_relaxations():
     assert any(s.startswith("/run/user/1001:") and "uid=1001" in s for s in tmpfs_specs)
     assert all("size=" in s for s in tmpfs_specs)
     assert "FRANKY_DISK_MB=8192" in argv
+
+
+def test_apparmor_selector_failure_aborts_before_resource_creation():
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    def fail(_runner):
+        raise container_mod.SecurityPolicyError("could not inspect Docker security options")
+
+    code, out = run_in_container(_cfg(), ["pi"], runner=runner, env={}, apparmor_selector=fail)
+
+    assert code == 1
+    assert out == "franky: could not inspect Docker security options - refusing to run"
+    assert calls == []
 
 
 def test_build_docker_argv_no_mounts_or_socket():
@@ -995,6 +1015,47 @@ def _fake_popen_factory(lines, returncode=0):
         return _FakePopen(lines=lines, returncode=returncode)
 
     return fake_popen
+
+
+MISSING_APPARMOR = 'docker: Error response from daemon: apparmor profile "franky-task" not found.\n'
+APPARMOR_INSTALL = "franky apparmor-profile > franky-task.apparmor"
+
+
+def test_missing_apparmor_profile_has_install_command_in_blocking_output():
+    def task(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 125, stdout="", stderr=MISSING_APPARMOR)
+
+    runner, _ = _orchestration_runner(task)
+    code, out = run_in_container(
+        _cfg(),
+        ["pi"],
+        runner=runner,
+        env={},
+        sleeper=NOOP_SLEEP,
+        apparmor_selector=lambda _runner: "franky-task",
+    )
+
+    assert code == 125
+    assert APPARMOR_INSTALL in out
+
+
+def test_missing_apparmor_profile_has_install_command_in_streaming_output():
+    runner, _ = _orchestration_runner(
+        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+    )
+    code, out = run_in_container(
+        _cfg(),
+        ["pi"],
+        runner=runner,
+        env={},
+        sleeper=NOOP_SLEEP,
+        progress=lambda _line: None,
+        popen=_fake_popen_factory([MISSING_APPARMOR], returncode=125),
+        apparmor_selector=lambda _runner: "franky-task",
+    )
+
+    assert code == 125
+    assert APPARMOR_INSTALL in out
 
 
 def test_run_in_container_streaming_calls_progress_for_each_line():

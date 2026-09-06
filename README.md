@@ -113,6 +113,21 @@ pipx install franky-agent
 pip install franky-agent
 ```
 
+Native AppArmor hosts need Franky's named task profile. Install it once after each Franky update:
+
+```
+(
+  set -e
+  profile="$(mktemp)"
+  trap 'rm -f "$profile"' EXIT
+  franky apparmor-profile > "$profile"
+  sudo /usr/sbin/apparmor_parser -K -r "$profile"
+  sudo /usr/bin/install -m 0644 "$profile" /etc/apparmor.d/franky-task
+)
+```
+
+Franky detects AppArmor from Docker. It refuses malformed daemon security data before it creates any run resources.
+
 On first run the CLI pulls version-pinned, public GHCR images.
 It pulls `ghcr.io/vietlabs-work/franky:X.Y.Z-<engine>` and `ghcr.io/vietlabs-work/franky-proxy:X.Y.Z`.
 Thus, all you need is Docker - no registry login. (Point `FRANKY_GHCR_REPO` at a different
@@ -680,17 +695,22 @@ container with:
 
 Franky explicitly selects packaged seccomp policies. It does not trust the Docker daemon's default profile.
 This keeps syscall filtering active when a Docker Desktop daemon has an unconfined default.
+On AppArmor hosts, Franky also selects the named `franky-task` profile.
+This profile starts from Moby's default and adds only tested rootless Docker operations.
+Its ABI 3 declaration keeps user namespaces compatible on newer AppArmor kernels.
 
-| Container | Seccomp policy | Task-only permissions |
-|-----------|----------------|-----------------------|
-| Task | Pinned Moby default plus tested rootless exceptions | Namespace creation, mount operations, and nested hostname setup |
-| Proxy | Pinned Moby default | None |
-| Storage, auth, and version helpers | Pinned Moby default | None |
+| Container | Seccomp policy | AppArmor policy | Task-only permissions |
+|-----------|----------------|------------------|-----------------------|
+| Task | Pinned Moby default plus tested exceptions | `franky-task` on AppArmor hosts | Rootless namespace, mount, hostname, and exact sysctl operations |
+| Proxy | Pinned Moby default | Docker default | None |
+| Storage, auth, and version helpers | Pinned Moby default | Docker default | None |
 
 The task policy restricts `clone` and `unshare` flags. It does not add outer capabilities.
 It blocks keyring access with `ENOSYS`, which lets runc continue without a session keyring.
 Other blocked calls, including BPF without its capability, remain blocked inside the user namespace.
 Missing policy files cause Docker startup to fail. No unconfined fallback exists.
+The AppArmor profile keeps unrelated `/proc/sys` writes denied.
+It permits only Docker's required `net.ipv4.ip_unprivileged_port_start` write.
 
 Run `make smoke-security` and `make smoke-dind` after policy changes.
 The first checks active filters, capability limits, exact policies, and denied operations.
@@ -740,6 +760,8 @@ task:
 
 The packaged task seccomp policy permits only the tested additions described above.
 Native Linux also applies its host security policy. A host denial is a failed gate, not a reason to disable security.
+The named AppArmor task policy permits user namespaces, mounts, and `pivot_root`.
+Capabilities remain limited by the outer container and the rootless user namespace.
 
 The blast radius stays bounded by everything else (rootless user namespace, read-only
 root, the egress cage below, no host FS, repo allowlist, PR-not-merge). The nested

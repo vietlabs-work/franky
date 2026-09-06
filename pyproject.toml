@@ -46,6 +46,7 @@ franky = [
     "persona.md",
     "security-default.json",
     "security-task.json",
+    "security-task.apparmor",
     "security-default.LICENSE",
 ]
 

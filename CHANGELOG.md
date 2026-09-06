@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Select pinned seccomp policies explicitly for tasks, proxies, and helpers, including Docker Desktop with an unconfined daemon default.
+- Select a named AppArmor task profile on native hosts. Keep AppArmor enabled for rootless Docker-in-Docker.
+- Refuse malformed Docker security options before run resources are created.
 - Test active syscall filters and real nested builds. Keep keyring access blocked while supporting rootless runc startup.
 - Reuse one bounded, read-only disk helper per task instead of creating a container for every disk check.
 - Replace recurring proxy health probes with a bounded, fail-closed HTTPS CONNECT startup gate.
@@ -31,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `franky apparmor-profile` prints the named task profile for trusted system tools to install.
 - `FRANKY_DISK_MB` sets a per-job disk budget, checked every five seconds. This watchdog is not a filesystem quota.
 - `make smoke-memory ARGS="--jobs N"` checks 1 through 8 concurrent runners. The default is 2.
 - Add an always-present, credential-free footprint check with versioned CPU, memory, image, overlap, OOM, and throughput budgets.

@@ -63,6 +63,11 @@ jobs:
           sysctl kernel.unprivileged_userns_clone || echo "userns clone setting unavailable"
           sysctl user.max_user_namespaces || echo "userns limit unavailable"
           sysctl kernel.apparmor_restrict_unprivileged_userns || echo "AppArmor userns setting unavailable"
+      - name: Load task AppArmor profile
+        if: contains(steps.select.outputs.checks, 'runtime')
+        run: |
+          franky apparmor-profile > "$RUNNER_TEMP/franky-task.apparmor"
+          sudo /usr/sbin/apparmor_parser -K -r "$RUNNER_TEMP/franky-task.apparmor"
       - name: Compare fixed host workloads
         if: contains(steps.select.outputs.checks, 'host')
         env:

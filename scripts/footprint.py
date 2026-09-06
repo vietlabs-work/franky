@@ -86,6 +86,14 @@ def _number(value, label: str) -> float:
     return value
 
 
+def _sha256(value) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and not any(character not in "0123456789abcdef" for character in value)
+    )
+
+
 def validate_host_report(report: dict, repeats: int = 3, required: set[str] | None = None) -> None:
     if report.get("schema") != 1 or not isinstance(report.get("metadata"), dict):
         raise FootprintError("missing or malformed host metadata")
@@ -211,12 +219,18 @@ def check_runtime(
     if not isinstance(profiles, dict) or set(profiles) != {"default", "task"}:
         raise FootprintError("missing or malformed runtime metadata.sandbox.profile_sha256")
     for digest in profiles.values():
-        if (
-            not isinstance(digest, str)
-            or len(digest) != 64
-            or any(character not in "0123456789abcdef" for character in digest)
-        ):
+        if not _sha256(digest):
             raise FootprintError("missing or malformed runtime metadata.sandbox.profile_sha256")
+    apparmor = sandbox.get("apparmor")
+    if not isinstance(apparmor, dict) or set(apparmor) != {"profile", "sha256"}:
+        raise FootprintError("missing or malformed runtime metadata.sandbox.apparmor")
+    apparmor_profile = apparmor["profile"]
+    apparmor_sha256 = apparmor["sha256"]
+    if not (
+        (apparmor_profile is None and apparmor_sha256 is None)
+        or (isinstance(apparmor_profile, str) and apparmor_profile and _sha256(apparmor_sha256))
+    ):
+        raise FootprintError("missing or malformed runtime metadata.sandbox.apparmor")
     for name in ("task", "proxy"):
         image = metadata.get("images", {}).get(name)
         if (
@@ -313,7 +327,12 @@ def compare_runtime_reports(base: list[dict], head: list[dict], budgets: dict) -
         check_runtime(report, budgets)
     sandboxes = [report["metadata"]["sandbox"] for report in base + head]
     signatures = {
-        (sandbox["mode"], tuple(sorted(sandbox["profile_sha256"].items()))) for sandbox in sandboxes
+        (
+            sandbox["mode"],
+            tuple(sorted(sandbox["profile_sha256"].items())),
+            tuple(sorted(sandbox["apparmor"].items())),
+        )
+        for sandbox in sandboxes
     }
     if len(signatures) != 1:
         raise FootprintError("shared security profile drift makes runtime comparison unresolved")

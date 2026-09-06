@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import hashlib
 import importlib
+import inspect
 import json
 import os
 from pathlib import Path
@@ -23,6 +24,8 @@ import uuid
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SECCOMP = ROOT / "franky/security-default.json"
 TASK_SECCOMP = ROOT / "franky/security-task.json"
+TASK_APPARMOR = ROOT / "franky/security-task.apparmor"
+TASK_APPARMOR_NAME = "franky-task"
 sys.path.insert(0, str(ROOT / "scripts"))
 
 from footprint import probe_image  # noqa: E402
@@ -77,8 +80,8 @@ print('WORKLOAD PASSED', flush=True)
 """
 
 
-def _adapt_docker_run(argv, task_names, images):
-    """Apply one shared seccomp policy without changing the benchmarked command."""
+def _adapt_docker_run(argv, task_names, images, task_apparmor=None):
+    """Apply shared host policies without changing the benchmarked command."""
     if not isinstance(argv, (list, tuple)) or list(argv[:2]) != ["docker", "run"]:
         return argv, False
     try:
@@ -93,8 +96,11 @@ def _adapt_docker_run(argv, task_names, images):
         if isinstance(token, str) and token.startswith("--name="):
             name = token.split("=", 1)[1]
             break
-    profile = TASK_SECCOMP if name in task_names else DEFAULT_SECCOMP
-    expected = f"seccomp={profile}"
+    is_task = name in task_names
+    profile = TASK_SECCOMP if is_task else DEFAULT_SECCOMP
+    expected = [f"seccomp={profile}"]
+    if is_task and task_apparmor is not None:
+        expected.append(f"apparmor={task_apparmor}")
     current = []
     options = []
     index = 2
@@ -102,7 +108,9 @@ def _adapt_docker_run(argv, task_names, images):
         token = argv[index]
         if token == "--security-opt" and index + 1 < image_index:
             value = argv[index + 1]
-            if isinstance(value, str) and value.startswith("seccomp="):
+            if isinstance(value, str) and (
+                value.startswith("seccomp=") or (is_task and value.startswith("apparmor="))
+            ):
                 current.append(value)
                 index += 2
                 continue
@@ -110,15 +118,24 @@ def _adapt_docker_run(argv, task_names, images):
             current.append(token.removeprefix("--security-opt="))
             index += 1
             continue
+        if is_task and isinstance(token, str) and token.startswith("--security-opt=apparmor="):
+            current.append(token.removeprefix("--security-opt="))
+            index += 1
+            continue
         options.append(token)
         index += 1
-    if current == [expected]:
+    if current == expected:
         return argv, False
-    return [*argv[:2], *options, f"--security-opt={expected}", *argv[image_index:]], True
+    return [
+        *argv[:2],
+        *options,
+        *(f"--security-opt={value}" for value in expected),
+        *argv[image_index:],
+    ], True
 
 
 @contextmanager
-def _shared_security_profiles(task_names, images):
+def _shared_security_profiles(task_names, images, task_apparmor=None):
     """Give base and head the same policies while retaining subprocess identity checks."""
     try:
         profile_sha256 = {
@@ -129,13 +146,21 @@ def _shared_security_profiles(task_names, images):
         raise RuntimeError(f"benchmark security profile is unavailable: {exc}") from exc
     metadata = {
         "mode": "algorithm_comparison_shared_security",
+        "apparmor": {
+            "profile": task_apparmor,
+            "sha256": (
+                hashlib.sha256(TASK_APPARMOR.read_bytes()).hexdigest()
+                if task_apparmor is not None
+                else None
+            ),
+        },
         "profile_sha256": profile_sha256,
         "compatibility_applied": False,
     }
     original_popen = subprocess.Popen
 
     def popen(argv, *args, **kwargs):
-        adapted_argv, adapted = _adapt_docker_run(argv, task_names, images)
+        adapted_argv, adapted = _adapt_docker_run(argv, task_names, images, task_apparmor)
         if adapted:
             metadata["compatibility_applied"] = True
         return original_popen(adapted_argv, *args, **kwargs)
@@ -145,6 +170,26 @@ def _shared_security_profiles(task_names, images):
         yield metadata
     finally:
         subprocess.Popen = original_popen
+
+
+def _detect_task_apparmor():
+    """Match the production task profile selection without importing a measured checkout."""
+    argv = ["docker", "info", "--format", "{{json .SecurityOptions}}"]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=3)
+        options = json.loads(proc.stdout) if proc.returncode == 0 else None
+    except Exception as exc:
+        raise RuntimeError("could not inspect Docker security options") from exc
+    if not isinstance(options, list) or not all(isinstance(value, str) for value in options):
+        raise RuntimeError("could not inspect Docker security options")
+    return TASK_APPARMOR_NAME if "name=apparmor" in options else None
+
+
+def _apparmor_selector_kwargs(run_in_container, task_apparmor):
+    """Reuse the outer selection without adding head-only Docker work to measurements."""
+    if "apparmor_selector" not in inspect.signature(run_in_container).parameters:
+        return {}
+    return {"apparmor_selector": lambda _runner: task_apparmor}
 
 
 def _load_runtime_modules(repo):
@@ -374,6 +419,7 @@ def _image_metadata(image, proxy=False):
 def _run_benchmark(args, repo, ids, task_names, sandbox):
     Config, run_in_container, run_names, PiEngine, Transcript = _load_runtime_modules(repo)
     task_names.update(run_names(job_id)[2] for job_id in ids)
+    selector_kwargs = _apparmor_selector_kwargs(run_in_container, sandbox["apparmor"]["profile"])
     usage_before = _rusage()
     daemon_before = _native_daemon_cpu()
     source_sha = (
@@ -424,6 +470,7 @@ def _run_benchmark(args, repo, ids, task_names, sandbox):
             timeout=90,
             progress=progress,
             run_id=job_id,
+            **selector_kwargs,
         )
         try:
             assert code == 0, output.tail(2000) if isinstance(output, Transcript) else output
@@ -502,7 +549,10 @@ def main():
     repo = args.repo.resolve()
     ids = [uuid.uuid4().hex[:12] for _ in range(args.jobs)]
     task_names = set()
-    with _shared_security_profiles(task_names, {args.image, args.proxy_image}) as sandbox:
+    task_apparmor = _detect_task_apparmor()
+    with _shared_security_profiles(
+        task_names, {args.image, args.proxy_image}, task_apparmor
+    ) as sandbox:
         _run_benchmark(args, repo, ids, task_names, sandbox)
 
 

@@ -8,6 +8,8 @@ import json
 from pathlib import Path
 import subprocess
 
+import pytest
+
 from franky import container, security
 
 try:
@@ -23,10 +25,15 @@ REVIEWED_TASK_EXCEPTIONS = {
     "sethostname",
     "umount2",
 }
+DEFAULT_APPARMOR = Path(__file__).with_name("fixtures") / "security-default.apparmor"
 
 
 def _seccomp_arg(path: Path) -> str:
     return f"--security-opt=seccomp={path}"
+
+
+def _apparmor_arg(name: str) -> str:
+    return f"--security-opt=apparmor={name}"
 
 
 def _load_footprint():
@@ -54,6 +61,35 @@ def test_moby_license_is_pinned_and_packaged():
     assert hashlib.sha256(content).hexdigest() == (
         "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30"
     )
+
+
+def test_default_apparmor_profile_is_pinned_to_reviewed_moby_source():
+    content = DEFAULT_APPARMOR.read_bytes()
+    assert content.endswith(b"\n") and not content.endswith(b"\n\n")
+    assert hashlib.sha256(content).hexdigest() == (
+        "537cd0f00ac450a17ac0c55c4d943f5cbbe6cba8faebfc18e73217a33ac02845"
+    )
+    assert security.MOBY_APPARMOR_TEMPLATE_SHA256 == (
+        "42130ca5908f45263facef820961d9e1a988e82f8a2937f4658e7bcccc96cc07"
+    )
+
+
+def test_task_apparmor_profile_is_default_plus_only_reviewed_exceptions():
+    default = DEFAULT_APPARMOR.read_text()
+    task = security.TASK_APPARMOR.read_text()
+    target = "net/ipv4/ip_unprivileged_port_start"
+    mismatches = [f"{target[:index]}[^{char}]**" for index, char in enumerate(target) if index]
+    proc_exception = (
+        "  deny @{PROC}/sys/[^kn]** w,\n"
+        f"  deny @{{PROC}}/sys/{{{','.join([*mismatches, target + '?**'])}}} w,"
+    )
+    task = task.replace("franky-task", "docker-default")
+    task = task.replace("  mount,\n  pivot_root,", "  deny mount,", 1)
+    task = task.replace(proc_exception, "  deny @{PROC}/sys/[^k]** w,", 1)
+
+    assert task == default
+    assert "unconfined" not in security.TASK_APPARMOR_NAME
+    assert "ip_unprivileged_port_start?**" in proc_exception
 
 
 def test_task_profile_is_default_plus_only_reviewed_exceptions():
@@ -100,7 +136,9 @@ def test_all_packaged_security_files_are_declared_as_package_data():
 
 
 def test_task_and_non_task_builders_select_explicit_profiles():
-    task = container.build_docker_argv("franky", {}, ["pi"])
+    task = container.build_docker_argv(
+        "franky", {}, ["pi"], apparmor_profile=security.TASK_APPARMOR_NAME
+    )
     proxy = container.build_proxy_argv("franky-proxy", "proxy", [".github.com"])
     auth = container.build_codex_auth_scrub_argv(
         "franky", require_auth=False, auth_volume="franky-codex-auth"
@@ -108,12 +146,46 @@ def test_task_and_non_task_builders_select_explicit_profiles():
     helper = container._storage_helper_argv("task", "franky", ["a", "b", "c"], 5)
 
     assert _seccomp_arg(security.TASK_SECCOMP) in task
+    assert _apparmor_arg(security.TASK_APPARMOR_NAME) in task
     for argv in (proxy, auth, helper):
         assert _seccomp_arg(security.DEFAULT_SECCOMP) in argv
         assert _seccomp_arg(security.TASK_SECCOMP) not in argv
     assert not any(
         "seccomp=unconfined" in token for argv in (task, proxy, auth, helper) for token in argv
     )
+
+
+@pytest.mark.parametrize(
+    ("options", "expected"),
+    [
+        (["name=apparmor", "name=seccomp,profile=builtin"], "franky-task"),
+        (["name=seccomp,profile=unconfined", "name=cgroupns"], None),
+    ],
+)
+def test_select_task_apparmor_uses_only_reported_daemon_support(options, expected):
+    def runner(argv, **kwargs):
+        assert argv == ["docker", "info", "--format", "{{json .SecurityOptions}}"]
+        assert kwargs["timeout"] == 3
+        return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(options), stderr="")
+
+    assert security.select_task_apparmor(runner) == expected
+
+
+@pytest.mark.parametrize("stdout", ["", "{}", '["name=apparmor", 1]', "not-json"])
+def test_select_task_apparmor_fails_closed_on_malformed_daemon_output(stdout):
+    def runner(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    with pytest.raises(security.SecurityPolicyError, match="security options"):
+        security.select_task_apparmor(runner)
+
+
+def test_select_task_apparmor_fails_closed_when_docker_info_fails():
+    def runner(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="unavailable")
+
+    with pytest.raises(security.SecurityPolicyError, match="security options"):
+        security.select_task_apparmor(runner)
 
 
 def test_storage_preflight_selects_explicit_default_profile():

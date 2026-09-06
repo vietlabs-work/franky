@@ -18,7 +18,12 @@ from franky.container import (  # noqa: E402
     build_proxy_argv,
     wait_proxy_ready,
 )
-from franky.security import DEFAULT_SECCOMP, TASK_SECCOMP  # noqa: E402
+from franky.security import (  # noqa: E402
+    DEFAULT_SECCOMP,
+    TASK_APPARMOR_NAME,
+    TASK_SECCOMP,
+    select_task_apparmor,
+)
 
 
 # Syscall numbers: Linux arch/x86/entry/syscalls/syscall_64.tbl and
@@ -55,6 +60,14 @@ elif mode == "helper":
 elif mode == "nested":
     record("keyctl", libc.syscall, keyctl, -1, 0, 0, 0, 0)
     record("bpf", libc.syscall, bpf, -1, 0, 0)
+    record("unshare_net", libc.unshare, 0x40000000)  # CLONE_NEWNET
+    for name in ("ip_unprivileged_port_start", "ip_forward"):
+        path = Path("/proc/sys/net/ipv4") / name
+        try:
+            value = path.read_text()
+            results[name] = [path.write_text(value), 0]
+        except OSError as exc:
+            results[name] = [-1, exc.errno]
 else:
     raise ValueError("unknown syscall probe")
 print(json.dumps({"uid": os.getuid(), "status": Path("/proc/self/status").read_text(),
@@ -128,7 +141,15 @@ def run_smoke(
             raise ValueError(f"{name} did not fail with the required errno {expected}")
 
     try:
-        argv = build_docker_argv(image, {}, ["sleep", "90"], name=task, network="none")
+        apparmor_profile = select_task_apparmor(bounded)
+        argv = build_docker_argv(
+            image,
+            {},
+            ["sleep", "90"],
+            name=task,
+            network="none",
+            apparmor_profile=apparmor_profile,
+        )
         argv.insert(2, "-d")
         checked(argv, timeout=40)
         volumes = _task_storage_volumes(task, bounded)
@@ -150,6 +171,15 @@ def run_smoke(
                 uid=uid,
                 capabilities=caps,
             )
+        if apparmor_profile is not None:
+            options = json.loads(
+                checked(["docker", "inspect", "-f", "{{json .HostConfig.SecurityOpt}}", task])
+            )
+            if options.count(f"apparmor={TASK_APPARMOR_NAME}") != 1:
+                raise ValueError("task does not use the required AppArmor profile")
+            label = checked(["docker", "exec", task, "cat", "/proc/self/attr/current"])
+            if not label.startswith(f"{TASK_APPARMOR_NAME} (enforce)"):
+                raise ValueError("task AppArmor profile is not enforcing")
         if not wait_proxy_ready(proxy, bounded, sleeper):
             raise ValueError("proxy did not enforce default-deny")
         ready_deadline = min(deadline, clock() + 35)
@@ -183,6 +213,12 @@ def run_smoke(
             raise ValueError("RootlessKit did not map the unprivileged task uid")
         denied(result, "keyctl", 38)  # Linux ENOSYS: runc accepts unavailable keyrings.
         denied(result, "bpf", 1)
+        if apparmor_profile is not None:
+            if result["results"].get("unshare_net") != [0, 0]:
+                raise ValueError("nested network namespace setup failed")
+            if result["results"].get("ip_unprivileged_port_start", [-1])[0] < 0:
+                raise ValueError("required nested Docker sysctl was denied")
+            denied(result, "ip_forward", 13)  # AppArmor EACCES: unrelated sysctls stay denied.
     finally:
         primary_error = sys.exc_info()[1]
         deadline = overall_deadline

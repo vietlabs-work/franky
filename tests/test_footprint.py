@@ -222,6 +222,7 @@ def _runtime(jobs=2, helper_peak=8.0):
             "source_sha": "a" * 40,
             "sandbox": {
                 "mode": "algorithm_comparison_shared_security",
+                "apparmor": {"profile": "franky-task", "sha256": "f" * 64},
                 "profile_sha256": {"default": "d" * 64, "task": "e" * 64},
                 "compatibility_applied": False,
             },
@@ -302,6 +303,25 @@ def test_check_runtime_rejects_missing_shared_security_metadata():
         footprint.check_runtime(report, budgets)
 
 
+@pytest.mark.parametrize(
+    "apparmor",
+    [
+        None,
+        {},
+        {"profile": None, "sha256": "f" * 64},
+        {"profile": "franky-task", "sha256": None},
+        {"profile": "franky-task", "sha256": "not-a-digest"},
+    ],
+)
+def test_check_runtime_rejects_malformed_apparmor_metadata(apparmor):
+    report = _runtime()
+    report["metadata"]["sandbox"]["apparmor"] = apparmor
+    budgets = footprint._read_json(str(footprint.ROOT / "scripts/footprint-budgets.json"))
+
+    with pytest.raises(footprint.FootprintError, match="sandbox.apparmor"):
+        footprint.check_runtime(report, budgets)
+
+
 def test_check_runtime_rejects_oom_and_missing_metrics():
     report = _runtime()
     report["scopes"]["proxy"]["oom_kills"] = 1
@@ -378,6 +398,16 @@ def test_compare_runtime_rejects_shared_security_profile_drift():
     base = [_runtime() for _ in range(3)]
     head = [_runtime() for _ in range(3)]
     head[1]["metadata"]["sandbox"]["profile_sha256"]["task"] = "f" * 64
+
+    with pytest.raises(footprint.FootprintError, match="shared security profile drift"):
+        footprint.compare_runtime_reports(base, head, budgets)
+
+
+def test_compare_runtime_rejects_shared_apparmor_profile_drift():
+    budgets = footprint._read_json(str(footprint.ROOT / "scripts/footprint-budgets.json"))
+    base = [_runtime() for _ in range(3)]
+    head = [_runtime() for _ in range(3)]
+    head[1]["metadata"]["sandbox"]["apparmor"]["sha256"] = "a" * 64
 
     with pytest.raises(footprint.FootprintError, match="shared security profile drift"):
         footprint.compare_runtime_reports(base, head, budgets)

@@ -74,14 +74,16 @@ def test_helper_mounts_reject_anything_except_three_readonly_task_volumes(change
         smoke.check_helper_mounts(mounts, ["work", "home", "tmp"])
 
 
-def fake_runner(smoke, *, failed_probe=False, missing_filter=False):
+def fake_runner(smoke, *, failed_probe=False, missing_filter=False, apparmor=False):
     calls = []
 
     def runner(argv, **kwargs):
         calls.append((argv, kwargs))
         assert 0 < kwargs["timeout"] <= 60
         output = ""
-        if argv[:3] == ["docker", "inspect", "-f"]:
+        if argv[:3] == ["docker", "info", "--format"]:
+            output = json.dumps(["name=apparmor"] if apparmor else ["name=seccomp"])
+        elif argv[:3] == ["docker", "inspect", "-f"]:
             if argv[3] == "{{json .Mounts}}":
                 output = json.dumps(
                     [
@@ -108,14 +110,20 @@ def fake_runner(smoke, *, failed_probe=False, missing_filter=False):
                     if argv[-1].endswith(("-proxy", "-disk"))
                     else smoke.TASK_SECCOMP
                 )
-                output = json.dumps(["seccomp=" + policy.read_text()])
+                options = ["seccomp=" + policy.read_text()]
+                if apparmor and not argv[-1].endswith(("-proxy", "-disk")):
+                    options.append("apparmor=" + smoke.TASK_APPARMOR_NAME)
+                output = json.dumps(options)
         elif argv[:2] == ["docker", "exec"]:
             name = argv[2]
             if "cat" in argv:
-                uid, caps = (13, 0) if name.endswith("-proxy") else (0, 4)
-                if not name.endswith(("-proxy", "-disk")):
-                    uid, caps = 1001, 0xC0
-                output = status(uid, caps)
+                if argv[-1] == "/proc/self/attr/current":
+                    output = smoke.TASK_APPARMOR_NAME + " (enforce)\n"
+                else:
+                    uid, caps = (13, 0) if name.endswith("-proxy") else (0, 4)
+                    if not name.endswith(("-proxy", "-disk")):
+                        uid, caps = 1001, 0xC0
+                    output = status(uid, caps)
                 if missing_filter:
                     output = output.replace("Seccomp_filters:\t1", "Seccomp_filters:\t0")
             elif "curl" in argv:
@@ -132,6 +140,9 @@ def fake_runner(smoke, *, failed_probe=False, missing_filter=False):
                             "unshare": [-1, 1],
                             "keyctl": [-1, 38 if mode == "nested" else 1],
                             "bpf": [-1, 1],
+                            "unshare_net": [0, 0],
+                            "ip_unprivileged_port_start": [2, 0],
+                            "ip_forward": [-1, 13],
                         },
                     }
                 )
@@ -182,6 +193,21 @@ def test_start_timeout_still_cleans_named_containers_and_discovered_volumes():
         smoke.run_smoke("task-image", "proxy-image", runner=timeout)
     assert sum(argv[:3] == ["docker", "rm", "-f"] for argv, _ in calls) == 3
     assert any(argv[:3] == ["docker", "volume", "rm"] for argv, _ in calls)
+
+
+def test_smoke_verifies_enforcing_task_apparmor_and_exact_sysctl_exception():
+    smoke = smoke_module()
+    runner, calls = fake_runner(smoke, apparmor=True)
+
+    smoke.run_smoke("task-image", "proxy-image", runner=runner)
+
+    task_run = next(
+        argv
+        for argv, _ in calls
+        if argv[:2] == ["docker", "run"] and "sleep" in argv and "--entrypoint=sleep" not in argv
+    )
+    assert f"--security-opt=apparmor={smoke.TASK_APPARMOR_NAME}" in task_run
+    assert any(argv[-1] == "/proc/self/attr/current" for argv, _ in calls)
 
 
 def test_probe_is_valid_python_and_rejects_unsupported_architecture(monkeypatch):

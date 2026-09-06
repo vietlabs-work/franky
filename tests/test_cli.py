@@ -21,6 +21,13 @@ def test_help_exit_zero():
     assert res.exit_code == 0
 
 
+def test_apparmor_profile_prints_packaged_policy():
+    res = CliRunner().invoke(cli.main, ["apparmor-profile"])
+
+    assert res.exit_code == 0
+    assert res.output == cli.TASK_APPARMOR.read_text()
+
+
 def test_version_prints_version():
     res = CliRunner().invoke(cli.main, ["version"])
     assert res.exit_code == 0

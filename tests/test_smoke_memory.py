@@ -109,12 +109,68 @@ def test_shared_security_adapter_changes_only_docker_policy_options(tmp_path, mo
     ]
     assert metadata == {
         "mode": "algorithm_comparison_shared_security",
+        "apparmor": {"profile": None, "sha256": None},
         "profile_sha256": {
             "default": "07d81f383304754105b34fc4ddb4684da6e89d1f7964beb085a2d823ce9529e1",
             "task": "31eaf5474b53bce546b5ecae76ff67db4378a7ec34330ce896e65ca9dd1123b2",
         },
         "compatibility_applied": True,
     }
+
+
+def test_shared_security_adapter_applies_same_task_apparmor_to_base_and_head(tmp_path, monkeypatch):
+    task_profile = tmp_path / "task.apparmor"
+    task_profile.write_text("profile franky-task {}\n", encoding="utf-8")
+    monkeypatch.setattr(smoke_memory, "TASK_APPARMOR", task_profile)
+    calls = []
+
+    def original_popen(argv, *args, **kwargs):
+        calls.append(argv)
+        return "process"
+
+    monkeypatch.setattr(subprocess, "Popen", original_popen)
+    task_name = "franky-run-abc123"
+    argv = [
+        "docker",
+        "run",
+        "--name",
+        task_name,
+        "--security-opt=seccomp=/old.json",
+        "task-image",
+    ]
+
+    with smoke_memory._shared_security_profiles(
+        {task_name}, {"task-image"}, task_apparmor="franky-task"
+    ) as metadata:
+        subprocess.Popen(argv)
+
+    assert "--security-opt=apparmor=franky-task" in calls[0]
+    assert metadata["apparmor"] == {
+        "profile": "franky-task",
+        "sha256": "f3e24ec12a0570dc1c60002d1087033fb5eb6f11ef4a572bb17434b6c91344ca",
+    }
+
+
+@pytest.mark.parametrize("stdout", ["", "{}", '["name=apparmor", 1]', "invalid"])
+def test_benchmark_apparmor_detection_fails_closed(stdout, monkeypatch):
+    def runner(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", runner)
+    with pytest.raises(RuntimeError, match="security options"):
+        smoke_memory._detect_task_apparmor()
+
+
+def test_benchmark_reuses_outer_apparmor_selection_when_runtime_supports_it():
+    def old_runtime(cfg, argv):
+        pass
+
+    def current_runtime(cfg, argv, apparmor_selector=None):
+        pass
+
+    assert smoke_memory._apparmor_selector_kwargs(old_runtime, "franky-task") == {}
+    kwargs = smoke_memory._apparmor_selector_kwargs(current_runtime, "franky-task")
+    assert kwargs["apparmor_selector"](None) == "franky-task"
 
 
 def test_shared_security_adapter_leaves_matching_policy_unadapted(tmp_path, monkeypatch):
