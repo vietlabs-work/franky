@@ -710,7 +710,7 @@ It blocks keyring access with `ENOSYS`, which lets runc continue without a sessi
 Other blocked calls, including BPF without its capability, remain blocked inside the user namespace.
 Missing policy files cause Docker startup to fail. No unconfined fallback exists.
 The AppArmor profile keeps unrelated `/proc/sys` writes denied.
-It permits only Docker's required `net.ipv4.ip_unprivileged_port_start` write.
+It permits Docker's port-start write and per-interface `disable_ipv6` flag.
 
 Run `make smoke-security` and `make smoke-dind` after policy changes.
 The first checks active filters, capability limits, exact policies, and denied operations.
@@ -761,6 +761,7 @@ task:
 The packaged task seccomp policy permits only the tested additions described above.
 Native Linux also applies its host security policy. A host denial is a failed gate, not a reason to disable security.
 The named AppArmor task policy permits user namespaces, mounts, and `pivot_root`.
+It also permits the two network-namespace sysctls that nested Docker requires.
 Capabilities remain limited by the outer container and the rootless user namespace.
 
 The blast radius stays bounded by everything else (rootless user namespace, read-only

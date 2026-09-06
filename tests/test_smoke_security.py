@@ -142,6 +142,8 @@ def fake_runner(smoke, *, failed_probe=False, missing_filter=False, apparmor=Fal
                             "bpf": [-1, 1],
                             "unshare_net": [0, 0],
                             "ip_unprivileged_port_start": [2, 0],
+                            "disable_ipv6": [2, 0],
+                            "ipv6_forwarding": [-1, 13],
                             "ip_forward": [-1, 13],
                         },
                     }

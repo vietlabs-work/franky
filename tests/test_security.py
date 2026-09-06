@@ -77,11 +77,29 @@ def test_default_apparmor_profile_is_pinned_to_reviewed_moby_source():
 def test_task_apparmor_profile_is_default_plus_only_reviewed_exceptions():
     default = DEFAULT_APPARMOR.read_text()
     task = security.TASK_APPARMOR.read_text()
-    target = "net/ipv4/ip_unprivileged_port_start"
-    mismatches = [f"{target[:index]}[^{char}]**" for index, char in enumerate(target) if index]
+    shared = "net/ipv"
+    port = "net/ipv4/ip_unprivileged_port_start"
+    ipv6 = "conf/"
+    setting = "disable_ipv6"
+
+    def mismatches(target, *, start=1):
+        return [
+            f"{target[:index]}[^{char}]**" for index, char in enumerate(target) if index >= start
+        ]
+
+    paths = [
+        *mismatches(shared),
+        shared + "[^46]**",
+        *mismatches(port, start=len(shared) + 1),
+        port + "?**",
+    ]
+    ipv6_paths = [f"[^{ipv6[0]}]**", *mismatches(ipv6)]
+    settings = [f"[^{setting[0]}]**", *mismatches(setting), setting + "?**"]
     proc_exception = (
         "  deny @{PROC}/sys/[^kn]** w,\n"
-        f"  deny @{{PROC}}/sys/{{{','.join([*mismatches, target + '?**'])}}} w,"
+        f"  deny @{{PROC}}/sys/{{{','.join(paths)}}} w,\n"
+        f"  deny @{{PROC}}/sys/net/ipv6/{{{','.join(ipv6_paths)}}} w,\n"
+        f"  deny @{{PROC}}/sys/net/ipv6/conf/*/{{{','.join(settings)}}} w,"
     )
     task = task.replace("franky-task", "docker-default")
     task = task.replace("  mount,\n  pivot_root,", "  deny mount,", 1)
@@ -90,6 +108,7 @@ def test_task_apparmor_profile_is_default_plus_only_reviewed_exceptions():
     assert task == default
     assert "unconfined" not in security.TASK_APPARMOR_NAME
     assert "ip_unprivileged_port_start?**" in proc_exception
+    assert "disable_ipv6?**" in proc_exception
 
 
 def test_task_profile_is_default_plus_only_reviewed_exceptions():

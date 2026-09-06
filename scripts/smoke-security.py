@@ -61,8 +61,12 @@ elif mode == "nested":
     record("keyctl", libc.syscall, keyctl, -1, 0, 0, 0, 0)
     record("bpf", libc.syscall, bpf, -1, 0, 0)
     record("unshare_net", libc.unshare, 0x40000000)  # CLONE_NEWNET
-    for name in ("ip_unprivileged_port_start", "ip_forward"):
-        path = Path("/proc/sys/net/ipv4") / name
+    for name, path in {
+        "ip_unprivileged_port_start": Path("/proc/sys/net/ipv4/ip_unprivileged_port_start"),
+        "disable_ipv6": Path("/proc/sys/net/ipv6/conf/lo/disable_ipv6"),
+        "ipv6_forwarding": Path("/proc/sys/net/ipv6/conf/lo/forwarding"),
+        "ip_forward": Path("/proc/sys/net/ipv4/ip_forward"),
+    }.items():
         try:
             value = path.read_text()
             results[name] = [path.write_text(value), 0]
@@ -218,6 +222,9 @@ def run_smoke(
                 raise ValueError("nested network namespace setup failed")
             if result["results"].get("ip_unprivileged_port_start", [-1])[0] < 0:
                 raise ValueError("required nested Docker sysctl was denied")
+            if result["results"].get("disable_ipv6", [-1])[0] < 0:
+                raise ValueError("required nested Docker IPv6 sysctl was denied")
+            denied(result, "ipv6_forwarding", 13)
             denied(result, "ip_forward", 13)  # AppArmor EACCES: unrelated sysctls stay denied.
     finally:
         primary_error = sys.exc_info()[1]

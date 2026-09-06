@@ -115,7 +115,7 @@ Module responsibilities:
 - Task-only seccomp exceptions must pass the pinned-policy delta test, `make smoke-security`, and `make smoke-dind`.
 - Helpers and proxies use the pinned Moby default policy, without task-only exceptions.
 - AppArmor hosts must load the output from `franky apparmor-profile` with the system `apparmor_parser`.
-- Never disable AppArmor or widen its `/proc/sys` exception beyond `net.ipv4.ip_unprivileged_port_start`.
+- Never disable AppArmor. Limit `/proc/sys` exceptions to `net.ipv4.ip_unprivileged_port_start` and `net.ipv6.conf.*.disable_ipv6`.
 - Proxy diagnostics read at most 64 KiB plus one sentinel byte before host capture.
 - `proxy_log_truncated` marks excluded records. Denial counts are recent observations, not guaranteed lifetime totals.
 - Keep proxy uid/gid 13 stable across image bases. Alpine runs with numeric `USER 13:13`.
