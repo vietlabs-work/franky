@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Use Alpine for the Squid proxy while preserving its numeric user and default-deny policy.
+- Share a stripped Node toolchain across engine images without retaining the original Node layer or build caches.
+- Start Codex through a native exec launcher. Preserve its companion executable, package metadata, arguments, exit codes, and signals.
+- Bound proxy diagnostic reads before host capture. Report incomplete log coverage and omit failed-read counts.
 - Move workspace, HOME, temporary files, and nested Docker data from RAM-backed mounts to disposable disk volumes.
 - Default to a 2 GiB task memory limit and a 128 MiB proxy limit. Configure tasks with `FRANKY_MEMORY_MB`.
 - Bound Squid file-descriptor tables to prevent high startup memory use.

@@ -49,20 +49,25 @@ Set `FRANKY_IMAGE` to override this selection.
 Use the full image when one engine must call another engine CLI inside the same container.
 Replay and resume start fresh containers. Thus, they can select a different engine without the full-image override.
 
-The current unreleased ARM64 images have these uncompressed sizes:
+These unreleased ARM64 builds compare with commit `2ea9419`:
 
-| Image | Bytes | Reduction from baseline |
-|-------|------:|------------------------:|
-| Previous full image | 1,858,963,346 | Baseline |
-| `pi` | 1,066,410,210 | 42.6% |
-| `claude` | 1,163,942,230 | 37.4% |
-| `codex` | 1,240,425,443 | 33.3% |
-| `opencode` | 1,132,756,145 | 39.1% |
-| New full image | 1,757,916,997 | 5.4% |
+| Image | Previous bytes | Current bytes | Reduction |
+|-------|---------------:|--------------:|----------:|
+| `pi` | 1,066,410,210 | 1,042,856,157 | 2.2% |
+| `claude` | 1,163,942,230 | 1,140,458,147 | 2.0% |
+| `codex` | 1,240,425,443 | 1,216,944,718 | 1.9% |
+| `opencode` | 1,132,756,145 | 1,109,270,617 | 2.1% |
+| Full | 1,757,916,997 | 1,734,338,308 | 1.3% |
+| Proxy | 212,463,904 | 32,751,240 | 84.6% |
 
 These are disk-image reductions. They do not reduce the task RAM limit or prove a real model workload fits.
+Sizes are uncompressed. Builds resolve current engine packages; Claude changed from 2.1.261 to 2.1.263 between these samples.
+Docker shares image layers across instances. It also shares the common toolchain across engine variants.
 Each selected engine passed `--version` in a networkless, hardened container.
 The variants omit other engine CLIs. They retain the common toolchain and nested Docker commands.
+
+The proxy uses Alpine. Task images retain Debian compatibility and copy stripped Node from a separate build stage.
+Codex starts its native executable directly, without a resident Node launcher. Its companion executable and package metadata remain available.
 
 OpenCode requires an explicit provider/model. Direct Moonshot:
 
@@ -348,6 +353,10 @@ members carry no host uid/username/timestamp.
 OOM-killed, its final container state, whether the nested rootless Docker daemon came up
 (`dind_ready`), a storage-full heuristic, and any hosts the egress proxy denied (with counts).
 The storage field retains its legacy name, `tmpfs_full`, for API compatibility.
+Proxy denial counts cover complete records in the most recent 64 KiB of the access log.
+`proxy_log_truncated` is true when capture excludes older bytes or an incomplete record.
+A zero count in a truncated log does not prove that the full run had no denials.
+Failed log reads omit these fields instead of reporting zero denials.
 These are captured host-side, best-effort, right before the task/proxy containers are reaped -
 for a wedged run, `job kill` captures them too (before it reaps). `--json` includes the same
 `diagnostics` object (see `franky schema` -> `job_record_schema`).
@@ -608,18 +617,19 @@ Each job holds 256 MiB of process memory, writes 512 MiB of disk data, and creat
 This checks runner overhead, overlap, cleanup, and VM headroom across all jobs.
 It does not replace a canary against your largest repository.
 
-The unreleased ARM64 Claude image produced these synthetic results:
+The unreleased ARM64 Codex image and Alpine proxy produced these synthetic results in a 2.86 GiB Docker VM:
 
 | Jobs | Peak task MiB | Minimum available VM memory | OOM kills |
 |-----:|---------------|----------------------------:|----------:|
-| 2 | 308.3, 307.9 | 48.2% | 0 |
-| 4 | 306.5, 346.3, 305.1, 306.2 | 26.2% | 0 |
+| 2 | 362.2, 387.0 | 50.0% | 0 |
+| 4 | 308.6, 310.2, 307.0, 309.9 | 28.3% | 0 |
 
 Each job held 256 MiB in its process. It also wrote 512 MiB and created 10,000 files on disk.
 These credential-free tests used the production runner, but they made no model calls.
 They do not prove that an actual agent or repository workload fits.
 
 Host transcript and snapshot processing uses bounded buffers and private temporary files.
+Proxy diagnostics also limit log reads inside the container, before host capture.
 Docker task logging is disabled, so Docker does not keep a second, unredacted stdout log.
 Use `franky job logs` for the completed redacted transcript; use `--verbose` for live output.
 JSONL events and structured payloads have a 1 MiB character limit; oversized events remain in the full redacted log.

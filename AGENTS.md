@@ -100,6 +100,11 @@ Module responsibilities:
 - Profile metadata is checked before file reads. Bounded reads reject files that grow past the remaining budget.
 - Snapshot scans stream with fail-closed ceilings. Never restore whole-file reads or skip unreadable data during secret verification.
 - Re-run all four real-Docker smoke gates after changing storage or container resource limits.
+- Proxy diagnostics read at most 64 KiB plus one sentinel byte before host capture.
+- `proxy_log_truncated` marks excluded records. Denial counts are recent observations, not guaranteed lifetime totals.
+- Keep proxy uid/gid 13 stable across image bases. Alpine runs with numeric `USER 13:13`.
+- Keep the stripped Node toolchain in shared runtime layers, separate from each engine payload.
+- Codex uses a build-resolved native exec launcher. Preserve its full platform package, companion executable, and managed-package metadata.
 
 ### Load-bearing invariants (do not regress these)
 

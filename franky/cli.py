@@ -2271,6 +2271,7 @@ def job_status(ctx: click.Context, job_id: str, as_json: bool) -> None:
                     "dind_ready",
                     "tmpfs_full",
                     "proxy_denied_count",
+                    "proxy_log_truncated",
                 ):
                     if k in diag:
                         click.echo(f"  {k}: {diag[k]}")
