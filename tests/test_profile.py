@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from franky import setups
 from franky.profile import (
     CLAUDE_MCP_CONTAINER_PATH,
     CONTAINER_HOME,
@@ -219,6 +220,48 @@ def test_load_profile_glob_no_matches_is_ok(tmp_path):
     cfg.write_text(f'[profile]\nskills = ["{empty}/*.md"]\n')
     spec = load_profile(cfg)
     assert spec.skills == []
+
+
+def test_load_profile_glob_preserves_segment_and_hidden_file_rules(tmp_path):
+    skills = tmp_path / "skills"
+    nested = skills / "nested"
+    nested.mkdir(parents=True)
+    (nested / "visible.md").write_text("visible\n", encoding="utf-8")
+    (nested / ".hidden.md").write_text("hidden\n", encoding="utf-8")
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text(
+        f'[profile]\nskills = ["{skills}/*/*.md", "{skills}/*/.*.md"]\n',
+        encoding="utf-8",
+    )
+
+    assert load_profile(cfg).skills == [nested / "visible.md", nested / ".hidden.md"]
+
+
+def test_load_profile_glob_keeps_double_star_nonrecursive(tmp_path):
+    skills = tmp_path / "skills"
+    one = skills / "one"
+    two = one / "two"
+    two.mkdir(parents=True)
+    (one / "direct.md").write_text("direct\n", encoding="utf-8")
+    (two / "nested.md").write_text("nested\n", encoding="utf-8")
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text(f'[profile]\nskills = ["{skills}/**/*.md"]\n', encoding="utf-8")
+
+    assert load_profile(cfg).skills == [one / "direct.md"]
+
+
+def test_load_profile_glob_follows_symlinked_directories(tmp_path):
+    external = tmp_path / "external"
+    external.mkdir()
+    target = external / "linked.md"
+    target.write_text("linked\n", encoding="utf-8")
+    skills = tmp_path / "skills"
+    skills.mkdir()
+    (skills / "linked").symlink_to(external)
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text(f'[profile]\nskills = ["{skills}/*/*.md"]\n', encoding="utf-8")
+
+    assert load_profile(cfg).skills == [skills / "linked" / "linked.md"]
 
 
 def test_load_profile_literal_missing_file_raises(tmp_path):
@@ -504,6 +547,18 @@ def test_mcp_secret_scan_allows_declared_placeholder_but_not_other_literal_secre
         build_bundle(load_profile(cfg))
 
 
+def test_mcp_secret_scan_accepts_crlf_declared_placeholder(tmp_path):
+    mcp = tmp_path / "mcp.toml"
+    mcp.write_bytes(b'[env]\r\nOPENAI_API_KEY = "${OPENAI_API_KEY}"\r\n')
+    spec = ProfileSpec(mcp_configs=[mcp], mcp_credentials=["OPENAI_API_KEY"])
+
+    bundle = build_bundle(spec)
+
+    packed = _decode_bundle(bundle).extractfile("profile/mcp.toml")
+    assert packed is not None
+    assert packed.read() == b'[env]\nOPENAI_API_KEY = "${OPENAI_API_KEY}"\n'
+
+
 # ---------------------------------------------------------------------------
 # build_bundle
 # ---------------------------------------------------------------------------
@@ -548,12 +603,109 @@ def test_build_bundle_multiple_files(tmp_path):
     assert len(tf.getmembers()) == 3
 
 
+def test_explicit_profile_rejects_oversized_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(setups, "MAX_SWEEP_BYTES", 8)
+    source = tmp_path / "instructions.md"
+    source.write_text("ninebytes", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="size limit"):
+        build_bundle(ProfileSpec(instructions=[source]))
+
+
+def test_profile_rejects_oversized_file_before_open(tmp_path, monkeypatch):
+    monkeypatch.setattr(setups, "MAX_SWEEP_BYTES", 8)
+    source = tmp_path / "instructions.md"
+    source.write_text("ninebytes", encoding="utf-8")
+    real_open = Path.open
+
+    def guarded_open(path, *args, **kwargs):
+        if path == source:
+            raise AssertionError("oversized file was opened")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+
+    with pytest.raises(ValueError, match="size limit"):
+        build_bundle(ProfileSpec(instructions=[source]))
+
+
+def test_profile_rejects_file_that_grows_past_remaining_budget(tmp_path, monkeypatch):
+    monkeypatch.setattr(setups, "MAX_SWEEP_BYTES", 8)
+    source = tmp_path / "instructions.md"
+    source.write_text("x", encoding="utf-8")
+    real_open = Path.open
+
+    def growing_open(path, *args, **kwargs):
+        if path == source:
+            return io.BytesIO(b"ninebytes")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", growing_open)
+
+    with pytest.raises(ValueError, match="size limit"):
+        build_bundle(ProfileSpec(instructions=[source]))
+
+
+def test_explicit_profile_rejects_invalid_utf8(tmp_path):
+    source = tmp_path / "instructions.md"
+    source.write_bytes(b"\xff")
+
+    with pytest.raises(ValueError, match="UTF-8"):
+        build_bundle(ProfileSpec(instructions=[source]))
+
+
+def test_combined_profile_budget_includes_explicit_swept_and_mcp_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(setups, "MAX_SWEEP_BYTES", 10)
+    explicit = tmp_path / "instructions.md"
+    swept = tmp_path / "CLAUDE.md"
+    mcp = tmp_path / "mcp.json"
+    explicit.write_text("four", encoding="utf-8")
+    swept.write_text("four", encoding="utf-8")
+    mcp.write_text("{}\n", encoding="utf-8")
+    spec = ProfileSpec(
+        instructions=[explicit],
+        mcp_configs=[mcp],
+        setup_scans={"claude": setups.SetupScan("claude", tmp_path, files=[swept])},
+    )
+
+    with pytest.raises(ValueError, match="size limit"):
+        build_bundle(spec)
+    assert any(result.error and "size limit" in result.error for result in scan_profile_files(spec))
+
+
+def test_combined_profile_file_limit_includes_explicit_swept_and_mcp_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(setups, "MAX_SWEEP_FILES", 2)
+    explicit = tmp_path / "instructions.md"
+    swept = tmp_path / "CLAUDE.md"
+    mcp = tmp_path / "mcp.json"
+    explicit.write_text("x", encoding="utf-8")
+    swept.write_text("x", encoding="utf-8")
+    mcp.write_text("{}", encoding="utf-8")
+    spec = ProfileSpec(
+        instructions=[explicit],
+        mcp_configs=[mcp],
+        setup_scans={"claude": setups.SetupScan("claude", tmp_path, files=[swept])},
+    )
+
+    with pytest.raises(ValueError, match="file limit"):
+        build_bundle(spec)
+    assert any(result.error and "file limit" in result.error for result in scan_profile_files(spec))
+
+
 def test_build_bundle_fail_closed_on_secret(tmp_path):
     f = tmp_path / "bad.md"
     f.write_text("token: ghp_aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890ab\n")
     spec = ProfileSpec(skills=[f])
     with pytest.raises(ValueError, match="credential"):
         build_bundle(spec)
+
+
+def test_build_bundle_rejects_known_assignment_after_cr_only_line(tmp_path):
+    source = tmp_path / "bad.md"
+    source.write_bytes(b"notes\rGH_TOKEN=value\r")
+
+    with pytest.raises(ValueError, match="credential"):
+        build_bundle(ProfileSpec(instructions=[source]))
 
 
 def test_build_bundle_fail_closed_on_pem_key(tmp_path):
@@ -810,6 +962,100 @@ def test_scan_profile_files_and_build_bundle_agree(tmp_path):
     good_spec = ProfileSpec(skills=[good])
     assert not any(r.findings for r in scan_profile_files(good_spec))
     build_bundle(good_spec)  # must not raise
+
+
+def test_load_profile_rejects_oversized_toml_before_parsing(tmp_path, monkeypatch):
+    monkeypatch.setattr(setups, "MAX_SWEEP_BYTES", 8)
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text("[profile]\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="size limit"):
+        load_profile(cfg)
+
+
+def test_load_profile_stops_glob_expansion_at_file_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(setups, "MAX_SWEEP_FILES", 2)
+    for index in range(3):
+        (tmp_path / f"skill-{index}.md").write_text("x", encoding="utf-8")
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text(
+        f'[profile]\nskills = ["{tmp_path}/skill-*.md"]\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="limit"):
+        load_profile(cfg)
+
+
+def test_load_profile_stops_scandir_before_a_wide_glob_is_materialized(tmp_path, monkeypatch):
+    monkeypatch.setattr(setups, "MAX_SWEEP_FILES", 2)
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text(f'[profile]\nskills = ["{tmp_path}/*.md"]\n', encoding="utf-8")
+    calls = 0
+
+    class Entry:
+        def __init__(self, name):
+            self.name = name
+            self.path = str(tmp_path / name)
+
+        def is_dir(self, *, follow_symlinks=True):
+            return False
+
+    class Scan:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            nonlocal calls
+            calls += 1
+            if calls > 3:
+                raise AssertionError("scandir continued after the enumeration limit")
+            return Entry(f"skill-{calls}.md")
+
+    monkeypatch.setattr(setups.os, "scandir", lambda _path: Scan())
+
+    with pytest.raises(ValueError, match="enumeration.*limit 2"):
+        load_profile(cfg)
+    assert calls == 3
+
+
+def test_load_profile_combines_explicit_swept_and_mcp_budgets(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(setups, "MAX_SWEEP_BYTES", 512)
+    explicit = tmp_path / "instructions.md"
+    explicit.write_text("x" * 200, encoding="utf-8")
+    mcp = tmp_path / "mcp.json"
+    mcp.write_text('{"x":"' + "y" * 190 + '"}', encoding="utf-8")
+    claude = tmp_path / ".claude"
+    claude.mkdir()
+    (claude / "CLAUDE.md").write_text("z" * 200, encoding="utf-8")
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text(
+        "[profile]\n"
+        f'instructions = ["{explicit}"]\n'
+        f'mcp_configs = ["{mcp}"]\n'
+        "[setups]\n"
+        f'claude = "{claude}"\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="size limit"):
+        load_profile(cfg)
+
+
+def test_mcp_config_read_is_bounded_before_parsing(tmp_path, monkeypatch):
+    monkeypatch.setattr(setups, "MAX_SWEEP_BYTES", 8)
+    mcp = tmp_path / "mcp.json"
+    mcp.write_text('{"x":"y"}', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="size limit"):
+        build_bundle(ProfileSpec(mcp_configs=[mcp]))
 
 
 # ---------------------------------------------------------------------------

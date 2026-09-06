@@ -29,8 +29,8 @@ throwaway container with a narrowly scoped token.
 
 ## Engines
 
-Franky is vendor-neutral. The engine that runs inside the container is pluggable;
-all ship in the one image.
+Franky is vendor-neutral. The engine that runs inside the container is pluggable.
+Release installations select a smaller image that contains only that engine.
 
 | Engine | CLI | Auth | Notes |
 |--------|-----|------|-------|
@@ -41,6 +41,28 @@ all ship in the one image.
 
 Select with `--engine pi|claude|codex|opencode`, or set `FRANKY_ENGINE`. Resolution order:
 `--engine` flag > `FRANKY_ENGINE` > default `pi`.
+
+The CLI selects `ghcr.io/vietlabs-work/franky:X.Y.Z-<engine>` for release runs.
+The unsuffixed `ghcr.io/vietlabs-work/franky:X.Y.Z` image contains all four engines.
+Set `FRANKY_IMAGE` to override this selection.
+
+Use the full image when one engine must call another engine CLI inside the same container.
+Replay and resume start fresh containers. Thus, they can select a different engine without the full-image override.
+
+The current unreleased ARM64 images have these uncompressed sizes:
+
+| Image | Bytes | Reduction from baseline |
+|-------|------:|------------------------:|
+| Previous full image | 1,858,963,346 | Baseline |
+| `pi` | 1,066,410,210 | 42.6% |
+| `claude` | 1,163,942,230 | 37.4% |
+| `codex` | 1,240,425,443 | 33.3% |
+| `opencode` | 1,132,756,145 | 39.1% |
+| New full image | 1,757,916,997 | 5.4% |
+
+These are disk-image reductions. They do not reduce the task RAM limit or prove a real model workload fits.
+Each selected engine passed `--version` in a networkless, hardened container.
+The variants omit other engine CLIs. They retain the common toolchain and nested Docker commands.
 
 OpenCode requires an explicit provider/model. Direct Moonshot:
 
@@ -86,9 +108,9 @@ pipx install franky-agent
 pip install franky-agent
 ```
 
-On first run the CLI pulls the version-pinned, public GHCR images
-(`ghcr.io/vietlabs-work/franky:X.Y.Z` and `ghcr.io/vietlabs-work/franky-proxy:X.Y.Z`),
-so all you need is Docker - no registry login. (Point `FRANKY_GHCR_REPO` at a different
+On first run the CLI pulls version-pinned, public GHCR images.
+It pulls `ghcr.io/vietlabs-work/franky:X.Y.Z-<engine>` and `ghcr.io/vietlabs-work/franky-proxy:X.Y.Z`.
+Thus, all you need is Docker - no registry login. (Point `FRANKY_GHCR_REPO` at a different
 namespace if you host the images elsewhere.)
 
 To move to a newer release later, run `franky update` - it detects how you
@@ -144,6 +166,12 @@ add an engine), so Codex, Cursor, pi, or Claude Code all start with the same con
    `commands/`, `prompts/`, `rules/`, `agents/`) and never ships transcripts, plugin trees,
    caches, or anything credential-shaped (`auth.json`, `settings*.json`, `*.jsonl`, `*.sqlite`);
    every file still passes the fail-closed secret scan. MCP is never auto-enabled by a sweep.
+   One combined profile can contain at most 5,000 files and 20 MiB.
+   These limits include explicit files, setup files, and MCP files.
+   Glob and setup scans can examine at most 5,000 directory entries per combined profile.
+   The profile TOML file has a separate 20 MiB read limit.
+   Franky refuses invalid UTF-8 in explicit files. It skips binary files from setup sweeps.
+   Skipped binary or unreadable sweep candidates still consume the sweep budget.
    ```
    franky profile init                 # interactive wizard -> ~/.franky/profile.toml
    franky profile check                # dry-run: files + MCP policy + secret scan
@@ -574,9 +602,22 @@ Limits are ceilings, not reservations. Large builds can still exceed the task li
 Limit each caller to one active job, for two jobs total. Franky does not enforce a global queue.
 Keep each instance's config, run directory, profile, and Codex auth volume separate.
 
-Run `make smoke-memory` after building both images. It runs two credential-free jobs through the production runner.
+Run `make smoke-memory` after building both images. It runs two credential-free jobs by default.
+Use `make smoke-memory ARGS="--jobs 4"` to select 1 through 8 concurrent jobs.
 Each job holds 256 MiB of process memory, writes 512 MiB of disk data, and creates 10,000 files.
-This checks runner overhead, cleanup, and VM headroom. It does not replace a canary against your largest repository.
+This checks runner overhead, overlap, cleanup, and VM headroom across all jobs.
+It does not replace a canary against your largest repository.
+
+The unreleased ARM64 Claude image produced these synthetic results:
+
+| Jobs | Peak task MiB | Minimum available VM memory | OOM kills |
+|-----:|---------------|----------------------------:|----------:|
+| 2 | 308.3, 307.9 | 48.2% | 0 |
+| 4 | 306.5, 346.3, 305.1, 306.2 | 26.2% | 0 |
+
+Each job held 256 MiB in its process. It also wrote 512 MiB and created 10,000 files on disk.
+These credential-free tests used the production runner, but they made no model calls.
+They do not prove that an actual agent or repository workload fits.
 
 Host transcript and snapshot processing uses bounded buffers and private temporary files.
 Docker task logging is disabled, so Docker does not keep a second, unredacted stdout log.

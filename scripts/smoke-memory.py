@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Two concurrent production runners, without credentials, model calls, or PRs.
+"""Concurrent production runners, without credentials, model calls, or PRs.
 
 Each holds 256 MiB of process memory, 512 MiB of build data, and 10,000 files. This tests
 the runner budget, not the memory needs of an arbitrary repository's test suite.
@@ -52,12 +52,37 @@ print('WORKLOAD PASSED', flush=True)
 """
 
 
+def summarize_results(results):
+    """Validate all job samples and return the smoke summary."""
+    if len(results) > 1:
+        assert max(rows[0]["time"] for rows in results) < min(
+            rows[-1]["time"] for rows in results
+        ), "jobs did not overlap"
+    samples = [sample for rows in results for sample in rows]
+    assert all(sample["oom_kill"] == 0 for sample in samples), "task OOM"
+    assert max(sample["shmem"] for sample in samples) < 64 * 1024 * 1024, "build data uses RAM"
+    available = min(sample["vm_available_kib"] / sample["vm_total_kib"] for sample in samples)
+    assert available >= 0.2, (
+        f"{available * 100:.1f}% VM headroom is less than 20%; "
+        "increase Docker memory or reduce workloads"
+    )
+    return {
+        "jobs": len(results),
+        "peak_task_mib": [
+            round(max(sample["bytes"] for sample in rows) / 1024**2, 1) for rows in results
+        ],
+        "minimum_vm_available_percent": round(available * 100, 1),
+        "oom_kills": 0,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--image", default="franky")
     parser.add_argument("--proxy-image", default="franky-proxy")
+    parser.add_argument("--jobs", type=int, choices=range(1, 9), default=2)
     args = parser.parse_args()
-    ids = [uuid.uuid4().hex[:12] for _ in range(2)]
+    ids = [uuid.uuid4().hex[:12] for _ in range(args.jobs)]
 
     def run(job_id):
         samples = []
@@ -78,34 +103,14 @@ def main():
         try:
             assert code == 0, output.tail(2000) if isinstance(output, Transcript) else output
             assert len(samples) == 10, "workload did not complete its samples"
-            assert all(s["oom_kill"] == 0 for s in samples), "task OOM"
-            assert max(s["shmem"] for s in samples) < 64 * 1024 * 1024, "build data uses RAM"
             return samples
         finally:
             if isinstance(output, Transcript):
                 output.close()
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        first, second = list(pool.map(run, ids))
-    assert max(first[0]["time"], second[0]["time"]) < min(first[-1]["time"], second[-1]["time"]), (
-        "jobs did not overlap"
-    )
-    samples = first + second
-    available = min(s["vm_available_kib"] / s["vm_total_kib"] for s in samples)
-    print(
-        json.dumps(
-            {
-                "jobs": 2,
-                "peak_task_mib": [
-                    round(max(s["bytes"] for s in rows) / 1024**2, 1) for rows in (first, second)
-                ],
-                "minimum_vm_available_percent": round(available * 100, 1),
-                "oom_kills": 0,
-            },
-            indent=2,
-        )
-    )
-    assert available >= 0.2, "less than 20% VM headroom; increase Docker memory or reduce workloads"
+    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
+        results = list(pool.map(run, ids))
+    print(json.dumps(summarize_results(results), indent=2))
     names = subprocess.run(
         ["docker", "ps", "-a", "--format", "{{.Names}}"],
         capture_output=True,
@@ -116,7 +121,7 @@ def main():
     assert not set(names).intersection(name for job_id in ids for name in run_names(job_id)), (
         "a smoke container remains"
     )
-    print("SMOKE PASS: two concurrent jobs completed with disk-backed data and no task OOM.")
+    print(f"SMOKE PASS: {args.jobs} jobs completed with disk-backed data and no task OOM.")
 
 
 if __name__ == "__main__":

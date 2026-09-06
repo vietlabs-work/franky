@@ -447,7 +447,7 @@ def build(
                 )
                 ctx.exit(EXIT_SUCCESS)
 
-        franky_img, proxy_img = _ensure_images(os.environ)
+        franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
 
         # Build the profile bundle (optional). Auto-discovers ~/.franky/profile.toml unless
         # overridden by --profile or FRANKY_PROFILE_PATH. Fails closed on detected credentials.
@@ -723,7 +723,7 @@ def iterate(
         except ValueError as exc:
             raise NetworkError(redact(str(exc), cfg_secrets_safe())) from exc
 
-        franky_img, proxy_img = _ensure_images(os.environ)
+        franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
 
         bundle, setup_block = _load_profile_bundle(None, process_env, secrets, cfg)
         verbose = verbose or bool(os.environ.get(FRANKY_VERBOSE_VAR))
@@ -934,7 +934,7 @@ def review_pr(
             )
         pinned_sha = live_sha
 
-        franky_img, proxy_img = _ensure_images(os.environ)
+        franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
         bundle, _setup_block = _load_profile_bundle(None, process_env, secrets, cfg)
         verbose = verbose or bool(os.environ.get(FRANKY_VERBOSE_VAR))
         progress = None if (quiet and not verbose) else _make_progress(cfg.engine, verbose)
@@ -1174,7 +1174,7 @@ def plan(
         # nothing).
         cfg, spec, _branch, secrets = _resolve_task_spec(task_input_str, repo, engine, os.environ)
 
-        franky_img, proxy_img = _ensure_images(os.environ)
+        franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
         bundle, _setup_block = _load_profile_bundle(profile_path_opt, process_env, secrets, cfg)
         progress = None if quiet else _make_progress(cfg.engine, False)
 
@@ -1276,15 +1276,15 @@ def _format_plan_summary(result: dict) -> list[str]:
     return lines
 
 
-def _ensure_images(env: Mapping[str, str]) -> tuple[str, str]:
+def _ensure_images(env: Mapping[str, str], engine: str) -> tuple[str, str]:
     """Resolve + ensure the franky and franky-proxy images are available locally.
 
     Returns (franky_image, proxy_image). Raises DockerError (exit 6, a clean message, no
     traceback) for the operator-facing failure modes: docker absent, auth needed, or pull
     failed - typed so the outer FrankyError handler emits the right code + JSON error too.
-    Shared by `build` and `iterate` - the only difference between them is the prompt.
+    Shared by every command that runs an engine container.
     """
-    franky_img = resolve_image(env, FRANKY_IMAGE_VAR, "franky")
+    franky_img = resolve_image(env, FRANKY_IMAGE_VAR, "franky", engine=engine)
     proxy_img = resolve_image(env, FRANKY_PROXY_IMAGE_VAR, "franky-proxy")
     for label, img, dev_build, dev_var in (
         ("franky", franky_img, "docker build -t franky .", FRANKY_IMAGE_VAR),
@@ -1934,7 +1934,7 @@ def _version_info(
         resolved = False
         host_binary_version = None
 
-    image = resolve_image(env)
+    image = resolve_image(env, engine=engine_name if resolved else None)
 
     return {
         "franky": franky_version(),
@@ -2499,7 +2499,7 @@ def job_diagnose(
         cfg = load_config(engine, os.environ)
         secrets = cfg.secret_values()
 
-        franky_img, proxy_img = _ensure_images(os.environ)
+        franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
         verbose = verbose or bool(os.environ.get(FRANKY_VERBOSE_VAR))
         progress = None if (quiet and not verbose) else _make_progress(cfg.engine, verbose)
         timeout = max_duration if max_duration is not None else _DIAGNOSE_DEFAULT_TIMEOUT
@@ -2691,7 +2691,7 @@ def job_replay(
         # but those are already rejected above).
         branch = record.get("branch") or f"franky/{task_slug(spec)}"
 
-        franky_img, proxy_img = _ensure_images(os.environ)
+        franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
         verbose = verbose or bool(os.environ.get(FRANKY_VERBOSE_VAR))
         progress = None if (quiet and not verbose) else _make_progress(cfg.engine, verbose)
 
@@ -2966,7 +2966,7 @@ def job_resume(
         # idempotency check knows about; fall back to a freshly predicted slug for old records.
         branch = record.get("branch") or f"franky/{task_slug(spec)}"
 
-        franky_img, proxy_img = _ensure_images(os.environ)
+        franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
         verbose = verbose or bool(os.environ.get(FRANKY_VERBOSE_VAR))
         progress = None if (quiet and not verbose) else _make_progress(cfg.engine, verbose)
 
@@ -3285,7 +3285,7 @@ def job_attach(ctx: click.Context, job_id: str, message: str | None, as_json: bo
 
 
 def _codex_auth_image() -> str:
-    image = resolve_image(dict(os.environ))
+    image = resolve_image(dict(os.environ), engine="codex")
     ok, reason = ensure_image_available(image)
     if not ok:
         raise click.ClickException(f"Codex auth image unavailable ({reason})")

@@ -14,11 +14,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bound Squid file-descriptor tables to prevent high startup memory use.
 - Stream redacted transcripts, parser input, exports, and snapshots instead of loading whole artifacts into memory.
 - Refuse oversized snapshot scans and parser events. Full redacted output remains in the run log.
+- Select engine-specific release images by default. The unsuffixed image still contains all engines.
+- Apply the existing 5,000-file and 20 MiB limits to each combined operator profile.
+- Bound profile reads before UTF-8 decoding, secret scanning, MCP parsing, or archive creation.
+- Bound glob and setup enumeration before directory entries accumulate. Normalize line endings before profile scans.
 
 ### Added
 
 - `FRANKY_DISK_MB` sets a per-job disk budget, checked every five seconds. This watchdog is not a filesystem quota.
-- `make smoke-memory` checks two concurrent production runners without credentials or model calls.
+- `make smoke-memory ARGS="--jobs N"` checks 1 through 8 concurrent runners. The default is 2.
 
 ## [0.1.3] - 2026-09-04
 

@@ -5,6 +5,9 @@ from pathlib import Path
 import pytest
 
 
+ROOT = Path(__file__).resolve().parents[1]
+
+
 def load_release():
     path = Path(__file__).resolve().parents[1] / "scripts" / "release.py"
     spec = importlib.util.spec_from_file_location("release", path)
@@ -25,6 +28,62 @@ update_changelog = release.update_changelog
 extract_notes = release.extract_notes
 assert_versions_match = release.assert_versions_match
 main = release.main
+
+
+def test_release_image_matrix_routes_each_tag_to_its_engine():
+    lines = (ROOT / ".github" / "workflows" / "release.yml").read_text().splitlines()
+    start = lines.index("        include:") + 1
+    rows = []
+    for line in lines[start:]:
+        if line.startswith("    steps:"):
+            break
+        key, value = line.strip().removeprefix("- ").split(":", 1)
+        if line.lstrip().startswith("- "):
+            rows.append({})
+        rows[-1][key] = value.strip().strip('"')
+
+    action = lines.index("      - uses: docker/build-push-action@v6")
+    build_args = next(
+        line.strip().split(": ", 1)[1]
+        for line in lines[action:]
+        if line.strip().startswith("build-args:")
+    )
+    tags = lines.index("          tags: |", action)
+    tag_templates = [line.strip() for line in lines[tags + 1 :] if line.strip()][:2]
+
+    def render(template, row):
+        return (
+            template.replace("${{ github.repository_owner }}", "owner")
+            .replace("${{ matrix.name }}", row["name"])
+            .replace("${{ matrix.engine }}", row["engine"])
+            .replace("${{ matrix.suffix }}", row["suffix"])
+            .replace("${{ env.VERSION }}", "1.2.3")
+        )
+
+    published = {render(tag_templates[0], row): row["engine"] for row in rows}
+    assert published == {
+        "ghcr.io/owner/franky:1.2.3": "all",
+        "ghcr.io/owner/franky:1.2.3-pi": "pi",
+        "ghcr.io/owner/franky:1.2.3-claude": "claude",
+        "ghcr.io/owner/franky:1.2.3-codex": "codex",
+        "ghcr.io/owner/franky:1.2.3-opencode": "opencode",
+        "ghcr.io/owner/franky-proxy:1.2.3": "all",
+    }
+    assert {render(build_args, row) for row in rows} == {
+        "FRANKY_ENGINE=all",
+        "FRANKY_ENGINE=pi",
+        "FRANKY_ENGINE=claude",
+        "FRANKY_ENGINE=codex",
+        "FRANKY_ENGINE=opencode",
+    }
+    assert {render(tag_templates[1], row) for row in rows} == {
+        "ghcr.io/owner/franky:latest",
+        "ghcr.io/owner/franky:latest-pi",
+        "ghcr.io/owner/franky:latest-claude",
+        "ghcr.io/owner/franky:latest-codex",
+        "ghcr.io/owner/franky:latest-opencode",
+        "ghcr.io/owner/franky-proxy:latest",
+    }
 
 
 @pytest.fixture

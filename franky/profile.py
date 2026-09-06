@@ -34,6 +34,7 @@ validated separately before the bundle is built.
 
 from __future__ import annotations
 
+import fnmatch
 import io
 import json
 import math
@@ -228,15 +229,59 @@ def profile_file_path(env: dict[str, str] | None = None) -> Path:
     return Path.home() / _DEFAULT_PROFILE_RELATIVE
 
 
-def _expand_glob(raw: str) -> list[Path]:
+def _expand_glob(raw: str, budget: setups.ReadBudget) -> list[Path]:
     """Expand a single path or glob pattern (after ~ expansion) into existing Paths."""
-    import glob as _glob
-
     expanded = Path(raw).expanduser()
     pattern = str(expanded)
     if any(c in pattern for c in ("*", "?", "[")):
-        return sorted(Path(p) for p in _glob.glob(pattern))
-    return [expanded] if expanded.exists() else []
+        matches: list[Path] = []
+        parts = expanded.parts
+        if expanded.is_absolute():
+            root = Path(expanded.anchor)
+            parts = parts[1:]
+        else:
+            root = Path()
+        pending = [(root, 0)]
+        while pending:
+            directory, index = pending.pop()
+            segment = parts[index]
+            last = index == len(parts) - 1
+            if any(character in segment for character in ("*", "?", "[")):
+                child_dirs: list[Path] = []
+                for entry in setups._scandir_bounded(directory, budget):
+                    if entry.name.startswith(".") and not segment.startswith("."):
+                        continue
+                    if not fnmatch.fnmatchcase(entry.name, segment):
+                        continue
+                    path = Path(entry.path)
+                    if last:
+                        setups.claim_file(path, budget)
+                        matches.append(path)
+                    else:
+                        try:
+                            if entry.is_dir(follow_symlinks=True):
+                                child_dirs.append(path)
+                        except OSError:
+                            continue
+                if len(pending) + len(child_dirs) > budget.max_files:
+                    raise ValueError(
+                        f"profile glob traversal exceeds entry limit {budget.max_files}"
+                    )
+                pending.extend((path, index + 1) for path in reversed(child_dirs))
+                continue
+
+            path = directory / segment
+            if last:
+                if path.exists():
+                    setups.claim_file(path, budget)
+                    matches.append(path)
+            elif path.is_dir():
+                pending.append((path, index + 1))
+        return sorted(matches)
+    if not expanded.exists():
+        return []
+    setups.claim_file(expanded, budget)
+    return [expanded]
 
 
 def container_path(host_path: Path) -> str:
@@ -252,7 +297,7 @@ def container_path(host_path: Path) -> str:
     return f"{CONTAINER_HOME}/{rel}"
 
 
-def _load_setups(raw, path: Path) -> dict[str, setups.SetupScan]:
+def _load_setups(raw, path: Path, budget: setups.ReadBudget) -> dict[str, setups.SetupScan]:
     """Parse and sweep the `[setups]` table: {kind: directory} -> {kind: SetupScan}.
 
     Fail-closed on an unknown kind (a typo'd `cluade = ...` must not silently inject nothing),
@@ -285,7 +330,7 @@ def _load_setups(raw, path: Path) -> dict[str, setups.SetupScan]:
                 f"{SETUPS_TABLE}.{kind} directory {root} must be under HOME ({home}) - the "
                 "bundle is unpacked relative to HOME inside the container"
             ) from exc
-        scans[kind] = setups.expand_setup(kind, root)
+        scans[kind] = setups.expand_setup(kind, root, budget)
     return scans
 
 
@@ -305,12 +350,12 @@ def load_profile(path: Path) -> ProfileSpec:
         import tomli as tomllib  # type: ignore[import-not-found,no-redef]
 
     try:
-        raw_bytes = path.read_bytes()
+        text = _read_profile_text(path)
     except OSError as exc:
         raise ValueError(f"could not read profile {path}: {exc}") from exc
 
     try:
-        data = tomllib.loads(raw_bytes.decode("utf-8"))
+        data = tomllib.loads(text)
     except Exception as exc:
         raise ValueError(f"malformed TOML in profile {path}: {exc}") from exc
 
@@ -319,6 +364,7 @@ def load_profile(path: Path) -> ProfileSpec:
         raise ValueError(f"[profile] in {path} must be a TOML table, not {type(table).__name__}")
 
     spec = ProfileSpec()
+    budget = setups.profile_budget()
     for category in PROFILE_FILE_CATEGORIES:
         raw_list = table.get(category, [])
         if not isinstance(raw_list, list):
@@ -332,7 +378,10 @@ def load_profile(path: Path) -> ProfileSpec:
             is_glob = any(c in entry for c in ("*", "?", "["))
             if category == "mcp_configs" and is_glob:
                 raise ValueError("profile.mcp_configs entries must be explicit files, not globs")
-            paths = _expand_glob(entry)
+            try:
+                paths = _expand_glob(entry, budget)
+            except OSError as exc:
+                raise ValueError(f"could not inspect profile file {entry!r}: {exc}") from exc
             if not paths and not is_glob:
                 raise ValueError(f"profile file not found: {entry!r} (listed in {path})")
             resolved.extend(paths)
@@ -346,7 +395,7 @@ def load_profile(path: Path) -> ProfileSpec:
             raise ValueError(f"profile.{category} entries must be strings in {path}")
         setattr(spec, category, list(raw_list))
 
-    spec.setup_scans = _load_setups(data.get(SETUPS_TABLE, {}), path)
+    spec.setup_scans = _load_setups(data.get(SETUPS_TABLE, {}), path, budget)
 
     for name in spec.mcp_credentials:
         if name.startswith("FRANKY_") or name in _RESERVED_MCP_CREDENTIALS:
@@ -383,9 +432,12 @@ def _valid_hostname(value: str) -> bool:
     )
 
 
-def _parse_mcp_config(path: Path) -> dict:
+def _parse_mcp_config(path: Path, budget: setups.ReadBudget) -> dict:
     try:
-        text = path.read_text(encoding="utf-8")
+        text = _read_profile_text(path, budget)
+    except OSError as exc:
+        raise ValueError(f"could not parse MCP config {path}: {exc}") from exc
+    try:
         if path.suffix.lower() == ".json":
             parsed = json.loads(text)
         elif path.suffix.lower() == ".toml":
@@ -396,7 +448,7 @@ def _parse_mcp_config(path: Path) -> dict:
             parsed = tomllib.loads(text)
         else:
             raise ValueError(f"MCP config {path} must be JSON or TOML")
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    except json.JSONDecodeError as exc:
         raise ValueError(f"could not parse MCP config {path}: {exc}") from exc
     except Exception as exc:
         if isinstance(exc, ValueError) and str(exc).startswith("MCP config"):
@@ -515,8 +567,9 @@ def validate_mcp_configs(spec: ProfileSpec) -> dict[Path, dict]:
     parsed: dict[Path, dict] = {}
     codex_path = (Path.home() / _CODEX_MCP_CONFIG).resolve()
     claude_path = (Path.home() / _CLAUDE_MCP_CONFIG).resolve()
+    budget = setups.profile_budget()
     for config_path in spec.mcp_configs:
-        document = _parse_mcp_config(config_path)
+        document = _parse_mcp_config(config_path, budget)
         if config_path.resolve() == codex_path:
             if set(document) != {"mcp_servers"}:
                 raise ValueError(
@@ -561,10 +614,11 @@ def resolve_mcp_credentials(spec: ProfileSpec, env: dict[str, str]) -> dict[str,
             "MCP credential(s) missing from the process environment: " + ", ".join(missing)
         )
     resolved = {name: env[name] for name in spec.mcp_credentials}
+    budget = setups.profile_budget()
     for config_path in spec.mcp_configs:
         try:
-            text = _read_profile_text(config_path)
-        except OSError as exc:
+            text = _read_profile_text(config_path, budget)
+        except (OSError, ValueError) as exc:
             raise ValueError(f"could not read MCP config {config_path}: {exc}") from exc
         for name, value in resolved.items():
             if value in text:
@@ -655,8 +709,9 @@ def read_profile_raw(path: Path) -> dict[str, list[str]]:
     except ModuleNotFoundError:
         import tomli as tomllib  # type: ignore[import-not-found,no-redef]
 
+    text = _read_profile_text(path)
     try:
-        data = tomllib.loads(path.read_bytes().decode("utf-8"))
+        data = tomllib.loads(text)
     except Exception as exc:
         raise ValueError(f"malformed TOML in profile {path}: {exc}") from exc
 
@@ -701,8 +756,9 @@ def read_setups_raw(path: Path) -> dict[str, str]:
     except ModuleNotFoundError:
         import tomli as tomllib  # type: ignore[import-not-found,no-redef]
 
+    text = _read_profile_text(path)
     try:
-        data = tomllib.loads(path.read_bytes().decode("utf-8"))
+        data = tomllib.loads(text)
     except Exception as exc:
         raise ValueError(f"malformed TOML in profile {path}: {exc}") from exc
 
@@ -784,14 +840,19 @@ def write_profile(
     path.chmod(0o644)
 
 
-def _read_profile_text(file_path: Path) -> str:
-    """Read a profile file as UTF-8 text (lossy on invalid bytes).
+def _read_profile_text(file_path: Path, budget: setups.ReadBudget | None = None) -> str:
+    """Read a profile file as bounded, strict UTF-8 text.
 
     The single read path shared by build_bundle() (the real fail-closed gate) and
     scan_profile_files() (the `franky profile check` dry-run), so the dry-run can never
     read a file differently from the build and thus never diverge on what it scans.
     """
-    return file_path.read_text(encoding="utf-8", errors="replace")
+    raw = setups.read_bounded(file_path, budget or setups.profile_budget())
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"profile file {file_path} is not valid UTF-8") from exc
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
 def scan_for_secrets(text: str) -> list[str]:
@@ -854,10 +915,11 @@ def scan_profile_files(spec: ProfileSpec) -> list[FileScanResult]:
             FileScanResult(path=path, size=0, findings=[], error=str(exc))
             for path in spec.mcp_configs
         ]
+    budget = setups.profile_budget()
     for file_path in spec.all_files():
         try:
-            text = _read_profile_text(file_path)
-        except OSError as exc:
+            text = _read_profile_text(file_path, budget)
+        except (OSError, ValueError) as exc:
             results.append(FileScanResult(path=file_path, size=0, findings=[], error=str(exc)))
             continue
         findings = (
@@ -899,16 +961,24 @@ def build_bundle(spec: ProfileSpec) -> bytes:
     if not files:
         raise ValueError("profile bundle is empty - no files to inject")
 
+    metadata_budget = setups.profile_budget()
+    for file_path in files:
+        try:
+            setups.claim_file(file_path, metadata_budget)
+        except OSError as exc:
+            raise ValueError(f"could not inspect profile file {file_path}: {exc}") from exc
+
     validate_mcp_configs(spec)
     home = Path.home().resolve()
     declared_home = Path.home().absolute()
     buf = io.BytesIO()
+    read_budget = setups.profile_budget()
 
     with tarfile.open(fileobj=buf, mode="w:gz") as tf:
         for file_path in files:
             try:
-                text = _read_profile_text(file_path)
-            except OSError as exc:
+                text = _read_profile_text(file_path, read_budget)
+            except (OSError, ValueError) as exc:
                 raise ValueError(f"could not read profile file {file_path}: {exc}") from exc
 
             findings = (
