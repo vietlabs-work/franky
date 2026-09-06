@@ -24,8 +24,18 @@ from footprint import probe_image  # noqa: E402
 
 WORKLOAD = r"""
 import json, os, pathlib, subprocess, time
-subprocess.run(['docker', 'info'], check=True, stdout=subprocess.DEVNULL,
-               stderr=subprocess.PIPE, timeout=5)
+try:
+    subprocess.run(['docker', 'info'], check=True, stdout=subprocess.DEVNULL,
+                   stderr=subprocess.PIPE, timeout=5)
+except subprocess.SubprocessError:
+    try:
+        with pathlib.Path('/tmp/dockerd.log').open('rb') as log:
+            log.seek(0, 2)
+            log.seek(max(0, log.tell() - 4096))
+            print(log.read(4096).decode(errors='replace'), flush=True)
+    except OSError:
+        print('dockerd log unavailable', flush=True)
+    raise
 block = b'x' * (1024 * 1024)
 os.mkdir('/work/sources')
 for index in range(10000):

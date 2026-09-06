@@ -1,6 +1,7 @@
 """Hermetic tests for the concurrent memory smoke script."""
 
 import importlib.util
+import io
 import os
 from pathlib import Path
 import subprocess
@@ -37,6 +38,31 @@ def test_workload_checks_nested_docker_before_using_resources(monkeypatch):
     monkeypatch.setattr(os, "mkdir", unexpected_write)
     with pytest.raises(CheckedDocker):
         exec(smoke_memory.WORKLOAD, {})
+
+
+@pytest.mark.parametrize(
+    "log", [b"old" * 3000 + b"namespace denied", None], ids=["bounded", "missing"]
+)
+def test_workload_reports_bounded_daemon_log_on_docker_failure(monkeypatch, capsys, log):
+    failure = subprocess.CalledProcessError(1, ["docker", "info"])
+
+    def fail(*args, **kwargs):
+        raise failure
+
+    def open_log(path, mode):
+        assert str(path) == "/tmp/dockerd.log"
+        assert mode == "rb"
+        if log is None:
+            raise FileNotFoundError
+        return io.BytesIO(log)
+
+    monkeypatch.setattr(subprocess, "run", fail)
+    monkeypatch.setattr(Path, "open", open_log)
+    with pytest.raises(subprocess.CalledProcessError) as exc:
+        exec(smoke_memory.WORKLOAD, {})
+    assert exc.value is failure
+    output = capsys.readouterr().out
+    assert output == (log[-4096:].decode() + "\n" if log else "dockerd log unavailable\n")
 
 
 @pytest.mark.parametrize("jobs", ["0", "9"])

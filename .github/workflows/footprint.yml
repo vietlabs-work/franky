@@ -94,7 +94,7 @@ jobs:
           cleanup() {
             git worktree remove --force "$base" 2>/dev/null || true
             docker image ls --filter "label=franky.footprint.run=$RUN_TAG" -q \
-              | xargs -r docker image rm -f
+              | sort -u | xargs -r docker image rm -f
             rm -rf "$scratch"
           }
           trap cleanup EXIT
