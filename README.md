@@ -628,6 +628,24 @@ Each job held 256 MiB in its process. It also wrote 512 MiB and created 10,000 f
 These credential-free tests used the production runner, but they made no model calls.
 They do not prove that an actual agent or repository workload fits.
 
+### Footprint gates
+
+Every pull request gets one `footprint` check. The check selects work inside one workflow:
+
+- Docker, dependency, harness, budget, workflow, and unknown changes run all checks.
+- Runtime Python changes run fixed host and production runner checks.
+- Documentation-only changes validate the footprint policy and tests.
+
+Weekly and pre-release runs execute the complete matrix. They build the five task variants and the proxy in one job, so shared layers stay shared. Image reports list logical sizes and shared layer IDs. They never describe the sum of logical sizes as host disk use.
+
+Host workloads measure parser, redaction, profile, and snapshot CPU time. Each CPU comparison uses at least three repeats and medians. The runner compares base and head results for two and four jobs. It records task, proxy, and disk-helper cgroup CPU and peak memory. Reports include dependency versions, base-layer digests, `RUSAGE_SELF`, `RUSAGE_CHILDREN`, elapsed time, and throughput. Native Linux records host `dockerd` and `containerd` CPU. Docker Desktop reports daemon CPU as unavailable. It never reports unavailable CPU as zero or total CPU. Version or base-layer drift makes the relative result unresolved and fails the check.
+
+Run `make footprint` for the host comparison. Run `make smoke-memory` and `make smoke-memory ARGS="--jobs 4"` after building `franky` and `franky-proxy`. The synthetic loads create 10,000 files, write 512 MiB, and hold 256 MiB per job. They guard regressions but do not represent arbitrary repository builds or model calls.
+
+The disk helper has a 64 MiB RAM limit. Reusing it avoids repeated container creation during five-second disk checks. An uncatchable host process kill can leave anonymous task volumes after the helper exits. Franky has no automatic orphan-volume cleanup. Proxy startup retries bounded HTTPS CONNECT probes for up to 15 seconds. The task starts only after the expected `403` denial. No recurring proxy health probe remains.
+
+The repository cannot require the check on its current private GitHub plan. An owner must enable branch protection after the repository has an eligible plan. The workflow itself does not change billing, visibility, or rulesets.
+
 Host transcript and snapshot processing uses bounded buffers and private temporary files.
 Proxy diagnostics also limit log reads inside the container, before host capture.
 Docker task logging is disabled, so Docker does not keep a second, unredacted stdout log.

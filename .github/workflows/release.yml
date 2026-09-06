@@ -17,8 +17,16 @@ permissions:
   packages: write
 
 jobs:
+  footprint:
+    uses: ./.github/workflows/footprint.yml
+    with:
+      mode: full
+    permissions:
+      contents: read
+
   # guard-before-publish: assert the three version sources agree before touching GHCR or PyPI.
   guard:
+    needs: footprint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

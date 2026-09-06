@@ -40,7 +40,7 @@ pid_filename /run/squid.pid
 EOF
 
 # Validate FAIL-CLOSED before serving: a malformed allowlist must never reach a running
-# state (a parse error here aborts the container, so the healthcheck never goes healthy).
+# state (a parse error here aborts the container, so the host startup probe cannot pass).
 squid -k parse -f "$CONF"
 
 # Foreground (-N), no daemonize: squid becomes PID 1 so the container lifecycle tracks it.

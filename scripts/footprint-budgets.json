@@ -1,0 +1,101 @@
+{
+  "schema": 1,
+  "reason": "Initial ARM64 image and sampled-memory caps use 2026-09-06 measurements plus headroom. The 1024 MiB task cgroup-peak cap covers write-cache peaks until native calibration. AMD64 caps allow architecture variance until native calibration.",
+  "cpu": {
+    "maximum_ratio": 1.15,
+    "minimum_delta_seconds": 0.05,
+    "minimum_repeats": 3
+  },
+  "host": {
+    "parser": {
+      "maximum_elapsed_seconds": 0.3,
+      "maximum_cpu_seconds": 0.2,
+      "maximum_peak_mib": 64,
+      "minimum_throughput_per_second": 250000
+    },
+    "profile": {
+      "maximum_elapsed_seconds": 2.0,
+      "maximum_cpu_seconds": 2.0,
+      "maximum_peak_mib": 64,
+      "minimum_throughput_per_second": 1000
+    },
+    "redaction": {
+      "maximum_elapsed_seconds": 0.1,
+      "maximum_cpu_seconds": 0.2,
+      "maximum_peak_mib": 64,
+      "minimum_throughput_per_second": 10000000
+    },
+    "snapshot": {
+      "maximum_elapsed_seconds": 1.0,
+      "maximum_cpu_seconds": 1.0,
+      "maximum_peak_mib": 64,
+      "minimum_throughput_per_second": 1000
+    }
+  },
+  "images": {
+    "arm64": {
+      "all": 1910000000,
+      "claude": 1260000000,
+      "codex": 1340000000,
+      "opencode": 1225000000,
+      "pi": 1150000000,
+      "proxy": 36000000
+    },
+    "amd64": {
+      "all": 2500000000,
+      "claude": 1900000000,
+      "codex": 1500000000,
+      "opencode": 1900000000,
+      "pi": 1900000000,
+      "proxy": 45000000
+    }
+  },
+  "runtime": {
+    "2": {
+      "maximum_children_cpu_seconds": 45,
+      "maximum_elapsed_seconds": 90,
+      "maximum_native_daemon_cpu_seconds": 45,
+      "maximum_self_cpu_seconds": 10,
+      "minimum_files_per_second": 150,
+      "minimum_vm_available_percent": 20,
+      "minimum_write_mib_per_second": 8,
+      "scopes": {
+        "helper": {
+          "maximum_cpu_seconds": 10,
+          "maximum_peak_mib": 64
+        },
+        "proxy": {
+          "maximum_cpu_seconds": 10,
+          "maximum_peak_mib": 128
+        },
+        "task": {
+          "maximum_cpu_seconds": 60,
+          "maximum_peak_mib": 1024
+        }
+      }
+    },
+    "4": {
+      "maximum_children_cpu_seconds": 90,
+      "maximum_elapsed_seconds": 90,
+      "maximum_native_daemon_cpu_seconds": 90,
+      "maximum_self_cpu_seconds": 20,
+      "minimum_files_per_second": 250,
+      "minimum_vm_available_percent": 20,
+      "minimum_write_mib_per_second": 12,
+      "scopes": {
+        "helper": {
+          "maximum_cpu_seconds": 20,
+          "maximum_peak_mib": 64
+        },
+        "proxy": {
+          "maximum_cpu_seconds": 20,
+          "maximum_peak_mib": 128
+        },
+        "task": {
+          "maximum_cpu_seconds": 120,
+          "maximum_peak_mib": 1024
+        }
+      }
+    }
+  }
+}

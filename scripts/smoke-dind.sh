@@ -38,10 +38,7 @@ cleanup
 docker network create --internal --driver bridge "$NET" >/dev/null
 python3 scripts/smoke-task.py "$PROXY_IMG" "$PROXY" proxy "$ALLOW" >/dev/null
 docker network connect "$NET" "$PROXY"
-for _ in $(seq 1 20); do
-  [ "$(docker inspect -f '{{.State.Health.Status}}' "$PROXY" 2>/dev/null)" = healthy ] && break; sleep 1
-done
-[ "$(docker inspect -f '{{.State.Health.Status}}' "$PROXY" 2>/dev/null)" = healthy ] || fail "proxy not healthy"
+python3 -c 'import sys; from franky.container import wait_proxy_ready; raise SystemExit(not wait_proxy_ready(sys.argv[1]))' "$PROXY" || fail "proxy did not enforce default-deny"
 
 echo "== run the franky image (real _HARDENING profile) in the cage =="
 SMOKE_NETWORK="$NET" SMOKE_PROXY_URL="http://$PROXY:3128" \

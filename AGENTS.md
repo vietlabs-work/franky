@@ -29,7 +29,7 @@ franky build <gh-issue-url | jira KEY | "prose"> [--repo owner/repo] [--engine p
 franky iterate <gh-pr-url> [--engine pi|claude|codex|opencode]
 franky version
 
-# Manual real-Docker gates (never in CI - the pytest suite mocks docker entirely).
+# Full manual real-Docker gates. The dedicated footprint CI uses only fixed credential-free loads.
 make smoke-dind        # always-on rootless DinD
 make smoke-resume      # `job resume` workspace restore
 make smoke-profile     # operator-profile injection ([setups]/[profile])
@@ -40,7 +40,7 @@ make smoke-memory      # 2 concurrent runners by default; ARGS="--jobs 1..8"
 make eval ARGS="-n 3 --engine pi --compare-engine codex"
 ```
 
-Tests use no real Docker, no network, and no live creds: every side effect (subprocess runner, env mapping, sleeper) is dependency-injected, so the suite runs in well under a second. Keep it that way - never reach for real `docker`/`gh` in a test. The egress block/allow *behavior* is verified manually against real Docker (see the PR for issue #1), not in CI. The **eval harness** (`scripts/eval.py`, #25) is the other out-of-band tool: it drives the real `franky build` flow to measure agent pass-rate, so its actual runs need creds/Docker - but its *logic* is unit-tested with an injected fake runner (`tests/test_eval.py`), staying in the fast suite.
+Unit tests use no real Docker, network, or live credentials. Each external action uses an injected test double. Keep unit tests hermetic. Never call real `docker` or `gh` from a unit test. The dedicated footprint workflow is separate. It runs fixed, credential-free production containers on GitHub's native Linux runner. The full egress, DinD, resume, profile, and eval gates remain manual. The eval harness (`scripts/eval.py`, #25) runs the real `franky build` flow to measure agent success. Its runs need credentials and Docker. Its logic uses injected runners in `tests/test_eval.py`.
 
 ## Architecture
 
@@ -84,6 +84,12 @@ Module responsibilities:
 | `franky/persona.md` | The agent's working persona. Packaged via `package-data`; loaded at runtime by `prompt.py`. |
 
 ### Memory and storage
+
+- For every feature, check image size, peak RAM, CPU time, and elapsed time. Report the two-job and four-job impact.
+- Run `make footprint` for fixed host work. Run `make smoke-memory` and the four-job variant for container changes.
+- Keep `scripts/footprint-budgets.json` fixed. Change a budget only with measured before-and-after evidence in the PR.
+- Unknown paths and footprint-policy changes run the complete CI gate. Documentation-only changes still validate the policy.
+- GitHub branch protection is not enabled by this repository. An eligible plan and repository owner must require the `footprint` check.
 
 - Tasks default to 2048 MiB RAM; proxies use 128 MiB. `FRANKY_MEMORY_MB` accepts 256..8192 MiB, including nested containers.
 - `/work`, HOME, and `/tmp` use private anonymous Docker volumes. Only runtime directories use small tmpfs mounts.

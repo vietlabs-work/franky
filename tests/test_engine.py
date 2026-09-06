@@ -11,13 +11,11 @@ from franky.engine import (
     FRANKY_CODEX_AUTH_VOLUME_VAR,
     OPENCODE_PROVIDERS,
     PI_PROVIDER_VARS,
-    PR_URL_RE,
     ClaudeEngine,
     CodexEngine,
     Engine,
     OpenCodeEngine,
     PiEngine,
-    _fallback_pr_url,
     codex_auth_volume,
     opencode_provider,
     resolve_engine,
@@ -97,13 +95,99 @@ def test_claude_parse_pr_url_from_stream_json():
 
 def test_fallback_regex_on_plain_text():
     text = f"some log\nfinal: {PR_URL}\n"
-    assert _fallback_pr_url(text, PR_URL_RE) == PR_URL
+    assert PiEngine().parse_pr_url(text) == PR_URL
 
 
 def test_fallback_returns_last_match():
     older = "https://github.com/octocat/hello/pull/1"
     text = f"{older}\nlater {PR_URL}"
-    assert _fallback_pr_url(text, PR_URL_RE) == PR_URL
+    assert PiEngine().parse_pr_url(text) == PR_URL
+
+
+def test_pr_parser_reads_plain_transcript_once():
+    from franky.transcript import Transcript
+
+    class SinglePassTranscript(Transcript):
+        reads = 0
+
+        def chunks(self):
+            self.reads += 1
+            assert self.reads == 1, "PR detection reread the complete transcript"
+            yield from super().chunks()
+
+    with SinglePassTranscript() as output:
+        output.write(f"ordinary output\nopened {PR_URL}\n")
+        assert PiEngine().parse_pr_url(output, repo="octocat/hello") == PR_URL
+
+
+def test_pr_parser_skips_json_decode_for_plain_logs(monkeypatch):
+    decoded = []
+    loads = json.loads
+
+    def record_decode(value):
+        decoded.append(value)
+        return loads(value)
+
+    monkeypatch.setattr(json, "loads", record_decode)
+    event = f'{{"type":"done","url":"{PR_URL}"}}'
+    output = f"ordinary build output\n123\nnull\ntrue\n{event}\nopened {PR_URL}\n"
+    assert PiEngine().parse_pr_url(output, repo="octocat/hello") == PR_URL
+    assert decoded == [event], "plain logs must not allocate JSON decoder exceptions"
+
+
+def test_pr_parser_skips_url_free_json_events(monkeypatch):
+    decoded = []
+    loads = json.loads
+
+    def record_decode(value):
+        decoded.append(value)
+        return loads(value)
+
+    monkeypatch.setattr(json, "loads", record_decode)
+    output = '{"type":"tool_result","text":"ordinary output"}\n["no URL"]\n"done"\n'
+    assert PiEngine().parse_pr_url(output, repo="octocat/hello") is None
+    assert decoded == [], "URL-free events without escapes need no JSON materialization"
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        r'{"text":"\u0068ttps:\/\/github.com\/octocat\/hello\/pull\/7"}',
+        r'["https:\/\/github.com\/octocat\/hello\/pull\/7"]',
+        r'"https:\/\/github.com\/octocat\/hello\/pull\/7"',
+    ],
+)
+def test_pr_parser_preserves_escaped_structured_urls_and_priority(event):
+    output = f"https://github.com/octocat/hello/pull/1\n{event}\n"
+    output += "https://github.com/octocat/hello/pull/99\n"
+    assert PiEngine().parse_pr_url(output, repo="octocat/hello") == PR_URL
+
+
+def test_pr_parser_keeps_first_url_in_last_matching_json_event():
+    output = "\n".join(
+        [
+            '{"text":"https://github.com/octocat/hello/pull/1"}',
+            f'{{"text":"{PR_URL} https://github.com/octocat/hello/pull/8"}}',
+            "https://github.com/octocat/hello/pull/9",
+        ]
+    )
+    assert PiEngine().parse_pr_url(output, repo="octocat/hello") == PR_URL
+
+
+@pytest.mark.parametrize("engine", [PiEngine(), ClaudeEngine(), CodexEngine(), OpenCodeEngine()])
+def test_distillers_skip_json_decode_for_non_objects(engine, monkeypatch):
+    decoded = []
+    loads = json.loads
+
+    def record_decode(value):
+        decoded.append(value)
+        return loads(value)
+
+    monkeypatch.setattr(json, "loads", record_decode)
+    for line in ["ordinary output", "123", "true", "null", '"text"', "[]", "  "]:
+        assert engine.distill_line(line) is None
+    assert engine.distill_line(' {"type":"unknown"} ') is None
+    assert decoded == ['{"type":"unknown"}']
 
 
 def test_parse_pr_url_none_when_absent():

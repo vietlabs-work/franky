@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Reuse one bounded, read-only disk helper per task instead of creating a container for every disk check.
+- Replace recurring proxy health probes with a bounded, fail-closed HTTPS CONNECT startup gate.
+- Scan PR output once and skip impossible JSON decoding in output and usage parsers.
 - Use Alpine for the Squid proxy while preserving its numeric user and default-deny policy.
 - Share a stripped Node toolchain across engine images without retaining the original Node layer or build caches.
 - Start Codex through a native exec launcher. Preserve its companion executable, package metadata, arguments, exit codes, and signals.
@@ -27,6 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `FRANKY_DISK_MB` sets a per-job disk budget, checked every five seconds. This watchdog is not a filesystem quota.
 - `make smoke-memory ARGS="--jobs N"` checks 1 through 8 concurrent runners. The default is 2.
+- Add an always-present, credential-free footprint check with versioned CPU, memory, image, overlap, OOM, and throughput budgets.
+- Add fixed host benchmarks, five release-image variants, shared-layer reporting, and complete weekly and pre-release gates.
 
 ## [0.1.3] - 2026-09-04
 

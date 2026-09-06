@@ -56,7 +56,7 @@ def _cfg():
 
 def _orchestration_runner(task_proc_fn, *, fail_step=None, reap_fn=None):
     """Build a fake runner that satisfies the egress orchestration (network create -> proxy
-    run -> connect -> inspect[healthy] -> task run) and delegates the TASK `docker run` to
+    run -> connect -> denied-CONNECT probe -> task run) and delegates the TASK `docker run` to
     `task_proc_fn(argv, **kwargs)`. Reaps (`docker rm`/`network rm`) succeed. Records the
     ordered sequence of docker subcommands in the returned `calls` list.
 
@@ -69,6 +69,8 @@ def _orchestration_runner(task_proc_fn, *, fail_step=None, reap_fn=None):
         calls.append(argv)
         if argv[:3] == ["docker", "rm", "-f"] and reap_fn is not None:
             return reap_fn(argv, **kwargs)
+        if argv[:2] == ["docker", "exec"] and "curl" in argv:
+            return subprocess.CompletedProcess(argv, 56, stdout="403", stderr="CONNECT refused")
         if argv[:3] == ["docker", "inspect", "-f"] or (argv[:2] == ["docker", "inspect"]):
             return subprocess.CompletedProcess(argv, 0, stdout="healthy", stderr="")
         if argv[:3] == ["docker", "network", "create"]:
@@ -624,7 +626,7 @@ def test_run_in_container_orchestration_order():
     i_net_create = first_index(lambda a: a[:3] == ["docker", "network", "create"])
     i_proxy_run = first_index(lambda a: a[:3] == ["docker", "run", "-d"])
     i_connect = first_index(lambda a: a[:3] == ["docker", "network", "connect"])
-    i_inspect = first_index(lambda a: a[:2] == ["docker", "inspect"])
+    i_probe = first_index(lambda a: a[:2] == ["docker", "exec"] and "curl" in a)
     i_task_run = first_index(lambda a: a[:2] == ["docker", "run"] and a[2] != "-d")
     i_rm_task = first_index(
         lambda a: a[:3] == ["docker", "rm", "-f"] and any("franky-run-" in x for x in a)
@@ -634,13 +636,13 @@ def test_run_in_container_orchestration_order():
     )
     i_net_rm = first_index(lambda a: a[:3] == ["docker", "network", "rm"])
 
-    # network-create -> proxy run -d -> connect -> inspect -> task run -> rm task -> rm proxy -> net rm
-    assert i_net_create < i_proxy_run < i_connect < i_inspect < i_task_run
+    # network-create -> proxy run -d -> connect -> denial probe -> task run -> teardown
+    assert i_net_create < i_proxy_run < i_connect < i_probe < i_task_run
     assert i_task_run < i_rm_task < i_rm_proxy < i_net_rm
 
 
 def test_run_in_container_fail_closed_when_proxy_never_ready():
-    # Proxy never becomes healthy: the task `docker run` must NEVER fire, and proxy+net are
+    # Proxy never proves default-deny: the task `docker run` must NEVER fire, and proxy+net are
     # torn down.
     calls = []
 
@@ -888,6 +890,8 @@ def test_run_in_container_streams_bundle_in_after_launch():
         calls.append(argv)
         if argv[:3] == ["docker", "inspect", "-f"] and "{{.State.Running}}" in argv:
             return subprocess.CompletedProcess(argv, 0, stdout="true", stderr="")
+        if argv[:2] == ["docker", "exec"] and "curl" in argv:
+            return base_runner(argv, **kwargs)
         if argv[:2] == ["docker", "exec"]:
             if "tar" in argv:
                 stdin_seen["input"] = kwargs.get("input")
@@ -1653,6 +1657,8 @@ def test_run_in_container_resume_restores_after_launch(tmp_path):
         # container_running poll -> report the task up so restore proceeds immediately.
         if argv[:3] == ["docker", "inspect", "-f"] and "{{.State.Running}}" in argv:
             return subprocess.CompletedProcess(argv, 0, stdout="true", stderr="")
+        if argv[:2] == ["docker", "exec"] and "curl" in argv:
+            return base_runner(argv, **kwargs)
         if argv[:2] == ["docker", "cp"] or argv[:2] == ["docker", "exec"]:
             return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
         return base_runner(argv, **kwargs)
@@ -1672,6 +1678,61 @@ def test_run_in_container_resume_restores_after_launch(tmp_path):
     assert any("tar" in c and "-xzf" in c and "-" in c for c in calls)
     assert not any("chown" in c for c in calls)
     assert any("touch" in c for c in calls)
+
+
+def test_storage_helper_lifetime_covers_delayed_profile_and_resume(monkeypatch):
+    import inspect
+    from types import SimpleNamespace
+
+    from franky import snapshot
+
+    # Pin the grace to the actual default bounds, including every readiness inspection.
+    setup_bound = 0
+    inspect_timeout = (
+        inspect.signature(container_mod.container_running).parameters["timeout"].default
+    )
+    for setup in (container_mod.deliver_profile, snapshot.restore_into_container):
+        defaults = inspect.signature(setup).parameters
+        setup_bound += (
+            defaults["ready_polls"].default * (inspect_timeout + defaults["poll_interval"].default)
+            + 2 * defaults["timeout"].default
+        )
+    now = [0.0]
+    helper_expiry = []
+    base_runner, _ = _orchestration_runner(lambda *a, **kw: None)
+
+    def thread(*, target, args, daemon):
+        helper_expiry.append(now[0] + args[-1])
+        return SimpleNamespace(start=lambda: None, join=lambda **kw: None)
+
+    def delayed_setup(*args, **kwargs):
+        now[0] += setup_bound / 2
+        return True
+
+    monkeypatch.setattr(container_mod.subprocess, "run", base_runner)
+    monkeypatch.setattr(container_mod, "_storage_sample", lambda *a: (0, 10**9))
+    monkeypatch.setattr(container_mod.threading, "Thread", thread)
+    monkeypatch.setattr(
+        container_mod.threading,
+        "Timer",
+        lambda *a: SimpleNamespace(start=lambda: None, cancel=lambda: None),
+    )
+    monkeypatch.setattr(container_mod.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(container_mod, "deliver_profile", delayed_setup)
+    monkeypatch.setattr(snapshot, "restore_into_container", delayed_setup)
+    code, _out = run_in_container(
+        _cfg(),
+        ["pi"],
+        timeout=60,
+        runner=base_runner,
+        env={},
+        sleeper=NOOP_SLEEP,
+        popen=_fake_popen_factory(["event\n"]),
+        profile_bundle=b"fixture",
+        resume_workspace="fixture.tar.gz",
+    )
+    assert code == 0
+    assert helper_expiry[0] >= now[0] + 60 + 30
 
 
 def test_run_in_container_resume_false_restore_does_not_change_result(tmp_path):
