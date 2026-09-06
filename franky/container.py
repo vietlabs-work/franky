@@ -104,6 +104,8 @@ _HARDENING = [
 # The Squid proxy image (built from proxy/) and the port it listens on inside the net.
 PROXY_IMAGE = "franky-proxy"
 PROXY_PORT = 3128
+# Diagnostic counts cover only complete records in this bounded recent log tail.
+_PROXY_LOG_BYTES = 64 * 1024
 # The GHCR namespace the public images live under. Overridable via FRANKY_GHCR_REPO so the
 # publishing org can move without a code change (and for dev/testing against a fork). The
 # default MUST match the org that hosts the public packages; the release workflow pushes to
@@ -114,8 +116,8 @@ FRANKY_IMAGE_VAR = "FRANKY_IMAGE"
 FRANKY_PROXY_IMAGE_VAR = "FRANKY_PROXY_IMAGE"
 
 # Hardening for the proxy container. Mirrors _HARDENING but the writable tmpfs dirs are
-# squid's, not the agent's: squid (debian package user `proxy`, uid/gid 13 - verified in the
-# franky-proxy image) writes its rendered config, pid, and logs there under a --read-only
+# squid's, not the agent's: the image runs with fixed uid/gid 13 (Debian `proxy`, or a numeric
+# Alpine user). It writes its rendered config, pid, and logs there under a --read-only
 # root. A bare --tmpfs mounts root-owned and `mode=` is silently ignored by the short form
 # (see _HARDENING note), so we MUST pin uid=/gid= to squid's user or it cannot write and
 # crashes on start. CONNECT tunneling does not require a large response cache.
@@ -660,13 +662,32 @@ def capture_diagnostics(
     if proxy_launched:
         try:
             proc = runner(
-                ["docker", "exec", proxy, "cat", "/run/squid-access.log"],
+                [
+                    "docker",
+                    "exec",
+                    proxy,
+                    "tail",
+                    "-c",
+                    str(_PROXY_LOG_BYTES + 1),
+                    "/run/squid-access.log",
+                ],
                 capture_output=True,
                 text=True,
+                errors="replace",
                 timeout=timeout,
             )
+            proc.check_returncode()
+            log = getattr(proc, "stdout", "") or ""
+            truncated = len(log.encode("utf-8")) > _PROXY_LOG_BYTES
+            incomplete = bool(log) and not log.endswith("\n")
+            if truncated:
+                # The first record can start inside a hostname or secret. Never parse it.
+                log = log.partition("\n")[2]
             counts: dict[str, int] = {}
-            for line in (getattr(proc, "stdout", "") or "").splitlines():
+            for line in log.splitlines(keepends=True):
+                # Squid can still be writing the final record during capture.
+                if not line.endswith("\n"):
+                    continue
                 if "TCP_DENIED" not in line:
                     continue
                 tokens = line.split()
@@ -686,10 +707,11 @@ def capture_diagnostics(
                 host = redact(host, secrets)
                 counts[host] = counts.get(host, 0) + 1
             # Assigned only inside this try (i.e. only when the exec itself succeeded) - an
-            # empty list + zero count IS the correct signal for "no denials", distinct from
-            # "we could not even reach the proxy to check".
+            # Empty/zero means no denials in this tail, not an unreadable log. The flag
+            # distinguishes a complete log from bounded recent observations.
             diag["egress_denied"] = [{"host": h, "count": c} for h, c in sorted(counts.items())]
             diag["proxy_denied_count"] = sum(counts.values())
+            diag["proxy_log_truncated"] = truncated or incomplete
         except Exception:
             pass
 

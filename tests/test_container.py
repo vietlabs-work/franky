@@ -1232,6 +1232,73 @@ def test_capture_diagnostics_parses_squid_denied_hosts():
     ]
 
 
+def test_capture_diagnostics_bounds_proxy_read_before_host_capture():
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, stdout=_SQUID_DENIED_LOG, stderr="")
+
+    diag = capture_diagnostics(
+        "t", "p", "", runner, task_launched=False, proxy_launched=True, secrets=[]
+    )
+    assert calls[0][0] == ["docker", "exec", "p", "tail", "-c", "65537", "/run/squid-access.log"]
+    assert calls[0][1]["errors"] == "replace"
+    assert diag["proxy_log_truncated"] is False
+    assert diag["proxy_denied_count"] == 3
+
+
+def test_capture_diagnostics_discards_truncated_first_line():
+    fragment = "TCP_DENIED/403 CONNECT partial.example.com:443"
+    suffix = "\n" + _SQUID_DENIED_LOG
+    output = fragment + " " * (65537 - len(fragment) - len(suffix)) + suffix
+
+    def runner(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout=output, stderr="")
+
+    diag = capture_diagnostics(
+        "t", "p", "", runner, task_launched=False, proxy_launched=True, secrets=[]
+    )
+    assert diag["proxy_log_truncated"] is True
+    assert diag["proxy_denied_count"] == 3
+    assert {item["host"] for item in diag["egress_denied"]} == {
+        "evil.example.com",
+        "other.example.com",
+    }
+
+
+def test_capture_diagnostics_ignores_and_marks_incomplete_last_record():
+    output = _SQUID_DENIED_LOG + "TCP_DENIED/403 CONNECT partial.example.com:443"
+
+    def runner(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout=output, stderr="")
+
+    diag = capture_diagnostics(
+        "t", "p", "", runner, task_launched=False, proxy_launched=True, secrets=[]
+    )
+    assert diag["proxy_denied_count"] == 3
+    assert diag["proxy_log_truncated"] is True
+
+
+def test_capture_diagnostics_omits_failed_proxy_read_but_keeps_transcript_signals():
+    def runner(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 1, stdout=_SQUID_DENIED_LOG, stderr="gone")
+
+    diag = capture_diagnostics(
+        "t",
+        "p",
+        "rootless dockerd ready",
+        runner,
+        task_launched=False,
+        proxy_launched=True,
+        secrets=[],
+    )
+    assert "proxy_denied_count" not in diag
+    assert "egress_denied" not in diag
+    assert "proxy_log_truncated" not in diag
+    assert diag["dind_ready"] is True
+
+
 def test_capture_diagnostics_dind_ready_markers():
     failure_diag = capture_diagnostics(
         "t",

@@ -114,7 +114,8 @@ _JOB_RECORD_SCHEMA: dict = {
     "teardown (issue #69), or null. Fields (all optional/best-effort): task_exit_code (int), "
     "oom_killed (bool), task_state (str), dind_ready (bool|null: nested rootless Docker daemon "
     "readiness), tmpfs_full (bool), egress_denied (array of {host, count} the Squid proxy "
-    "403'd - hosts redacted), proxy_denied_count (int).",
+    "403'd in the recent log tail - hosts redacted), proxy_denied_count (int), "
+    "proxy_log_truncated (bool: some log records were excluded).",
     "source": "the TaskSpec source this run was built from: issue | jira | prose | pr, or null "
     "(issue #70 - lets `job replay` reconstruct the original TaskSpec). Null on records "
     "written before replay support was added.",

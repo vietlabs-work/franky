@@ -2,12 +2,10 @@
 # It does blind HTTPS CONNECT (no TLS termination), so the agent's creds tunnel through
 # without the proxy ever seeing them. The task container has NO internet route except via
 # this proxy (Docker --internal network), so this allowlist is the egress wall.
-FROM debian:stable-slim
+FROM alpine:3.23
 
 # squid is the proxy; curl + ca-certificates are for the HEALTHCHECK below.
-# --no-install-recommends keeps the layer lean; clean apt lists after install.
-RUN apt-get update && apt-get install -y --no-install-recommends squid ca-certificates curl \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache squid ca-certificates curl
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
@@ -19,6 +17,6 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 HEALTHCHECK --interval=2s --timeout=3s --start-period=2s --retries=10 \
   CMD curl -s -o /dev/null -w "%{http_code}" -x http://127.0.0.1:3128 http://denied.invalid/ | grep -q 403 || exit 1
 
-# Run as squid's own unprivileged user (debian package user `proxy`), never root.
-USER proxy
+# Alpine owns gid 13 as `news`; keep the numeric uid/gid expected by the host runtime.
+USER 13:13
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

@@ -7,7 +7,42 @@
 # the repo's build/base images are pulled by the nested daemon at run time - clean separation,
 # the franky image never mixes with repo toolchains.
 
-# ---- stage 1: fetch Docker's STATIC binaries (glibc-safe, lean - only what we need) ----------
+# ---- stage 1: strip the shared Node toolchain ------------------------------------------------
+FROM node:22-bookworm-slim AS node-build
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends binutils \
+    && strip --strip-unneeded /usr/local/bin/node \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---- stage 2: install only the selected engine payload --------------------------------------
+FROM node-build AS engine-build
+
+COPY install-codex-native-launcher.sh /tmp/install-codex-native-launcher.sh
+
+# Select one engine for release variants. The default preserves the full local-development image.
+#   pi       -> @earendil-works/pi-coding-agent  (bin: pi)
+#   claude   -> @anthropic-ai/claude-code        (bin: claude)
+#   codex    -> @openai/codex                    (bin: codex)
+#   opencode -> opencode-ai                      (bin: opencode)
+ARG FRANKY_ENGINE=all
+RUN set -eux; \
+    case "$FRANKY_ENGINE" in \
+        pi) packages="@earendil-works/pi-coding-agent" ;; \
+        claude) packages="@anthropic-ai/claude-code" ;; \
+        codex) packages="@openai/codex" ;; \
+        opencode) packages="opencode-ai" ;; \
+        all) packages="@earendil-works/pi-coding-agent @anthropic-ai/claude-code @openai/codex opencode-ai" ;; \
+        *) echo "unsupported FRANKY_ENGINE" >&2; exit 2 ;; \
+    esac; \
+    npm install -g --prefix /out/usr/local $packages; \
+    if [ "$FRANKY_ENGINE" = codex ] || [ "$FRANKY_ENGINE" = all ]; then \
+        sh /tmp/install-codex-native-launcher.sh \
+            /out/usr/local/lib/node_modules/@openai/codex \
+            /out/usr/local/bin/codex \
+            /usr/local/lib/node_modules/@openai/codex; \
+    fi
+
+# ---- stage 3: fetch Docker's STATIC binaries (glibc-safe, lean - only what we need) ----------
 # Static binaries off download.docker.com avoid the full docker-ce apt package set (systemd
 # units, recommends, rootful service) and the musl/glibc mismatch of COPY-ing from the Alpine
 # docker:dind image. Versions are pinned + overridable.
@@ -46,8 +81,8 @@ RUN set -eux; \
         /out/bin/rootlesskit /out/bin/rootlesskit-docker-proxy \
         /out/cli-plugins/docker-compose
 
-# ---- stage 2: the franky runtime image -------------------------------------------------------
-FROM node:22-slim
+# ---- stage 4: shared runtime ----------------------------------------------------------------
+FROM debian:bookworm-slim AS runtime-base
 
 # Toolchain: git + gh (GitHub CLI via its apt keyring) + python3 + ripgrep + build deps, PLUS the
 # rootless-Docker runtime deps that are NOT in the static tarballs: uidmap (newuidmap/newgidmap
@@ -85,24 +120,9 @@ RUN apt-get update \
 COPY --from=docker-dl /out/bin/ /usr/local/bin/
 COPY --from=docker-dl /out/cli-plugins/ /usr/local/lib/docker/cli-plugins/
 
-# Select one engine for release variants. The default preserves the full local-development image.
-#   pi     -> @earendil-works/pi-coding-agent  (bin: pi)
-#   claude -> @anthropic-ai/claude-code        (bin: claude)
-#   codex  -> @openai/codex                    (bin: codex)
-#   opencode -> opencode-ai                    (bin: opencode)
-# Clean the npm cache in the SAME layer - otherwise ~100MB of /root/.npm download
-# cache commits into the image (it is dead weight at runtime; npm refetches on demand).
-ARG FRANKY_ENGINE=all
-RUN case "$FRANKY_ENGINE" in \
-        pi) packages="@earendil-works/pi-coding-agent" ;; \
-        claude) packages="@anthropic-ai/claude-code" ;; \
-        codex) packages="@openai/codex" ;; \
-        opencode) packages="opencode-ai" ;; \
-        all) packages="@earendil-works/pi-coding-agent @anthropic-ai/claude-code @openai/codex opencode-ai" ;; \
-        *) echo "unsupported FRANKY_ENGINE" >&2; exit 2 ;; \
-    esac \
-    && npm install -g $packages \
-    && npm cache clean --force
+# These layers are identical across engine variants, so Docker stores the Node toolchain once.
+COPY --from=node-build /usr/local/ /usr/local/
+COPY --from=node-build /opt/ /opt/
 
 # Non-root: the agent (and the rootless Docker daemon) run as this unprivileged user inside the
 # disposable container. Pin uid 1001 EXPLICITLY - container.py's tmpfs uid=, the subuid/subgid
@@ -127,6 +147,10 @@ RUN useradd --uid 1001 --create-home --shell /bin/bash franky \
 # franky/container.py).
 COPY franky-dind-entrypoint.sh /usr/local/bin/franky-dind-entrypoint.sh
 RUN chmod +x /usr/local/bin/franky-dind-entrypoint.sh
+
+# ---- stage 5: selected engine ---------------------------------------------------------------
+FROM runtime-base
+COPY --from=engine-build /out/usr/local/ /usr/local/
 
 # Point the docker CLI at the rootless daemon's socket for EVERY process in the container (not
 # just the entrypoint's exec'd child) so `docker` works for the engine AND any `docker exec`
