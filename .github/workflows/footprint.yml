@@ -22,9 +22,8 @@ concurrency:
 jobs:
   footprint:
     name: footprint
-    # Fixed benchmark host; newer namespace-policy compatibility needs separate validation.
-    # Migrate before Ubuntu 22.04 runner retirement on 2027-04-17.
-    runs-on: ubuntu-22.04
+    # Fixed benchmark host; never relax production hardening to make measurements pass.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5

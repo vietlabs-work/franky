@@ -630,9 +630,9 @@ They do not prove that an actual agent or repository workload fits.
 
 ### Footprint gates
 
-The benchmark selects Ubuntu 22.04 as a temporary fixed host. Ubuntu 24.04 currently rejects RootlessKit child creation under Franky's unchanged hardening.
-The exact rejecting policy remains unconfirmed. Migrate the benchmark before [runner retirement on April 17, 2027](https://github.com/actions/runner-images/issues/14254).
-Do not disable security controls to make this check pass.
+The benchmark selects Ubuntu 24.04 as a fixed host. Native Ubuntu 22.04 and 24.04 currently reject RootlessKit child creation under Franky's unchanged hardening.
+The runtime gate remains blocked until native Docker compatibility is resolved. The exact rejecting policy remains unconfirmed.
+Do not disable security controls or skip Docker readiness to make this check pass.
 
 Every pull request gets one `footprint` check. The check selects work inside one workflow:
 
