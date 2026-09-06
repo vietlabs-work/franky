@@ -22,7 +22,9 @@ concurrency:
 jobs:
   footprint:
     name: footprint
-    runs-on: ubuntu-latest
+    # Fixed benchmark host; newer namespace-policy compatibility needs separate validation.
+    # Migrate before Ubuntu 22.04 runner retirement on 2027-04-17.
+    runs-on: ubuntu-22.04
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
@@ -54,6 +56,14 @@ jobs:
           echo "Selected: $checks; images: ${variants:-none}"
       - name: Validate footprint policy
         run: pytest -q tests/test_footprint.py tests/test_smoke_memory.py
+      - name: Record runtime host prerequisites
+        if: contains(steps.select.outputs.checks, 'runtime')
+        run: |
+          uname -a
+          docker info --format '{{json .SecurityOptions}}'
+          sysctl kernel.unprivileged_userns_clone || echo "userns clone setting unavailable"
+          sysctl user.max_user_namespaces || echo "userns limit unavailable"
+          sysctl kernel.apparmor_restrict_unprivileged_userns || echo "AppArmor userns setting unavailable"
       - name: Compare fixed host workloads
         if: contains(steps.select.outputs.checks, 'host')
         env:
@@ -169,6 +179,9 @@ jobs:
               compare_runtime
             fi
           fi
+      - name: Record bounded kernel denials
+        if: failure() && contains(steps.select.outputs.checks, 'runtime')
+        run: sudo dmesg | grep -E 'apparmor|audit|seccomp|DENIED' | tail -c 4096 || true
       - name: Upload bounded summary
         if: always()
         uses: actions/upload-artifact@v6
