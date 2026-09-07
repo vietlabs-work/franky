@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-07
+
 ### Changed
 
 - Shorten and refresh the docs. Extend `franky schema` with arguments and per-command JSON contracts. Make `profile init` fail fast without a TTY.
