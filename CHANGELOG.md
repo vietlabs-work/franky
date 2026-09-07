@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Select pinned seccomp policies explicitly for tasks, proxies, and helpers, including Docker Desktop with an unconfined daemon default.
+- Select a named AppArmor task profile on native hosts. Keep AppArmor enabled for rootless Docker-in-Docker.
+- Limit AppArmor sysctl access to nested Docker's port start and per-interface IPv6 disable flag.
+- Refuse malformed Docker security options before run resources are created.
+- Test active syscall filters and real nested builds. Keep keyring access blocked while supporting rootless runc startup.
+- Reuse one bounded, read-only disk helper per task instead of creating a container for every disk check.
+- Replace recurring proxy health probes with a bounded, fail-closed HTTPS CONNECT startup gate.
+- Set the proxy display hostname explicitly to remove startup DNS discovery.
+- Scan PR output once and skip impossible JSON decoding in output and usage parsers.
 - Use Alpine for the Squid proxy while preserving its numeric user and default-deny policy.
 - Share a stripped Node toolchain across engine images without retaining the original Node layer or build caches.
 - Start Codex through a native exec launcher. Preserve its companion executable, package metadata, arguments, exit codes, and signals.
@@ -25,8 +34,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `franky apparmor-profile` prints the named task profile for trusted system tools to install.
 - `FRANKY_DISK_MB` sets a per-job disk budget, checked every five seconds. This watchdog is not a filesystem quota.
 - `make smoke-memory ARGS="--jobs N"` checks 1 through 8 concurrent runners. The default is 2.
+- Add an always-present, credential-free footprint check with versioned CPU, memory, image, overlap, OOM, and throughput budgets.
+- Add fixed host benchmarks, five release-image variants, shared-layer reporting, and complete weekly and pre-release gates.
 
 ## [0.1.3] - 2026-09-04
 

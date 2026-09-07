@@ -130,24 +130,9 @@ def _pr_url_pattern(repo: str | None) -> re.Pattern[str]:
     return re.compile(r"https://github\.com/" + re.escape(repo) + r"/pull/\d+")
 
 
-def _fallback_pr_url(output: str, pattern: re.Pattern[str]) -> str | None:
-    """Return the LAST PR URL matching `pattern` in plain text, or None. Used when
-    structured per-line parsing yields nothing."""
-    from .transcript import lines
-
-    found = None
-    for line in lines(output):
-        if line is None:
-            return None
-        for match in pattern.finditer(line):
-            found = match.group(0)
-    return found
-
-
 def _scan_jsonl_for_pr_url(output: str, repo: str | None = None) -> str | None:
-    """The engines emit one JSON object per line. Walk lines, json.loads each (skip any
-    non-JSON line, never raise), and return the last PR URL found in the stringified event
-    values. Falls back to the plain-text regex over the whole output if nothing is found.
+    """Return the first PR URL in the last matching JSON event, else the last plain URL.
+    Collect both candidates in one bounded pass. Skip JSON decoding for ordinary logs.
     Matches are scoped to `repo` when given (see _pr_url_pattern).
 
     WHY scan stringified values rather than a known key: the PR URL can surface in a tool
@@ -156,13 +141,22 @@ def _scan_jsonl_for_pr_url(output: str, repo: str | None = None) -> str | None:
     """
     pattern = _pr_url_pattern(repo)
     found: str | None = None
+    fallback: str | None = None
     from .transcript import lines
 
     for line in lines(output):
         if line is None:
             return None
+        has_url = "https://github.com/" in line
+        if found is None and has_url:
+            for match in pattern.finditer(line):
+                fallback = match.group(0)
         line = line.strip()
-        if not line:
+        # Objects, arrays, and strings can contain URLs, including JSON-escaped URLs.
+        if not line.startswith(("{", "[", '"')):
+            continue
+        # A JSON escape can hide any URL character, so escaped events still need decoding.
+        if not has_url and "\\" not in line:
             continue
         try:
             event = json.loads(line)
@@ -171,7 +165,7 @@ def _scan_jsonl_for_pr_url(output: str, repo: str | None = None) -> str | None:
         match = pattern.search(json.dumps(event))
         if match:
             found = match.group(0)  # keep walking; last wins
-    return found or _fallback_pr_url(output, pattern)
+    return found or fallback
 
 
 def _tool_use_summary(name: object, inp: dict) -> str:
@@ -304,7 +298,7 @@ class PiEngine(Engine):
 
     def distill_line(self, line: str) -> str | None:
         line = line.strip()
-        if not line:
+        if not line.startswith("{"):
             return None
         try:
             event = json.loads(line)
@@ -369,7 +363,7 @@ class ClaudeEngine(Engine):
 
     def distill_line(self, line: str) -> str | None:
         line = line.strip()
-        if not line:
+        if not line.startswith("{"):
             return None
         try:
             event = json.loads(line)
@@ -438,7 +432,7 @@ class CodexEngine(Engine):
 
     def distill_line(self, line: str) -> str | None:
         line = line.strip()
-        if not line:
+        if not line.startswith("{"):
             return None
         try:
             event = json.loads(line)
@@ -506,6 +500,9 @@ class OpenCodeEngine(Engine):
         return "set MOONSHOT_API_KEY or OPENROUTER_API_KEY for the selected FRANKY_MODEL"
 
     def distill_line(self, line: str) -> str | None:
+        line = line.strip()
+        if not line.startswith("{"):
+            return None
         try:
             event = json.loads(line)
         except (ValueError, TypeError):

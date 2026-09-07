@@ -55,7 +55,7 @@ def parse_usage(output: str) -> Usage:
         if line is None:
             continue
         line = line.strip()
-        if not line:
+        if not line.startswith("{"):
             continue
         try:
             event = json.loads(line)

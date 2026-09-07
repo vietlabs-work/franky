@@ -12,7 +12,7 @@ the creds it carries. So the task container runs on a Docker `--internal` networ
 to the internet at all) whose only peer is a Squid proxy enforcing a default-deny domain
 allowlist. Squid does blind HTTPS CONNECT (no TLS termination), so the creds tunnel through
 it without the proxy ever seeing them. We refuse to run the task unless the proxy is
-confirmed healthy first (fail-closed). All docker argv is built by pure functions here;
+confirmed to deny an off-allowlist CONNECT first (fail-closed). All docker argv is built here;
 the allowlist POLICY lives in egress.py.
 """
 
@@ -31,6 +31,7 @@ from . import egress, franky_version, snapshot
 from .config import DEFAULT_DISK_MB, DEFAULT_MEMORY_MB, redact
 from .engine import CODEX_SUBSCRIPTION_VAR, ENGINES
 from .profile import CONTAINER_HOME, PROFILE_WAIT_VAR
+from .security import DEFAULT_SECCOMP, TASK_SECCOMP, SecurityPolicyError, select_task_apparmor
 from .transcript import CHUNK_SIZE, MAX_EVENT_CHARS, Redactor, Transcript, chunks
 
 # Long agent runs: a full clone-build-test-PR cycle can take many minutes. 30 min cap.
@@ -76,6 +77,7 @@ _HARDENING = [
     # cannot mount over -> "mounting proc: operation not permitted"). This ONLY lifts the /proc
     # path masking; it is NOT --privileged and NOT seccomp=unconfined.
     "--security-opt=systempaths=unconfined",
+    f"--security-opt=seccomp={TASK_SECCOMP}",
     # NOTE: --security-opt=no-new-privileges is DELIBERATELY ABSENT (it used to be here). It
     # blocks the setuid escalation newuidmap/newgidmap rely on, so rootless dockerd cannot set
     # up its uid map and refuses to start - even WITH CAP_SETUID/SETGID added. It is incompatible
@@ -127,6 +129,7 @@ _PROXY_HARDENING = [
     "--rm",
     "--cap-drop=ALL",
     "--security-opt=no-new-privileges",
+    f"--security-opt=seccomp={DEFAULT_SECCOMP}",
     "--read-only",
     "--tmpfs",
     f"/run:exec,uid={_PROXY_UID},gid={_PROXY_GID},size=16m",
@@ -142,9 +145,11 @@ _PROXY_HARDENING = [
     "--ulimit=nofile=4096:4096",
 ]
 
-# Readiness poll for the proxy's HEALTHCHECK. 30 * 0.5s = 15s ceiling before we fail-closed.
+# The startup denial probe polls for at most 15 seconds before it fails closed.
 PROXY_READY_POLLS = 30
 PROXY_READY_INTERVAL = 0.5
+PROXY_READY_TIMEOUT = 15.0
+PROXY_PROBE_TIMEOUT = 2.0
 
 # The mid-run steering mailbox (issue #72, `franky job attach`). HOME (/home/franky) is one of
 # the writable volumes under --read-only (see _HARDENING above), so a file written there by
@@ -167,6 +172,7 @@ def build_docker_argv(
     auth_volume: str | None = None,
     memory_mb: int = DEFAULT_MEMORY_MB,
     disk_mb: int = DEFAULT_DISK_MB,
+    apparmor_profile: str | None = None,
 ) -> list[str]:
     """Build the full `docker run` argv. Pure - no docker invoked.
 
@@ -201,6 +207,7 @@ def build_docker_argv(
         "docker",
         "run",
         *_HARDENING,
+        *([f"--security-opt=apparmor={apparmor_profile}"] if apparmor_profile is not None else []),
         f"--memory={memory_mb}m",
         f"--memory-swap={memory_mb}m",
         "--name",
@@ -272,6 +279,7 @@ def _codex_auth_argv(
         *(["--network", "none"] if networkless else []),
         "--cap-drop=ALL",
         "--security-opt=no-new-privileges",
+        f"--security-opt=seccomp={DEFAULT_SECCOMP}",
         "--read-only",
         "--pids-limit=128",
         "--memory=512m",
@@ -461,20 +469,32 @@ def run_names(run_id: str) -> tuple[str, str, str]:
     return (f"franky-net-{run_id}", f"franky-proxy-{run_id}", f"franky-run-{run_id}")
 
 
-def container_running(name: str, runner=subprocess.run) -> bool:
+def container_running(name: str, runner=subprocess.run, timeout: float = 3) -> bool:
     """True iff a container named `name` exists AND is currently running (`docker inspect`).
 
     For `job status`: distinguishes a still-alive (possibly stuck) run from one that is gone.
     Never raises - a docker error or a missing container reads as not-running."""
+    return _container_running_state(name, runner, timeout) is True
+
+
+def _container_running_state(name: str, runner, timeout: float = 3) -> bool | None:
+    """Separate confirmed task death from an unavailable Docker daemon."""
     try:
         proc = runner(
             ["docker", "inspect", "-f", "{{.State.Running}}", name],
             capture_output=True,
             text=True,
+            timeout=timeout,
         )
     except Exception:
+        return None
+    if getattr(proc, "returncode", 1) == 0:
+        state = (getattr(proc, "stdout", "") or "").strip()
+        return state == "true" if state in {"true", "false"} else None
+    error = (getattr(proc, "stderr", "") or "").strip().lower()
+    if error in {f"error: no such object: {name}", f"error: no such container: {name}"}:
         return False
-    return (getattr(proc, "stdout", "") or "").strip() == "true"
+    return None
 
 
 def build_steer_argv(container: str, steer_file: str = STEER_FILE) -> list[str]:
@@ -577,13 +597,13 @@ def deliver_profile(
 
 
 def reap_run(run_id: str, runner=subprocess.run) -> bool:
-    """Force-remove a run's task container and reap its proxy sidecar + internal network.
+    """Force-remove a run's disk helper, task, proxy sidecar, and internal network.
 
-    For `franky job kill`: tears down the whole run topology by id, in the same task -> proxy
-    -> net order as run_in_container's own teardown. Returns True iff the task container (the
-    one holding the injected creds) was removed; proxy/net are lower-severity resource leaks.
+    The disk helper goes first so the task's `docker rm -v` can remove its anonymous volumes.
+    Returns True iff the task container holding the injected credentials was removed.
     Never raises."""
     net, proxy, task = run_names(run_id)
+    _reap(f"{task}-disk", runner)
     task_reaped = _reap(task, runner)
     _reap(proxy, runner)
     _reap_network(net, runner)
@@ -770,21 +790,23 @@ def _reap_network(net_name: str, runner) -> bool:
     """Best-effort `docker network rm`. Same never-raise contract as _reap. A leaked network
     is a low-severity resource leak (it holds NO creds), unlike a leaked task container."""
     try:
-        proc = runner(["docker", "network", "rm", net_name], capture_output=True, text=True)
+        proc = runner(
+            ["docker", "network", "rm", net_name], capture_output=True, text=True, timeout=10
+        )
     except Exception:
         return False
     return getattr(proc, "returncode", 1) == 0
 
 
 def _storage_sample(task: str | None, image: str, runner) -> tuple[int, int]:
-    """Read allocated KiB and free KiB without trusting the autonomous task's tools.
+    """Read free KiB before launch without trusting the autonomous task's tools.
 
-    Nested Docker files use mapped uids. A trusted, networkless helper needs DAC_READ_SEARCH
-    to count them. It mounts only this task's data volumes, read-only, and receives no secrets.
-    The named subscription volume is excluded. Raw helper errors never leave this function.
+    Task storage uses the persistent helper in `_watch_storage`; this one-shot path is only the
+    production preflight before a task exists. Raw helper errors never leave this function.
     """
-    helper = f"{task}-disk" if task else f"franky-disk-{uuid.uuid4().hex[:12]}"
-    volumes = []
+    if task is not None:
+        raise ValueError("task storage needs a persistent helper")
+    helper = f"franky-disk-{uuid.uuid4().hex[:12]}"
     argv = [
         "docker",
         "run",
@@ -796,41 +818,14 @@ def _storage_sample(task: str | None, image: str, runner) -> tuple[int, int]:
         "--cap-drop=ALL",
         "--cap-add=DAC_READ_SEARCH",
         "--security-opt=no-new-privileges",
+        f"--security-opt=seccomp={DEFAULT_SECCOMP}",
         "--user=0",
         "--pids-limit=32",
         "--memory=64m",
         "--memory-swap=64m",
         "--entrypoint=bash",
     ]
-    if task:
-        inspected = runner(
-            ["docker", "inspect", "-f", "{{json .Mounts}}", task],
-            capture_output=True,
-            text=True,
-            timeout=3,
-        )
-        destinations = {"/work": "work", _HOME: "home", "/tmp": "tmp"}
-        mounts = json.loads(inspected.stdout)
-        found = set()
-        for mount in mounts:
-            dest = mount.get("Destination")
-            if dest not in destinations or mount.get("Type") != "volume":
-                continue
-            name = mount.get("Name", "")
-            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
-                raise ValueError("invalid task storage")
-            found.add(dest)
-            volumes.append(name)
-            argv += ["--mount", f"type=volume,src={name},dst=/data/{destinations[dest]},readonly"]
-        if found != set(destinations):
-            raise ValueError("task storage is missing")
-        script = (
-            "set -eo pipefail\n"
-            "du -skx /data/work /data/home /data/tmp | awk '{n += $1} END {print n}'\n"
-            "df -Pk /data/home | awk 'NR==2 {print $4}'"
-        )
-    else:
-        script = "set -eo pipefail\nprintf '0\\n'\ndf -Pk / | awk 'NR==2 {print $4}'"
+    script = "set -eo pipefail\nprintf '0\\n'\ndf -Pk / | awk 'NR==2 {print $4}'"
     try:
         proc = runner(argv + [image, "-c", script], capture_output=True, text=True, timeout=10)
         values = proc.stdout.split()
@@ -839,28 +834,141 @@ def _storage_sample(task: str | None, image: str, runner) -> tuple[int, int]:
         return int(values[0]), int(values[1])
     finally:
         _reap(helper, runner)
-        # An auto-removing task can exit while the helper still holds its volumes.
-        # Remove only those exact volumes after releasing the helper; Docker refuses
-        # removal if another container still uses them, including a stopped task.
-        if volumes and not container_running(task, runner):
-            try:
-                runner(["docker", "volume", "rm", *volumes], capture_output=True, timeout=10)
-            except Exception:
-                pass
 
 
-def _watch_storage(task: str, image: str, disk_mb: int, runner, stop, failures: list[str]) -> None:
+def _task_storage_volumes(task: str, runner, timeout: float = 3) -> list[str]:
+    inspected = runner(
+        ["docker", "inspect", "-f", "{{json .Mounts}}", task],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if getattr(inspected, "returncode", 1) != 0:
+        raise ValueError("could not inspect task storage")
+    destinations = {"/work": "work", _HOME: "home", "/tmp": "tmp"}
+    selected = {}
+    for mount in json.loads(inspected.stdout):
+        dest = mount.get("Destination")
+        if dest not in destinations or mount.get("Type") != "volume":
+            continue
+        name = mount.get("Name", "")
+        if dest in selected or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", name):
+            raise ValueError("invalid task storage")
+        selected[dest] = name
+    if set(selected) != set(destinations):
+        raise ValueError("task storage is missing")
+    return [selected[dest] for dest in destinations]
+
+
+def _storage_helper_argv(task: str, image: str, volumes: list[str], lifetime: int) -> list[str]:
+    destinations = ("work", "home", "tmp")
+    mounts = [
+        token
+        for volume, destination in zip(volumes, destinations, strict=True)
+        for token in ("--mount", f"type=volume,src={volume},dst=/data/{destination},readonly")
+    ]
+    return [
+        "docker",
+        "run",
+        "-d",
+        "--rm",
+        "--name",
+        f"{task}-disk",
+        "--network=none",
+        "--read-only",
+        "--cap-drop=ALL",
+        "--cap-add=DAC_READ_SEARCH",
+        "--security-opt=no-new-privileges",
+        f"--security-opt=seccomp={DEFAULT_SECCOMP}",
+        "--user=0",
+        "--pids-limit=32",
+        "--memory=64m",
+        "--memory-swap=64m",
+        *mounts,
+        "--entrypoint=sleep",
+        image,
+        str(max(1, lifetime)),
+    ]
+
+
+def _storage_helper_sample(helper: str, runner) -> tuple[int, int]:
+    script = (
+        "set -eo pipefail\n"
+        "du -skx /data/work /data/home /data/tmp | awk '{n += $1} END {print n}'\n"
+        "df -Pk /data/home | awk 'NR==2 {print $4}'"
+    )
+    proc = runner(
+        ["docker", "exec", helper, "bash", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    values = (getattr(proc, "stdout", "") or "").split()
+    if getattr(proc, "returncode", 1) or len(values) != 2 or not all(v.isdigit() for v in values):
+        raise ValueError("could not measure task storage")
+    return int(values[0]), int(values[1])
+
+
+def _remove_volumes(volumes: list[str], runner) -> None:
+    try:
+        runner(["docker", "volume", "rm", *volumes], capture_output=True, timeout=10)
+    except Exception:
+        pass
+
+
+def _watch_storage(
+    task: str,
+    image: str,
+    disk_mb: int,
+    runner,
+    stop,
+    failures: list[str],
+    helper_lifetime: int,
+) -> None:
     """Stop excess disk use. This five-second watchdog is not a filesystem quota.
 
     Keep 1 GiB free for other containers. A fast writer can overshoot between samples;
     the Docker VM disk limit remains the final disk boundary.
     """
-    # Let docker run create its container before the first inspect.
-    if stop.wait(1):
-        return
-    while not stop.is_set():
-        try:
-            used, free = _storage_sample(task, image, runner)
+    helper = f"{task}-disk"
+    volumes: list[str] = []
+    helper_attempted = False
+    stop_task = False
+    try:
+        # The Popen can return before Docker has created the task container.
+        mount_deadline = time.monotonic() + 10
+        for _ in range(20):
+            if stop.is_set():
+                return
+            remaining = mount_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                volumes = _task_storage_volumes(task, runner, min(3, remaining))
+                break
+            except Exception:
+                remaining = mount_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                if stop.wait(min(0.5, remaining)):
+                    return
+        else:
+            raise ValueError("task storage did not appear")
+        if not volumes:
+            raise ValueError("task storage did not appear")
+
+        helper_attempted = True
+        started = runner(
+            _storage_helper_argv(task, image, volumes, helper_lifetime),
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if getattr(started, "returncode", 1) != 0:
+            raise ValueError("could not start task storage helper")
+
+        while not stop.is_set():
+            used, free = _storage_helper_sample(helper, runner)
             message = (
                 "franky: task exceeded its disk budget"
                 if used > disk_mb * 1024
@@ -868,37 +976,77 @@ def _watch_storage(task: str, image: str, disk_mb: int, runner, stop, failures: 
                 if free < 1024 * 1024
                 else ""
             )
-        except Exception:
-            if stop.is_set() or not container_running(task, runner):
+            if message:
+                failures.append(message)
+                stop_task = True
                 return
-            message = "franky: could not verify task disk usage - stopping the run"
-        if message and not stop.is_set():
-            failures.append(message)
+            if stop.wait(5):
+                return
+    except Exception:
+        if not stop.is_set() and _container_running_state(task, runner) is not False:
+            failures.append("franky: could not verify task disk usage - stopping the run")
+            stop_task = True
+    finally:
+        if helper_attempted:
+            _reap(helper, runner)
+        if stop_task:
             _reap(task, runner)
-            return
-        if stop.wait(5):
-            return
+        if volumes and (stop_task or _container_running_state(task, runner) is False):
+            _remove_volumes(volumes, runner)
 
 
-def _wait_proxy_ready(proxy_name: str, runner, sleeper=time.sleep) -> bool:
-    """Poll the proxy container's HEALTHCHECK status until it reports "healthy". The
-    healthcheck asserts default-deny (a known-denied host gets a 403), so "healthy" means the
-    allowlist actually loaded - not mere liveness. Returns True on healthy, False if the poll
-    cap is exhausted. Never raises (a docker error just counts as not-yet-ready). `sleeper`
-    is injectable so tests pass a no-op."""
+def build_proxy_probe_argv(proxy_name: str) -> list[str]:
+    """Probe Squid's default-deny HTTPS CONNECT policy from inside its container."""
+    return [
+        "docker",
+        "exec",
+        proxy_name,
+        "curl",
+        "--silent",
+        "--output",
+        "/dev/null",
+        "--write-out",
+        "%{http_connect}",
+        "--proxy",
+        f"http://127.0.0.1:{PROXY_PORT}",
+        "--noproxy",
+        "",
+        "--connect-timeout",
+        "2",
+        "--max-time",
+        "2",
+        "https://denied.invalid:443",
+    ]
+
+
+def wait_proxy_ready(proxy_name: str, runner=subprocess.run, sleeper=time.sleep) -> bool:
+    """Wait for Squid to refuse a known-denied HTTPS CONNECT with exactly 403."""
+    deadline = time.monotonic() + PROXY_READY_TIMEOUT
     for _ in range(PROXY_READY_POLLS):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
         try:
             proc = runner(
-                ["docker", "inspect", "-f", "{{.State.Health.Status}}", proxy_name],
+                build_proxy_probe_argv(proxy_name),
                 capture_output=True,
                 text=True,
+                timeout=min(PROXY_PROBE_TIMEOUT, remaining),
             )
         except Exception:
             proc = None
         status = (getattr(proc, "stdout", "") or "").strip()
-        if status == "healthy":
+        # curl returns nonzero when Squid refuses the tunnel. The CONNECT status is the gate;
+        # process success alone proves neither liveness nor a default-deny policy.
+        if status == "403":
             return True
-        sleeper(PROXY_READY_INTERVAL)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or not container_running(proxy_name, runner, min(3, remaining)):
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        sleeper(min(PROXY_READY_INTERVAL, remaining))
     return False
 
 
@@ -939,6 +1087,7 @@ def run_in_container(
     diagnostics_sink: dict | None = None,
     snapshot_sink: dict | None = None,
     resume_workspace: str | None = None,
+    apparmor_selector=select_task_apparmor,
 ) -> tuple[int, str | Transcript]:
     """Run the inner engine in a hardened, egress-controlled container; return
     (returncode, redacted_output).
@@ -962,7 +1111,7 @@ def run_in_container(
     Topology: an --internal network (no internet route) hosts a Squid proxy (default-deny
     allowlist) and the task container. The task's HTTP(S)_PROXY points at the proxy and its
     own DNS is killed, so its only path out is through the allowlist. We refuse to start the
-    task until the proxy is confirmed healthy (fail-closed). A `finally` ALWAYS tears down
+    task until the proxy passes the default-deny startup probe. A `finally` ALWAYS tears down
     whatever was created, in order task -> proxy -> net.
 
     The child env is os.environ + cfg.passthrough_env, so the `-e KEY` (name-only) flags
@@ -1001,6 +1150,10 @@ def run_in_container(
     storage_thread = None
 
     try:
+        try:
+            apparmor_profile = apparmor_selector(runner)
+        except SecurityPolicyError as exc:
+            raise _AbortRun(f"franky: {exc} - refusing to run") from exc
         if runner is subprocess.run:
             try:
                 _, free = _storage_sample(None, image, runner)
@@ -1036,8 +1189,8 @@ def run_in_container(
                 "franky: could not attach egress proxy to the network - refusing to run"
             )
 
-        # 4. Fail-closed gate: NEVER run the task without a confirmed-healthy proxy.
-        if not _wait_proxy_ready(proxy, runner, sleeper):
+        # 4. Fail-closed gate: NEVER run the task before Squid proves default-deny CONNECT.
+        if not wait_proxy_ready(proxy, runner, sleeper):
             raise _AbortRun(
                 "franky: egress proxy did not become ready - refusing to run (fail-closed)"
             )
@@ -1064,6 +1217,7 @@ def run_in_container(
             auth_volume=cfg.auth_volume,
             memory_mb=cfg.memory_mb,
             disk_mb=cfg.disk_mb,
+            apparmor_profile=apparmor_profile,
         )
         if effective_progress is not None:
             # Redact before disk and callbacks, retaining only bounded unfinished fragments.
@@ -1093,9 +1247,20 @@ def run_in_container(
                 )
                 task_launched = True
                 if runner is subprocess.run:
+                    # Setup precedes the task timeout. Current bounded profile and restore
+                    # calls need at most 225 + 145 seconds, including readiness inspections.
+                    setup_grace = 400 if injecting or resuming else 0
                     storage_thread = threading.Thread(
                         target=_watch_storage,
-                        args=(task, image, cfg.disk_mb, runner, storage_stop, storage_failures),
+                        args=(
+                            task,
+                            image,
+                            cfg.disk_mb,
+                            runner,
+                            storage_stop,
+                            storage_failures,
+                            timeout + setup_grace + 30,
+                        ),
                         daemon=True,
                     )
                     storage_thread.start()
@@ -1198,6 +1363,25 @@ def run_in_container(
                 )
             except OSError as exc:
                 code, output = 1, f"franky: could not launch docker ({exc})"
+        tail = output.tail(4096) if isinstance(output, Transcript) else output[-4096:]
+        if (
+            code
+            and apparmor_profile
+            and "apparmor" in tail.lower()
+            and apparmor_profile.lower() in tail.lower()
+            and any(marker in tail.lower() for marker in ("not found", "not loaded"))
+        ):
+            hint = (
+                "\nfranky: the AppArmor task profile is not loaded. Run:\n"
+                "`franky apparmor-profile > franky-task.apparmor && "
+                "sudo /usr/sbin/apparmor_parser -K -r franky-task.apparmor && "
+                "sudo /usr/bin/install -m 0644 franky-task.apparmor "
+                "/etc/apparmor.d/franky-task`"
+            )
+            if isinstance(output, Transcript):
+                output.write(hint)
+            else:
+                output += hint
     except _AbortRun as abort:
         # A pre-task step failed. code/output set here; teardown still runs in `finally` and
         # its warnings append to THIS output, which the single return below surfaces.
@@ -1206,6 +1390,7 @@ def run_in_container(
         storage_stop.set()
         if storage_thread is not None:
             storage_thread.join(timeout=40)
+            _reap(f"{task}-disk", runner)
         if storage_failures:
             code = code or 1
             message = "\n" + storage_failures[0]

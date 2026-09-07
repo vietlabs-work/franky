@@ -103,6 +103,7 @@ from .result import (
     build_error,
     build_result,
 )
+from .security import TASK_APPARMOR
 from .schema import build_schema
 from .task import PROSE_MAX_CHARS, TaskSpec, parse_pr_task, parse_review_pr_task, parse_task
 from .update_check import force_update, maybe_auto_update
@@ -294,6 +295,12 @@ def _emit_result(
 @click.group()
 def main() -> None:
     """Franky - a lean personal coding agent that builds in a container and opens a PR."""
+
+
+@main.command("apparmor-profile")
+def apparmor_profile() -> None:
+    """Print the named task policy for installation by trusted system tools."""
+    click.echo(TASK_APPARMOR.read_text(encoding="utf-8"), nl=False)
 
 
 @main.command()

@@ -23,6 +23,8 @@ CONF=/run/squid.conf
 # blind-CONNECT property that keeps creds opaque to the proxy. Default-deny order: deny
 # non-443 ports, deny CONNECT to non-443, ALLOW the allowlist, then deny everything else.
 cat > "$CONF" <<EOF
+# Skip hostname discovery and its repeated DNS probes during startup.
+visible_hostname franky-proxy
 acl allowed_domains dstdomain $DOMAINS
 acl SSL_ports port 443
 acl Safe_ports port 443
@@ -40,7 +42,7 @@ pid_filename /run/squid.pid
 EOF
 
 # Validate FAIL-CLOSED before serving: a malformed allowlist must never reach a running
-# state (a parse error here aborts the container, so the healthcheck never goes healthy).
+# state (a parse error here aborts the container, so the host startup probe cannot pass).
 squid -k parse -f "$CONF"
 
 # Foreground (-N), no daemonize: squid becomes PID 1 so the container lifecycle tracks it.

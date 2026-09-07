@@ -20,11 +20,12 @@ PROXY_IMG="${PROXY_IMG:-franky-proxy}"
 NET="smoke-dind-net-$$"
 PROXY="smoke-dind-proxy-$$"
 TASK="smoke-dind-task-$$"
+SCRATCH="$(mktemp -d)"
 # Derive policy from the production modules.
 ALLOW="$(python3 -c 'from franky.egress import DOCKER_REGISTRY_DOMAINS, GITHUB_DOMAINS; print(",".join(DOCKER_REGISTRY_DOMAINS + GITHUB_DOMAINS))')"
 
 cleanup() { docker rm -f -v "$TASK" "$PROXY" >/dev/null 2>&1 || true; docker network rm "$NET" >/dev/null 2>&1 || true; }
-trap cleanup EXIT
+trap 'cleanup; rm -f "$SCRATCH/compose.log" "$SCRATCH/build.log" "$SCRATCH/denial.log"; rmdir "$SCRATCH"' EXIT
 fail() { echo "SMOKE FAIL: $*" >&2; exit 1; }
 
 echo "== build images =="
@@ -38,19 +39,16 @@ cleanup
 docker network create --internal --driver bridge "$NET" >/dev/null
 python3 scripts/smoke-task.py "$PROXY_IMG" "$PROXY" proxy "$ALLOW" >/dev/null
 docker network connect "$NET" "$PROXY"
-for _ in $(seq 1 20); do
-  [ "$(docker inspect -f '{{.State.Health.Status}}' "$PROXY" 2>/dev/null)" = healthy ] && break; sleep 1
-done
-[ "$(docker inspect -f '{{.State.Health.Status}}' "$PROXY" 2>/dev/null)" = healthy ] || fail "proxy not healthy"
+python3 -c 'import sys; from franky.container import wait_proxy_ready; raise SystemExit(not wait_proxy_ready(sys.argv[1]))' "$PROXY" || fail "proxy did not enforce default-deny"
 
 echo "== run the franky image (real _HARDENING profile) in the cage =="
 SMOKE_NETWORK="$NET" SMOKE_PROXY_URL="http://$PROXY:3128" \
-  python3 scripts/smoke-task.py "$FRANKY_IMG" "$TASK" normal sleep 300 >/dev/null
+  python3 scripts/smoke-task.py "$FRANKY_IMG" "$TASK" normal sleep 600 >/dev/null
 
 echo "== 1. rootless dockerd readiness =="
 ready=0
-for _ in $(seq 1 30); do docker exec "$TASK" docker version >/dev/null 2>&1 && { ready=1; break; }; sleep 2; done
-[ "$ready" = 1 ] || { docker exec "$TASK" cat /tmp/dockerd.log 2>&1 | tail -20 || true; fail "rootless dockerd did not come up"; }
+for _ in $(seq 1 30); do docker exec "$TASK" timeout 3 docker version >/dev/null 2>&1 && { ready=1; break; }; sleep 1; done
+[ "$ready" = 1 ] || { docker exec "$TASK" tail -c 4096 /tmp/dockerd.log 2>&1 || true; fail "rootless dockerd did not come up"; }
 echo "   OK"
 
 echo "== 2. nested compose up test infra THROUGH the proxy =="
@@ -61,19 +59,38 @@ services:
     environment: { POSTGRES_PASSWORD: smoke }
     healthcheck: { test: ["CMD-SHELL","pg_isready -U postgres"], interval: 2s, retries: 20 }
 EOF
-cd /tmp/p && docker compose up -d --wait' >/dev/null 2>&1 || fail "compose up failed"
+cd /tmp/p && timeout 85 docker compose up -d --wait' >"$SCRATCH/compose.log" 2>&1 || {
+  tail -c 4096 "$SCRATCH/compose.log"; fail "compose up failed";
+}
 docker exec "$TASK" sh -c 'cd /tmp/p && docker compose exec -T db psql -U postgres -tAc "select 1"' | grep -q 1 || fail "psql query failed"
 docker exec "$TASK" sh -c 'cd /tmp/p && docker compose down -v' >/dev/null 2>&1
 echo "   OK"
 
+echo "== positive nested build with RUN and hostname =="
+docker exec "$TASK" sh -ec 'mkdir -p /tmp/positive
+printf "FROM alpine:3.20\nRUN echo build-ok > /proof\n" > /tmp/positive/Dockerfile
+timeout 85 docker build -t smoke-proof /tmp/positive
+timeout 10 docker run --rm --hostname smoke-proof smoke-proof sh -ec "test \"\$(cat /proof)\" = build-ok; test \"\$(hostname)\" = smoke-proof"' >"$SCRATCH/build.log" 2>&1 || {
+  tail -c 4096 "$SCRATCH/build.log"; fail "nested build or container failed";
+}
+echo "   OK"
+
 echo "== 3. off-allowlist docker build FROM is refused by the proxy (cage holds) =="
-if docker exec "$TASK" sh -c 'mkdir -p /tmp/b && printf "FROM cr.example.com/x/y:latest\n" > /tmp/b/Dockerfile && cd /tmp/b && timeout 40 docker build -t t . ' >/dev/null 2>&1; then
+if docker exec "$TASK" sh -c 'mkdir -p /tmp/b && printf "FROM cr.example.com/x/y:latest\n" > /tmp/b/Dockerfile && cd /tmp/b && timeout 40 docker build -t t . ' >"$SCRATCH/denial.log" 2>&1; then
   fail "off-allowlist FROM unexpectedly SUCCEEDED - egress cage breached"
 fi
+grep -Eq '403|Forbidden' "$SCRATCH/denial.log" || { tail -c 4096 "$SCRATCH/denial.log"; fail "FROM failed without a proxy denial"; }
 echo "   OK (build refused)"
 
+echo "== off-allowlist build RUN receives a proxy denial =="
+docker exec "$TASK" sh -ec 'printf "FROM alpine:3.20\nRUN http_proxy=\$HTTP_PROXY wget -O /dev/null http://example.com/\n" > /tmp/b/Dockerfile'
+if docker exec "$TASK" timeout 40 docker build -t smoke-denied /tmp/b >"$SCRATCH/denial.log" 2>&1; then
+  fail "off-allowlist RUN unexpectedly succeeded"
+fi
+grep -Eq '403|Forbidden' "$SCRATCH/denial.log" || { tail -c 4096 "$SCRATCH/denial.log"; fail "RUN failed without a proxy denial"; }
+
 echo "== 4. nested container has no route to the internet (proxies unset, raw IP) =="
-if docker exec "$TASK" sh -c 'docker run --rm -e HTTP_PROXY= -e HTTPS_PROXY= -e http_proxy= -e https_proxy= alpine:3.20 wget -T 8 -q -O /dev/null https://1.1.1.1/' >/dev/null 2>&1; then
+if docker exec "$TASK" timeout 15 docker run --rm -e HTTP_PROXY= -e HTTPS_PROXY= -e http_proxy= -e https_proxy= alpine:3.20 wget -T 8 -q -O /dev/null https://1.1.1.1/ >/dev/null 2>&1; then
   fail "nested container reached the internet directly - egress cage breached"
 fi
 echo "   OK (no route)"

@@ -42,7 +42,13 @@ franky = "franky.cli:main"
 packages = ["franky"]
 
 [tool.setuptools.package-data]
-franky = ["persona.md"]
+franky = [
+    "persona.md",
+    "security-default.json",
+    "security-task.json",
+    "security-task.apparmor",
+    "security-default.LICENSE",
+]
 
 [tool.ruff]
 # 100, not the default 88: the codebase favours longer lines (the load-bearing WHY-comments

@@ -113,6 +113,21 @@ pipx install franky-agent
 pip install franky-agent
 ```
 
+Native AppArmor hosts need Franky's named task profile. Install it once after each Franky update:
+
+```
+(
+  set -e
+  profile="$(mktemp)"
+  trap 'rm -f "$profile"' EXIT
+  franky apparmor-profile > "$profile"
+  sudo /usr/sbin/apparmor_parser -K -r "$profile"
+  sudo /usr/bin/install -m 0644 "$profile" /etc/apparmor.d/franky-task
+)
+```
+
+Franky detects AppArmor from Docker. It refuses malformed daemon security data before it creates any run resources.
+
 On first run the CLI pulls version-pinned, public GHCR images.
 It pulls `ghcr.io/vietlabs-work/franky:X.Y.Z-<engine>` and `ghcr.io/vietlabs-work/franky-proxy:X.Y.Z`.
 Thus, all you need is Docker - no registry login. (Point `FRANKY_GHCR_REPO` at a different
@@ -628,6 +643,28 @@ Each job held 256 MiB in its process. It also wrote 512 MiB and created 10,000 f
 These credential-free tests used the production runner, but they made no model calls.
 They do not prove that an actual agent or repository workload fits.
 
+### Footprint gates
+
+The benchmark selects Ubuntu 24.04 as a fixed host. Native Ubuntu 22.04 and 24.04 currently reject RootlessKit child creation under Franky's unchanged hardening.
+The runtime gate remains blocked until native Docker compatibility is resolved. The exact rejecting policy remains unconfirmed.
+Do not disable security controls or skip Docker readiness to make this check pass.
+
+Every pull request gets one `footprint` check. The check selects work inside one workflow:
+
+- Docker, dependency, harness, budget, workflow, and unknown changes run all checks.
+- Runtime Python changes run fixed host and production runner checks.
+- Documentation-only changes validate the footprint policy and tests.
+
+Weekly and pre-release runs execute the complete matrix. They build the five task variants and the proxy in one job, so shared layers stay shared. Image reports list logical sizes and shared layer IDs. They never describe the sum of logical sizes as host disk use.
+
+Host workloads measure parser, redaction, profile, and snapshot CPU time. Each CPU comparison uses at least three repeats and medians. The runner compares base and head results for two and four jobs. It records task, proxy, and disk-helper cgroup CPU and peak memory. Reports include dependency versions, base-layer digests, `RUSAGE_SELF`, `RUSAGE_CHILDREN`, elapsed time, and throughput. Native Linux records host `dockerd` and `containerd` CPU. Docker Desktop reports daemon CPU as unavailable. It never reports unavailable CPU as zero or total CPU. Version or base-layer drift makes the relative result unresolved and fails the check.
+
+Run `make footprint` for the host comparison. Run `make smoke-memory` and `make smoke-memory ARGS="--jobs 4"` after building `franky` and `franky-proxy`. The synthetic loads create 10,000 files, write 512 MiB, and hold 256 MiB per job. They guard regressions but do not represent arbitrary repository builds or model calls.
+
+The disk helper has a 64 MiB RAM limit. Reusing it avoids repeated container creation during five-second disk checks. An uncatchable host process kill can leave anonymous task volumes after the helper exits. Franky has no automatic orphan-volume cleanup. Proxy startup retries bounded HTTPS CONNECT probes for up to 15 seconds. The task starts only after the expected `403` denial. No recurring proxy health probe remains.
+
+The repository cannot require the check on its current private GitHub plan. An owner must enable branch protection after the repository has an eligible plan. The workflow itself does not change billing, visibility, or rulesets.
+
 Host transcript and snapshot processing uses bounded buffers and private temporary files.
 Proxy diagnostics also limit log reads inside the container, before host capture.
 Docker task logging is disabled, so Docker does not keep a second, unredacted stdout log.
@@ -655,6 +692,29 @@ container with:
   the container and the nested Docker daemon is rootless, so the agent never
   touches your filesystem or your host's Docker daemon
 - only the selected engine's required env vars passed in; nothing else
+
+Franky explicitly selects packaged seccomp policies. It does not trust the Docker daemon's default profile.
+This keeps syscall filtering active when a Docker Desktop daemon has an unconfined default.
+On AppArmor hosts, Franky also selects the named `franky-task` profile.
+This profile starts from Moby's default and adds only tested rootless Docker operations.
+Its ABI 3 declaration keeps user namespaces compatible on newer AppArmor kernels.
+
+| Container | Seccomp policy | AppArmor policy | Task-only permissions |
+|-----------|----------------|------------------|-----------------------|
+| Task | Pinned Moby default plus tested exceptions | `franky-task` on AppArmor hosts | Rootless namespace, mount, hostname, and exact sysctl operations |
+| Proxy | Pinned Moby default | Docker default | None |
+| Storage, auth, and version helpers | Pinned Moby default | Docker default | None |
+
+The task policy restricts `clone` and `unshare` flags. It does not add outer capabilities.
+It blocks keyring access with `ENOSYS`, which lets runc continue without a session keyring.
+Other blocked calls, including BPF without its capability, remain blocked inside the user namespace.
+Missing policy files cause Docker startup to fail. No unconfined fallback exists.
+The AppArmor profile keeps unrelated `/proc/sys` writes denied.
+It permits Docker's port-start write and per-interface `disable_ipv6` flag.
+
+Run `make smoke-security` and `make smoke-dind` after policy changes.
+The first checks active filters, capability limits, exact policies, and denied operations.
+The second checks Compose, a real build, explicit proxy denials, and blocked direct egress.
 
 MCP profiles can add explicitly named process-environment credentials and hostname-only
 egress destinations. Credential values reach Docker only through name-only `-e NAME` flags
@@ -689,7 +749,7 @@ it is always available.
 This is rootless DinD (a daemon running as the non-root `franky` user inside its
 own user namespace), **not** a mounted host Docker socket and **not** `--privileged`.
 It needs a few specific, minimal relaxations of the locked profile, applied to every
-task and verified on Docker Desktop for Mac:
+task:
 
 - `--security-opt=no-new-privileges` is **dropped** (it blocks the setuid uid-map
   helpers rootless Docker needs to start),
@@ -697,6 +757,12 @@ task and verified on Docker Desktop for Mac:
   mount it for inner containers - far narrower than `--privileged`/`seccomp=unconfined`),
 - `CAP_SETUID`/`CAP_SETGID` added back on top of `--cap-drop=ALL`, and `/dev/net/tun`
   for the rootless network stack.
+
+The packaged task seccomp policy permits only the tested additions described above.
+Native Linux also applies its host security policy. A host denial is a failed gate, not a reason to disable security.
+The named AppArmor task policy permits user namespaces, mounts, and `pivot_root`.
+It also permits the two network-namespace sysctls that nested Docker requires.
+Capabilities remain limited by the outer container and the rootless user namespace.
 
 The blast radius stays bounded by everything else (rootless user namespace, read-only
 root, the egress cage below, no host FS, repo allowlist, PR-not-merge). The nested

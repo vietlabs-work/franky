@@ -143,6 +143,21 @@ def test_parse_usage_skips_non_json_lines():
     assert u.output_tokens == 5
 
 
+def test_usage_skips_json_decode_for_non_objects(monkeypatch):
+    decoded = []
+    loads = json.loads
+
+    def record_decode(value):
+        decoded.append(value)
+        return loads(value)
+
+    monkeypatch.setattr(json, "loads", record_decode)
+    event = '{"type":"result","usage":{"input_tokens":10,"output_tokens":5}}'
+    output = f'ordinary output\n123\nnull\ntrue\n"text"\n[]\n {event} \n'
+    assert parse_usage(output) == Usage(input_tokens=10, output_tokens=5)
+    assert decoded == [event], "irrelevant lines must not reach the JSON decoder"
+
+
 def test_parse_usage_nested_message_usage():
     """Usage nested under message.usage (claude stream-json assistant events) is recognised."""
     output = _line(
