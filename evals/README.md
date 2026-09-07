@@ -1,57 +1,40 @@
-# Franky eval harness (#25)
+# Franky eval harness
 
-Measure whether a change to the persona, prompt, model, or (later) profile makes Franky
-**better or worse** - instead of guessing. Agent quality is non-deterministic, so the metric is
-**pass-rate over a golden task set run N times**, not "it worked once".
+The eval harness measures agent pass rate over a task set. Use it for prompt, persona, engine, model, or profile changes.
 
-This is **opt-in and out-of-band**, exactly like `make smoke-dind`: it runs the *real* Franky
-flow, so it needs real Docker + engine creds + GitHub access and costs real spend/time. It is
-deliberately NOT part of the fast, hermetic unit suite (which stays docker-free and sub-second).
-Only the harness *logic* is unit-tested (`tests/test_eval.py`, with an injected fake runner).
+Runs use real Docker, credentials, model calls, GitHub access, time, and money. They are not part of the hermetic unit suite.
 
 ## Prerequisites
 
-Same as a normal `franky build` (see the top-level README "Security" + "Install"):
+- Working Franky task and proxy images.
+- `FRANKY_ALLOWED_REPOS`, `GH_TOKEN`, and engine credentials.
+- A disposable repository where Franky can push branches and open PRs.
+- The host `gh` CLI for artifact checks.
 
-- Both images built/pulled (`docker build -t franky . && docker build -t franky-proxy proxy/`).
-- `FRANKY_ALLOWED_REPOS`, `GH_TOKEN`, and the selected engine's creds configured - run
-  `franky config init` (writes `~/.franky/config`) or export them as env vars.
-- A **throwaway sandbox repo** you own and are happy to have PRs opened against. Use a junk
-  repo - the agent is autonomous and will push branches + open PRs.
+Never target a valuable repository. The evaluated agent is autonomous.
 
-## Configure the task set
+## Task file
 
-Edit [`tasks.json`](tasks.json) and replace every `<your-sandbox-repo>` with your sandbox
-`owner/repo`. Each task is:
+Edit [`tasks.json`](tasks.json) and replace each placeholder repository.
 
-| field | meaning |
+| Field | Required | Meaning |
+|-------|----------|---------|
+| `id` | Yes | Short report label |
+| `input` | Yes | Prose, JIRA key, or GitHub issue URL |
+| `repo` | Yes | Allowed `owner/repo` target |
+| `engine` | No | Per-task engine unless a command flag overrides it |
+| `expect` | No | Checks that must pass; default `["pr_opened"]` |
+| `files` | For `diff_touches_files` | Required paths or path suffixes |
+| `contains` | For `change_present` | Required literal diff strings |
+
+Available checks:
+
+| Check | Meaning |
 |-------|---------|
-| `id` | short label shown in the report |
-| `input` | the `franky build` task input: a prose request, a JIRA key, or a GitHub issue URL |
-| `repo` | target `owner/repo` (must be in `FRANKY_ALLOWED_REPOS`) |
-| `engine` | *(optional)* engine for this task; overridden by `--engine` / comparison mode |
-| `expect` | list of success checkers, **all** of which must pass for a run to count |
-
-Checkers (all must pass for a run to count as a success):
-
-Output checkers - derived from the `franky build` result, no extra network needed:
-
-- `pr_opened` - a PR URL was printed to stdout (the baseline "Franky did its job").
-- `exit_zero` - the build exited 0.
-
-Artifact checkers - fetch the live PR via `gh pr view` / `gh pr diff`; require `gh` installed
-and authenticated. They warn to stderr and fail gracefully if `gh` is unavailable:
-
-- `diff_touches_files` - every path in the task's `files` list was touched by the PR diff.
-  Matching is suffix-based: a declared path `"cli.py"` matches a changed path `"franky/cli.py"`.
-  Full paths also match exactly. Requires `files` to be non-empty (load-time error if missing).
-- `change_present` - every string in the task's `contains` list appears as a substring of the
-  PR diff. Plain substring test, not regex. Requires `contains` to be non-empty (load-time
-  error if missing).
-
-### Artifact checker task fields
-
-Add `files` and/or `contains` alongside `expect`:
+| `pr_opened` | Franky returned a PR URL. |
+| `exit_zero` | The build exited successfully. |
+| `diff_touches_files` | The PR changed every declared path or path suffix. |
+| `change_present` | The PR diff contains every declared literal string. |
 
 ```json
 {
@@ -64,47 +47,31 @@ Add `files` and/or `contains` alongside `expect`:
 }
 ```
 
-`files` matching semantics: `"cli.py"` matches `"franky/cli.py"` (suffix match) and
-`"franky/cli.py"` (exact match), but NOT `"other/xcli.py"` (not a path-component suffix).
-
-`contains` matching semantics: plain Python `in` substring test against the full diff text.
+`cli.py` matches `franky/cli.py` by path-component suffix. `contains` uses a plain substring match, not a regular expression.
 
 ## Run
 
 ```bash
-# Pass-rate over the set, 3 runs per task (non-determinism needs a sample):
 make eval ARGS="-n 3"
-
-# Or directly:
 python3 scripts/eval.py --tasks evals/tasks.json -n 3 --engine pi
-
-# Comparison mode: run the set under two engines and report the per-task + overall delta.
 python3 scripts/eval.py -n 3 --engine pi --compare-engine codex
-
-# Profile comparison: does an operator profile (#23) make Franky better? Run the set with the
-# profile OFF vs ON and report the delta. `franky build --profile P` injects that profile; an
-# empty [profile] injects nothing, so it is the "off" side.
-printf '[profile]\n' > /tmp/empty-profile.toml
-python3 scripts/eval.py -n 3 --profile /tmp/empty-profile.toml --compare-profile ~/.franky/profile.toml
 ```
 
-Two comparison axes are wired: `--compare-engine` (varies engine, holds `--profile` constant)
-and `--compare-profile` (varies profile, holds `--engine` constant). They are mutually exclusive
-- a single delta report varies one axis, so passing both is an error.
+Compare a run without an operator profile to a run with one:
 
-**Why the empty baseline:** with no `--profile`, `franky build` auto-discovers
-`~/.franky/profile.toml`, so an unset baseline is NOT truly "off" (it would compare the profile
-against itself). Pass an empty `[profile]` file as `--profile` for a genuine off-vs-on run; side
-A then injects no bundle and side B injects the real profile.
+```bash
+printf '[profile]\n' > /tmp/empty-profile.toml
+python3 scripts/eval.py -n 3 \
+  --profile /tmp/empty-profile.toml \
+  --compare-profile ~/.franky/profile.toml
+```
 
-Reading the report: `passes/runs` and a pass-rate per task, plus a pooled `OVERALL`. Comparison
-mode shows `rate_a -> rate_b (+/- pts)` per task. A change is "better" when it moves the overall
-pass-rate up without regressing individual tasks - that is the signal #23 (profiles) and #24
-(iteration) need to justify their quality claims.
+An omitted profile auto-discovers `~/.franky/profile.toml`. Use an empty profile for a true disabled baseline.
 
-## Scope (MVP)
+`--compare-engine` and `--compare-profile` are mutually exclusive. Each report changes one axis.
 
-In: the golden set, the opt-in runner, pass-rate + comparison along two axes (engine and
-profile). Out (for now): CI integration (needs creds + spend), a large benchmark suite,
-model/persona levers on the build CLI (`franky build` has no `--model` flag or persona selector
-yet), and LLM-as-judge for fuzzy criteria.
+The report shows passes, runs, rate per task, and pooled overall rate. Comparison mode also shows percentage-point changes.
+
+Use several runs because agent behavior is probabilistic. Check both overall gains and individual task regressions.
+
+The harness does not provide CI integration, a large benchmark suite, model selection on `franky build`, or an LLM judge.

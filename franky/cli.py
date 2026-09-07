@@ -4,9 +4,8 @@ The primary caller is an LLM/agent, so the machine contract is load-bearing: `bu
 `iterate` raise typed FrankyError subclasses (config/task/jira/docker), each carrying a stable
 exit code, and a single outer handler emits either a `--json` error object (stdout) or a prose
 line (stderr) and exits with that code. Successful runs emit a `--json` result object or a bare
-PR URL. Every printed or logged string is redacted first - a secret value must never reach the
-terminal or the on-disk log. Interactive prompts (plan-first confirm, config wizard, `build -`
-stdin) fail fast in a non-TTY rather than hang.
+PR URL. Autonomous run output and stored transcripts are redacted before release. Explicit
+operator commands can reveal local configuration. Interactive prompts fail fast in a non-TTY.
 """
 
 from __future__ import annotations
@@ -158,9 +157,8 @@ def _stdin_is_interactive() -> bool:
     """True when stdin is a TTY (a human can answer a prompt).
 
     Wrapped in a module function so tests can monkeypatch it without touching sys.stdin.
-    Every blocking prompt (plan-first confirm, `config set`/`init` wizard, `build -` stdin)
-    guards on this so a non-TTY run fails fast (exit 2) instead of hanging - the never-hang
-    guarantee.
+    Every blocking prompt guards on this. This includes plan approval, config/profile wizards,
+    secret input, job steering, and `build -` stdin. A non-TTY run fails fast with exit 2.
     """
     return sys.stdin.isatty()
 
@@ -401,11 +399,8 @@ def build(
       franky build "add a --json flag" --repo you/repo
       franky build - --repo you/repo          (read the prose task from stdin)
 
-    With --plan-first, Franky first runs the engine in a read-only planning pass, prints the
-    plan, and waits for explicit approval; nothing is built or PR'd until you confirm
-    (--yes auto-approves; a non-interactive run without --yes fails fast, exit 2). The
-    approval gate is the hard guarantee (the planning container is still autonomous), so a
-    declined or non-interactive run writes nothing.
+    With --plan-first, Franky first asks the engine for a plan. The host starts no build pass
+    until you confirm. --yes auto-approves. A non-interactive run without --yes exits 2.
 
     --json emits one machine-readable result/error object on stdout; exit codes follow the
     documented taxonomy (0 ok, 2 usage, 3 config, 4 task, 5 auth, 6 docker, 7 agent, 8 net,
@@ -697,10 +692,9 @@ def iterate(
       franky iterate https://github.com/you/repo/pull/42
 
     Runs the SAME hardened, egress-controlled container as `franky build`, but instead of
-    starting fresh it checks out the PR's existing branch, reads the review comments and
-    failing checks via `gh`, and pushes ADDITIVE follow-up commits to that branch. It never
-    force-pushes, never merges, and never opens a new PR - a human still reviews every change.
-    The PR URL is authoritative (it carries owner/repo), so there is no --repo flag.
+    starting fresh it checks out the PR's existing branch, reads review comments and failing
+    checks, and pushes additive commits. The prompt forbids force pushes, merges, and new PRs.
+    The PR URL is authoritative, so there is no --repo flag.
 
     --json emits one machine-readable result/error object on stdout (status iterate_complete
     on exit 0; the input PR URL is echoed back as pr_url). Exit codes follow the documented
@@ -872,11 +866,10 @@ def review_pr(
       franky review-pr https://github.com/you/repo/pull/42
       franky review-pr --no-publish -- https://github.com/you/repo/pull/42 "focus on error handling"
 
-    Runs the SAME hardened, egress-controlled container as `build`/`iterate`, but the agent only
-    inspects the PR (diff, metadata, linked issue) and runs the repo's existing checks - it never
-    edits, commits, pushes, merges, approves, dismisses reviews, or resolves conversations here.
-    Franky itself (never the agent) posts the resulting GitHub review, and only ever as COMMENT
-    or REQUEST_CHANGES - it never auto-approves.
+    Runs the SAME hardened, egress-controlled container as `build`/`iterate`. The prompt directs
+    the agent to inspect the PR and run existing checks without changing GitHub or the checkout.
+    The host publishes the result as COMMENT or REQUEST_CHANGES, never APPROVE. Token permissions
+    remain the enforced GitHub boundary for the autonomous container.
 
     --expected-head-sha pins the PR head you last observed; a live head that disagrees (checked
     BEFORE the pass starts, and again immediately BEFORE publishing) refuses rather than
@@ -1152,13 +1145,12 @@ def plan(
     quiet: bool,
     max_duration: int | None,
 ) -> None:
-    """Assess scope and decompose TASK_INPUT into PR-sized sub-tasks - READ-ONLY, builds nothing.
+    """Request a read-only scope assessment and PR-sized sub-tasks without a build pass.
 
     Accepts the SAME task forms as `build` (a GitHub issue URL, a JIRA key, or a prose
-    request, plus `plan - --repo ...` to read prose from stdin). Runs one read-only container
-    pass that inspects the repo/issue, decides whether the task fits one focused PR or needs
-    splitting, and emits a decomposition. It creates no branch, opens no PR, and writes
-    nothing to the target repo - the caller orchestrates what to do with the sub-tasks.
+    request, plus `plan - --repo ...` to read prose from stdin). The prompt asks one container
+    pass to inspect the task and emit a decomposition without repository changes. The caller
+    decides what to do with the sub-tasks.
 
     --json emits one machine-readable object on stdout: a decomposition
     `{fits_one_pr, subtasks:[{title, summary, suggested_repo}], rationale, engine, repo,
@@ -1979,8 +1971,8 @@ def version(as_json: bool) -> None:
 
 @main.command()
 def schema() -> None:
-    """Emit a machine-readable JSON description of Franky's commands, flags, result/error
-    shapes, and exit-code taxonomy (the agent-facing capability contract).
+    """Emit a machine-readable JSON description of Franky's commands, arguments, flags,
+    result/error shapes, and exit-code taxonomy (the agent-facing capability contract).
 
     Always JSON - no --json flag - and the single JSON object is the only thing on stdout.
     """
@@ -2472,13 +2464,11 @@ def job_diagnose(
     quiet: bool,
     max_duration: int | None,
 ) -> None:
-    """Diagnose WHY a recorded run failed - a read-only meta-agent over its transcript (issue #64).
+    """Diagnose WHY a recorded run failed from its saved transcript and metadata (issue #64).
 
-    Dispatches the engine in a read-only container pass over the run's persisted transcript +
-    metadata (it clones nothing, edits nothing, opens no PR) and emits a structured root-cause,
-    proposed fix, and a `retryable`/`retry_hint` learning signal - the same signal `franky build
-    --retry` feeds back into a fresh attempt. Unknown/corrupt id -> exit 2; a run with no
-    transcript yet -> exit 2; the pass timing out -> exit 9; no parseable diagnosis -> exit 7.
+    The prompt asks the engine to analyze the saved data without changes. It emits a root cause,
+    proposed fix, and `retryable`/`retry_hint` signal for `build --retry`. Unknown or corrupt id
+    exits 2. Missing transcript exits 2. Timeout exits 9. An invalid diagnosis exits 7.
 
     --json emits one machine-readable diagnosis object (a DISTINCT envelope from build/iterate);
     see `franky schema` -> diagnosis_result_schema.
@@ -3474,7 +3464,7 @@ def config_set(key: str, value: str | None) -> None:
 
 @config_group.command("init")
 def config_init() -> None:
-    """Interactive wizard to create or overwrite the config file.
+    """Interactive wizard to create or update the config file.
 
     Walks through engine selection, repo allowlist, GitHub token,
     engine creds, and optional JIRA settings.
@@ -3829,6 +3819,10 @@ def profile_check() -> None:
 @profile_group.command("init")
 def profile_init() -> None:
     """Interactive wizard to create or extend ~/.franky/profile.toml (merge-not-clobber)."""
+    if not _stdin_is_interactive():
+        raise click.UsageError(
+            "profile init is interactive; with no TTY edit the profile file directly."
+        )
     _profile_init_wizard(dict(os.environ))
 
 

@@ -1,142 +1,167 @@
 # AGENTS.md
 
-Guidance for any coding agent (Claude Code, Codex, Cursor, pi, ...) working with code in this repository. This is the canonical agent guide; `CLAUDE.md` is a symlink to it, so Claude Code picks up the same content.
+This file is the canonical guide for coding agents in this repository. `CLAUDE.md` is a symlink to this file.
 
-## What this is
+## Product
 
-Franky is a lean personal coding agent. Given a GitHub issue URL, a JIRA key, or a prose sentence, it runs a pluggable coding agent (`pi` default; `claude`, `codex`, and `opencode` alternatives) inside a fresh, hardened Docker container that clones the target repo, makes the change, and opens a PR. The agent is autonomous inside the container; safety comes from OS-level container isolation + a default-deny egress allowlist + a fail-closed repo allowlist + opening a PR (never merging). The container also runs its own **rootless Docker daemon, always on** (issue #12), so the agent can `docker build` / `docker compose up` test infra / run testcontainers to actually build+verify repos - rootless DinD, never a host socket or `--privileged`, and the nested daemon stays inside the same egress cage.
+Franky runs a pluggable coding agent in a fresh Docker container. It accepts an issue, JIRA key, PR, or prose task.
 
-## Commands
+The task container clones an allowlisted repository, makes or reviews changes, and can open a PR. Prompts forbid autonomous merges.
+
+Each task also runs a rootless Docker daemon. The agent can use Docker, Compose, and testcontainers without access to the host daemon.
+
+## Development commands
 
 ```bash
-# Install (editable) into a venv
-python3 -m venv .venv && .venv/bin/pip install -e ".[dev]"
+python3 -m venv .venv
+.venv/bin/pip install -e ".[dev]"
 
-# Build BOTH images (required once before any real run)
 docker build -t franky .
 docker build -t franky-proxy proxy/
 
-# Run the full test suite
 .venv/bin/python -m pytest -q
-
-# Run one file / one test
 .venv/bin/python -m pytest tests/test_container.py -q
 .venv/bin/python -m pytest tests/test_container.py::test_build_docker_argv_hardening_flags -q
 
-# Invoke the CLI
-franky build <gh-issue-url | jira KEY | "prose"> [--repo owner/repo] [--engine pi|claude|codex|opencode] [--plan-first]
-# Follow-up pass on an existing Franky PR: address review/CI feedback with additive commits.
-franky iterate <gh-pr-url> [--engine pi|claude|codex|opencode]
-franky version
+ruff check .
+ruff format --check .
 
-# Full manual real-Docker gates. The dedicated footprint CI uses only fixed credential-free loads.
-make smoke-dind        # always-on rootless DinD
-make smoke-security    # explicit filters, capability limits, denied operations
-make smoke-resume      # `job resume` workspace restore
-make smoke-profile     # operator-profile injection ([setups]/[profile])
-profile="$(mktemp)"  # native AppArmor hosts
-franky apparmor-profile > "$profile"
-sudo /usr/sbin/apparmor_parser -K -r "$profile"
-make smoke-memory      # 2 concurrent runners by default; ARGS="--jobs 1..8"
+make footprint
+make smoke-security
+make smoke-dind
+make smoke-resume
+make smoke-profile
+make smoke-memory
+make smoke-memory ARGS="--jobs 4"
 
-# Opt-in, OUT-OF-BAND agent-quality eval (#25) - needs real Docker + creds + a sandbox repo.
-# Bare runs evals/tasks.json once; ARGS passes flags. See evals/README.md.
 make eval ARGS="-n 3 --engine pi --compare-engine codex"
 ```
 
-Unit tests use no real Docker, network, or live credentials. Each external action uses an injected test double. Keep unit tests hermetic. Never call real `docker` or `gh` from a unit test. The dedicated footprint workflow is separate. It runs fixed, credential-free production containers on GitHub's native Linux runner. The full egress, DinD, resume, profile, and eval gates remain manual. The eval harness (`scripts/eval.py`, #25) runs the real `franky build` flow to measure agent success. Its runs need credentials and Docker. Its logic uses injected runners in `tests/test_eval.py`.
+Unit tests must not use real Docker, networks, GitHub, or credentials. Inject runners, environments, and sleepers instead.
+
+Real Docker gates stay outside the unit suite. The footprint workflow uses fixed credential-free workloads on Ubuntu 24.04.
 
 ## Architecture
 
-A pure-logic core is wired together by a thin CLI; only one module touches the outside world.
-
-```
-cli.build  ->  load_config(engine, env)      config.py   resolve engine, fail-closed passthrough env
-           ->  parse_task(input, repo, allow) task.py     issue-URL vs prose, allowlist gate
-           ->  build_prompt(spec)             prompt.py   persona + task + literal conventions
-           ->  engine.inner_argv(prompt)      engine.py   per-engine headless argv
-           ->  ensure_image(franky/-proxy)    container.py
-           ->  run_in_container(cfg, argv)    container.py  the ONLY side-effect layer:
-           ->  engine.parse_pr_url(out, repo)               net + proxy + task lifecycle
+```text
+CLI -> config and task policy -> prompt -> engine command -> container runtime -> parsed result
+                                      |
+                                      +-> internal network -> proxy -> allowed HTTPS hosts
 ```
 
-`run_in_container` orchestrates an `--internal` Docker network + a Squid proxy sidecar around the task container (allowlist policy from `egress.py`); the task's only egress path is the proxy. See "Egress control" below.
+| Area | Files | Responsibility |
+|------|-------|----------------|
+| CLI contract | `cli.py`, `result.py`, `schema.py` | Commands, exit codes, JSON results, machine discovery |
+| Configuration | `config.py`, `userconfig.py`, `engine.py` | Fail-closed settings, credentials, engine selection |
+| Task resolution | `task.py`, `jira.py`, `idempotency.py`, `baseref.py` | Input parsing, repo gates, base commits, duplicate-PR checks |
+| Agent instructions | `prompt.py`, `persona.md`, `decompose.py`, `diagnosis.py`, `reviewpr.py`, `sentinel.py` | Prompts and bounded structured output |
+| Runtime | `container.py`, `security.py`, `egress.py`, `franky-dind-entrypoint.sh`, `proxy/` | Docker lifecycle, isolation, policies, proxy |
+| Transfer | `profile.py`, `setups.py`, `snapshot.py` | Bounded, secret-scanned profile and workspace bundles |
+| Runs | `jobs.py`, `transcript.py`, `economics.py` | Records, redacted logs, diagnostics, usage |
+| Host helpers | `github.py`, `update_check.py`, `_install.py` | `gh` passthrough, updates, install detection |
 
-Module responsibilities:
+Keep policy code pure where practical. Keep subprocess calls injectable so tests remain hermetic.
 
-| Module | Role |
-|--------|------|
-| `franky/cli.py` | Click entrypoint. Wires the pipeline; config/task errors become `ClickException` (operator errors, no traceback). Requires both the `franky` and `franky-proxy` images. Writes a redacted log to `<FRANKY_RUNS_DIR>/tasks/<timestamp>-<run_id>.log` (default `~/.franky/runs/tasks/`). The `build` and `iterate` commands share `_ensure_images` / `_run_pass` / `_economics_line`; the only difference between them is the prompt. `build --retry N` (issue #64) loops `_build_once` up to `1+N` times, running `_diagnose` between retryable failures (timeout/agent_error/no_pr) and feeding the diagnosis `retry_hint` into the next attempt's prompt; it re-checks idempotency before each retry (never a second PR) and stops when a diagnosis is unparseable / not retryable (never a blind restart). `franky job diagnose` runs a standalone read-only diagnose pass. Both use `_diagnose`, which registers its own `command="diagnose"` run (statuses `diagnosed`/`diagnose_failed`, outside compute_stats' success/failed sets). `franky job attach` (issue #72) injects a one-shot mid-run correction into a still-`running` job: resolves the engine from the RECORD (no config/creds needed), gates on `supports_steering`, confirms the container is alive, then delivers via `deliver_steer` and appends a bounded, redacted note to the record's `steer_notes`. |
-| `franky/config.py` | `Config` dataclass + `load_config` (fail-closed) + `redact`. Owns optional egress domains and validated Codex MCP overrides; OpenCode validates `FRANKY_MODEL` against the shared provider mapping and forwards only its selected credential. |
-| `franky/profile.py` | Operator profile parsing, bounded reading, secret scanning, and bundle creation. The 5,000-file and 20 MiB limits cover explicit, swept, and MCP files together. Glob and setup scans share a 5,000-entry enumeration limit. `profile check` and bundle creation use the same strict UTF-8 reader and limits. `build_bundle` still returns raw gzip-tar bytes for stdin delivery. Tier-2 fields keep the existing MCP credential, domain, JSON/TOML, Codex, and Claude controls. |
-| `franky/setups.py` | Pure policy for the `[setups]` sweep. It owns the setup manifests, resolved-path deny rules, common profile read budget, and PR-spec discovery. The sweep prunes denied directories and checks candidates before it accumulates them. It skips non-UTF-8 files because the secret scanner cannot inspect them. |
-| `franky/task.py` | `parse_task` -> `TaskSpec` (issue URL / JIRA key / prose, for `build`) and `parse_pr_task` -> `TaskSpec(source="pr")` (a PR URL, for `iterate`). Earliest point the target repo is known, so the allowlist gate lives here. `GH_PR_RE` is anchored and `parse_pr_task` reconstructs the canonical URL from the captured groups so the gate and what `gh pr checkout` acts on can never diverge. |
-| `franky/engine.py` | `Engine` base + the four engine implementations. Each engine owns: headless argv, PR-URL parsing, required creds, and `provider_hosts` (which network host(s) feed the egress allowlist). `OPENCODE_PROVIDERS` is the single mapping from model prefix to credential and API host (`moonshotai` -> Moonshot direct, `openrouter` -> OpenRouter). `resolve_engine` order: `--engine` flag > `FRANKY_ENGINE` > default `pi`. `supports_steering` (issue #72, class attribute, True for pi/claude/codex and False for opencode) gates `franky job attach`'s mid-run steering channel: it means the engine's PROMPT tells it to poll the steer-file mailbox, not that the engine polls it natively. |
-| `franky/egress.py` | Pure allowlist POLICY: `build_allowlist` = the engine's model-selected provider host(s) + GitHub + npm/PyPI + container image registries (`DOCKER_REGISTRY_DOMAINS`, for always-on DinD) + operator extras. OpenCode never widens provider egress for an unrelated profile credential. No docker, no I/O. |
-| `franky/security.py` | Packaged seccomp and AppArmor policies. Selects AppArmor from strict Docker security data. |
-| `franky/prompt.py` | `build_prompt` = `persona.md` + task block + literal conventions (branch `franky/<slug>`, tests-green-before-PR, conventional commits, 3-section PR body, never merge) + the optional `operator_setup` block; its `prior_failures` arg (issue #64 #5) injects a learning-signal block for `--retry` (empty = byte-identical to before). `build_iterate_prompt` is the `iterate` variant: check out the existing branch (`gh pr checkout`, no new branch), gather review/CI feedback via `gh`, push ADDITIVE commits, never force-push / new-PR / merge, with a prompt-level own-PR guard (head `franky/*` + not cross-repo). Standalone - it does not reuse `_task_block`, so `source="pr"` never hits build-mode logic. `build_diagnose_prompt` (issue #64 #4) frames a read-only failure analysis over a run's metadata + tail-capped (already-redacted) transcript, emitting one `FRANKY_DIAG_<nonce>` block. `build_setup_block` renders the operator-setup block when the profile declares `[setups]`: where the setup was unpacked, which file is its PR-description spec (host-discovered - a slash command is never auto-invoked, so without a pointer the file ships unread), and three precedence rules. The rules are NOT optional: an operator's instruction file is written for an interactive session, and a plan-approval or review gate in it would stall an autonomous run into a `no_pr` failure (everything else - host-only tools and paths - self-neutralizes), so the block pins "Franky's conventions win / never wait for approval / ignore what is not here". Threaded into build/iterate/replay(`--open-pr`)/resume, never into the read-only passes (their block would end in "open the PR"). |
-| `franky/sentinel.py` | Shared scanner `scan_sentinel_json(output, label, nonce)` for the nonce-fenced structured-output block both `franky plan` (label `PLAN`) and `franky job diagnose` (label `DIAG`) end their read-only pass with. Owns the JSONL-leaf walk + tempered fence regex in ONE place (extracted from decompose.py, issue #64) so the subtle logic can't drift. Pure, never raises. |
-| `franky/diagnosis.py` | `parse_diagnosis(output, nonce)` (via `sentinel`, label `DIAG`) + `build_diagnosis_result(parsed, *, job_id, engine)` for `franky job diagnose` / `build --retry` (issue #64). Mirrors `decompose.py`: defensively coerces the autonomous agent's payload (`category` off a known set -> `unknown`, `confidence` -> `low`, `retryable` -> bool, bounded `evidence` list) into a stable envelope. The `retryable`/`retry_hint` fields are the learning signal the retry loop consumes. Pure, never raises. |
-| `franky/container.py` | All docker MECHANICS (pure argv builders, testable without Docker): task/proxy/network argv + `run_in_container` (injectable `runner`/`sleeper`) + `ensure_image`. `_HARDENING` is the relaxed-for-DinD profile (see invariants). Codex subscription auth uses a named volume (default `franky-codex-auth`, overridable per instance via `FRANKY_CODEX_AUTH_VOLUME`, resolved by `engine.codex_auth_volume`); trusted helpers create/login/status/remove it and scrub everything except `auth.json` before autonomous runs. `deliver_profile` streams the operator profile tar into the started container over `docker exec -i` stdin (reusing `snapshot`'s untar/marker argv builders with HOME as the target) and touches the ready marker LAST - the bundle never rides the argv, because a swept setup is ~400 KB gzipped and Linux caps one argv string at 128 KB, and `docker cp` INTO the `--read-only` container is refused by the daemon anyway. `STEER_FILE` + `build_steer_argv`/`deliver_steer` (issue #72) are the host-side mechanics for `franky job attach`: a `docker exec -i <container> tee -a` into the mailbox path under HOME's writable volume, message delivered on STDIN (never argv), captured stdout/stderr always discarded (never raises). |
-| `franky-dind-entrypoint.sh` | Image ENTRYPOINT (not a Python module): starts the rootless Docker daemon, renders `~/.docker/config.json` proxies so inner containers inherit the cage (proxy URLs only, never creds), waits for the socket (30s cap, proceeds on timeout), then - under `FRANKY_PROFILE_WAIT` - blocks up to 120s for the profile ready marker the host touches after streaming the bundle in (absent marker -> exit 78, never a silent build without the operator's setup), then execs the engine argv. |
-| `franky/update_check.py` | `force_update` (behind `franky update [--force]`): fresh latest-release fetch (`gh` then REST w/ `GH_TOKEN` fallback), `X.Y.Z` compare, reinstall via the `_install.py`-detected manager (uv tool/pipx/pip). `maybe_auto_update` (top of `franky build`): hint-only best-effort sibling - tight ~1s fetch, tiered `~/.franky/update_check.json` cache, prints a stderr hint and proceeds; never blocks or re-execs. Stdlib-only. |
-| `franky/_install.py` | Install-provenance detection shared by `franky version` and `franky update`: `detect_install` -> `Install(kind, path)` from interpreter path + editable metadata. |
-| `franky/github.py` | `run_gh(args, env, runner, timeout)` for `franky gh`: a host-side passthrough to the real `gh` CLI with Franky's `GH_TOKEN` (the caller's sandbox usually has neither). Token reaches `gh` via the child ENV, never on the argv; output is CAPTURED (injectable `runner`, so tests never invoke real `gh`) then redacted by the CLI. FULL `gh` surface, bounded only by the token's scopes - no read-only gate, no repo allowlist here (deliberately: `build`/`iterate`'s allowlist gates the autonomous content-driven path; `franky gh` is an operator/agent command, same trust as the host-side `idempotency` check). Non-interactive by design (capture -> `gh` sees a non-TTY and skips prompts, so no hang). |
-| `franky/jobs.py` | Run registry for `franky jobs` / `franky job status\|logs\|kill\|export` (issues #63, #64). Filesystem-only (no docker), stdlib-only: per-run JSON record under `~/.franky/runs/<job_id>.json` (override dir via `FRANKY_RUNS_DIR` for tests), atomic write (tempfile+replace, 0600/0700, mirrors userconfig). `new_record`/`write_record`/`read_record`/`update_record`/`list_records`(newest-first)/`prune`(bounded, never prunes a `running` record). Records store NO secret value - only names/paths/status/timings + a redacted task summary. Job id is validated `[0-9a-f]` so a user-supplied `job status <id>` can't traverse out of the runs dir. Read/update never raise (fail-closed -> None/False), so a registry hiccup never breaks a build. The build/iterate path writes a `running` record BEFORE the pass (best-effort) and updates it after; `run_id` threads into `run_in_container` so the container/net/proxy names derive from the job id and `job kill`/`status` can target them. Docker mechanics for status/kill live in container.py (`run_names`/`container_running`/`reap_run`). #64 adds two PURE helpers over the same records/artifacts (no docker): `compute_stats(records)` (cross-run success/hang rate + median duration/cost, broken down by engine/repo; `hangs` = timeout + stale-`running` orphans) for `jobs --stats`, and `export_bundle(record, dest)` (a secret-free `.tar.gz` of `record.json` + the already-redacted `transcript.log`, with host-free tar member metadata) for `job export`. |
-| `franky/economics.py` | Best-effort per-run economics: `parse_usage` sums OpenCode per-step token/cost events and otherwise takes the last terminal event's totals + `format_economics` (one-line summary). Pure, no I/O; never raises - degrades to all-unknown so economics can never fail a build. |
-| `franky/userconfig.py` | On-disk persistence for `~/.franky/config` (TOML, mode 0600). `read_config_file` / `write_config_file` (atomic, hand-rolled TOML for the constrained single-table schema). `load_config_file(env)` injects file values into `env` via `setdefault` (process env wins). `set_value` read-modify-write. `SECRET_KEYS` frozenset (union of all cred vars from engine.py + jira.py + config.py). `mask_value` for display. Path overridable via `FRANKY_CONFIG_FILE` env var for hermetic tests. |
-| `proxy/` | The `franky-proxy` image: Squid + an entrypoint that renders a default-deny, HTTPS-only allowlist config from `FRANKY_ALLOWED_DOMAINS`. |
-| `franky/persona.md` | The agent's working persona. Packaged via `package-data`; loaded at runtime by `prompt.py`. |
+## Resource rules
 
-### Memory and storage
+- Check image size, peak RAM, CPU time, and elapsed time for every feature.
+- State the effect on two and four concurrent jobs in each PR.
+- Run `make footprint` for fixed host comparisons.
+- Run two-job and four-job memory smokes after container or storage changes.
+- Run all relevant security, DinD, resume, and profile smokes after runtime changes.
+- Do not increase `scripts/footprint-budgets.json` without measured before-and-after evidence.
+- Keep shared runtime layers separate from engine payloads. Do not add a tool to every image without need.
+- Keep the proxy user as numeric `13:13` across image bases.
+- Keep the Codex native launcher, platform package, companion executable, and managed-package metadata.
 
-- For every feature, check image size, peak RAM, CPU time, and elapsed time. Report the two-job and four-job impact.
-- Run `make footprint` for fixed host work. Run `make smoke-memory` and the four-job variant for container changes.
-- Keep `scripts/footprint-budgets.json` fixed. Change a budget only with measured before-and-after evidence in the PR.
-- Unknown paths and footprint-policy changes run the complete CI gate. Documentation-only changes still validate the policy.
-- GitHub branch protection is not enabled by this repository. An eligible plan and repository owner must require the `footprint` check.
+Resource defaults:
 
-- Tasks default to 2048 MiB RAM; proxies use 128 MiB. `FRANKY_MEMORY_MB` accepts 256..8192 MiB, including nested containers.
-- `/work`, HOME, and `/tmp` use private anonymous Docker volumes. Only runtime directories use small tmpfs mounts.
-- Docker `--rm` and forced `docker rm -f -v` remove task volumes. Disk deletion is not secure erasure.
-- `FRANKY_DISK_MB` accepts 1024..32768 MiB, default 8192. The five-second disk watchdog is a soft budget, not a filesystem quota.
-- A trusted networkless helper measures only this task's data volumes, read-only. It receives no credentials or subscription volume.
-- `franky/transcript.py` owns bounded redacted disk spooling. Production output is a `Transcript`; injected test runners can still return strings.
-- Parsers accept events/payloads up to 1 MiB characters. Oversized content remains in the full log but cannot yield a successful parsed result.
-- Profiles accept at most 5,000 files and 20 MiB across explicit, swept, and MCP files.
-- Glob and setup scans examine at most 5,000 directory entries per combined profile.
-- The profile TOML file has a separate 20 MiB read limit.
-- Skipped binary and unreadable sweep candidates consume the sweep file and byte budget.
-- Setup traversal refuses more than 5,000 visited directories.
-- Profile metadata is checked before file reads. Bounded reads reject files that grow past the remaining budget.
-- Snapshot scans stream with fail-closed ceilings. Never restore whole-file reads or skip unreadable data during secret verification.
-- Re-run all four real-Docker smoke gates after changing storage or container resource limits.
-- Every Docker run selects a packaged seccomp profile. Never rely on the daemon default or use `seccomp=unconfined`.
-- Task-only seccomp exceptions must pass the pinned-policy delta test, `make smoke-security`, and `make smoke-dind`.
-- Helpers and proxies use the pinned Moby default policy, without task-only exceptions.
-- AppArmor hosts must load the output from `franky apparmor-profile` with the system `apparmor_parser`.
-- Never disable AppArmor. Limit `/proc/sys` exceptions to `net.ipv4.ip_unprivileged_port_start` and `net.ipv6.conf.*.disable_ipv6`.
-- Proxy diagnostics read at most 64 KiB plus one sentinel byte before host capture.
-- `proxy_log_truncated` marks excluded records. Denial counts are recent observations, not guaranteed lifetime totals.
-- Keep proxy uid/gid 13 stable across image bases. Alpine runs with numeric `USER 13:13`.
-- Keep the stripped Node toolchain in shared runtime layers, separate from each engine payload.
-- Codex uses a build-resolved native exec launcher. Preserve its full platform package, companion executable, and managed-package metadata.
+| Resource | Limit |
+|----------|-------|
+| Task tree | 2048 MiB, configurable from 256 through 8192 MiB |
+| Proxy | 128 MiB |
+| Task disk | 8192 MiB soft budget, configurable from 1024 through 32768 MiB |
+| Disk helper | 64 MiB, short-lived and networkless |
 
-### Load-bearing invariants (do not regress these)
+`/work`, HOME, and `/tmp` use anonymous disk volumes. Small runtime paths use tmpfs.
 
-- **Secrets pass by name, never by value.** `build_docker_argv` emits `-e KEY` (name only) for the task; the value is inherited from Franky's own env. This includes arbitrary MCP credentials declared by name in an operator profile; their values must come from the process environment and join `Config.secret_values()`. A secret value must never land on an argv (visible in `ps`), in the terminal, or in a log file. The Codex subscription exception is `auth.json` in a fixed named volume: a trusted networkless helper reads bounded token strings into host memory only for redaction, never into argv/logs/files. (The proxy gets only `FRANKY_ALLOWED_DOMAINS` by value - it is policy, not a secret, and the proxy receives NO creds.)
-- **Everything printed or logged is redacted first.** `redact()` masks every secret *value* (longest-first). All output returned from `run_in_container` is already scrubbed. Any new print/log path must route through `redact`.
-- **Fail-closed.** `load_config` refuses if the repo allowlist is unset/empty, if `GH_TOKEN` is missing, if the engine has no creds, or if OpenCode lacks a supported model and its matching credential: `FRANKY_MODEL=moonshotai/kimi-k3` + `MOONSHOT_API_KEY`, or `FRANKY_MODEL=openrouter/<model-id>` + `OPENROUTER_API_KEY`. `parse_task` refuses any repo not in `FRANKY_ALLOWED_REPOS`. `run_in_container` refuses to start the task unless the proxy is confirmed healthy; the proxy refuses an empty or malformed allowlist.
-- **Container hardening is a safety boundary**, not tool prompts (the agent runs autonomously - `claude --dangerously-skip-permissions`, `codex --dangerously-bypass-approvals-and-sandbox`, pi default tools). The `_HARDENING`/`_PROXY_HARDENING` flags in `container.py` are load-bearing: `--read-only`, pids/memory caps (`--memory-swap` = `--memory`, no swap), non-root uid 1001, and **no host bind mounts, no host docker socket** (the repo is cloned *inside* the container and the Docker daemon is rootless+nested, so the agent never touches the host FS or the host daemon). Writes use private anonymous volumes and small runtime tmpfs mounts, except the fixed Codex subscription volume, mounted only at `/home/franky/.codex` for subscription runs and scrubbed to `auth.json` before each autonomous run; `--ignore-user-config` is also mandatory. Codex MCP profiles are parsed on the host and passed as explicit `-c mcp_servers...` overrides; they never enable user config. The task `_HARDENING` is deliberately **relaxed for always-on rootless DinD** (#12): `--cap-drop=ALL` keeps the baseline but `CAP_SETUID`/`CAP_SETGID` are added back (rootless uid-map helpers), `--security-opt=no-new-privileges` is **dropped** (it blocks those setuid helpers - do NOT re-add it), `--security-opt=systempaths=unconfined` and `--device /dev/net/tun` are added. This is NOT `--privileged` and NOT `seccomp=unconfined`; each relaxation is the minimal one proven necessary (see the README security section). Image binaries `newuidmap`/`newgidmap` use file capabilities (`cap_setuid/setgid+ep`), NOT the Debian setuid bit, which fails under `--cap-drop=ALL`. Changes here must be re-verified with `make smoke-dind` (real Docker; the pytest suite never touches Docker); `make smoke-resume` and `make smoke-profile` are the same kind of gate for the two host-side stream-into-container paths (workspace restore, operator-profile injection) - both extract as uid 1001 over `docker exec -i` stdin, so both can trip a daemon-level refusal the mocked suite cannot see.
-- **AppArmor stays enabled on native hosts.** Franky selects `franky-task` only when Docker reports AppArmor. The ABI 3 profile is Moby's default plus tested mount, `pivot_root`, and exact nested-Docker sysctl access. Its declared ABI preserves user-namespace compatibility on newer AppArmor kernels. Load it with fixed system tools. Never run user-installed Python under `sudo`. Missing or malformed Docker security data aborts before any run resource is created.
-- **Each engine bypasses its OWN approval/sandbox - on purpose - because the container is the safety boundary, not the engine's in-tool guardrails.** The agent runs autonomously, so a per-engine approval prompt is both redundant with the OS-level isolation + egress cage and would hang a headless run. So every engine disables its own gate: `claude` passes `--dangerously-skip-permissions`, `codex` passes `--dangerously-bypass-approvals-and-sandbox`, OpenCode passes `--auto --pure`, `pi` runs its default tools, and a new engine MUST do the equivalent. Some engines additionally **self-sandbox** (Landlock/seccomp - codex does both): nested inside Franky's already-hardened container that self-sandbox is redundant AND can fail to initialize, which is exactly why codex's bypass flag disables the sandbox as well as the approval prompt - we deliberately turn it off and trust the container. The bargain is identical for every engine: the engine's docs warn the flag is "only for an isolated runner," and Franky's container is that runner. An engine author must preserve this - shipping an engine that still prompts for approval (or insists on its own sandbox) will stall the autonomous build.
-- **Egress is the other safety boundary.** The task runs on an `--internal` network (no internet route) whose only peer is the Squid proxy enforcing a default-deny `dstdomain` allowlist; egress is HTTPS-only (blind CONNECT, so the proxy never sees creds) and in-container DNS is killed (`--dns 127.0.0.1`) to block DNS exfil. OpenCode provider egress comes from the validated model prefix, never from every credential in `passthrough_env`, so an unrelated profile credential cannot open another provider host. The nested rootless Docker daemon inherits `HTTP(S)_PROXY`, so its image pulls + `docker build` fetches go through the proxy too (verified: off-allowlist `FROM`/`RUN` is `403`'d, and a nested container has no direct route out). The allowlist therefore includes a broad set of container registries (`DOCKER_REGISTRY_DOMAINS`). Residual risk: the agent can reach the allowlisted high-trust hosts (GitHub, provider, language + container registries) AND can move its creds into nested containers (bounded by the allowlist + PR-not-merge), so treat allowlisted destinations as trusted, not inert. Squid `dstdomain .github.com` matches the apex AND subdomains - do NOT also list the bare apex (Squid 6 FATALs on the overlap); the same dot-form rule governs the registry list.
-- **PR-URL detection is repo-scoped.** `parse_pr_url(output, repo=spec.repo)` anchors to the task's own repo so a hostile issue body cannot make Franky report an attacker's PR URL.
+The disk watchdog samples approximately every five seconds. It is not a filesystem quota. Volume deletion is not secure erasure.
 
-### Adding an engine
+Profiles allow 5,000 files and 20 MiB across explicit, swept, and MCP files. The profile file has a separate 20 MiB limit.
 
-Subclass `Engine` in `engine.py`. Implement `inner_argv`, `parse_pr_url`, `required_env`, `provider_hosts`, and `cred_hint`.
-Register the engine in `ENGINES` so the CLI and image resolver accept it.
-Add the package case to `Dockerfile`. Add its release variant to `.github/workflows/release.yml`.
-Disable the engine's own approval and sandbox in `inner_argv`.
-For a pi provider variable, update both `PI_PROVIDER_VARS` and `PI_PROVIDER_HOSTS`.
+Glob and setup scans can inspect 5,000 entries. Setup traversal can visit 5,000 directories.
+
+Skipped binary or unreadable sweep files consume the budget. Snapshot and transcript reads also use fail-closed size limits.
+
+## Security invariants
+
+Do not weaken these rules.
+
+### Secrets and output
+
+- Pass credentials to task containers as `-e NAME`, never as values on the command line.
+- MCP credentials must come from named process environment variables.
+- Send only policy data, such as `FRANKY_ALLOWED_DOMAINS`, by value to the proxy.
+- Redact autonomous output, stored transcripts, diagnostics, and JSON errors before release.
+- `config list --reveal` is explicit operator output. Do not claim that Franky redacts it.
+- Codex subscription auth is the only persistent task volume. Scrub it to `auth.json` before each run.
+- Never mount the subscription volume into helpers, proxies, or non-subscription tasks.
+
+### Fail-closed policy
+
+- Refuse an empty repository allowlist, missing `GH_TOKEN`, missing engine credentials, or unsupported OpenCode provider.
+- Gate every task and PR repository with `FRANKY_ALLOWED_REPOS`.
+- Scope parsed PR URLs to the task repository.
+- Refuse malformed security data, proxy policy, profile data, snapshots, or structured output.
+- Start the task only after the proxy passes its bounded health check.
+
+`franky gh` is an explicit host-side exception. It exposes the full `gh` surface and is limited only by `GH_TOKEN`.
+
+### Container boundary
+
+- Run as uid 1001 with a read-only root, memory and process limits, no swap, and `--cap-drop=ALL`.
+- Never add host bind mounts, the host Docker socket, `--privileged`, or `seccomp=unconfined`.
+- Use the packaged seccomp policies for every container. Never depend on the daemon default.
+- Use `franky-task` on AppArmor hosts. Never fall back to an unconfined profile.
+- Limit AppArmor sysctl access to `net.ipv4.ip_unprivileged_port_start` and `net.ipv6.conf.*.disable_ipv6`.
+
+Rootless Docker needs these exact task exceptions:
+
+- Add `CAP_SETUID` and `CAP_SETGID` after dropping all capabilities.
+- Omit `no-new-privileges` because uid-map helpers need file capabilities.
+- Set `systempaths=unconfined` and pass `/dev/net/tun`.
+- Keep `newuidmap` and `newgidmap` file capabilities. Do not use setuid bits.
+- Permit only tested namespace, mount, `pivot_root`, hostname, keyring, and sysctl operations in task security policies.
+
+Any policy delta must pass pinned-policy tests, `make smoke-security`, and `make smoke-dind`.
+
+### Egress boundary
+
+- Put the task on a Docker `--internal` network and set task DNS to `127.0.0.1`.
+- Route all task and nested-Docker traffic through the HTTPS-only Squid proxy.
+- Build the provider allowlist from the selected engine and model only.
+- Keep package and container registries explicit in `DOCKER_REGISTRY_DOMAINS`.
+- Treat allowlisted hosts as trusted destinations. The agent can move its credentials into nested containers.
+- In Squid, `.example.com` matches the apex and subdomains. Do not also add the bare apex.
+
+### Agent and transfer behavior
+
+- Disable each engine's own approval and sandbox prompts. The container is the autonomous safety boundary.
+- Keep `claude --dangerously-skip-permissions`, `codex --dangerously-bypass-approvals-and-sandbox`, and OpenCode `--auto --pure`.
+- Stream profile and snapshot archives through `docker exec -i`. Never place archive data in arguments or environment values.
+- Secret-scan every injected profile file. Resolve symlinks before deny checks.
+- Skip unscannable setup files. Never inject setup MCP configuration automatically.
+- Keep Codex `--ignore-user-config`. Pass validated MCP servers as explicit overrides.
+- Tell review agents to stay read-only. The host publisher only uses COMMENT or REQUEST_CHANGES.
+- Keep iterate commits additive. Tell autonomous agents never to merge or force-push.
+
+## Add an engine
+
+1. Subclass `Engine` in `engine.py`.
+2. Implement `inner_argv`, `parse_pr_url`, `required_env`, `provider_hosts`, and `cred_hint`.
+3. Disable the engine's own approval and sandbox prompts.
+4. Register it in `ENGINES`.
+5. Add its package case to `Dockerfile` and its release variant to `release.yml`.
+6. Add tests for command arguments, credentials, provider hosts, PR parsing, and image selection.
+7. For a Pi provider, update both `PI_PROVIDER_VARS` and `PI_PROVIDER_HOSTS`.
+8. Measure host, image, two-job, and four-job impact.
