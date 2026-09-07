@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Shorten and refresh the docs. Extend `franky schema` with arguments and per-command JSON contracts. Make `profile init` fail fast without a TTY.
 - Select pinned seccomp policies explicitly for tasks, proxies, and helpers, including Docker Desktop with an unconfined daemon default.
 - Select a named AppArmor task profile on native hosts. Keep AppArmor enabled for rootless Docker-in-Docker.
 - Limit AppArmor sysctl access to nested Docker's port start and per-interface IPv6 disable flag.

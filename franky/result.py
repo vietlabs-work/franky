@@ -28,8 +28,8 @@ EXIT_CONFIG = 3  # bad config file, allowlist unset/empty/malformed, bad engine
 EXIT_TASK_REJECTED = 4  # allowlist / task rejection
 EXIT_AUTH = 5  # auth/creds missing (GH_TOKEN, engine creds, JIRA creds, JIRA 401/403)
 EXIT_DOCKER = 6  # docker / image unavailable, or a required host tool (e.g. gh) is missing
-EXIT_AGENT = 7  # agent ran but exited nonzero / produced no PR / (plan) no parseable plan
-EXIT_NETWORK = 8  # network/timeout (JIRA reach/HTTP/parse)
+EXIT_AGENT = 7  # agent/result failure, including stale-head review publication blocks
+EXIT_NETWORK = 8  # JIRA/network failure, including GitHub review publication failure
 EXIT_TIMEOUT = 9  # run exceeded --max-duration; distinct from 8 network/JIRA-timeout
 
 # Single source of truth for exit-code docs (consumed by `franky schema` -> exit_codes). Every
@@ -41,8 +41,8 @@ EXIT_CODES: dict[int, str] = {
     EXIT_TASK_REJECTED: "task rejected: off-allowlist repo, missing --repo, or bad URL/key",
     EXIT_AUTH: "missing creds (GH_TOKEN, engine creds, JIRA creds) or JIRA 401/403",
     EXIT_DOCKER: "docker or image unavailable, or a required host tool (e.g. gh) is missing",
-    EXIT_AGENT: "agent ran but exited nonzero, produced no PR, or (plan) emitted no parseable plan",
-    EXIT_NETWORK: "network/timeout reaching JIRA, HTTP error, or unparseable response",
+    EXIT_AGENT: "agent/result failure, including no PR, invalid output, or stale review head",
+    EXIT_NETWORK: "JIRA/network failure, including GitHub review publication failure",
     EXIT_TIMEOUT: "run exceeded --max-duration (the container was killed)",
 }
 
@@ -134,7 +134,8 @@ def build_result(
     hint, not a guarantee. `iterate` passes null (no host-predicted branch). `usage` is an
     economics.Usage (input_tokens/output_tokens/cost_usd, each int|None / float|None). Status
     is one of: pr_opened | no_pr | agent_error | timeout | already_open | iterate_complete |
-    replay_complete (issue #70: a reproduce-only replay pass finished cleanly).
+    replay_complete | review_published | review_complete | no_findings |
+    publish_blocked_stale_head | publish_failed.
 
     For the `already_open` status (idempotency short-circuit, no container ran) the caller
     passes the sentinels `duration=0.0` and `log_path=""` - there is no run to time or log.

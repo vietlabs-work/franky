@@ -1732,6 +1732,14 @@ def test_config_init_non_interactive_no_hang(monkeypatch, tmp_path):
     assert "interactive" in res.output  # failed for the right reason, not an unrelated error
 
 
+def test_profile_init_non_interactive_no_hang(monkeypatch, tmp_path):
+    monkeypatch.setenv("FRANKY_PROFILE_PATH", str(tmp_path / "profile.toml"))
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: False)
+    res = CliRunner().invoke(cli.main, ["profile", "init"])
+    assert res.exit_code == 2
+    assert "interactive" in res.output
+
+
 def test_iterate_json_complete(monkeypatch):
     agent_output = json.dumps({"type": "result", "usage": {"input_tokens": 8, "output_tokens": 4}})
     env = {**_iterate_env(), "FRANKY_CONFIG_FILE": os.environ["FRANKY_CONFIG_FILE"]}
@@ -2101,6 +2109,7 @@ def test_profile_init_writes_entered_globs(tmp_path, monkeypatch):
 
     prof = tmp_path / "profile.toml"
     monkeypatch.setenv("FRANKY_PROFILE_PATH", str(prof))
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)
     # Hermetic: HOME has no agentic setup dirs, so the setup confirm is never offered and the
     # wizard asks only the three explicit-glob prompts.
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
@@ -2122,6 +2131,7 @@ def test_profile_init_offers_detected_setups(tmp_path, monkeypatch):
     (home / ".codex").mkdir()
     prof = tmp_path / "profile.toml"
     monkeypatch.setenv("FRANKY_PROFILE_PATH", str(prof))
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)
     monkeypatch.setenv("HOME", str(home))
 
     res = CliRunner().invoke(cli.main, ["profile", "init"], input="y\n\n\n\n")
@@ -2137,6 +2147,7 @@ def test_profile_init_declining_setups_writes_none(tmp_path, monkeypatch):
     (home / ".claude").mkdir(parents=True)
     prof = tmp_path / "profile.toml"
     monkeypatch.setenv("FRANKY_PROFILE_PATH", str(prof))
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)
     monkeypatch.setenv("HOME", str(home))
 
     res = CliRunner().invoke(cli.main, ["profile", "init"], input="n\n~/x.md\n\n\n")
@@ -2157,6 +2168,7 @@ def test_profile_init_merges_existing(tmp_path, monkeypatch):
         encoding="utf-8",
     )
     monkeypatch.setenv("FRANKY_PROFILE_PATH", str(prof))
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     wizard_input = "~/new.md\n\n\n"  # add a skill, skip instructions + knowledge
     res = CliRunner().invoke(cli.main, ["profile", "init"], input=wizard_input)

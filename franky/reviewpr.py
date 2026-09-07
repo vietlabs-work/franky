@@ -10,12 +10,9 @@ This module owns the pure halves of consuming that:
 - `render_review_body` / `review_event` turn that shape into the actual GitHub review the CLI
   posts host-side.
 
-WHY the agent never posts its own review: the agent is autonomous inside the container and could
-in principle call `gh pr review` itself, but that would make "never approve" a prompt-only
-promise. Instead the agent only ever emits this findings JSON; Franky's host process (never the
-container) is the one piece of code that calls the GitHub review API, and `review_event` hard-caps
-its choice to COMMENT or REQUEST_CHANGES - APPROVE is never a reachable value, regardless of what
-the agent's `summary`/findings say.
+The prompt tells the agent to emit findings JSON without writing to GitHub. Franky's host process
+publishes that result. `review_event` hard-caps host publication to COMMENT or REQUEST_CHANGES.
+The container is autonomous, so GitHub token permissions remain the hard external-write boundary.
 """
 
 from __future__ import annotations

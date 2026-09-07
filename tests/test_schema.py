@@ -49,6 +49,132 @@ def test_schema_lists_core_commands_with_flags():
     assert "max_duration" in iterate_flag_names
 
 
+def test_schema_lists_every_live_command_recursively():
+    def assert_group_matches(group, commands):
+        assert set(commands) == set(group.commands)
+        for name, command in group.commands.items():
+            if hasattr(command, "commands"):
+                assert_group_matches(command, commands[name]["commands"])
+
+    assert_group_matches(cli.main, build_schema(cli.main)["commands"])
+
+
+def test_schema_command_help_is_bounded_to_one_line():
+    def assert_concise(commands):
+        for command in commands.values():
+            assert "\n" not in command["help"]
+            assert len(command["help"]) <= 160
+            if "commands" in command:
+                assert_concise(command["commands"])
+
+    assert_concise(build_schema(cli.main)["commands"])
+
+
+def test_schema_documents_positional_arguments():
+    commands = build_schema(cli.main)["commands"]
+    build_arg = commands["build"]["arguments"][0]
+    assert build_arg == {
+        "name": "task_input",
+        "required": True,
+        "nargs": -1,
+        "type": {"param_type": "String", "name": "text"},
+    }
+
+    review_args = commands["review-pr"]["arguments"]
+    assert [(arg["name"], arg["required"]) for arg in review_args] == [
+        ("pr_url", True),
+        ("instructions", False),
+    ]
+
+    login_arg = commands["auth"]["commands"]["login"]["arguments"][0]
+    assert login_arg["type"]["choices"] == ["codex"]
+
+
+def test_schema_documents_option_types_and_defaults():
+    build_flags = {
+        flag["name"]: flag for flag in build_schema(cli.main)["commands"]["build"]["flags"]
+    }
+    assert build_flags["engine"]["type"]["choices"] == [
+        "claude",
+        "codex",
+        "opencode",
+        "pi",
+    ]
+    assert build_flags["retry"]["default"] == 0
+
+
+def test_schema_maps_every_json_command_to_output_schemas():
+    schema = build_schema(cli.main)
+
+    def assert_references_exist(value):
+        if isinstance(value, str):
+            assert value in schema
+        elif isinstance(value, dict):
+            for nested in value.values():
+                assert_references_exist(nested)
+
+    def assert_json_outputs(group, commands):
+        for name, command in group.commands.items():
+            entry = commands[name]
+            if any(param.name == "as_json" for param in command.params):
+                assert "json_output" in entry, name
+                assert_references_exist(entry["json_output"])
+            if hasattr(command, "commands"):
+                assert_json_outputs(command, entry["commands"])
+
+    assert_json_outputs(cli.main, schema["commands"])
+
+    commands = schema["commands"]
+    assert commands["build"]["json_output"]["success"] == "result_schema"
+    assert commands["jobs"]["json_output"]["success"] == {
+        "default": "job_list_schema",
+        "--stats": "job_stats_schema",
+    }
+    assert commands["job"]["commands"]["status"]["json_output"]["success"] == ("job_status_schema")
+
+
+def test_schema_documents_special_json_output_shapes():
+    schema = build_schema(cli.main)
+    for key in (
+        "version_result_schema",
+        "job_list_schema",
+        "job_stats_schema",
+        "job_status_schema",
+        "job_kill_schema",
+        "job_export_schema",
+        "job_attach_schema",
+    ):
+        assert key in schema
+
+    assert schema["job_list_schema"] == {"type": "array", "items": "job_record_schema"}
+    assert schema["job_status_schema"]["includes"] == "all job_record_schema fields"
+    assert "container_running" in schema["job_status_schema"]
+    assert set(schema["job_kill_schema"]) == {"job_id", "status", "container_reaped"}
+    assert set(schema["job_export_schema"]) == {
+        "job_id",
+        "output_path",
+        "bytes",
+        "included",
+    }
+    assert set(schema["job_attach_schema"]) == {"job_id", "delivered", "engine", "kind"}
+
+    stats = schema["job_stats_schema"]
+    for field in (
+        "total",
+        "by_status",
+        "success",
+        "failed",
+        "running_fresh",
+        "hangs",
+        "success_rate",
+        "median_duration_s",
+        "total_cost_usd",
+        "by_engine",
+        "by_repo",
+    ):
+        assert field in stats
+
+
 def test_schema_recurses_into_subgroups():
     schema = build_schema(cli.main)
     cmds = schema["commands"]
@@ -80,6 +206,30 @@ def test_result_schema_documents_fields_and_predicted_branch():
         assert econ_field in rs["economics"]
 
 
+def test_result_schemas_document_review_outputs():
+    schema = build_schema(cli.main)
+    for status in (
+        "review_published",
+        "review_complete",
+        "no_findings",
+        "publish_blocked_stale_head",
+        "publish_failed",
+    ):
+        assert status in schema["result_schema"]["status"]
+        assert status in schema["job_record_schema"]["status"]
+    for field in (
+        "reviewed_sha",
+        "findings_summary",
+        "checks",
+        "review_url",
+        "review_id",
+    ):
+        assert field in schema["result_schema"]
+    checks = schema["result_schema"]["checks"]
+    assert isinstance(checks, list)
+    assert set(checks[0]) == {"name", "outcome", "detail"}
+
+
 def test_plan_result_schema_is_distinct_envelope():
     schema = build_schema(cli.main)
     assert "plan_result_schema" in schema
@@ -103,6 +253,11 @@ def test_job_record_schema_documents_diagnostics():
     # diagnostics is issue #69's addition; assert its sub-fields are named in the description.
     for sub_field in ("task_exit_code", "oom_killed", "dind_ready", "tmpfs_full", "egress_denied"):
         assert sub_field in jrs["diagnostics"]
+
+
+def test_job_record_schema_documents_review_command():
+    schema = build_schema(cli.main)
+    assert "review-pr" in schema["job_record_schema"]["command"]
 
 
 def test_result_schema_documents_replay_of():

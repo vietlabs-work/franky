@@ -49,6 +49,11 @@ def test_exit_codes_map_covers_every_exit_constant():
         assert isinstance(EXIT_CODES[code], str) and EXIT_CODES[code]
 
 
+def test_exit_codes_describe_review_publication_failures():
+    assert "stale" in EXIT_CODES[EXIT_AGENT]
+    assert "review publication" in EXIT_CODES[EXIT_NETWORK]
+
+
 def test_franky_error_is_value_error():
     # Every existing `except ValueError` / pytest.raises(ValueError) must still catch these.
     assert issubclass(FrankyError, ValueError)

@@ -1,107 +1,73 @@
 # Releasing Franky
 
-## Cutting a release
+## Create a release
 
 ```bash
 make release VERSION=x.y.z
 ```
 
-This runs `scripts/release.py x.y.z`, which:
-1. Validates the version string (plain `x.y.z` only - no prerelease suffixes).
-2. Asserts the repo is on `main`, the working tree is clean, and local `main` matches
-   `origin/main`.
-3. Asserts the tag `vX.Y.Z` does not already exist.
-4. Bumps `version` in `pyproject.toml` and `__version__` in `franky/__init__.py` in lockstep.
-5. Retitles the `## [Unreleased]` section in `CHANGELOG.md` to `## [X.Y.Z] - YYYY-MM-DD`
-   and inserts a fresh empty `## [Unreleased]` block above it.
-6. Bumps the `vX.Y.Z` on the `## Status` line in `README.md` so the docs track the release.
-   (The PyPI install command has no version pin, so there is nothing else to bump.) Fails
-   loudly if the Status line is missing.
-7. Commits (`release: vX.Y.Z`), creates an annotated tag (`vX.Y.Z`), and pushes both
-   in a single `git push origin main vX.Y.Z`.
+The release script:
 
-A CI doc-coherence guard (`tests/test_doc_coherence.py`, in the pytest job) asserts on every
-PR that the README version refs and the newest CHANGELOG section stay in step with
-`pyproject.toml`, and that no literal `X.Y.Z` placeholder lingers in a README command block -
-so drift cannot creep back in between releases.
+1. Accepts a plain `x.y.z` version.
+2. Requires a clean `main` that matches `origin/main`.
+3. Refuses an existing `vX.Y.Z` tag.
+4. Updates `pyproject.toml` and `franky/__init__.py` together.
+5. Converts `Unreleased` into a dated changelog section.
+6. Updates the README status version.
+7. Commits, creates an annotated tag, and pushes `main` with the tag.
+
+Tests reject README, changelog, and package version drift before release.
 
 ## Dry run
 
 ```bash
 make release-dry VERSION=x.y.z
-# or
+# Or:
 python3 scripts/release.py x.y.z --dry-run
 ```
 
-Prints exactly what WOULD change (version bumps, changelog diff, git commands) without
-writing any files or running any git mutations.
+The dry run prints file changes and Git commands. It does not write files or change Git state.
 
-## Version-skew guard
+## Recover a failed tag push
 
-CI runs `python3 scripts/release.py guard vX.Y.Z` on every tag push before publishing
-anything. It asserts that `pyproject.toml`, `franky/__init__.py`, and the tag all carry
-the same version. Any skew exits nonzero and blocks the publish jobs.
-
-You can run it locally:
+Use this only when the release commit exists but its tag push failed:
 
 ```bash
-python3 scripts/release.py guard v0.1.0
-```
-
-## Recovery: tag subcommand
-
-If the commit was created but the push failed, you can re-push just the tag:
-
-```bash
-python3 scripts/release.py tag x.y.z
-# or with --dry-run to check first
 python3 scripts/release.py tag x.y.z --dry-run
+python3 scripts/release.py tag x.y.z
 ```
 
-`tag` asserts the versions in pyproject and `__init__.py` already match `x.y.z`,
-the tag is absent, and the tree is clean - then creates and pushes the tag only.
+The command requires matching package versions, an absent tag, and a clean tree.
 
-## What CI publishes
+## CI release gate
 
-On a `vX.Y.Z` tag push, the `release.yml` workflow:
-1. Runs the guard.
-2. Builds the Python wheel and sdist (`python -m build`).
-3. Publishes the wheel + sdist to PyPI (as `franky-agent`) via Trusted Publishing (OIDC) -
-   no stored token.
-4. Builds and pushes both Docker images to GHCR under the repo's owning org
-   (`ghcr.io/<owner>/franky:X.Y.Z` and `ghcr.io/<owner>/franky-proxy:X.Y.Z`, plus `:latest`
-   convenience tags).
-5. Creates a GitHub Release with the wheel/sdist attached and the changelog section as
-   release notes.
+Each tag push first runs the complete footprint workflow. It then verifies that the tag and both package version files match.
 
-The GitHub Release is the last job (`needs: [wheel, pypi, image]`) so its existence implies
-the wheel, the PyPI publish, and the images all shipped.
+A successful `vX.Y.Z` workflow publishes:
 
-## One-time publishing prerequisites
+| Artifact | Destination |
+|----------|-------------|
+| Wheel and source archive | PyPI package `franky-agent` |
+| Full task image | `ghcr.io/<owner>/franky:X.Y.Z` |
+| Engine images | The same tag with `-pi`, `-claude`, `-codex`, or `-opencode` |
+| Proxy image | `ghcr.io/<owner>/franky-proxy:X.Y.Z` |
+| Convenience images | Matching `latest` tags |
+| Release notes and archives | GitHub Release |
 
-Before the first public release these must be set up out-of-band (no secret is stored in the
-repo for either):
+The GitHub Release runs last. Its presence means PyPI and all images completed.
 
-- **PyPI Trusted Publisher** for `franky-agent`: on PyPI, add a pending publisher bound to
-  this repo, workflow `release.yml`, and environment `pypi`. The `pypi` job uses OIDC
-  (`id-token: write`) - no API token.
-- **Public GHCR packages**: set the `franky` and `franky-proxy` packages to public visibility
-  in the owning org's package settings, so the CLI pulls them with no `docker login`.
+PyPI publishing uses Trusted Publishing with OIDC. The repository stores no PyPI token.
 
-The CLI's default GHCR namespace (`DEFAULT_GHCR_REPO` in `franky/container.py`) must match the
-org that hosts the public packages. The release workflow pushes to
-`ghcr.io/${{ github.repository_owner }}`, so moving the repo to a new org retargets the images
-automatically; update `DEFAULT_GHCR_REPO` to the same org. Until they align, set
-`FRANKY_GHCR_REPO=ghcr.io/<owner>` to point the CLI at wherever the images currently live.
+## One-time setup
 
-## Image overrides for local dev
+- Register a PyPI trusted publisher for `franky-agent`, `release.yml`, and the `pypi` environment.
+- Make the `franky` and `franky-proxy` GHCR packages public.
+- Keep `DEFAULT_GHCR_REPO` aligned with the repository owner.
 
-Set `FRANKY_IMAGE` and `FRANKY_PROXY_IMAGE` to point at local builds to bypass GHCR entirely,
-or `FRANKY_GHCR_REPO` to retarget just the namespace (see `config.example.toml`, or run
-`franky config path`).
+The workflow derives its namespace from `github.repository_owner`. Set `FRANKY_GHCR_REPO` during a namespace migration.
 
-## Trust model for images
+## Image trust
 
-The CLI always resolves to the version-pinned tag (`ghcr.io/<owner>/franky:X.Y.Z`),
-not `:latest`. That tag is treated as immutable: once published it is never overwritten.
-`:latest` is a human convenience tag; the CLI never uses it.
+The CLI uses version-pinned image tags, never `latest`. Treat each published version tag as immutable.
+
+For local development, set `FRANKY_IMAGE` and `FRANKY_PROXY_IMAGE`. See [`config.example.toml`](../config.example.toml).
