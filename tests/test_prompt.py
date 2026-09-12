@@ -9,6 +9,7 @@ from franky.prompt import (
     build_prompt,
     build_replay_prompt,
     build_resume_prompt,
+    build_run_skill_prompt,
     build_setup_block,
     load_persona,
     task_slug,
@@ -534,3 +535,73 @@ def test_prompts_are_unchanged_without_an_operator_setup():
     assert build_resume_prompt(spec, branch="franky/t") == build_resume_prompt(
         spec, branch="franky/t", operator_setup=""
     )
+
+
+# ---------------------------------------------------------------------------
+# run-skill prompt
+# ---------------------------------------------------------------------------
+
+_NONCE = "deadbeefcafe1234"
+
+
+def _run_skill(**kwargs):
+    return build_run_skill_prompt("me/repo", "deploy", "staging abc1234", _NONCE, **kwargs)
+
+
+def test_run_skill_prompt_points_at_the_repos_own_skill_file():
+    text = _run_skill()
+    assert "me/repo" in text
+    assert ".claude/skills/deploy/SKILL.md" in text
+    assert "staging abc1234" in text
+    # A missing skill file must be reported as a FENCED proof failure, never improvised around.
+    assert f"PROOF {_NONCE} fail missing-skill" in text
+
+
+def test_run_skill_prompt_never_names_a_push_or_a_pr_creation_command():
+    """The container is read-only against GitHub - the prompt must not hand it those verbs."""
+    for text in (_run_skill(), _run_skill(push_branch="staging")):
+        assert "gh pr create" not in text
+        assert "git push" not in text
+
+
+def test_run_skill_prompt_names_the_push_branch_when_pushing():
+    text = _run_skill(push_branch="staging")
+    assert "`staging`" in text
+    assert "origin/staging" in text
+    assert "the host" in text.lower()
+
+
+def test_run_skill_prompt_says_nothing_reaches_the_remote_without_a_push_branch():
+    text = _run_skill()
+    assert "Nothing you do reaches the remote" in text
+    assert "origin/" not in text
+
+
+def test_run_skill_prompt_allows_a_local_merge_and_forbids_github_mutations():
+    text = _run_skill(push_branch="staging")
+    assert "A LOCAL `git merge` inside your own checkout IS allowed" in text
+    assert "Never create, merge, close, or approve a pull request" in text
+    assert "--force-with-lease" in text
+
+
+def test_run_skill_prompt_fences_the_proof_contract_with_the_nonce():
+    text = _run_skill()
+    assert f"`PROOF {_NONCE} ok <key=value ...>`" in text
+    assert f"`PROOF {_NONCE} fail <reason>`" in text
+    # The agent is told to RE-EMIT the skill's verdict, and never to fence quoted text.
+    assert "RE-EMIT" in text
+    assert "Never " in text and "quoting from a file" in text
+
+
+def test_run_skill_prompt_nonce_changes_with_the_run():
+    a = build_run_skill_prompt("me/repo", "deploy", "", "aaaaaaaa")
+    b = build_run_skill_prompt("me/repo", "deploy", "", "bbbbbbbb")
+    assert "PROOF aaaaaaaa ok" in a
+    assert "aaaaaaaa" not in b
+    assert a != b
+
+
+def test_run_skill_prompt_threads_the_operator_setup():
+    marker = "\nOperator setup (injected):\nMARKER\n"
+    assert marker in _run_skill(operator_setup=marker)
+    assert _run_skill() == _run_skill(operator_setup="")

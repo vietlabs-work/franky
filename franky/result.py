@@ -125,6 +125,9 @@ def build_result(
     checks: list | None = None,
     review_url: str | None = None,
     review_id: int | None = None,
+    proof: str | None = None,
+    proof_verdict: str | None = None,
+    pushed: dict | None = None,
 ) -> dict:
     """Shape the success/agent-result object emitted on stdout under `--json`.
 
@@ -135,7 +138,8 @@ def build_result(
     economics.Usage (input_tokens/output_tokens/cost_usd, each int|None / float|None). Status
     is one of: pr_opened | no_pr | agent_error | timeout | already_open | iterate_complete |
     replay_complete | review_published | review_complete | no_findings |
-    publish_blocked_stale_head | publish_failed.
+    publish_blocked_stale_head | publish_failed | proof_reported | no_proof | skill_failed |
+    push_refused | push_failed | workspace_unavailable.
 
     For the `already_open` status (idempotency short-circuit, no container ran) the caller
     passes the sentinels `duration=0.0` and `log_path=""` - there is no run to time or log.
@@ -160,6 +164,13 @@ def build_result(
     ran; `review_url`/`review_id` identify the GitHub review Franky posted, present only when
     `publish=True` actually posted one (never on a `--no-publish` run, which writes nothing to
     GitHub - see the `review-pr` command).
+
+    `proof_verdict`/`proof`/`pushed` are `run-skill`-only fields on the same "absent, not null"
+    pattern. `proof_verdict` is `ok` or `fail` from the agent's final NONCE-FENCED `PROOF` line
+    (an unfenced one - say, an example quoted out of the repo's own SKILL.md - never counts) and
+    `proof` is the redacted free text after it. `pushed` is `{branch, sha}` for the single
+    fast-forward branch the HOST pushed after a successful pass, present only when
+    `--push-branch` was given AND the push actually landed.
     """
     result = {
         "status": status,
@@ -194,6 +205,12 @@ def build_result(
         result["review_url"] = review_url
     if review_id is not None:
         result["review_id"] = review_id
+    if proof_verdict is not None:
+        result["proof_verdict"] = proof_verdict
+    if proof is not None:
+        result["proof"] = proof
+    if pushed is not None:
+        result["pushed"] = pushed
     return result
 
 

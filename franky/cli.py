@@ -14,9 +14,12 @@ import json
 import os
 import re
 import secrets
+import shutil
+import signal
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
 from collections.abc import Mapping
 from dataclasses import replace as dc_replace
@@ -28,7 +31,14 @@ import click
 from . import baseref, franky_version
 from .transcript import Transcript, Redactor, chunks, open_secure
 from ._install import detect_install
-from .config import GH_TOKEN_VAR, Config, load_config, redact, repo_allowed
+from .config import (
+    GH_TOKEN_VAR,
+    PUSH_TOKEN_VAR,
+    Config,
+    load_config,
+    redact,
+    repo_allowed,
+)
 from .decompose import build_plan_result, parse_decomposition
 from .diagnosis import build_diagnosis_result, parse_diagnosis
 from .economics import Usage, format_economics, parse_usage
@@ -44,12 +54,13 @@ from .container import (
     resolve_image,
     run_in_container,
 )
-from . import jobs, snapshot
+from . import jobs, push, snapshot
 from .container import container_running, deliver_steer, reap_run, run_names
 from .engine import (
     CODEX_SUBSCRIPTION_VAR,
     ENGINES,
     PI_PROVIDER_VARS,
+    parse_proof_line,
     codex_auth_volume,
     opencode_provider,
     resolve_engine,
@@ -83,14 +94,17 @@ from .prompt import (
     build_replay_prompt,
     build_resume_prompt,
     build_review_pr_prompt,
+    build_run_skill_prompt,
     build_setup_block,
     task_slug,
 )
 from .reviewpr import build_review_findings, parse_review_findings, render_review_body, review_event
 from .result import (
     EXIT_AGENT,
+    EXIT_DOCKER,
     EXIT_NETWORK,
     EXIT_SUCCESS,
+    EXIT_TASK_REJECTED,
     EXIT_TIMEOUT,
     EXIT_USAGE,
     AuthError,
@@ -122,6 +136,11 @@ from .userconfig import (
 # the bridge's own `_SHA_RE` shape check, which Franky re-validates independently since
 # this CLI is also reachable directly, not only via the bridge).
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+
+# Shape for `run-skill --skill` - a bare skill DIRECTORY name. Load-bearing path-injection
+# control: the name is interpolated straight into the `.claude/skills/<name>/SKILL.md` path
+# the agent is told to read, so no dot, slash, or traversal segment may pass.
+_SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?$")
 
 FRANKY_VERBOSE_VAR = "FRANKY_VERBOSE"
 # `franky gh` subprocess watchdog. A default cap honors the never-hang guarantee for the
@@ -1096,6 +1115,320 @@ def review_pr(
         ctx.exit(exc.code)
 
 
+@main.command("run-skill")
+@click.argument("args", nargs=-1, type=click.UNPROCESSED)
+@click.option("--repo", "repo", required=True, help="Target repo owner/repo (required).")
+@click.option(
+    "--skill",
+    "skill",
+    required=True,
+    help="Name of the skill to run from the target repo's .claude/skills/<name>/SKILL.md.",
+)
+@click.option(
+    "--push-branch",
+    "push_branch",
+    default=None,
+    help="After a successful run, push exactly this branch from the HOST, fast-forward only. "
+    f"Requires {PUSH_TOKEN_VAR} in the host env; that token never enters the container.",
+)
+@click.option(
+    "--require-ancestor",
+    "require_ancestor",
+    default=None,
+    help="Refuse the push unless this commit (7-40 hex chars) is an ancestor of the pushed "
+    "branch. Requires --push-branch.",
+)
+@click.option(
+    "--engine",
+    "engine",
+    default=None,
+    # Same registry-derived choice as `build` (see that command's note).
+    type=click.Choice(sorted(ENGINES)),
+    help="Engine override; else FRANKY_ENGINE, else pi.",
+)
+@click.option(
+    "--profile",
+    "profile_path_opt",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False),
+    help="Path to a profile.toml to inject operator files/MCP config into the container. "
+    "Auto-discovered from ~/.franky/profile.toml if present.",
+)
+@click.option(
+    "-v",
+    "--verbose",
+    "verbose",
+    is_flag=True,
+    default=False,
+    help="Stream raw agent output to stderr during the run (also: FRANKY_VERBOSE=1).",
+)
+@click.option(
+    "--json", "as_json", is_flag=True, help="Emit a single JSON result/error object on stdout."
+)
+@click.option(
+    "-q",
+    "--quiet",
+    "quiet",
+    is_flag=True,
+    help="Suppress progress + the update hint (implied by --json).",
+)
+@click.option(
+    "--max-duration",
+    "max_duration",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Abort the run after N seconds (default 1800).",
+)
+@click.pass_context
+def run_skill(
+    ctx: click.Context,
+    args: tuple[str, ...],
+    repo: str,
+    skill: str,
+    push_branch: str | None,
+    require_ancestor: str | None,
+    engine: str | None,
+    profile_path_opt: str | None,
+    verbose: bool,
+    as_json: bool,
+    quiet: bool,
+    max_duration: int | None,
+) -> None:
+    """Run an allowlisted repo's OWN skill in the sandbox, then optionally push one branch.
+
+    Example:
+      franky run-skill --repo you/repo --skill deploy --push-branch staging -- staging abc1234
+
+    The agent clones the repo, reads `.claude/skills/<SKILL>/SKILL.md` from that checkout, and
+    follows it with everything after `--` as its arguments. It stays READ-ONLY against GitHub:
+    the container's `GH_TOKEN` cannot write, and its prompt forbids pushing, merging, and
+    opening pull requests.
+
+    With --push-branch, Franky copies the finished workspace out of the container and pushes
+    that ONE branch itself, fast-forward only and never the repository's default branch, using
+    FRANKY_PUSH_TOKEN - a separate host-only credential that never reaches the container. That
+    token must be set or the command refuses (exit 3) before any container starts.
+
+    The agent's last stdout line is its verdict: `PROOF ok <k=v ...>` or `PROOF fail <reason>`.
+
+    --json emits one machine-readable result/error object on stdout (status proof_reported on
+    exit 0, plus proof_verdict/proof and, once pushed, `pushed`). Exit codes follow the
+    documented taxonomy (0 ok, 2 usage, 3 config, 4 task, 5 auth, 6 docker, 7 agent, 8 net,
+    9 timeout).
+    """
+    quiet = quiet or as_json
+    secrets = cfg_secrets_safe()
+    process_env = dict(os.environ)
+    bundle_dir: str | None = None
+    job_id: str | None = None
+    try:
+        if not quiet:
+            maybe_auto_update()
+
+        # --- Validation, ALL of it before any container starts ---
+        if not _SKILL_NAME_RE.match(skill or ""):
+            raise TaskRejected(
+                f"--skill {skill!r} is not a valid skill name (letters, digits, '-' and '_' "
+                "only; no dots, no slashes)"
+            )
+        if require_ancestor and not push_branch:
+            raise TaskRejected("--require-ancestor needs --push-branch (there is nothing to pin)")
+        if push_branch and not push.valid_branch(push_branch):
+            raise TaskRejected(f"--push-branch {push_branch!r} is not a branch name Franky pushes")
+        if require_ancestor and not push.valid_sha(require_ancestor):
+            raise TaskRejected(
+                f"--require-ancestor {require_ancestor!r} is not a valid git SHA (7-40 hex chars)"
+            )
+
+        # Same config-file injection as `build`/`iterate` (see build's WHY comment).
+        try:
+            load_config_file(os.environ)
+        except FrankyError:
+            raise
+        except ValueError as exc:
+            raise ConfigError(f"config file error: {exc}") from exc
+
+        try:
+            cfg = load_config(engine, os.environ)
+        except FrankyError:
+            raise
+        except ValueError as exc:
+            raise NetworkError(redact(str(exc), cfg_secrets_safe())) from exc
+        if not repo_allowed(repo, cfg.allowed_repos):
+            raise TaskRejected(f"repo '{repo}' is not in the allowlist - refusing")
+
+        # The push credential is host-only and fail-closed: refuse BEFORE spending a container on
+        # work whose whole point is a push that would then be impossible. It goes into
+        # `cfg.extra_secrets`, NOT `passthrough_env` - see config.PUSH_TOKEN_VAR - so it is
+        # redacted from every log, transcript, and result while remaining unable to reach the
+        # container's `-e` list.
+        push_token = (os.environ.get(PUSH_TOKEN_VAR) or "").strip() if push_branch else ""
+        if push_branch and not push_token:
+            raise ConfigError(
+                f"--push-branch needs {PUSH_TOKEN_VAR} in the host environment - refusing "
+                f"(a contents:write token for {repo} only; it never enters the container)"
+            )
+        if push_token:
+            cfg.extra_secrets.append(push_token)
+        secrets = cfg.secret_values()
+
+        franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
+        bundle, setup_block = _load_profile_bundle(profile_path_opt, process_env, secrets, cfg)
+        verbose = verbose or bool(os.environ.get(FRANKY_VERBOSE_VAR))
+        progress = None if (quiet and not verbose) else _make_progress(cfg.engine, verbose)
+
+        # Per-run nonce fencing the PROOF line, same anti-injection register as `plan`/`review-pr`:
+        # the agent READS SKILL.md, whose own example `PROOF ok ...` line lands in the transcript
+        # verbatim, so an unfenced sentinel would let quoted documentation declare success.
+        nonce = _make_nonce()
+        skill_args = " ".join(args).strip()[:PROSE_MAX_CHARS]
+        job_id = jobs.new_job_id()
+        _record_run_start(
+            job_id,
+            command="run-skill",
+            cfg=cfg,
+            repo=repo,
+            summary=f"skill {skill} {skill_args}".strip(),
+            branch=push_branch,
+        )
+        if not quiet:
+            click.echo(f"franky: job {job_id} started", err=True)
+
+        diagnostics: dict = {}
+        # Only a pushing run needs anything out of the container, and then only a git BUNDLE of
+        # the one branch - never a copy of the container-authored tree (see franky/push.py). The
+        # `gate` is what keeps a timed-out, errored, or failure-reporting run from producing one.
+        workspace_sink: dict | None = None
+        if push_branch:
+            bundle_dir = tempfile.mkdtemp(prefix="franky-bundle-")
+            workspace_sink = {
+                "dest": str(Path(bundle_dir) / "work.bundle"),
+                "branch": push_branch,
+                "gate": lambda out: (parse_proof_line(out, nonce) or ("fail", ""))[0] == "ok",
+            }
+
+        with _task_signal_reaper(job_id, armed=push_branch is not None):
+            code, output, duration = _run_pass(
+                cfg,
+                build_run_skill_prompt(
+                    repo,
+                    skill,
+                    skill_args,
+                    nonce,
+                    push_branch=push_branch,
+                    operator_setup=setup_block,
+                ),
+                franky_img,
+                proxy_img,
+                bundle,
+                progress=progress,
+                timeout=max_duration,
+                run_id=job_id,
+                diagnostics_sink=diagnostics,
+                workspace_sink=workspace_sink,
+            )
+
+        usage = _parse_usage_safe(output)
+        econ = _economics_line(usage, duration, secrets)
+        if not as_json:
+            click.echo(econ, err=True)
+        log_path = _write_log(output, secrets, footer=econ, run_id=job_id, env=os.environ)
+
+        proof = parse_proof_line(output, nonce)
+        pushed: dict | None = None
+        proof_verdict = proof[0] if proof else None
+        proof_text = redact(proof[1], secrets) if proof else None
+
+        # Timeout first (124 is nonzero), then a nonzero exit, then the agent's own verdict. A run
+        # with no fenced proof line is a failure: Franky never infers success from silence.
+        if code == CONTAINER_TIMEOUT_CODE:
+            status, reason, exit_code = "timeout", "exceeded max-duration", EXIT_TIMEOUT
+        elif code != 0:
+            status, reason, exit_code = "agent_error", f"agent exited {code}", EXIT_AGENT
+        elif proof is None:
+            status = "no_proof"
+            reason = f"agent reported no PROOF line - see the redacted log ({log_path})"
+            exit_code = EXIT_AGENT
+        elif proof_verdict == "fail":
+            status = "skill_failed"
+            reason = (
+                f"skill reported failure: {proof_text}" if proof_text else "skill reported failure"
+            )
+            exit_code = EXIT_AGENT
+        elif not push_branch:
+            status, reason, exit_code = "proof_reported", "skill reported success", EXIT_SUCCESS
+        else:
+            # PROOF ok + --push-branch: the fixed HOST push, from the sandbox-produced bundle. The
+            # task container is already reaped; nothing from its checkout runs here.
+            sink = workspace_sink or {}
+            if not sink.get("bundled"):
+                status = "workspace_unavailable"
+                detail = redact(str(sink.get("detail") or ""), secrets)[:500]
+                reason = "could not bundle the finished branch out of the sandbox" + (
+                    f": {detail}" if detail else ""
+                )
+                exit_code = EXIT_DOCKER
+            else:
+                outcome = push.push_branch(
+                    bundle_path=sink["dest"],
+                    repo=repo,
+                    branch=push_branch,
+                    push_token=push_token,
+                    read_env={GH_TOKEN_VAR: os.environ.get(GH_TOKEN_VAR, "")},
+                    require_ancestor=require_ancestor,
+                    secrets=secrets,
+                )
+                reason = redact(outcome["reason"], secrets)
+                if outcome["status"] == "pushed":
+                    status, exit_code = "proof_reported", EXIT_SUCCESS
+                    pushed = {"branch": outcome["branch"], "sha": outcome["sha"]}
+                elif outcome["status"] == "push_refused":
+                    status, exit_code = "push_refused", EXIT_TASK_REJECTED
+                elif outcome["status"] == "workspace_unavailable":
+                    status, exit_code = "workspace_unavailable", EXIT_DOCKER
+                else:
+                    status, exit_code = "push_failed", EXIT_NETWORK
+
+        _record_run_end(
+            job_id,
+            status=status,
+            pr_url=None,
+            usage=usage,
+            duration=duration,
+            exit_code=exit_code,
+            log_path=log_path,
+            diagnostics=diagnostics,
+        )
+        result = build_result(
+            status=status,
+            pr_url=None,
+            reason=reason,
+            exit_code=exit_code,
+            usage=usage,
+            duration=duration,
+            log_path=str(log_path),
+            engine=cfg.engine.name,
+            repo=repo,
+            branch=push_branch,
+            job_id=job_id,
+            proof=proof_text,
+            proof_verdict=proof_verdict,
+            pushed=pushed,
+        )
+        _emit_result(result, as_json, secrets, pr_url=None, status=status, quiet=quiet)
+        if not as_json and not quiet:
+            click.echo(redact(f"franky: run-skill {status} - {reason}", secrets), err=True)
+        ctx.exit(exit_code)
+    except FrankyError as exc:
+        _emit_error(exc, as_json, secrets)
+        ctx.exit(exc.code)
+    finally:
+        # The bundle is container-derived bytes staged on the host; it exists only for the push
+        # above and is removed whatever the outcome.
+        if bundle_dir:
+            shutil.rmtree(bundle_dir, ignore_errors=True)
+
+
 @main.command()
 @click.argument("task_input", nargs=-1, required=True)
 @click.option(
@@ -1240,6 +1573,55 @@ def plan(
         ctx.exit(exc.code)
 
 
+class _task_signal_reaper:
+    """Reap the task container on SIGTERM/SIGINT for the duration of a pushing `run-skill` run.
+
+    WHY only here: every other command starts the task with `--rm`, so Docker removes it when it
+    stops. A `--push-branch` run drops `--rm` (the stopped container's volumes must survive long
+    enough for the sandboxed bundler to read them), which means a host process killed mid-run
+    would leave a stopped container behind - and its environment holds the run's tokens. These
+    handlers close the common cases; a SIGKILL cannot be caught, which the README documents.
+
+    Restores the previous handlers on exit, and degrades to a no-op off the main thread (where
+    `signal.signal` raises) so a library caller is never broken by it.
+    """
+
+    def __init__(self, job_id: str, *, armed: bool = True) -> None:
+        self._job_id = job_id
+        self._armed = armed
+        self._previous: dict = {}
+
+    def _handle(self, signum, _frame) -> None:
+        try:
+            reap_run(self._job_id)
+        except Exception:
+            pass
+        # Restore and re-raise so the process still dies of the signal it was sent.
+        previous = self._previous.pop(signum, signal.SIG_DFL)
+        try:
+            signal.signal(signum, previous)
+            os.kill(os.getpid(), signum)
+        except Exception:
+            raise SystemExit(EXIT_AGENT) from None
+
+    def __enter__(self):
+        if self._armed:
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                try:
+                    self._previous[sig] = signal.signal(sig, self._handle)
+                except (ValueError, OSError, AttributeError):
+                    pass  # not the main thread, or no such signal on this platform
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        for sig, previous in self._previous.items():
+            try:
+                signal.signal(sig, previous)
+            except (ValueError, OSError):
+                pass
+        self._previous.clear()
+
+
 def _make_nonce() -> str:
     """A per-run hex nonce for the `plan` sentinel fence.
 
@@ -1319,6 +1701,7 @@ def _run_pass(
     run_id: str | None = None,
     diagnostics_sink: dict | None = None,
     snapshot_sink: dict | None = None,
+    workspace_sink: dict | None = None,
     resume_workspace: str | None = None,
 ) -> tuple[int, str, float]:
     """Run one container pass for `prompt` and return (exit_code, output, duration_secs).
@@ -1335,6 +1718,8 @@ def _run_pass(
     docstring; None (the default) means no capture, byte-identical to pre-#69 behavior.
     `snapshot_sink`/`resume_workspace` (issue #71) are likewise forwarded unchanged - a
     snapshot-on-timeout sink and a workspace-to-restore path respectively; both None by default.
+    `workspace_sink` (`run-skill --push-branch`) is forwarded the same way - an extract-on-any-exit
+    sink; None by default, so every other command is unchanged.
     """
     inner_argv = cfg.engine.inner_argv(prompt, model=cfg.model)
     for override in cfg.codex_mcp_overrides:
@@ -1353,6 +1738,7 @@ def _run_pass(
         run_id=run_id,
         diagnostics_sink=diagnostics_sink,
         snapshot_sink=snapshot_sink,
+        workspace_sink=workspace_sink,
         resume_workspace=resume_workspace,
         **extra,
     )

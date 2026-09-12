@@ -3873,3 +3873,588 @@ def test_review_pr_matches_bridge_argv_contract(monkeypatch):
     assert data["review_id"] == 555
     assert data["repo"] == "me/repo"
     assert isinstance(data["job_id"], str) and data["job_id"]
+
+
+# ---------------------------------------------------------------------------
+# run-skill (`franky run-skill`)
+# ---------------------------------------------------------------------------
+
+PUSH_TOKEN = "ghp_push_token_value"
+READ_TOKEN = "ghp_read_only_token"
+NONCE = "deadbeefcafe1234"
+PUSHED_SHA = "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2"
+
+
+def _run_skill_env(extra=None):
+    env = {
+        "FRANKY_ALLOWED_REPOS": "me/repo",
+        "GH_TOKEN": READ_TOKEN,
+        "OPENROUTER_API_KEY": "sk-or-fake",
+    }
+    if extra:
+        env.update(extra)
+    return env
+
+
+def _run_skill_setup(monkeypatch, *, output=None, code=0, env=None, bundled=True, seen=None):
+    """Hermetic run-skill wiring: no docker, no git, a fixed nonce. Returns the capture dict."""
+    seen = {} if seen is None else seen
+    output = f"PROOF {NONCE} ok x=1" if output is None else output
+    monkeypatch.setattr(cli.os, "environ", env if env is not None else _run_skill_env())
+    monkeypatch.setattr(cli, "maybe_auto_update", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    monkeypatch.setattr(cli, "_make_nonce", lambda: NONCE)
+
+    def fake_run(cfg, inner_argv, *a, **k):
+        seen["ran"] = True
+        seen["passthrough"] = dict(cfg.passthrough_env)
+        seen["secret_values"] = list(cfg.secret_values())
+        seen["prompt"] = " ".join(inner_argv)
+        sink = k.get("workspace_sink")
+        seen["workspace_sink"] = sink
+        if sink is not None:
+            # Mirror run_in_container: the gate decides, then the bundle file appears.
+            gate = sink.get("gate")
+            sink["bundled"] = bool(bundled and code == 0 and (gate is None or gate(output)))
+            seen["gate_passed"] = sink["bundled"]
+            if sink["bundled"]:
+                Path(sink["dest"]).write_bytes(b"fake-bundle-bytes")
+            else:
+                sink["detail"] = "expected exactly one checkout under /work, found 0"
+        return code, output
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+    return seen
+
+
+def _git_runner(calls, *, overrides=None, default_branch="main", remote_sha=None):
+    """A fake subprocess.run for the host push: records every argv + env, no git involved."""
+    overrides = overrides or {}
+    state = {"pushed": False}
+
+    def runner(argv, **kwargs):
+        calls.append({"argv": list(argv), "env": kwargs.get("env") or {}})
+        joined = " ".join(str(a) for a in argv)
+        for key, rc in overrides.items():
+            if key in joined:
+                return subprocess.CompletedProcess(argv, rc, stdout="", stderr="denied")
+        if argv[:3] == ["git", "init", "--bare"]:
+            root = Path(argv[-1])
+            (root / "objects").mkdir(parents=True)
+            (root / "refs").mkdir()
+            (root / "HEAD").write_text("ref: refs/heads/main\n")
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        if argv[:2] == ["gh", "api"]:
+            return subprocess.CompletedProcess(argv, 0, stdout=default_branch + "\n", stderr="")
+        if "ls-remote" in argv:
+            sha = PUSHED_SHA if state["pushed"] else remote_sha
+            out = f"{sha}\trefs/heads/staging\n" if sha else ""
+            return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+        if "push" in argv:
+            state["pushed"] = True
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        if "rev-parse" in argv:
+            return subprocess.CompletedProcess(argv, 0, stdout=PUSHED_SHA + "\n", stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    return runner
+
+
+def _inject_git_runner(monkeypatch, calls, **kwargs):
+    """Route the REAL push gates through a fake runner instead of the host's git/gh."""
+    real = cli.push.push_branch
+    runner = _git_runner(calls, **kwargs)
+    monkeypatch.setattr(cli.push, "push_branch", lambda **kw: real(**{**kw, "runner": runner}))
+
+
+def _push_argv(args):
+    return [
+        "run-skill",
+        "--repo",
+        "me/repo",
+        "--skill",
+        "deploy",
+        "--push-branch",
+        "staging",
+        *args,
+    ]
+
+
+def test_run_skill_help_shows_the_flags():
+    res = CliRunner().invoke(cli.main, ["run-skill", "--help"])
+    assert res.exit_code == 0
+    assert "--skill" in res.output
+    assert "--push-branch" in res.output
+    assert "--require-ancestor" in res.output
+
+
+def test_run_skill_happy_path_without_push(monkeypatch):
+    seen = _run_skill_setup(monkeypatch)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(
+            cli.main,
+            ["run-skill", "--repo", "me/repo", "--skill", "deploy", "--json", "--", "staging"],
+        )
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.stdout)
+    assert data["status"] == "proof_reported"
+    assert data["proof_verdict"] == "ok"
+    assert data["proof"] == "x=1"
+    assert data["pr_url"] is None
+    assert "pushed" not in data
+    # A report-only run asks the container for nothing at all.
+    assert seen["workspace_sink"] is None
+
+
+def test_run_skill_happy_path_with_push(monkeypatch):
+    env = _run_skill_env({cli.PUSH_TOKEN_VAR: PUSH_TOKEN})
+    _run_skill_setup(monkeypatch, env=env)
+    calls = []
+    _inject_git_runner(monkeypatch, calls, remote_sha=PUSHED_SHA)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(
+            cli.main,
+            _push_argv(["--require-ancestor", "abc1234", "--json", "--", "staging", "abc1234"]),
+        )
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.stdout)
+    assert data["status"] == "proof_reported"
+    assert data["pushed"] == {"branch": "staging", "sha": PUSHED_SHA}
+    assert data["branch"] == "staging"
+
+    joined = [" ".join(str(a) for a in c["argv"]) for c in calls]
+    assert any("init --bare --template=" in c for c in joined)
+    assert any("bundle verify" in c for c in joined)
+    assert any("gh api repos/me/repo --jq .default_branch" in c for c in joined)
+    assert any("merge-base --is-ancestor abc1234 refs/heads/staging" in c for c in joined)
+    assert any(
+        "fetch https://github.com/me/repo.git +refs/heads/staging:refs/remotes/origin/staging" in c
+        for c in joined
+    )
+
+    push_calls = [c for c in calls if "push" in c["argv"]]
+    assert len(push_calls) == 1
+    assert push_calls[0]["argv"][-3:] == [
+        "push",
+        "https://github.com/me/repo.git",
+        f"{PUSHED_SHA}:refs/heads/staging",
+    ]
+    assert "push.followTags=false" in push_calls[0]["argv"]
+    assert not any("--force" in str(a) for a in push_calls[0]["argv"])
+    # The push token reaches git ONLY through the child env, never an argv, never the output.
+    assert push_calls[0]["env"]["GH_TOKEN"] == PUSH_TOKEN
+    assert not any(PUSH_TOKEN in str(a) for c in calls for a in c["argv"])
+    assert PUSH_TOKEN not in res.output
+
+
+def test_run_skill_host_git_never_gets_the_ambient_environment(monkeypatch):
+    """The operator's whole session (engine keys, the read token) must not reach these calls."""
+    env = _run_skill_env({cli.PUSH_TOKEN_VAR: PUSH_TOKEN, "SOME_OTHER_SECRET": "leak-me"})
+    _run_skill_setup(monkeypatch, env=env)
+    calls = []
+    _inject_git_runner(monkeypatch, calls, remote_sha=PUSHED_SHA)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, _push_argv(["--json"]))
+    assert res.exit_code == 0, res.output
+    allowed = {
+        "PATH",
+        "HOME",
+        "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_TERMINAL_PROMPT",
+        "LANG",
+        "GH_TOKEN",
+    }
+    git_calls = [c for c in calls if c["argv"][0] in ("git", "gh")]
+    assert git_calls
+    for call in git_calls:
+        assert set(call["env"]) <= allowed, call["argv"]
+        assert "OPENROUTER_API_KEY" not in call["env"]
+        assert "leak-me" not in call["env"].values()
+
+
+def test_run_skill_never_reads_a_remote_url_or_head_from_the_container(monkeypatch):
+    """The destination and the default branch are host-derived; the checkout is not consulted."""
+    env = _run_skill_env({cli.PUSH_TOKEN_VAR: PUSH_TOKEN})
+    _run_skill_setup(monkeypatch, env=env)
+    calls = []
+    _inject_git_runner(monkeypatch, calls, remote_sha=PUSHED_SHA)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, _push_argv(["--json"]))
+    assert res.exit_code == 0, res.output
+    joined = " ".join(" ".join(str(a) for a in c["argv"]) for c in calls)
+    assert "remote get-url" not in joined
+    assert "symbolic-ref" not in joined
+    assert "refs/remotes/origin/HEAD" not in joined
+    # And every host git command that names a repository names the HOST-owned one - never the
+    # container's checkout. (`git -C <dir>` is the only way a repo is selected here.)
+    targets = [c["argv"][c["argv"].index("-C") + 1] for c in calls if "-C" in c["argv"]]
+    assert targets
+    for target in targets:
+        assert "franky-push-" in target and target.endswith("trusted.git"), target
+
+
+def test_run_skill_push_token_never_reaches_the_container(monkeypatch):
+    """The push credential must not be in passthrough_env, so it can never become a `-e` flag."""
+    from franky.container import build_docker_argv
+
+    env = _run_skill_env({cli.PUSH_TOKEN_VAR: PUSH_TOKEN})
+    seen = _run_skill_setup(monkeypatch, env=env)
+    _inject_git_runner(monkeypatch, [], remote_sha=PUSHED_SHA)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, _push_argv([]))
+    assert res.exit_code == 0, res.output
+    passthrough = seen["passthrough"]
+    assert cli.PUSH_TOKEN_VAR not in passthrough
+    assert PUSH_TOKEN not in passthrough.values()
+    # The argv the container would actually start with carries neither the name nor the value.
+    argv = build_docker_argv("franky", passthrough, ["pi"])
+    e_names = [argv[i + 1] for i, t in enumerate(argv) if t == "-e"]
+    assert cli.PUSH_TOKEN_VAR not in e_names
+    assert not any(PUSH_TOKEN in tok for tok in argv)
+    assert PUSH_TOKEN not in seen["prompt"]
+    # But it IS in the redaction set, so every log/transcript/result masks it.
+    assert PUSH_TOKEN in seen["secret_values"]
+
+
+def test_push_token_is_a_secret_key_but_is_not_settable():
+    """`franky config set` must refuse to persist a contents:write token to disk."""
+    from franky.userconfig import SECRET_KEYS, SETTABLE_KEYS
+
+    assert cli.PUSH_TOKEN_VAR in SECRET_KEYS
+    assert cli.PUSH_TOKEN_VAR not in SETTABLE_KEYS
+
+
+def test_run_skill_missing_push_token_exits_3_before_any_container(monkeypatch):
+    seen = _run_skill_setup(monkeypatch)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, _push_argv(["--json"]))
+    assert res.exit_code == 3, res.output
+    error = json.loads(res.stdout)["error"]
+    assert error["kind"] == "config_error"
+    assert cli.PUSH_TOKEN_VAR in error["message"]
+    assert "ran" not in seen
+
+
+def test_run_skill_off_allowlist_repo_exits_4(monkeypatch):
+    seen = _run_skill_setup(monkeypatch)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(
+            cli.main, ["run-skill", "--repo", "attacker/repo", "--skill", "deploy", "--json"]
+        )
+    assert res.exit_code == 4, res.output
+    assert json.loads(res.stdout)["error"]["kind"] == "task_rejected"
+    assert "ran" not in seen
+
+
+@pytest.mark.parametrize("skill", ["../x", "a.b", "a/b", "..", "-x", "a b", ""])
+def test_run_skill_rejects_a_bad_skill_name(monkeypatch, skill):
+    seen = _run_skill_setup(monkeypatch)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(
+            cli.main, ["run-skill", "--repo", "me/repo", "--skill", skill, "--json"]
+        )
+    assert res.exit_code == 4, res.output
+    assert json.loads(res.stdout)["error"]["kind"] == "task_rejected"
+    assert "ran" not in seen
+
+
+def test_run_skill_require_ancestor_without_push_branch_exits_4(monkeypatch):
+    """Documented choice: a flag combination Franky refuses is a task rejection (exit 4)."""
+    seen = _run_skill_setup(monkeypatch)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(
+            cli.main,
+            [
+                "run-skill",
+                "--repo",
+                "me/repo",
+                "--skill",
+                "deploy",
+                "--require-ancestor",
+                "abc1234",
+                "--json",
+            ],
+        )
+    assert res.exit_code == 4, res.output
+    assert "--push-branch" in json.loads(res.stdout)["error"]["message"]
+    assert "ran" not in seen
+
+
+@pytest.mark.parametrize("branch", ["HEAD", "--force", "a..b", "-x"])
+def test_run_skill_bad_push_branch_exits_4(monkeypatch, branch):
+    seen = _run_skill_setup(monkeypatch)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(
+            cli.main,
+            [
+                "run-skill",
+                "--repo",
+                "me/repo",
+                "--skill",
+                "deploy",
+                "--push-branch",
+                branch,
+                "--json",
+            ],
+        )
+    assert res.exit_code == 4, res.output
+    assert "ran" not in seen
+
+
+# --- proof gating -----------------------------------------------------------
+
+
+def test_run_skill_ignores_an_unfenced_proof_from_the_skill_file(monkeypatch):
+    """SKILL.md's own example `PROOF ok` must never declare success, and must never push."""
+    env = _run_skill_env({cli.PUSH_TOKEN_VAR: PUSH_TOKEN})
+    seen = _run_skill_setup(
+        monkeypatch,
+        env=env,
+        output=(
+            "reading .claude/skills/deploy/SKILL.md\n"
+            "End your run with: PROOF ok sha=<sha> branch=<branch>\n"
+            "DEPLOY_PROOF ok sha=abc1234\n"
+            "I could not finish: the merge conflicted.\n"
+        ),
+    )
+    calls = []
+    _inject_git_runner(monkeypatch, calls, remote_sha=PUSHED_SHA)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, _push_argv(["--json"]))
+    assert res.exit_code == 7, res.output
+    data = json.loads(res.stdout)
+    assert data["status"] == "no_proof"
+    assert "proof_verdict" not in data
+    assert seen["gate_passed"] is False
+    assert calls == []
+
+
+def test_run_skill_proof_fail_is_skill_failed_and_never_bundles_or_pushes(monkeypatch):
+    env = _run_skill_env({cli.PUSH_TOKEN_VAR: PUSH_TOKEN})
+    seen = _run_skill_setup(monkeypatch, output=f"working\nPROOF {NONCE} fail conflict", env=env)
+    calls = []
+    _inject_git_runner(monkeypatch, calls, remote_sha=PUSHED_SHA)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, _push_argv(["--json"]))
+    assert res.exit_code == 7, res.output
+    data = json.loads(res.stdout)
+    assert data["status"] == "skill_failed"
+    assert data["proof_verdict"] == "fail"
+    assert data["proof"] == "conflict"
+    assert "pushed" not in data
+    assert seen["gate_passed"] is False
+    assert calls == []
+
+
+def test_run_skill_nonzero_exit_never_bundles_or_pushes(monkeypatch):
+    env = _run_skill_env({cli.PUSH_TOKEN_VAR: PUSH_TOKEN})
+    seen = _run_skill_setup(monkeypatch, output=f"PROOF {NONCE} ok x=1", code=3, env=env)
+    calls = []
+    _inject_git_runner(monkeypatch, calls, remote_sha=PUSHED_SHA)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, _push_argv(["--json"]))
+    assert res.exit_code == 7, res.output
+    assert json.loads(res.stdout)["status"] == "agent_error"
+    assert seen["workspace_sink"]["bundled"] is False
+    assert calls == []
+
+
+def test_run_skill_timeout_maps_to_exit_9_and_never_pushes(monkeypatch):
+    env = _run_skill_env({cli.PUSH_TOKEN_VAR: PUSH_TOKEN})
+    _run_skill_setup(monkeypatch, output="killed", code=cli.CONTAINER_TIMEOUT_CODE, env=env)
+    calls = []
+    _inject_git_runner(monkeypatch, calls, remote_sha=PUSHED_SHA)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, _push_argv(["--json"]))
+    assert res.exit_code == 9, res.output
+    assert json.loads(res.stdout)["status"] == "timeout"
+    assert calls == []
+
+
+# --- push outcomes ----------------------------------------------------------
+
+
+def test_run_skill_unbundleable_workspace_exits_6(monkeypatch):
+    env = _run_skill_env({cli.PUSH_TOKEN_VAR: PUSH_TOKEN})
+    _run_skill_setup(monkeypatch, env=env, bundled=False)
+    calls = []
+    _inject_git_runner(monkeypatch, calls, remote_sha=PUSHED_SHA)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, _push_argv(["--json"]))
+    assert res.exit_code == 6, res.output
+    data = json.loads(res.stdout)
+    assert data["status"] == "workspace_unavailable"
+    assert "found 0" in data["reason"]
+    assert calls == []
+
+
+@pytest.mark.parametrize(
+    "kwargs,fragment",
+    [
+        ({"default_branch": "staging"}, "default branch"),
+        ({"overrides": {"gh api": 1}}, "default branch"),
+        (
+            {
+                "overrides": {"merge-base --is-ancestor refs/remotes/origin/staging": 1},
+                "remote_sha": PUSHED_SHA,
+            },
+            "fast-forward",
+        ),
+        ({"overrides": {"merge-base --is-ancestor abc1234": 1}}, "ancestor"),
+    ],
+)
+def test_run_skill_push_refused_exits_4(monkeypatch, kwargs, fragment):
+    env = _run_skill_env({cli.PUSH_TOKEN_VAR: PUSH_TOKEN})
+    _run_skill_setup(monkeypatch, env=env)
+    calls = []
+    _inject_git_runner(monkeypatch, calls, **kwargs)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, _push_argv(["--require-ancestor", "abc1234", "--json"]))
+    assert res.exit_code == 4, res.output
+    data = json.loads(res.stdout)
+    assert data["status"] == "push_refused"
+    assert fragment in data["reason"]
+    assert "pushed" not in data
+    assert not any("push" in c["argv"] for c in calls)
+
+
+def test_run_skill_github_rejection_is_push_refused_exit_4(monkeypatch):
+    env = _run_skill_env({cli.PUSH_TOKEN_VAR: PUSH_TOKEN})
+    _run_skill_setup(monkeypatch, env=env)
+    calls = []
+    real = cli.push.push_branch
+    base = _git_runner(calls, remote_sha=PUSHED_SHA)
+
+    def runner_fn(argv, **kwargs):
+        if "push" in argv and "ls-remote" not in argv:
+            calls.append({"argv": list(argv), "env": kwargs.get("env") or {}})
+            return subprocess.CompletedProcess(
+                argv, 1, stdout="", stderr="! [remote rejected] (protected branch hook declined)"
+            )
+        return base(argv, **kwargs)
+
+    monkeypatch.setattr(cli.push, "push_branch", lambda **kw: real(**{**kw, "runner": runner_fn}))
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, _push_argv(["--json"]))
+    assert res.exit_code == 4, res.output
+    data = json.loads(res.stdout)
+    assert data["status"] == "push_refused"
+    assert "protected branch" in data["reason"]
+
+
+def test_run_skill_transport_failure_is_push_failed_exit_8(monkeypatch):
+    env = _run_skill_env({cli.PUSH_TOKEN_VAR: PUSH_TOKEN})
+    _run_skill_setup(monkeypatch, env=env)
+    calls = []
+    real = cli.push.push_branch
+    base = _git_runner(calls, remote_sha=PUSHED_SHA)
+
+    def runner_fn(argv, **kwargs):
+        if "push" in argv and "ls-remote" not in argv:
+            calls.append({"argv": list(argv), "env": kwargs.get("env") or {}})
+            return subprocess.CompletedProcess(
+                argv, 1, stdout="", stderr=f"fatal: unable to access (token {PUSH_TOKEN})"
+            )
+        return base(argv, **kwargs)
+
+    monkeypatch.setattr(cli.push, "push_branch", lambda **kw: real(**{**kw, "runner": runner_fn}))
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, _push_argv(["--json"]))
+    assert res.exit_code == 8, res.output
+    data = json.loads(res.stdout)
+    assert data["status"] == "push_failed"
+    assert PUSH_TOKEN not in res.output
+    assert "***REDACTED***" in data["reason"]
+
+
+def test_run_skill_secret_scan_finding_refuses_the_push(monkeypatch):
+    env = _run_skill_env({cli.PUSH_TOKEN_VAR: PUSH_TOKEN})
+    _run_skill_setup(monkeypatch, env=env)
+    monkeypatch.setattr(
+        cli.push.snapshot,
+        "verify_no_secrets",
+        lambda *a, **k: ["secret value in git object content (trusted.git)"],
+    )
+    calls = []
+    _inject_git_runner(monkeypatch, calls, remote_sha=PUSHED_SHA)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, _push_argv(["--json"]))
+    assert res.exit_code == 4, res.output
+    data = json.loads(res.stdout)
+    assert data["status"] == "push_refused"
+    assert "secret scan" in data["reason"]
+    assert not any("push" in c["argv"] for c in calls)
+
+
+def test_run_skill_cleans_up_the_bundle(monkeypatch):
+    env = _run_skill_env({cli.PUSH_TOKEN_VAR: PUSH_TOKEN})
+    seen = _run_skill_setup(monkeypatch, env=env)
+    _inject_git_runner(monkeypatch, [], remote_sha=PUSHED_SHA)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, _push_argv([]))
+    assert res.exit_code == 0, res.output
+    # Container-derived bytes must not outlive the command.
+    assert not Path(seen["workspace_sink"]["dest"]).exists()
+
+
+def test_run_skill_arms_a_signal_reaper_only_for_a_pushing_run(monkeypatch):
+    """A pushing run drops --rm, so a caught SIGTERM/SIGINT must still reap the task."""
+    import signal as signal_mod
+
+    installed = []
+    monkeypatch.setattr(
+        cli.signal, "signal", lambda sig, handler: installed.append((sig, handler)) or None
+    )
+    reaped = []
+    monkeypatch.setattr(cli, "reap_run", lambda job_id: reaped.append(job_id))
+
+    with cli._task_signal_reaper("job123", armed=False):
+        pass
+    assert installed == []
+
+    with cli._task_signal_reaper("job123", armed=True) as guard:
+        signals = {sig for sig, _handler in installed}
+        assert signal_mod.SIGTERM in signals and signal_mod.SIGINT in signals
+        handler = next(h for s, h in installed if s == signal_mod.SIGTERM)
+        # The handler reaps the task container before letting the process die.
+        with pytest.raises(SystemExit):
+            monkeypatch.setattr(cli.os, "kill", lambda *a: (_ for _ in ()).throw(OSError("no")))
+            handler(signal_mod.SIGTERM, None)
+        assert reaped == ["job123"]
+        assert guard is not None

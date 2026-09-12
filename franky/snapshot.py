@@ -344,15 +344,37 @@ def scrub_workspace(root: Path, secrets: list[str]) -> None:
                 _redact_file(path, value_bytes)
 
 
+def _is_bare_repo(root: Path) -> bool:
+    """True iff `root` IS a bare git repository (its own object store, no work tree).
+
+    Used by `verify_no_secrets` so the same fail-closed scan can be pointed at the host-owned
+    bare repo a `run-skill` push is staged in (`franky/push.py`), where the store is the root
+    itself and there is no `.git` directory to find. Deliberately narrow - an object store, a
+    HEAD file, and NO `.git` - so an ordinary work tree can never be mistaken for one.
+    """
+    objects = root / "objects"
+    return (
+        objects.is_dir()
+        and not objects.is_symlink()
+        and (root / "HEAD").is_file()
+        and not (root / ".git").exists()
+    )
+
+
 def _iter_object_stores(root: Path):
     """Yield `(label, git_dir)` for every git object store under root that `git cat-file` must
     decompress-verify: each top-level `.git` dir PLUS every submodule store beneath it.
+
+    A BARE root is its own single store (see `_is_bare_repo`); a work tree is walked as before.
 
     WHY submodules need their own entry: a submodule's objects live in `.git/modules/<name>/`,
     which is NOT itself named `.git`, so `_iter_git_dirs` misses it entirely. A secret committed
     into a submodule's history would then ride into the tar unverified. We find every dir under a
     `.git/modules` tree that has its own `objects/` store (handles nested submodules too) and
     verify each. Symlinked dirs are skipped throughout (never escape `root`)."""
+    if _is_bare_repo(root):
+        yield (root.name, root)
+        return
     for git_dir in _iter_git_dirs(root):
         yield (f"{git_dir.parent.name}/.git", git_dir)
         modules = git_dir / "modules"
@@ -390,6 +412,10 @@ def verify_no_secrets(root: Path, secrets: list[str], runner=subprocess.run) -> 
     """
     findings: list[str] = []
     value_bytes = [s.encode("utf-8") for s in secrets if s]
+    # In a BARE repo every file IS a git internal, so the pattern scan applies to `config` only -
+    # exactly the work-tree rule, which exempts object stores (they hold committed test fixtures,
+    # and packfiles are compressed anyway; the object-content scan below is what covers them).
+    bare = _is_bare_repo(root)
 
     # Scan all raw values; scan patterns in working files and git configuration.
     try:
@@ -400,7 +426,7 @@ def verify_no_secrets(root: Path, secrets: list[str], runner=subprocess.run) -> 
             with path.open("rb") as stream:
                 if _contains_values(stream, value_bytes):
                     return [f"secret value survived in {rel}"]
-                if not _is_under_git(path, root) or path.name == "config":
+                if (not bare and not _is_under_git(path, root)) or path.name == "config":
                     stream.seek(0)
                     if _has_pattern(stream):
                         return [f"credential pattern in {rel}"]
