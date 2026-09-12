@@ -13,8 +13,6 @@ from franky.engine import (
     PI_PROVIDER_VARS,
     ClaudeEngine,
     CodexEngine,
-    parse_proof_line,
-    proof_pattern,
     Engine,
     OpenCodeEngine,
     PiEngine,
@@ -727,99 +725,3 @@ def test_codex_auth_volume_rejects_empty_string():
 def test_codex_auth_volume_rejects_trailing_newline():
     with pytest.raises(ValueError, match=FRANKY_CODEX_AUTH_VOLUME_VAR):
         codex_auth_volume({FRANKY_CODEX_AUTH_VOLUME_VAR: "myvol\n"})
-
-
-# ---------------------------------------------------------------------------
-# PROOF line parsing (`franky run-skill`)
-# ---------------------------------------------------------------------------
-
-NONCE = "deadbeefcafe1234"
-
-
-def test_parse_proof_line_reads_a_fenced_last_line():
-    assert parse_proof_line(f"working...\nPROOF {NONCE} ok sha=abc1234 branch=staging", NONCE) == (
-        "ok",
-        "sha=abc1234 branch=staging",
-    )
-
-
-def test_parse_proof_line_accepts_the_deploy_proof_alias():
-    assert parse_proof_line(f"DEPLOY_PROOF {NONCE} ok sha=abc1234", NONCE) == ("ok", "sha=abc1234")
-
-
-def test_parse_proof_line_reads_fail_with_a_reason():
-    assert parse_proof_line(f"PROOF {NONCE} fail conflict", NONCE) == ("fail", "conflict")
-
-
-def test_parse_proof_line_keeps_the_last_match():
-    out = f"PROOF {NONCE} ok early=1\nmore work\nPROOF {NONCE} fail conflict"
-    assert parse_proof_line(out, NONCE) == ("fail", "conflict")
-
-
-def test_parse_proof_line_reads_a_json_string_leaf():
-    event = json.dumps(
-        {
-            "type": "assistant",
-            "message": {"content": [{"text": f"done\nPROOF {NONCE} ok sha=abc1234"}]},
-        }
-    )
-    assert parse_proof_line(f"banner\n{event}\n", NONCE) == ("ok", "sha=abc1234")
-
-
-def test_parse_proof_line_ignores_an_unfenced_line():
-    """The whole point of the fence: SKILL.md's own example must not declare success."""
-    transcript = (
-        "reading .claude/skills/deploy/SKILL.md\n"
-        "End with: PROOF ok sha=<sha> branch=<branch>\n"
-        "DEPLOY_PROOF ok sha=abc1234\n"
-        "I could not finish: the merge conflicted.\n"
-    )
-    assert parse_proof_line(transcript, NONCE) is None
-
-
-def test_parse_proof_line_ignores_a_quoted_skill_example_inside_a_tool_result():
-    event = json.dumps(
-        {
-            "type": "user",
-            "message": {
-                "content": [
-                    {
-                        "type": "tool_result",
-                        "content": "# Deploy skill\nFinish with `PROOF ok sha=<sha>`.\n",
-                    }
-                ]
-            },
-        }
-    )
-    assert parse_proof_line(f"{event}\nI could not finish.\n", NONCE) is None
-
-
-def test_parse_proof_line_ignores_another_runs_nonce():
-    assert parse_proof_line(f"PROOF {NONCE} ok x=1", "0ther0ther0ther00") is None
-
-
-def test_parse_proof_line_requires_a_nonce():
-    assert parse_proof_line(f"PROOF {NONCE} ok x=1", "") is None
-
-
-def test_parse_proof_line_ignores_a_mid_line_mention():
-    assert parse_proof_line(f"the skill prints PROOF {NONCE} ok when it finishes", NONCE) is None
-
-
-def test_parse_proof_line_returns_none_without_a_proof():
-    assert parse_proof_line("built everything, all good", NONCE) is None
-    assert parse_proof_line("", NONCE) is None
-
-
-def test_parse_proof_line_ignores_an_unknown_verdict():
-    assert parse_proof_line(f"PROOF {NONCE} maybe sha=abc1234", NONCE) is None
-
-
-def test_parse_proof_line_allows_an_empty_tail():
-    assert parse_proof_line(f"PROOF {NONCE} ok", NONCE) == ("ok", "")
-
-
-def test_proof_pattern_escapes_the_nonce():
-    """A nonce is host-minted hex, but the pattern must never treat it as a regex."""
-    assert proof_pattern("a.c").match("PROOF abc ok x=1") is None
-    assert proof_pattern("a.c").match("PROOF a.c ok x=1") is not None

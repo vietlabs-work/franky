@@ -7,13 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- `franky run-skill` runs an allowlisted repository's own `.claude/skills/<name>/SKILL.md` in the sandbox and reports the agent's nonce-fenced `PROOF ok|fail` verdict.
-- `franky run-skill --push-branch` pushes one branch from the host, fast-forward only and never the default branch, with a host-only `FRANKY_PUSH_TOKEN` that never enters the container.
-- The host never runs git in the container's checkout. A networkless sandbox emits a git bundle, and the host unpacks it into a repository it creates, with a minimal environment and a host-derived remote URL.
-- The host scans the bundled history with the existing fail-closed secret scan before it publishes anything.
-
 ## [0.2.0] - 2026-09-07
 
 ### Changed

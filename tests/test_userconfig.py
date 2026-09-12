@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from franky.config import GH_TOKEN_VAR, PUSH_TOKEN_VAR, REDACT_TOKEN
+from franky.config import GH_TOKEN_VAR, REDACT_TOKEN
 from franky.engine import (
     CLAUDE_TOKEN_VAR,
     CODEX_PROVIDER_VARS,
@@ -19,7 +19,6 @@ from franky.engine import (
 )
 from franky.jira import JIRA_API_TOKEN_VAR
 from franky.userconfig import (
-    HOST_ONLY_SECRET_KEYS,
     SECRET_KEYS,
     SETTABLE_KEYS,
     config_file_path,
@@ -277,7 +276,6 @@ def test_secret_keys_is_exact_union() -> None:
         | frozenset(credential for credential, _host in OPENCODE_PROVIDERS.values())
         | frozenset({CLAUDE_TOKEN_VAR})
         | frozenset({JIRA_API_TOKEN_VAR})
-        | frozenset({PUSH_TOKEN_VAR})
     ) - frozenset({"OLLAMA_HOST"})  # the one URL excluded from the credential set
     assert SECRET_KEYS == expected
 
@@ -345,17 +343,8 @@ def test_moonshot_api_key_is_secret() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_settable_keys_includes_every_storable_secret_key() -> None:
-    assert (SECRET_KEYS - HOST_ONLY_SECRET_KEYS) <= SETTABLE_KEYS
-
-
-def test_the_push_token_is_masked_but_never_storable() -> None:
-    """A contents:write token is redacted and masked like any secret, but `config set` refuses
-    it: it is host-only by design and must not land in ~/.franky/config.toml beside read-only
-    credentials."""
-    assert PUSH_TOKEN_VAR in SECRET_KEYS
-    assert PUSH_TOKEN_VAR not in SETTABLE_KEYS
-    assert mask_value(PUSH_TOKEN_VAR, "ghp_write_token") != "ghp_write_token"
+def test_settable_keys_includes_secret_keys() -> None:
+    assert SECRET_KEYS <= SETTABLE_KEYS
 
 
 def test_settable_keys_includes_non_secret_keys() -> None:
