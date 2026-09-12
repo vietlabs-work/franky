@@ -173,6 +173,7 @@ def build_docker_argv(
     memory_mb: int = DEFAULT_MEMORY_MB,
     disk_mb: int = DEFAULT_DISK_MB,
     apparmor_profile: str | None = None,
+    keep_container: bool = False,
 ) -> list[str]:
     """Build the full `docker run` argv. Pure - no docker invoked.
 
@@ -201,12 +202,19 @@ def build_docker_argv(
 
     `auth_volume` is the fixed Codex subscription named volume selected by fail-closed config.
     It is never a caller-supplied path or bind mount.
+
+    `keep_container` drops ONLY `--rm` (see `run_in_container`'s `workspace_sink`): a run whose
+    `/work` must be copied out after a CLEAN exit needs the stopped container to still exist for
+    `docker cp`. Every other hardening flag is untouched, and the forced `docker rm -f -v` reap
+    in `run_in_container`'s `finally` still removes the container AND its anonymous volumes -
+    `--rm` is a convenience, never the boundary. False (the default) is byte-identical.
     """
     container_name = name or f"franky-run-{uuid.uuid4().hex[:12]}"
+    hardening = [flag for flag in _HARDENING if flag != "--rm"] if keep_container else _HARDENING
     argv = [
         "docker",
         "run",
-        *_HARDENING,
+        *hardening,
         *([f"--security-opt=apparmor={apparmor_profile}"] if apparmor_profile is not None else []),
         f"--memory={memory_mb}m",
         f"--memory-swap={memory_mb}m",
@@ -995,6 +1003,140 @@ def _watch_storage(
             _remove_volumes(volumes, runner)
 
 
+# --- Workspace bundling (`run-skill --push-branch`) -------------------------------------------
+#
+# WHY a bundle and not `docker cp` of /work: the checkout in /work is AUTHORED BY THE CONTAINER.
+# Running ANY host git command inside it hands the container the host process - hooks in
+# `.git/hooks`, `core.fsmonitor`, `core.sshCommand`, `url.<x>.insteadOf`, a rewritten `pushurl`,
+# a forged `origin/HEAD` - with the push token in its environment. So the host never touches that
+# tree. Instead a throwaway sandbox reads it and emits ONE git bundle on stdout: an inert,
+# self-describing archive of exactly `refs/heads/<branch>`. The host verifies and unpacks that
+# file into a repository IT created (see `franky/push.py`). Every git execution against untrusted
+# content stays inside Docker.
+#
+# The helper is networkless, read-only, capability-free, no-new-privileges, runs the packaged
+# seccomp policy, and mounts the task's volumes READ-ONLY via --volumes-from. Its only writable
+# path is a small tmpfs used as HOME.
+BUNDLE_HELPER_HOME = "/run/franky-bundle"
+BUNDLE_TIMEOUT_SECS = 180
+# Hard ceiling on the bundle we will accept from the sandbox. A repo bigger than this is not a
+# deploy branch; refusing beats filling the host disk from container-controlled output.
+BUNDLE_MAX_BYTES = 2 * 1024**3
+
+# Runs INSIDE the sandbox. `$1` is the branch (validated host-side against push.valid_branch, so
+# it carries no shell metacharacter) and is passed as an ARGUMENT, never interpolated. Exactly one
+# checkout must exist or we refuse - pushing "whichever clone we found first" is not a contract.
+_BUNDLE_SCRIPT = """set -eu
+found=$(find /work -mindepth 2 -maxdepth 4 -name .git -type d 2>/dev/null || true)
+count=$(printf '%s' "$found" | grep -c . || true)
+if [ "$count" != "1" ]; then
+  echo "franky-bundle: expected exactly one checkout under /work, found $count" >&2
+  exit 3
+fi
+cd "$(dirname "$found")"
+exec git -c safe.directory='*' bundle create - "refs/heads/$1"
+"""
+
+
+def bundle_container_name(task: str) -> str:
+    """The helper's container name, derived from the task's so a reaper can find both."""
+    return f"{task}-bundle"
+
+
+def build_bundle_argv(task: str, image: str, branch: str) -> list[str]:
+    """`docker run` argv for the sandboxed bundler. Pure - no docker invoked.
+
+    Mirrors `_storage_helper_argv`'s hardening register (networkless, read-only, no caps, no new
+    privileges, packaged seccomp, tight pids/memory) and adds the task's own volumes READ-ONLY.
+    The bundle goes to stdout; nothing is written to a shared path.
+    """
+    return [
+        "docker",
+        "run",
+        "--rm",
+        "--name",
+        bundle_container_name(task),
+        "--network=none",
+        "--read-only",
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges",
+        f"--security-opt=seccomp={DEFAULT_SECCOMP}",
+        "--volumes-from",
+        f"{task}:ro",
+        # A small writable scratch for git. NOT /tmp: the task's /tmp is an inherited VOLUME, and
+        # a tmpfs at the same destination is a duplicate mount point.
+        "--tmpfs",
+        f"{BUNDLE_HELPER_HOME}:exec,uid={_RUN_UID},gid={_RUN_GID},size=16m",
+        "-e",
+        f"HOME={BUNDLE_HELPER_HOME}",
+        "-e",
+        "GIT_CONFIG_NOSYSTEM=1",
+        "-e",
+        "GIT_TERMINAL_PROMPT=0",
+        "--pids-limit=64",
+        "--memory=256m",
+        "--memory-swap=256m",
+        "--log-driver=none",
+        "--entrypoint=sh",
+        image,
+        "-c",
+        _BUNDLE_SCRIPT,
+        "franky-bundle",
+        branch,
+    ]
+
+
+def bundle_workspace(task, image, branch, dest, popen=subprocess.Popen, runner=subprocess.run):
+    """Bundle `refs/heads/<branch>` out of `task`'s /work into the host file `dest`.
+
+    Returns (ok, detail). `detail` is the helper's stderr (or a short reason), never a secret -
+    the caller still redacts it. The stdout bytes are streamed straight to `dest` under a hard
+    `BUNDLE_MAX_BYTES` cap, so container-controlled output cannot fill the host disk, and the
+    partial file is removed on any failure. Never raises.
+    """
+    argv = build_bundle_argv(task, image, branch)
+    dest = Path(dest)
+    proc = None
+    try:
+        # 0600, O_EXCL: the bundle is container-derived bytes staged on the host.
+        fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as target:
+            proc = popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            written = 0
+            oversize = False
+            while chunk := proc.stdout.read(CHUNK_SIZE):
+                written += len(chunk)
+                if written > BUNDLE_MAX_BYTES:
+                    oversize = True
+                    break
+                target.write(chunk)
+        if oversize:
+            proc.kill()
+            return False, f"workspace bundle exceeded {BUNDLE_MAX_BYTES} bytes"
+        proc.stdout.close()
+        code = proc.wait(timeout=BUNDLE_TIMEOUT_SECS)
+        detail = (proc.stderr.read() or b"").decode("utf-8", errors="replace").strip()
+        if code != 0:
+            return False, detail or f"bundle helper exited {code}"
+        if written == 0:
+            return False, detail or "bundle helper produced no output"
+        return True, ""
+    except Exception as exc:
+        return False, f"bundle helper failed: {exc}"
+    finally:
+        if proc is not None:
+            for stream in (proc.stdout, proc.stderr):
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        _reap(bundle_container_name(task), runner)
+
+
 def build_proxy_probe_argv(proxy_name: str) -> list[str]:
     """Probe Squid's default-deny HTTPS CONNECT policy from inside its container."""
     return [
@@ -1086,6 +1228,7 @@ def run_in_container(
     run_id: str | None = None,
     diagnostics_sink: dict | None = None,
     snapshot_sink: dict | None = None,
+    workspace_sink: dict | None = None,
     resume_workspace: str | None = None,
     apparmor_selector=select_task_apparmor,
 ) -> tuple[int, str | Transcript]:
@@ -1102,6 +1245,17 @@ def run_in_container(
     reap (the only step that needs the container alive), then `finalize_snapshot` (scrub + verify
     + pack) runs AFTER the reap so teardown is never delayed by it. On success the sink gains a
     `"snapshot_path"` key. Any failure is swallowed - a snapshot can never regress the run.
+
+    `workspace_sink` (`run-skill --push-branch`), when given a dict with `"dest"` (a host FILE
+    path) and `"branch"`, opts into producing a git BUNDLE of that branch out of the task's
+    `/work` - never a copy of the tree; see `bundle_workspace` for why the host must not touch a
+    container-authored checkout. The task is then started WITHOUT `--rm` so the stopped container
+    survives long enough for the sandboxed bundler to read its volumes, which happens in the
+    `finally` BEFORE the reap. An optional `"gate"` callable receives the run output and must
+    return True for the bundle to be produced at all (`run-skill` gates on its nonce-fenced
+    `PROOF ok`); without one, a zero exit code is the gate. The sink gains `"bundled":
+    True|False` and, on failure, a `"detail"` string. Any failure is swallowed - bundling can
+    never regress a run. None (the default) leaves every existing caller byte-identical.
 
     `resume_workspace` (issue #71), when set to a host tar path, RESTORES that workspace into the
     freshly launched container between launch and the engine run. This forces the streaming
@@ -1218,6 +1372,7 @@ def run_in_container(
             memory_mb=cfg.memory_mb,
             disk_mb=cfg.disk_mb,
             apparmor_profile=apparmor_profile,
+            keep_container=workspace_sink is not None,
         )
         if effective_progress is not None:
             # Redact before disk and callbacks, retaining only bounded unfinished fragments.
@@ -1433,6 +1588,28 @@ def run_in_container(
                     _snapshot_tmp = None
             except Exception:
                 _snapshot_tmp = None
+        # Workspace bundling (`run-skill --push-branch`): same before-the-reap placement and the
+        # same never-regress-the-run isolation as the snapshot above. Gated twice - a clean exit
+        # code AND the caller's own predicate - so a timed-out, errored, or failure-reporting run
+        # never produces a bundle the host could go on to push.
+        if workspace_sink is not None and task_launched:
+            workspace_sink["bundled"] = False
+            try:
+                gate = workspace_sink.get("gate")
+                if code == 0 and (gate is None or gate(output)):
+                    ok, detail = bundle_workspace(
+                        task,
+                        image,
+                        str(workspace_sink["branch"]),
+                        str(workspace_sink["dest"]),
+                        popen=popen,
+                        runner=runner,
+                    )
+                    workspace_sink["bundled"] = ok
+                    if not ok:
+                        workspace_sink["detail"] = redact(detail, secrets)
+            except Exception as exc:
+                workspace_sink["detail"] = redact(f"bundle helper failed: {exc}", secrets)
         # Best-effort teardown, ALWAYS, in order task -> proxy -> net. A reap FAILURE on the
         # TASK container is surfaced at full severity because it holds the injected creds. A
         # proxy/net reap failure is a lower-severity resource leak (the proxy holds NO creds).

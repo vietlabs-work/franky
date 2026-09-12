@@ -168,6 +168,73 @@ def _scan_jsonl_for_pr_url(output: str, repo: str | None = None) -> str | None:
     return found or fallback
 
 
+def proof_pattern(nonce: str) -> re.Pattern[str]:
+    """The nonce-fenced result line `PROOF <nonce> ok|fail <rest>`.
+
+    WHY the nonce is mandatory: the agent READS `SKILL.md`, whose own text almost certainly
+    contains an example `PROOF ok ...` line, and that file lands in the transcript verbatim
+    inside a tool result. A fixed sentinel would let quoted documentation - or a hostile repo -
+    declare success for a run that never happened. The nonce is minted per run by the host, so
+    only text the agent itself composed for THIS run can match. `DEPLOY_PROOF` is accepted as an
+    alias because repo deploy skills already print that spelling.
+    """
+    return re.compile(r"^(?:DEPLOY_)?PROOF " + re.escape(nonce) + r" (ok|fail)\b(.*)$")
+
+
+def _string_leaves(value):
+    """Yield every string leaf of a decoded JSON value (depth-first, in document order)."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for nested in value.values():
+            yield from _string_leaves(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from _string_leaves(nested)
+
+
+def parse_proof_line(output, nonce: str) -> tuple[str, str] | None:
+    """Return the LAST `PROOF <nonce> ok|fail <text>` line as `(verdict, text)`, else None.
+
+    Same bounded single-pass shape as `_scan_jsonl_for_pr_url`, and for the same reason: the
+    engines wrap agent output in JSONL, so the proof line can arrive as a raw stdout line OR
+    embedded in a JSON string leaf (an assistant text block, a tool result). We scan both, and
+    the LAST match wins - a skill that reports progress before its final verdict must not have
+    an early line mistaken for the result.
+
+    An oversized event aborts the scan (returns None, mirroring `_scan_jsonl_for_pr_url`): a
+    truncated stream is not a stream we can claim a verdict from, and `no_proof` is the safe
+    classification.
+
+    `nonce` is required and fences the line - see `proof_pattern`. An empty nonce matches
+    nothing, so a caller that forgets to mint one gets `no_proof`, never a false success.
+    """
+    from .transcript import lines
+
+    if not nonce:
+        return None
+    pattern = proof_pattern(nonce)
+    found: tuple[str, str] | None = None
+    for line in lines(output):
+        if line is None:
+            return None
+        if nonce not in line:
+            continue
+        candidates = [line]
+        stripped = line.strip()
+        if stripped.startswith(("{", "[", '"')):
+            try:
+                candidates += list(_string_leaves(json.loads(stripped)))
+            except (ValueError, TypeError, RecursionError):
+                pass  # not JSON (banner, log line) - the raw line above still counts
+        for candidate in candidates:
+            for text in candidate.splitlines():
+                match = pattern.match(text.strip())
+                if match:
+                    found = (match.group(1), match.group(2).strip())
+    return found
+
+
 def _tool_use_summary(name: object, inp: dict) -> str:
     """Return a compact `franky: <verb> <detail>` line for a tool-use event.
 

@@ -44,6 +44,7 @@ from .engine import (
     OPENCODE_PROVIDERS,
     PI_PROVIDER_VARS,
 )
+from .config import PUSH_TOKEN_VAR
 from .jira import JIRA_API_TOKEN_VAR
 
 # The table name used in the TOML file.
@@ -68,9 +69,16 @@ SECRET_KEYS: frozenset[str] = frozenset(
         | {credential for credential, _host in OPENCODE_PROVIDERS.values()}
         | {CLAUDE_TOKEN_VAR}
         | {JIRA_API_TOKEN_VAR}
+        | {PUSH_TOKEN_VAR}
     )
     - {_OLLAMA_HOST}
 )
+
+# Secrets Franky redacts and masks but REFUSES to store: the `run-skill` push token is a
+# contents:write credential, and the whole point of keeping it host-only is that it lives in the
+# operator's environment for the length of one command. Persisting it in ~/.franky/config.toml
+# would put a write token on disk beside read-only ones, so it is excluded from SETTABLE_KEYS.
+HOST_ONLY_SECRET_KEYS: frozenset[str] = frozenset({PUSH_TOKEN_VAR})
 
 # Full set of keys that `franky config set` accepts. Partitioned as:
 #   SECRET_KEYS  - stored but masked on display, refused as positional argv
@@ -100,7 +108,7 @@ _NON_SECRET_SETTABLE_KEYS: frozenset[str] = frozenset(
     }
 )
 
-SETTABLE_KEYS: frozenset[str] = SECRET_KEYS | _NON_SECRET_SETTABLE_KEYS
+SETTABLE_KEYS: frozenset[str] = (SECRET_KEYS - HOST_ONLY_SECRET_KEYS) | _NON_SECRET_SETTABLE_KEYS
 
 
 def config_file_path(env: dict[str, str] | None = None) -> Path:

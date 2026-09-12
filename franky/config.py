@@ -25,6 +25,12 @@ from .result import AuthError, ConfigError
 REDACT_TOKEN = "***REDACTED***"
 
 GH_TOKEN_VAR = "GH_TOKEN"
+# The HOST-ONLY push credential for `franky run-skill --push-branch` (contents:write on ONE
+# repo). It is named here, beside the other var names, but it is deliberately NEVER read into
+# `Config.passthrough_env`: a var that is not in passthrough_env can never become a `-e` flag on
+# the task container. It reaches only the host git subprocesses that talk to the remote, and it
+# joins `secret_values()` through `extra_secrets` so every log, transcript, and result redacts it.
+PUSH_TOKEN_VAR = "FRANKY_PUSH_TOKEN"
 ALLOWED_REPOS_VAR = "FRANKY_ALLOWED_REPOS"
 EXTRA_ALLOWED_DOMAINS_VAR = "FRANKY_EXTRA_ALLOWED_DOMAINS"
 MODEL_VAR = "FRANKY_MODEL"
@@ -78,14 +84,20 @@ class Config:
     model: str | None = None
     memory_mb: int = DEFAULT_MEMORY_MB
     disk_mb: int = DEFAULT_DISK_MB
+    extra_secrets: list[str] = field(default_factory=list)
 
     def secret_values(self) -> list[str]:
         """Secret strings known to the host and therefore available for output redaction.
 
         Subscription auth.json never crosses the Docker volume boundary, so its contents are
         intentionally neither read nor returned here.
+
+        `extra_secrets` carries host-only credentials that must be REDACTED but must never be
+        PASSED to the container - today just `PUSH_TOKEN_VAR`. Keeping them out of
+        `passthrough_env` is what guarantees they cannot become a `-e` flag, and putting them
+        here is what guarantees they are still masked everywhere output is released.
         """
-        return [v for v in self.passthrough_env.values() if v]
+        return [v for v in [*self.passthrough_env.values(), *self.extra_secrets] if v]
 
 
 def validate_allowlist_entry(entry: str) -> None:

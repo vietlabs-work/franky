@@ -117,6 +117,7 @@ Run `franky COMMAND --help` for flags and examples. Run `franky schema` for the 
 | `franky build TASK` | Implement a GitHub issue, JIRA task, prose task, or stdin task. Open one PR. |
 | `franky iterate PR_URL` | Address review or CI feedback with additive commits on Franky's existing PR. |
 | `franky review-pr PR_URL [INSTRUCTIONS]` | Review a PR. Publish findings unless `--no-publish` is set. |
+| `franky run-skill --repo R --skill S [-- ARGS]` | Run repo `R`'s own `.claude/skills/S/SKILL.md` in the sandbox. With `--push-branch`, push that one branch from the host, fast-forward only. |
 | `franky plan TASK` | Request a read-only scope assessment and return PR-sized tasks. |
 | `franky jobs` | List runs. Add `--stats` for success, hang, duration, and cost data. |
 | `franky gh ARGS...` | Run the host `gh` CLI with Franky's token. |
@@ -175,6 +176,16 @@ Before each build attempt, Franky checks for an open PR on the predicted branch.
 `iterate` only targets an allowlisted PR from a same-repository `franky/*` branch. Its prompt forbids force pushes, new PRs, and merges.
 
 The `review-pr` prompt tells the agent to inspect only. The host publishes comments or change requests after it rechecks the PR head.
+
+`run-skill` runs the target repository's own skill instead of a Franky-authored task. The agent ends with a nonce-fenced `PROOF <nonce> ok <key=value ...>` or `PROOF <nonce> fail <reason>` line. Franky mints the nonce per run, so an unfenced `PROOF ok` quoted out of the repository's own `SKILL.md` cannot report success. A run with no fenced line is a failure.
+
+Supply a read-only `GH_TOKEN` to the container. Franky cannot verify token scope, so this is your requirement to meet, not a property Franky enforces. `FRANKY_PUSH_TOKEN` (`contents:write`, one repository) is consumed only by the host push step. Set it in the environment. `franky config` refuses to store it. Without it, `--push-branch` refuses with exit `3` before any container starts.
+
+With `--push-branch`, the host pushes exactly one branch, fast-forward only, never the default branch. Nothing from the container's checkout executes on the host: a networkless sandbox reads the stopped container's volumes and emits one git bundle, and the host unpacks that bundle into a repository it created itself. The destination URL comes from `--repo` and the default branch from the GitHub API, so a rewritten remote, a forged `origin/HEAD`, or a hook in the container's `.git` changes nothing. Use `--require-ancestor SHA` to demand a known commit in the pushed branch.
+
+These gates bound destruction, not content. They stop a force push, a default-branch push, and a push to another repository. They do not decide what the deploy branch says: whoever can land a file on the target repository's default branch, or invoke Franky, decides that. Protect the default branch in GitHub and control who can call `run-skill`.
+
+A pushing run starts its task container without `--rm` so the bundler can read its volumes, and removes it afterwards. Franky also reaps it on `SIGTERM` and `SIGINT`. A `SIGKILL` of the host process cannot be caught and can leave a stopped `franky-run-*` container holding the run's tokens in its environment. Remove it with `docker rm -f`.
 
 Scope `GH_TOKEN` permissions because they are the enforced GitHub boundary for the autonomous container.
 
