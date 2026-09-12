@@ -97,31 +97,6 @@ _PLAN_RESULT_SCHEMA: dict = {
     "exit_code": "the process exit code this result corresponds to (0 on success)",
 }
 
-# Static description of the `franky run-skill` success object. A SEPARATE envelope from
-# result_schema: run-skill opens no PR and reports the agent's own PROOF verdict plus, when
-# --push-branch was given, the one fast-forward branch the HOST pushed afterwards.
-_RUN_SKILL_RESULT_SCHEMA: dict = {
-    "status": "result class: proof_reported | no_proof | skill_failed | push_refused | "
-    "push_failed | workspace_unavailable | agent_error | timeout",
-    "pr_url": "always null; run-skill never opens a PR",
-    "branch": "the --push-branch value, or null when the run was report-only",
-    "reason": "a short human-readable explanation of the status",
-    "exit_code": "the process exit code this result corresponds to (see exit_codes)",
-    "economics": _RESULT_SCHEMA["economics"],
-    "log_path": "absolute path to the redacted task log under FRANKY_RUNS_DIR/tasks/",
-    "engine": "the resolved engine name (e.g. pi | claude | codex | opencode)",
-    "repo": "the target owner/repo",
-    "job_id": "the run handle; use with `franky job status|logs|kill`",
-    "proof_verdict": "string: ok | fail - the verdict from the agent's final NONCE-FENCED "
-    "`PROOF <nonce> ok|fail ...` line. Absent when the run produced no fenced line; an unfenced "
-    "`PROOF ok` (for example one quoted out of the repo's own SKILL.md) never counts.",
-    "proof": "string; the redacted free text after the PROOF verdict (e.g. `sha=abc1234`). "
-    "Absent when the run produced no fenced PROOF line.",
-    "pushed": "present ONLY when --push-branch was given AND the host push landed: "
-    "{branch, sha} for the single fast-forward push. Absent otherwise, including on "
-    "push_refused/push_failed.",
-}
-
 # Static description of the on-disk run record (~/.franky/runs/<job_id>.json), the same shape
 # `franky job status --json` / `franky jobs --json` emit (jobs.new_record + the update_record
 # patches applied on top). This was a pre-existing gap - no schema described the record shape
@@ -130,7 +105,7 @@ _RUN_SKILL_RESULT_SCHEMA: dict = {
 _JOB_RECORD_SCHEMA: dict = {
     "job_id": "the run handle (see result_schema.job_id)",
     "command": "the Franky command that produced this run: build | iterate | review-pr | "
-    "diagnose | replay | resume | run-skill",
+    "diagnose | replay | resume",
     "repo": "the target owner/repo",
     "engine": "the resolved engine name (e.g. pi | claude | codex | opencode)",
     "task": "a redacted, truncated summary of the task text (a handle, not the full prompt)",
@@ -141,8 +116,7 @@ _JOB_RECORD_SCHEMA: dict = {
     "status": "running | pr_opened | no_pr | agent_error | timeout | already_open | "
     "iterate_complete | killed | diagnosed | diagnose_failed | replay_complete | "
     "review_published | review_complete | no_findings | publish_blocked_stale_head | "
-    "publish_failed | proof_reported | no_proof | skill_failed | push_refused | push_failed | "
-    "workspace_unavailable",
+    "publish_failed",
     "started_at": "ISO-8601 UTC timestamp when the run was registered",
     "ended_at": "ISO-8601 UTC timestamp when the run finished, or null while running",
     "pr_url": "the PR URL (string) or null when none was produced",
@@ -244,7 +218,6 @@ _JSON_OUTPUTS: dict[tuple[str, ...], dict] = {
     ("build",): {"success": "result_schema", "error": "error_schema"},
     ("iterate",): {"success": "result_schema", "error": "error_schema"},
     ("review-pr",): {"success": "result_schema", "error": "error_schema"},
-    ("run-skill",): {"success": "run_skill_result_schema", "error": "error_schema"},
     ("plan",): {"success": "plan_result_schema", "error": "error_schema"},
     ("version",): {"success": "version_result_schema"},
     ("jobs",): {"success": {"default": "job_list_schema", "--stats": "job_stats_schema"}},
@@ -342,7 +315,6 @@ def build_schema(group: click.Group) -> dict:
         "commands": _walk(group),
         "result_schema": _RESULT_SCHEMA,
         "plan_result_schema": _PLAN_RESULT_SCHEMA,
-        "run_skill_result_schema": _RUN_SKILL_RESULT_SCHEMA,
         "diagnosis_result_schema": _DIAGNOSIS_RESULT_SCHEMA,
         "job_record_schema": _JOB_RECORD_SCHEMA,
         "version_result_schema": _VERSION_RESULT_SCHEMA,
