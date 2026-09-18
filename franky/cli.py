@@ -1951,7 +1951,24 @@ def _version_info(
 @click.option("--json", "as_json", is_flag=True, help="Emit version info as a single JSON object.")
 def version(as_json: bool) -> None:
     """Print Franky version, install provenance, resolved engine, and task image."""
-    info = _version_info(os.environ)
+    # Merge ~/.franky/config into a COPY of the environment (never os.environ itself -
+    # `version` is a read-only report and must not change what a later call resolves).
+    # Without the merge this command reports the DEFAULT engine and its image tag while
+    # `build`/`iterate`/`review-pr` - which all merge the file - really run the engine the
+    # file names. An operator who keeps FRANKY_ENGINE only in the config file then reads a
+    # version banner that disagrees with every actual run.
+    # A malformed or unreadable file must still let `version` print: it is the command an
+    # operator reaches for when something is already wrong, so a broken config degrades to
+    # the pre-merge answer rather than a traceback. It says so out loud on stderr - a silent
+    # skip would report a plausible engine that no real run resolves, which is the very
+    # confusion this merge exists to remove. Stderr keeps --json's stdout a single JSON
+    # value. Repairing the file means editing it: `config set` reads it first and fails too.
+    env = dict(os.environ)
+    try:
+        load_config_file(env)
+    except (ValueError, OSError, RuntimeError) as exc:
+        click.echo(f"franky: ignoring the config file ({exc})", err=True)
+    info = _version_info(env)
     if as_json:
         click.echo(json.dumps(info))
         return

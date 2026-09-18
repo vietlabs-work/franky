@@ -40,8 +40,15 @@ def test_version_prints_version():
 
 
 def _make_env(extra=None):
-    """Minimal env that resolves engine cleanly (defaults to pi, no creds needed for version)."""
-    env = {}
+    """Minimal env that resolves engine cleanly (defaults to pi, no creds needed for version).
+
+    Carries FRANKY_CONFIG_FILE from the real environment, where conftest's autouse
+    _hermetic_config_file fixture points it at a non-existent tmp path. `version` merges the
+    config file into its own copy of this dict, so without that key the command would read
+    the developer's real ~/.franky/config and these assertions would follow whatever that
+    file says.
+    """
+    env = {"FRANKY_CONFIG_FILE": os.environ["FRANKY_CONFIG_FILE"]}
     if extra:
         env.update(extra)
     return env
@@ -136,6 +143,80 @@ def test_version_host_binary_absent_no_crash(monkeypatch):
     # Inject the raising runner directly into _version_info.
     info = cli._version_info(_make_env(), runner=raising_runner)
     assert info["engine"]["host_binary_version"] is None
+
+
+def _write_config(tmp_path, body):
+    """Write a [franky] config file and return its path."""
+    path = tmp_path / "franky-config"
+    path.write_text(body)
+    return path
+
+
+def test_version_engine_follows_the_config_file(monkeypatch, tmp_path):
+    """FRANKY_ENGINE set only in ~/.franky/config must reach the reported engine AND image.
+
+    Before this merge, `version` reported the default engine and a `-pi` image while
+    build/iterate/review-pr all ran the engine the config file names.
+    """
+    path = _write_config(tmp_path, '[franky]\nFRANKY_ENGINE = "claude"\n')
+    monkeypatch.setattr(cli, "_engine_binary_version", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "detect_install", lambda **_kw: Install("pip", "/usr/bin/python3"))
+    monkeypatch.setattr(cli.os, "environ", _make_env({"FRANKY_CONFIG_FILE": str(path)}))
+
+    res = CliRunner().invoke(cli.main, ["version", "--json"])
+
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.stdout)
+    assert data["engine"]["name"] == "claude"
+    assert data["engine"]["resolved"] is True
+    assert data["image"].endswith("-claude")
+
+
+def test_version_process_env_beats_the_config_file(monkeypatch, tmp_path):
+    """Precedence is unchanged: an exported FRANKY_ENGINE still wins over the file."""
+    path = _write_config(tmp_path, '[franky]\nFRANKY_ENGINE = "claude"\n')
+    monkeypatch.setattr(cli, "_engine_binary_version", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "detect_install", lambda **_kw: Install("pip", "/usr/bin/python3"))
+    monkeypatch.setattr(
+        cli.os,
+        "environ",
+        _make_env({"FRANKY_CONFIG_FILE": str(path), "FRANKY_ENGINE": "codex"}),
+    )
+
+    res = CliRunner().invoke(cli.main, ["version", "--json"])
+
+    assert res.exit_code == 0, res.output
+    assert json.loads(res.stdout)["engine"]["name"] == "codex"
+
+
+def test_version_survives_a_malformed_config_file(monkeypatch, tmp_path):
+    """`version` is what an operator runs when something is wrong, so a broken config file
+    degrades to the pre-merge answer instead of a traceback - and says so on stderr, because
+    a silent fallback would report an engine that no real run resolves. stdout stays a
+    single JSON value for the machines reading it."""
+    path = _write_config(tmp_path, "this is not TOML {[")
+    monkeypatch.setattr(cli, "_engine_binary_version", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "detect_install", lambda **_kw: Install("pip", "/usr/bin/python3"))
+    monkeypatch.setattr(cli.os, "environ", _make_env({"FRANKY_CONFIG_FILE": str(path)}))
+
+    res = CliRunner().invoke(cli.main, ["version", "--json"])
+
+    assert res.exit_code == 0, res.output
+    assert json.loads(res.stdout)["engine"]["name"] == "pi"
+    assert "ignoring the config file" in res.stderr
+
+
+def test_version_does_not_mutate_the_process_environment(monkeypatch, tmp_path):
+    """The merge lands on a copy. `version` reports; it never changes what a later call sees."""
+    path = _write_config(tmp_path, '[franky]\nFRANKY_ENGINE = "claude"\n')
+    env = _make_env({"FRANKY_CONFIG_FILE": str(path)})
+    monkeypatch.setattr(cli, "_engine_binary_version", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "detect_install", lambda **_kw: Install("pip", "/usr/bin/python3"))
+    monkeypatch.setattr(cli.os, "environ", env)
+
+    CliRunner().invoke(cli.main, ["version", "--json"])
+
+    assert "FRANKY_ENGINE" not in env
 
 
 def test_engine_binary_version_filenotfound():

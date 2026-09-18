@@ -241,7 +241,10 @@ def load_config_file(env: dict[str, str] | None = None, path: Path | None = None
     - Absent file -> silent no-op.
     - Malformed file -> raises ValueError (the `build` command converts this to a
       clean ClickException so the operator sees a helpful message, not a traceback).
-    - Never called from `version` or `config` subcommands (see cli.py WHY comment).
+    - Never called from the `config` subcommands (see cli.py WHY comment): they must stay
+      usable when the file itself is malformed.
+    - `version` DOES call it, on a copy of the environment and with the error swallowed, so
+      the engine and image it reports match what a real run resolves.
     """
     if env is None:
         env = os.environ  # type: ignore[assignment]
