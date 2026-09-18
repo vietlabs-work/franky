@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Report the engine and image tag that `~/.franky/config` selects in `franky version`. It skipped the config-file merge that every run performs, so it named the default engine while builds used another one. A malformed config file still lets the command print, and now says so on stderr.
+
 ## [0.2.0] - 2026-09-07
 
 ### Changed
