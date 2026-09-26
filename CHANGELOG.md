@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-26
+
 ### Added
 
 - Add `review-pr --thread`: one stored review session per PR. Claude resumes it natively. Other engines, or a stale or rejected session, start a new session seeded with the stored findings. A failed resume retries once as a seeded session in the same run. The session id is saved before each run, and only the session file and its side directory are transferred.
