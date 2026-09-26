@@ -7,6 +7,7 @@ secret-safety guarantees: cred files removed, git remote userinfo + helpers stri
 values redacted, git object content decompress-scanned, and a fail-closed refusal on any hit.
 """
 
+import io
 import subprocess
 import sys
 import tarfile
@@ -602,3 +603,92 @@ def test_snapshot_path_for_uses_runs_dir(tmp_path):
     env = {"FRANKY_RUNS_DIR": str(tmp_path / "runs")}
     path = snapshot.snapshot_path_for("abc123", env)
     assert path == tmp_path / "runs" / "abc123.snapshot.tar.gz"
+
+
+def test_build_home_extract_argv_streams_one_home_path_as_a_tar():
+    assert snapshot.build_home_extract_argv("t1", ".claude/projects/-work/u.jsonl") == [
+        "docker",
+        "cp",
+        "t1:/home/franky/.claude/projects/-work/u.jsonl",
+        "-",
+    ]
+
+
+class _TarPopen:
+    """Fake `docker cp ... -`: stdout serves the given bytes; records kills."""
+
+    def __init__(self, data, returncode=0):
+        self.stdout = io.BytesIO(data)
+        self.returncode = returncode
+        self.killed = False
+        self.done = False
+        self.argv = None
+
+    def __call__(self, argv, **kwargs):
+        self.argv = argv
+        return self
+
+    def kill(self):
+        self.killed = self.done = True
+
+    def poll(self):
+        return self.returncode if self.done else None
+
+    def wait(self, timeout=None):
+        self.done = True
+        return self.returncode
+
+
+def _tar_bytes(add):
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as tar:
+        add(tar)
+    return buffer.getvalue()
+
+
+def _member(tar, name, data=b"", kind=tarfile.REGTYPE, linkname=""):
+    info = tarfile.TarInfo(name)
+    info.type = kind
+    info.linkname = linkname
+    info.size = len(data) if kind == tarfile.REGTYPE else 0
+    tar.addfile(info, io.BytesIO(data) if kind == tarfile.REGTYPE else None)
+
+
+def test_copy_home_path_extracts_only_plain_files_and_dirs(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    def add(tar):
+        _member(tar, "u", kind=tarfile.DIRTYPE)
+        _member(tar, "u/a.jsonl", b"{}")
+        _member(tar, "u/link", kind=tarfile.SYMTYPE, linkname=str(outside))
+        _member(tar, "u/hard", kind=tarfile.LNKTYPE, linkname="u/a.jsonl")
+        _member(tar, "u/dev", kind=tarfile.CHRTYPE)
+        _member(tar, "u/fifo", kind=tarfile.FIFOTYPE)
+        _member(tar, "../escape", b"x")
+        _member(tar, "/abs", b"x")
+
+    popen = _TarPopen(_tar_bytes(add))
+    dest = tmp_path / "dest"
+    dest.mkdir()
+    status, used = snapshot.copy_home_path("t1", "u", dest, max_bytes=10**6, popen=popen)
+    assert status == "ok" and used > 0
+    assert popen.argv == ["docker", "cp", "t1:/home/franky/u", "-"]
+    names = sorted(str(p.relative_to(dest)) for p in dest.rglob("*"))
+    assert names == ["u", "u/a.jsonl"]
+    assert not (tmp_path / "escape").exists() and not list(outside.iterdir())
+    assert oct((dest / "u" / "a.jsonl").stat().st_mode & 0o777) == oct(0o600)
+
+
+def test_copy_home_path_kills_an_over_cap_stream(tmp_path):
+    popen = _TarPopen(_tar_bytes(lambda tar: _member(tar, "big.jsonl", b"x" * 200_000)))
+    status, used = snapshot.copy_home_path(
+        "t1", "big.jsonl", tmp_path, max_bytes=100_000, popen=popen
+    )
+    assert status == "too_large" and used > 100_000
+    assert popen.killed and not list(tmp_path.iterdir())
+
+
+def test_copy_home_path_reports_a_docker_failure(tmp_path):
+    popen = _TarPopen(b"", returncode=1)
+    assert snapshot.copy_home_path("t1", "u", tmp_path, max_bytes=10, popen=popen)[0] == "failed"

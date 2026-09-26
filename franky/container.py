@@ -547,13 +547,15 @@ PROFILE_READY_MARKER = f"{CONTAINER_HOME}/.franky-profile-ready"
 
 def deliver_profile(
     task: str,
-    bundle: bytes,
+    bundle: bytes | None,
     runner=subprocess.run,
     *,
     ready_polls: int = 30,
     poll_interval: float = 0.5,
     timeout: float = 60.0,
     sleeper=time.sleep,
+    session_tar: str | None = None,
+    session_timeout: float = 20.0,
 ) -> bool:
     """Stream the operator profile tar into a freshly launched container, then signal it.
 
@@ -568,6 +570,10 @@ def deliver_profile(
     the engine on a half-unpacked profile: no marker means it exits nonzero and the run is
     classified as a failure rather than silently proceeding without the operator's setup.
     Returns True iff every step succeeded; never raises.
+
+    `session_tar` (a host tar path, `review-pr --thread`) is streamed from the file into HOME on
+    the same channel AFTER the profile. Its failure still touches the marker: the review runs,
+    the engine's resume fails, and the thread store drops that session for the next run.
     """
     from . import snapshot
 
@@ -577,14 +583,26 @@ def deliver_profile(
                 break
             sleeper(poll_interval)
 
-        untar = runner(
-            snapshot.build_untar_argv(task, target=CONTAINER_HOME),
-            input=bundle,
-            capture_output=True,
-            timeout=timeout,
-        )
-        if getattr(untar, "returncode", 1) != 0:
-            return False
+        if bundle is not None:
+            untar = runner(
+                snapshot.build_untar_argv(task, target=CONTAINER_HOME),
+                input=bundle,
+                capture_output=True,
+                timeout=timeout,
+            )
+            if getattr(untar, "returncode", 1) != 0:
+                return False
+        if session_tar is not None:
+            try:
+                with open(session_tar, "rb") as tar_fh:
+                    runner(
+                        snapshot.build_untar_argv(task, target=CONTAINER_HOME),
+                        stdin=tar_fh,
+                        capture_output=True,
+                        timeout=session_timeout,
+                    )
+            except Exception:
+                pass
         marker = runner(
             snapshot.build_marker_argv(task, marker=PROFILE_READY_MARKER),
             capture_output=True,
@@ -1088,6 +1106,8 @@ def run_in_container(
     snapshot_sink: dict | None = None,
     resume_workspace: str | None = None,
     apparmor_selector=select_task_apparmor,
+    session_tar: str | None = None,
+    session_sink: dict | None = None,
 ) -> tuple[int, str | Transcript]:
     """Run the inner engine in a hardened, egress-controlled container; return
     (returncode, redacted_output).
@@ -1107,6 +1127,13 @@ def run_in_container(
     freshly launched container between launch and the engine run. This forces the streaming
     (popen) path even without `progress`, because the restore must happen after the container is
     up but before it completes; a no-op progress callback is used when none was given.
+
+    `session_tar` (`review-pr --thread`) is a host tar of a stored engine session, streamed into
+    HOME with the profile (same wait mode). `session_sink` = {"paths": [HOME-relative paths],
+    "dest": host dir, "max_bytes": int}: after a clean exit (code 0), before the reap, each path
+    is streamed out (`docker cp ... -`, 20s cap each) and extracted as plain files and dirs under
+    `dest`. The first path is required, the rest optional; the sink gains `"status"`: ok,
+    too_large (the combined stream passed `max_bytes`), or failed.
 
     Topology: an --internal network (no internet route) hosts a Squid proxy (default-deny
     allowlist) and the task container. The task's HTTP(S)_PROXY points at the proxy and its
@@ -1199,7 +1226,7 @@ def run_in_container(
         # Production always streams, including quiet runs. Runner-only test doubles keep
         # their injected capture boundary; profile/restore and injected Popen use streaming.
         resuming = resume_workspace is not None
-        injecting = profile_bundle is not None
+        injecting = profile_bundle is not None or session_tar is not None
         effective_progress = progress
         if (
             resuming or injecting or runner is subprocess.run or popen is not subprocess.Popen
@@ -1248,7 +1275,7 @@ def run_in_container(
                 task_launched = True
                 if runner is subprocess.run:
                     # Setup precedes the task timeout. Current bounded profile and restore
-                    # calls need at most 225 + 145 seconds, including readiness inspections.
+                    # calls need at most 245 + 145 seconds, including readiness inspections.
                     setup_grace = 400 if injecting or resuming else 0
                     storage_thread = threading.Thread(
                         target=_watch_storage,
@@ -1268,8 +1295,10 @@ def run_in_container(
                 # on the ready marker in profile-wait mode. A False result is fine to proceed on -
                 # the entrypoint exits nonzero on its own (refusing to run without the operator's
                 # setup) and the run classifies as agent_error; do NOT abort the stream, drain it.
-                if profile_bundle is not None:
-                    deliver_profile(task, profile_bundle, runner, sleeper=sleeper)
+                if injecting:
+                    deliver_profile(
+                        task, profile_bundle, runner, sleeper=sleeper, session_tar=session_tar
+                    )
                 # Restore the prior workspace into the just-launched container (issue #71) BEFORE
                 # draining stdout: the container is waiting on the ready marker in resume-wait
                 # mode. A False result is fine to proceed on - the entrypoint will exit 75 quickly
@@ -1433,6 +1462,25 @@ def run_in_container(
                     _snapshot_tmp = None
             except Exception:
                 _snapshot_tmp = None
+        # Thread session copy-out: like the snapshot extract, it needs the live container, so it
+        # runs before the reap, capped, and only after a clean exit. Any failure is swallowed.
+        if session_sink is not None and task_launched and code == 0:
+            try:
+                budget = session_sink["max_bytes"] + 1
+                status = "ok"
+                for index, rel in enumerate(session_sink["paths"]):
+                    target = Path(session_sink["dest"]) / Path(rel).parent
+                    target.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    result, used = snapshot.copy_home_path(
+                        task, rel, target, max_bytes=budget, popen=popen
+                    )
+                    budget -= used
+                    if result == "too_large" or (result != "ok" and index == 0):
+                        status = result
+                        break
+                session_sink["status"] = status
+            except Exception:
+                pass
         # Best-effort teardown, ALWAYS, in order task -> proxy -> net. A reap FAILURE on the
         # TASK container is surfaced at full severity because it holds the injected creds. A
         # proxy/net reap failure is a lower-severity resource leak (the proxy holds NO creds).

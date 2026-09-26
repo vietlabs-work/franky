@@ -937,3 +937,23 @@ def test_job_kill_iterate_running_does_not_snapshot(monkeypatch, tmp_path):
     persisted = jobs.read_record("ab00aa", env)
     assert persisted["status"] == "killed"
     assert persisted["snapshot_path"] is None
+
+
+def test_new_record_adds_thread_id_only_when_given():
+    # thread_id names the `review-pr --thread` thread a run belongs to; every other record keeps
+    # exactly its previous keys.
+    assert "thread_id" not in _rec()
+    record = jobs.new_record(
+        job_id="abc",
+        command="review-pr",
+        repo="o/r",
+        engine="claude",
+        task="t",
+        container="c",
+        network="n",
+        proxy="p",
+        branch=None,
+        started_at="2026-07-05T10:00:00+00:00",
+        thread_id="o__r__1__reviewer",
+    )
+    assert record["thread_id"] == "o__r__1__reviewer"

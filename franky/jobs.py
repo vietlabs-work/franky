@@ -114,6 +114,7 @@ def new_record(
     base_sha: str | None = None,
     replay_of: str | None = None,
     resumed_from: str | None = None,
+    thread_id: str | None = None,
 ) -> dict:
     """Shape the initial (status=running) record written before the container pass starts.
 
@@ -138,8 +139,11 @@ def new_record(
     `steer_notes` (issue #72) is a bounded audit trail of operator corrections injected via
     `franky job attach` while this run was live - null until (and unless) `job attach`
     annotates it via update_record. See cli.job_attach.
+
+    `thread_id` names the review thread (threads.py) a `review-pr --thread` run belongs to. It
+    is added ONLY when set, so every other record keeps exactly its previous keys.
     """
-    return {
+    record = {
         "job_id": job_id,
         "command": command,
         "repo": repo,
@@ -168,6 +172,9 @@ def new_record(
         "snapshot_path": None,
         "steer_notes": None,
     }
+    if thread_id is not None:
+        record["thread_id"] = thread_id
+    return record
 
 
 def _record_path(job_id: str, env: Mapping[str, str] | None) -> Path | None:
@@ -189,11 +196,20 @@ def write_record(record: dict, env: Mapping[str, str] | None = None) -> bool:
     path = _record_path(job_id, env)
     if path is None:
         return False
+    return _atomic_write(path, record, prefix=".franky-run-")
+
+
+def _atomic_write(path: Path, data: dict, *, prefix: str) -> bool:
+    """Write `data` as JSON to `path` via tempfile + os.replace (dir 0700, file 0600).
+
+    Shared by the run registry and the thread store (threads.py). Returns False on any failure
+    (including a non-serializable value) instead of raising.
+    """
     try:
         parent = path.parent
         parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        content = json.dumps(record, indent=2, sort_keys=True) + "\n"
-        fd, tmp_str = tempfile.mkstemp(dir=parent, prefix=".franky-run-")
+        content = json.dumps(data, indent=2, sort_keys=True) + "\n"
+        fd, tmp_str = tempfile.mkstemp(dir=parent, prefix=prefix)
         tmp = Path(tmp_str)
         try:
             os.chmod(fd, stat.S_IRUSR | stat.S_IWUSR)  # 0600 before writing

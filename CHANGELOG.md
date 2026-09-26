@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add `review-pr --thread`: one stored review session per PR. Claude resumes it natively. Other engines, or a stale or rejected session, start a new session seeded with the stored findings. A failed resume retries once as a seeded session in the same run. The session id is saved before each run, and only the session file and its side directory are transferred.
+- Add `review-pr --rubric-version` to pin a rubric label to the thread. A change starts a new session.
+- Add `franky threads list`, `prune`, and `purge`. `prune` removes orphaned, idle, and (with `--closed`) merged or closed threads, and caps stored session bytes. `--repo` limits every pass to one repository and skips the disk cap.
+- Add `thread` and `handoff` keys to the `review-pr --json` result, only with `--thread`, and `thread_id` to run records.
+- Add an optional per-finding `status` (`new`, `open`, `resolved`) for `--thread` runs. A resolved finding never requests changes. Runs without `--thread` ignore it.
+- Exit code 4 now also covers a busy review thread (`thread_busy`).
+- Add `make smoke-thread`, which also checks that the image's `claude` accepts `--session-id` and `--resume`.
+
 ## [0.2.1] - 2026-09-21
 
 ### Fixed

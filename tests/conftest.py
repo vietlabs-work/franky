@@ -38,6 +38,24 @@ def _hermetic_runs_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def _hermetic_threads_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never let a test touch the developer's real ~/.franky/threads (`review-pr --thread`).
+
+    Same shape as `_hermetic_runs_dir`: an explicit FRANKY_THREADS_DIR still wins.
+    """
+    import franky.threads as threads
+
+    default = tmp_path / "test-franky-threads"
+
+    def _safe_threads_dir(env=None):
+        source = os.environ if env is None else env
+        override = source.get("FRANKY_THREADS_DIR")
+        return Path(override) if override else default
+
+    monkeypatch.setattr(threads, "threads_dir", _safe_threads_dir)
+
+
+@pytest.fixture(autouse=True)
 def _hermetic_config_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Point FRANKY_CONFIG_FILE at a non-existent path for every test.
 

@@ -245,3 +245,21 @@ def test_build_result_omits_resumed_from_when_none():
         repo="me/repo",
     )
     assert "resumed_from" not in r
+
+
+def test_build_result_thread_keys_are_absent_without_thread_and_both_present_with_it():
+    base = dict(
+        status="review_complete",
+        pr_url="u",
+        reason="r",
+        exit_code=0,
+        usage=Usage(),
+        duration=1.0,
+        log_path="/l",
+        engine="claude",
+        repo="o/r",
+    )
+    plain = result_mod.build_result(**base)
+    assert "thread" not in plain and "handoff" not in plain
+    threaded = result_mod.build_result(**base, thread={"id": "o__r__1__reviewer"}, handoff=None)
+    assert threaded["thread"] == {"id": "o__r__1__reviewer"} and threaded["handoff"] is None

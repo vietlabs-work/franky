@@ -21,6 +21,8 @@ from .sentinel import scan_sentinel_json
 
 _VALID_SEVERITIES = frozenset({"blocking", "normal", "nit"})
 _VALID_OUTCOMES = frozenset({"pass", "fail", "skipped"})
+# Per-finding status on a `--thread` re-review: new, still open, or fixed since the last review.
+_VALID_STATUSES = frozenset({"new", "open", "resolved"})
 
 
 def parse_review_findings(output: str, nonce: str) -> dict | None:
@@ -32,12 +34,14 @@ def parse_review_findings(output: str, nonce: str) -> dict | None:
     return scan_sentinel_json(output, "REVIEW", nonce)
 
 
-def _shape_finding(raw: object) -> dict | None:
-    """Normalize one raw finding into {title, body, severity, file, line}, or None to drop it.
+def _shape_finding(raw: object, threaded: bool = False) -> dict | None:
+    """Normalize one raw finding into {title, body, severity, file, line, status}, or None.
 
     A finding must be a dict with a non-empty title; anything else is malformed and dropped (the
     engine is autonomous, so we never trust the shape). An unrecognized severity defaults to
     "normal" rather than being dropped, so a slightly-off label doesn't silently lose a finding.
+    A missing or unrecognized status defaults to "new", and so does every status when the run is
+    not `--thread`: only a threaded re-review may mark a finding open or resolved.
     """
     if not isinstance(raw, dict):
         return None
@@ -54,6 +58,7 @@ def _shape_finding(raw: object) -> dict | None:
         "severity": severity,
         "file": file_.strip() if isinstance(file_, str) and file_.strip() else None,
         "line": line if isinstance(line, int) and not isinstance(line, bool) else None,
+        "status": raw.get("status") if threaded and raw.get("status") in _VALID_STATUSES else "new",
     }
 
 
@@ -73,17 +78,18 @@ def _shape_check(raw: object) -> dict | None:
     }
 
 
-def build_review_findings(parsed: dict) -> dict:
+def build_review_findings(parsed: dict, threaded: bool = False) -> dict:
     """Normalize the parsed review payload into {summary, findings, checks, has_blocking}.
 
     `has_blocking` is derived (never trusted from the agent directly) so `review_event` has a
-    single, grounded signal for whether REQUEST_CHANGES is warranted.
+    single, grounded signal for whether REQUEST_CHANGES is warranted. A resolved finding never
+    blocks. `threaded` (`review-pr --thread`) is the only way a status other than "new" is kept.
     """
     raw_findings = parsed.get("findings")
     findings: list[dict] = []
     if isinstance(raw_findings, list):
         for raw in raw_findings:
-            shaped = _shape_finding(raw)
+            shaped = _shape_finding(raw, threaded)
             if shaped is not None:
                 findings.append(shaped)
 
@@ -100,7 +106,9 @@ def build_review_findings(parsed: dict) -> dict:
         "summary": summary.strip() if isinstance(summary, str) else "",
         "findings": findings,
         "checks": checks,
-        "has_blocking": any(f["severity"] == "blocking" for f in findings),
+        "has_blocking": any(
+            f["severity"] == "blocking" and f["status"] != "resolved" for f in findings
+        ),
     }
 
 
@@ -116,7 +124,9 @@ def render_review_body(shaped: dict) -> str:
         lines.append("\n**Findings:**")
         for f in shaped["findings"]:
             loc = f" ({f['file']}:{f['line']})" if f["file"] else ""
-            lines.append(f"- [{f['severity']}] {f['title']}{loc}\n  {f['body']}")
+            # "new" is the default and stays untagged, so a non-thread review body is unchanged.
+            tag = f"[{f['status']}]" if f.get("status", "new") != "new" else ""
+            lines.append(f"- [{f['severity']}]{tag} {f['title']}{loc}\n  {f['body']}")
     else:
         lines.append("\nNo findings.")
     return "\n".join(lines)

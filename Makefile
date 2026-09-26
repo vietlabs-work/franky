@@ -5,7 +5,7 @@
 # The `\#` is escaped: a bare `#` would start a Make comment and eat the `)`.
 VERSION ?= $(shell for kv in $(MAKEOVERRIDES); do n=$${kv%%=*}; l=$$(printf '%s' "$$n" | tr A-Z a-z); if [ "$$l" = version ] || [ "$$l" = v ]; then printf '%s' "$${kv\#*=}"; break; fi; done)
 
-.PHONY: footprint smoke-security smoke-dind smoke-resume smoke-profile smoke-memory eval release release-dry
+.PHONY: footprint smoke-security smoke-dind smoke-resume smoke-profile smoke-thread smoke-memory eval release release-dry
 
 # Credential-free host CPU and memory comparison against BASE. Real-Docker runtime checks stay
 # in smoke-memory; CI also builds and checks every release image variant.
@@ -39,6 +39,12 @@ smoke-resume:
 # branch of franky-dind-entrypoint.sh, or container.py's task _HARDENING.
 smoke-profile:
 	bash scripts/smoke-profile.sh
+
+# Manual gate for `review-pr --thread` session transfer. Needs real Docker + an image with claude;
+# not in CI. Run before merging changes to container.deliver_profile, session copy-out, or the
+# task _HARDENING. It also gates releases on the unpinned claude CLI keeping its session flags.
+smoke-thread:
+	bash scripts/smoke-thread.sh
 
 smoke-memory:
 	python3 scripts/smoke-memory.py $(ARGS)

@@ -40,12 +40,13 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 from collections import deque
 from pathlib import Path
 
 from . import jobs
-from .profile import scan_for_secrets
+from .profile import CONTAINER_HOME, scan_for_secrets
 
 # The container-side marker the host touches (via `docker exec`) once the workspace tar has been
 # copied in and extracted; the entrypoint waits for it before exec-ing the engine (see
@@ -206,6 +207,89 @@ def build_extract_argv(task: str, dest_dir: str) -> list[str]:
     The trailing `/.` copies the DIRECTORY CONTENTS (not the /work dir itself) into dest_dir, so
     the host tree mirrors the workspace root."""
     return ["docker", "cp", f"{task}:/work/.", dest_dir]
+
+
+def build_home_extract_argv(task: str, rel: str) -> list[str]:
+    """`docker cp <task>:<HOME>/<rel> -` - stream one HOME path out as a tar on stdout.
+
+    `rel` is a HOME-relative engine session path (threads.session_paths), never caller input."""
+    return ["docker", "cp", f"{task}:{CONTAINER_HOME}/{rel}", "-"]
+
+
+def _extract_plain(stream, dest: Path) -> None:
+    """Extract a tar stream into `dest`, keeping only regular files and directories with
+    relative names and no `..`. Links, hard links, devices, FIFOs and anything else are skipped,
+    and files are opened O_NOFOLLOW, so nothing can land outside `dest`."""
+    with tarfile.open(fileobj=stream, mode="r|") as tar:
+        for member in tar:
+            parts = Path(member.name).parts
+            if (
+                not parts
+                or member.name.startswith("/")
+                or ".." in parts
+                or not (member.isreg() or member.isdir())
+            ):
+                continue
+            target = dest.joinpath(*parts)
+            if member.isdir():
+                target.mkdir(mode=0o700, parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            source = tar.extractfile(member)
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "wb") as out:
+                shutil.copyfileobj(source, out, _CHUNK_BYTES)
+
+
+def copy_home_path(
+    task: str,
+    rel: str,
+    dest_dir: Path,
+    *,
+    max_bytes: int,
+    popen=subprocess.Popen,
+    timeout: float = 20.0,
+) -> tuple[str, int]:
+    """Stream `<HOME>/<rel>` out of a live container and extract it under `dest_dir`.
+
+    Returns (status, tar_bytes): "ok", "too_large" (the stream passed `max_bytes` and was
+    killed), or "failed" (docker error, timeout, bad archive). The stream is spooled to an
+    anonymous temp file, never held in memory, and a watchdog kills a silent `docker cp` at
+    `timeout`. Never raises."""
+    total = 0
+    try:
+        with tempfile.TemporaryFile() as spool:
+            proc = popen(
+                build_home_extract_argv(task, rel),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+            watchdog = threading.Timer(timeout, proc.kill)
+            watchdog.daemon = True
+            watchdog.start()
+            try:
+                while chunk := proc.stdout.read(_CHUNK_BYTES):
+                    total += len(chunk)
+                    if total > max_bytes:
+                        return "too_large", total
+                    spool.write(chunk)
+                code = proc.wait(timeout=timeout)
+            finally:
+                watchdog.cancel()
+                proc.stdout.close()
+                if proc.poll() is None:
+                    proc.kill()
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        pass
+            if code != 0:
+                return "failed", total
+            spool.seek(0)
+            _extract_plain(spool, Path(dest_dir))
+    except Exception:
+        return "failed", total
+    return "ok", total
 
 
 def build_untar_argv(task: str, target: str = "/work") -> list[str]:

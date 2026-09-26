@@ -58,6 +58,40 @@ _RESULT_SCHEMA: dict = {
     ],
     "review_url": "string; present ONLY when `review-pr` publishes a GitHub review",
     "review_id": "integer; present ONLY when `review-pr` publishes a GitHub review",
+    "thread": {
+        "id": "string; thread id `<owner>__<repo>__<pr>__<role>`. The whole `thread` object is "
+        "present ONLY for `review-pr --thread`.",
+        "role": "string: reviewer",
+        "engine": "string; engine pinned to the thread for this run",
+        "model": "string or null; model pinned to the thread for this run",
+        "rubric_version": "string; --rubric-version pinned to the thread (default empty)",
+        "session_id": "string or null; the engine session id (null without native resume)",
+        "session": "string: resumed | seeded | fresh - how this run's session started",
+        "session_reason": "string; why it was not resumed (e.g. new_thread, "
+        "engine_changed:pi->claude, model_changed, rubric_changed, no_native_resume, "
+        "session_not_ok, no_session, too_large, stale), or resume_failed / "
+        "engine_flags_unsupported when the engine rejected its session flags, or "
+        "session_pack_failed / record_write_failed when the stored session could not be used; "
+        "empty when resumed. resume_failed with session seeded means the resumed attempt failed "
+        "and this result is from one seeded retry in the same run",
+        "last_sha_before": "string or null; the head the previous successful review covered",
+    },
+    "handoff": {
+        "schema": "integer: 1. The whole `handoff` value is present ONLY for `review-pr "
+        "--thread`, null until a review succeeds: the bounded, redacted context the next run is "
+        "seeded with.",
+        "sha": "string; the reviewed head",
+        "summary": "string; review summary, at most 500 chars",
+        "findings": [
+            {
+                "title": "string; at most 200 chars",
+                "file": "string or null; at most 200 chars",
+                "line": "integer or null",
+                "severity": "string: blocking | normal | nit",
+                "status": "string: new | open (resolved findings are dropped; at most 40)",
+            }
+        ],
+    },
 }
 
 # Static description of the `franky job diagnose` success object (build_diagnosis_result). A
@@ -148,6 +182,55 @@ _JOB_RECORD_SCHEMA: dict = {
     "steer_notes": "operator corrections injected via `franky job attach` while the run was "
     "live (issue #72): a bounded list of {message (redacted), delivered} - or null if none. "
     "Audit trail only.",
+    "thread_id": "present ONLY on a `review-pr --thread` run: the review thread it belongs to "
+    "(see thread_record_schema). Absent on every other run.",
+}
+
+# Static description of one stored review thread (~/.franky/threads/<id>/record.json), as
+# `franky threads list --json` emits it (plus `thread` and `session_bytes`).
+_THREAD_RECORD_SCHEMA: dict = {
+    "thread": "string; thread id `<owner>__<repo>__<pr>__<role>`",
+    "schema": "integer: 1",
+    "repo": "string; owner/repo",
+    "pr": "integer; pull request number",
+    "role": "string: reviewer | author",
+    "engine": "string; engine pinned to the stored session",
+    "model": "string or null; model pinned to the stored session",
+    "rubric_version": "string; rubric label pinned to the stored session",
+    "session_id": "string or null; engine session id, written before each run starts",
+    "session_ok": "boolean; whether the stored session can be resumed",
+    "last_sha": "string or null; head covered by the last successful review",
+    "last_job_id": "string; job id of the last run on this thread",
+    "handoff": "object or null; see result_schema.handoff",
+    "created_at": "ISO-8601 UTC timestamp",
+    "updated_at": "ISO-8601 UTC timestamp of the last successful review",
+    "session_bytes": "integer; bytes of stored session files",
+}
+
+_THREADS_LIST_SCHEMA: dict = {"type": "array", "items": "thread_record_schema"}
+
+_THREADS_PRUNE_SCHEMA: dict = {
+    "purged": [
+        {
+            "thread": "string; thread id",
+            "reason": "string: closed | idle | disk | orphan (disk keeps record and handoff)",
+            "bytes": "integer; session bytes freed",
+        }
+    ],
+    "kept": "integer; threads still stored (of that repository with --repo)",
+    "bytes": "integer; session bytes still stored (of that repository with --repo)",
+    "disk_skipped": "boolean; true with --repo, where the global disk cap is not applied",
+}
+
+_THREADS_PURGE_SCHEMA: dict = {
+    "purged": [
+        {
+            "thread": "string; thread id",
+            "reason": "string: manual",
+            "bytes": "integer; session bytes freed",
+        }
+    ],
+    "busy": "array of thread ids skipped because a run, prune or purge held them",
 }
 
 _VERSION_RESULT_SCHEMA: dict = {
@@ -228,6 +311,9 @@ _JSON_OUTPUTS: dict[tuple[str, ...], dict] = {
     ("job", "replay"): {"success": "result_schema", "error": "error_schema"},
     ("job", "resume"): {"success": "result_schema", "error": "error_schema"},
     ("job", "attach"): {"success": "job_attach_schema", "error": "error_schema"},
+    ("threads", "list"): {"success": "threads_list_schema"},
+    ("threads", "prune"): {"success": "threads_prune_schema", "error": "error_schema"},
+    ("threads", "purge"): {"success": "threads_purge_schema", "error": "error_schema"},
 }
 
 # Static description of the error object (the dict build_error shapes), emitted on stdout
@@ -325,6 +411,10 @@ def build_schema(group: click.Group) -> dict:
         "job_kill_schema": _JOB_KILL_SCHEMA,
         "job_export_schema": _JOB_EXPORT_SCHEMA,
         "job_attach_schema": _JOB_ATTACH_SCHEMA,
+        "thread_record_schema": _THREAD_RECORD_SCHEMA,
+        "threads_list_schema": _THREADS_LIST_SCHEMA,
+        "threads_prune_schema": _THREADS_PRUNE_SCHEMA,
+        "threads_purge_schema": _THREADS_PURGE_SCHEMA,
         "error_schema": _ERROR_SCHEMA,
         # JSON object keys are strings; stringify the int exit codes for a valid JSON map.
         "exit_codes": {str(code): meaning for code, meaning in result.EXIT_CODES.items()},

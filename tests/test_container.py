@@ -1758,6 +1758,8 @@ def test_storage_helper_lifetime_covers_delayed_profile_and_resume(monkeypatch):
             defaults["ready_polls"].default * (inspect_timeout + defaults["poll_interval"].default)
             + 2 * defaults["timeout"].default
         )
+        if "session_timeout" in defaults:  # the thread session untar rides the profile delivery
+            setup_bound += defaults["session_timeout"].default
     now = [0.0]
     helper_expiry = []
     base_runner, _ = _orchestration_runner(lambda *a, **kw: None)
@@ -1948,3 +1950,188 @@ def test_deliver_steer_does_not_return_captured_output():
 
     result = deliver_steer("c", "a secret-looking correction", runner=runner)
     assert result is True  # the only thing deliver_steer returns is the bool
+
+
+# ---------------------------------------------------------------------------
+# Review thread sessions (`review-pr --thread`): stream-in and copy-out only, never a mount
+# ---------------------------------------------------------------------------
+
+
+def _session_runner(untar_rc=0):
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append((argv, kwargs))
+        if argv[:3] == ["docker", "inspect", "-f"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="true", stderr="")
+        if "-xzf" in argv:
+            if "stdin" in kwargs:
+                kwargs["stdin"].read()
+                return subprocess.CompletedProcess(argv, untar_rc, stdout="", stderr="")
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    return runner, calls
+
+
+def test_deliver_profile_streams_profile_then_session_then_marker(tmp_path):
+    tar = tmp_path / "session.tar.gz"
+    tar.write_bytes(b"session-bytes")
+    runner, calls = _session_runner()
+    assert container_mod.deliver_profile(
+        "t1", b"profile-bytes", runner, sleeper=NOOP_SLEEP, session_tar=str(tar)
+    )
+    steps = [(argv, kw) for argv, kw in calls if argv[:2] == ["docker", "exec"]]
+    assert [("input" in kw, "stdin" in kw, "touch" in argv) for argv, kw in steps] == [
+        (True, False, False),  # profile bytes
+        (False, True, False),  # session streamed from the file, never read into argv/env
+        (False, False, True),  # marker last
+    ]
+    assert all(CONTAINER_HOME in argv for argv, _kw in steps[:2])  # both untar into HOME
+    assert not any(argv[:2] == ["docker", "cp"] for argv, _kw in calls)
+
+
+def test_deliver_profile_session_only_and_marker_survives_a_failed_session_untar(tmp_path):
+    tar = tmp_path / "session.tar.gz"
+    tar.write_bytes(b"session-bytes")
+    runner, calls = _session_runner(untar_rc=2)
+    assert container_mod.deliver_profile(
+        "t1", None, runner, sleeper=NOOP_SLEEP, session_tar=str(tar)
+    )
+    execs = [argv for argv, _kw in calls if argv[:2] == ["docker", "exec"]]
+    assert len(execs) == 2 and "touch" in execs[-1]
+
+
+def test_run_in_container_session_tar_alone_uses_injection_mode_without_new_mounts(tmp_path):
+    tar = tmp_path / "session.tar.gz"
+    tar.write_bytes(b"session-bytes")
+    base_runner, calls = _orchestration_runner(lambda *a, **k: None)
+    runner, _ = _session_runner()
+    seen = {}
+
+    def full_runner(argv, **kwargs):
+        if argv[:2] == ["docker", "exec"] and "curl" not in argv:
+            return runner(argv, **kwargs)
+        return base_runner(argv, **kwargs)
+
+    def popen(argv, **kwargs):
+        seen["argv"] = argv
+        return _FakePopen(["event\n"])
+
+    code, _out = run_in_container(
+        _cfg(),
+        ["claude"],
+        runner=full_runner,
+        env={},
+        sleeper=NOOP_SLEEP,
+        popen=popen,
+        session_tar=str(tar),
+    )
+    assert code == 0
+    assert f"{PROFILE_WAIT_VAR}=1" in seen["argv"]
+    mounts = [seen["argv"][i + 1] for i, t in enumerate(seen["argv"]) if t == "--mount"]
+    assert mounts == [
+        "type=volume,dst=/work",
+        "type=volume,dst=/home/franky",
+        "type=volume,dst=/tmp",
+    ]
+    assert not any("-v" == t or "--volume" == t for t in seen["argv"])
+
+
+class _CpPopen:
+    """Fake `docker cp ... -` for the session copy-out: serves one tar, or fails."""
+
+    def __init__(self, data, returncode=0):
+        import io
+
+        self.stdout = io.BytesIO(data)
+        self.returncode = returncode
+        self.done = False
+
+    def kill(self):
+        self.done = True
+
+    def poll(self):
+        return self.returncode if self.done else None
+
+    def wait(self, timeout=None):
+        self.done = True
+        return self.returncode
+
+
+def _session_tar_bytes(name, data=b"{}"):
+    import io
+    import tarfile
+
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as tar:
+        info = tarfile.TarInfo(name)
+        info.size = len(data)
+        tar.addfile(info, io.BytesIO(data))
+    return buffer.getvalue()
+
+
+def _copy_out_run(tmp_path, *, task_code=0, cp=None, paths=None):
+    calls = []
+    runner, runner_calls = _orchestration_runner(lambda *a, **k: None)
+
+    def logged_runner(argv, **kwargs):
+        calls.append(argv)
+        return runner(argv, **kwargs)
+
+    def popen(argv, **kwargs):
+        calls.append(argv)
+        if argv[:2] == ["docker", "cp"]:
+            return cp(argv)
+        return _FakePopen(["event\n"], returncode=task_code)
+
+    sink = {
+        "paths": paths or [".claude/projects/-work/s1.jsonl", ".claude/projects/-work/s1"],
+        "dest": str(tmp_path),
+        "max_bytes": 10**6,
+    }
+    run_in_container(
+        _cfg(),
+        ["claude"],
+        runner=logged_runner,
+        env={},
+        sleeper=NOOP_SLEEP,
+        popen=popen,
+        run_id="abc123def456",
+        session_sink=sink,
+    )
+    return calls, sink
+
+
+def test_run_in_container_session_copy_out_streams_only_session_paths_before_reap(tmp_path):
+    def cp(argv):
+        if argv[2].endswith("s1.jsonl"):
+            return _CpPopen(_session_tar_bytes("s1.jsonl"))
+        return _CpPopen(b"", returncode=1)  # no side dir: optional
+
+    calls, sink = _copy_out_run(tmp_path, cp=cp)
+    task = "franky-run-abc123def456"
+    cps = [i for i, c in enumerate(calls) if c[:2] == ["docker", "cp"]]
+    reap = next(i for i, c in enumerate(calls) if c[:3] == ["docker", "rm", "-f"] and task in c)
+    assert [calls[i] for i in cps] == [
+        ["docker", "cp", f"{task}:/home/franky/.claude/projects/-work/s1.jsonl", "-"],
+        ["docker", "cp", f"{task}:/home/franky/.claude/projects/-work/s1", "-"],
+    ]
+    assert cps[-1] < reap
+    # Never the whole project dir (Claude project memory lives in -work/memory/).
+    assert not any(calls[i][2].endswith(("-work", "-work/.", "memory")) for i in cps)
+    assert sink["status"] == "ok"
+    assert (tmp_path / ".claude/projects/-work/s1.jsonl").read_text() == "{}"
+
+
+def test_run_in_container_session_copy_out_skipped_on_failure(tmp_path):
+    calls, sink = _copy_out_run(tmp_path, task_code=1, cp=lambda argv: pytest.fail("no copy"))
+    assert not any(c[:2] == ["docker", "cp"] for c in calls) and "status" not in sink
+
+
+def test_run_in_container_session_copy_out_reports_failure_and_too_large(tmp_path):
+    _calls, sink = _copy_out_run(tmp_path, cp=lambda argv: _CpPopen(b"", returncode=1))
+    assert sink["status"] == "failed"
+    big = _session_tar_bytes("s1.jsonl", b"x" * 2_000_000)
+    _calls, sink = _copy_out_run(tmp_path / "b", cp=lambda argv: _CpPopen(big))
+    assert sink["status"] == "too_large"

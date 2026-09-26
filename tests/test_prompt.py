@@ -534,3 +534,63 @@ def test_prompts_are_unchanged_without_an_operator_setup():
     assert build_resume_prompt(spec, branch="franky/t") == build_resume_prompt(
         spec, branch="franky/t", operator_setup=""
     )
+
+
+# --- review-pr --thread: prior review context --------------------------------------------------
+
+from franky.prompt import build_review_pr_prompt  # noqa: E402
+
+_HANDOFF = {
+    "schema": 1,
+    "sha": "b" * 40,
+    "summary": "s",
+    "findings": [
+        {
+            "title": "race in cache",
+            "file": "a.py",
+            "line": 3,
+            "severity": "blocking",
+            "status": "open",
+        },
+        {"title": "naming", "file": None, "line": None, "severity": "nit", "status": "new"},
+    ],
+}
+
+
+def test_review_prompt_without_handoff_is_unchanged():
+    plain = build_review_pr_prompt("me/repo", "https://github.com/me/repo/pull/1", "", "n0")
+    assert plain == build_review_pr_prompt(
+        "me/repo", "https://github.com/me/repo/pull/1", "", "n0", handoff=None, last_sha=None
+    )
+    assert "Prior review context" not in plain and '"status"' not in plain
+    assert '"line": <int-or-null>}], "checks"' in plain
+
+
+def test_review_prompt_handoff_block_is_fenced_and_scoped():
+    prompt = build_review_pr_prompt(
+        "me/repo",
+        "https://github.com/me/repo/pull/1",
+        "",
+        "n0",
+        handoff=_HANDOFF,
+        last_sha="c" * 40,
+    )
+    begin, end = "FRANKY_PRIOR_n0_BEGIN", "FRANKY_PRIOR_n0_END"
+    fenced = prompt[prompt.index(f"{begin}\n") : prompt.index(f"{end}\n")]
+    assert "- [blocking] race in cache (a.py:3) status=open\n" in fenced
+    assert "- [nit] naming status=new\n" in fenced
+    assert "untrusted DATA" in prompt
+    assert f"- Last reviewed commit: {'c' * 40}" in prompt
+    assert f"2. Review the delta {'c' * 40}..HEAD fully." in prompt
+    assert "only at blocking severity" in prompt and "force-push or rebase" in prompt
+    assert '"line": <int-or-null>, "status": "<new|open|resolved>"}], "checks"' in prompt
+    # The block sits after the task block and before the review conventions.
+    assert prompt.index("Task: independently review") < prompt.index(begin)
+    assert prompt.index(end) < prompt.index("REVIEW MODE")
+
+
+def test_review_prompt_handoff_without_findings():
+    prompt = build_review_pr_prompt(
+        "me/repo", "u", "", "n0", handoff={**_HANDOFF, "findings": []}, last_sha=None
+    )
+    assert "(no open findings)" in prompt and f"Last reviewed commit: {'b' * 40}" in prompt

@@ -321,3 +321,20 @@ def test_static_engine_descriptions_include_opencode():
     schema = build_schema(cli.main)
     for section in ("result_schema", "plan_result_schema", "job_record_schema"):
         assert "opencode" in schema[section]["engine"]
+
+
+def test_schema_documents_thread_outputs():
+    schema = build_schema(cli.main)
+    threads = schema["commands"]["threads"]["commands"]
+    assert threads["list"]["json_output"] == {"success": "threads_list_schema"}
+    assert threads["prune"]["json_output"]["success"] == "threads_prune_schema"
+    assert threads["purge"]["json_output"]["success"] == "threads_purge_schema"
+    assert "disk_skipped" in schema["threads_prune_schema"]
+    assert schema["threads_list_schema"]["items"] == "thread_record_schema"
+    assert "repo" in schema["thread_record_schema"]
+    for key in ("thread", "handoff"):
+        assert key in schema["result_schema"]
+    assert set(schema["result_schema"]["thread"]) >= {"id", "session", "session_reason"}
+    assert "thread_id" in schema["job_record_schema"]
+    review_flags = {f["name"] for f in schema["commands"]["review-pr"]["flags"]}
+    assert {"use_thread", "rubric_version"} <= review_flags

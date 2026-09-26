@@ -20,7 +20,7 @@ import tarfile
 import time
 from collections.abc import Mapping
 from dataclasses import replace as dc_replace
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import click
@@ -44,7 +44,7 @@ from .container import (
     resolve_image,
     run_in_container,
 )
-from . import jobs, snapshot
+from . import jobs, snapshot, threads
 from .container import container_running, deliver_steer, reap_run, run_names
 from .engine import (
     CODEX_SUBSCRIPTION_VAR,
@@ -815,6 +815,20 @@ def iterate(
     help="Review but write nothing to GitHub; report findings only (default: publish a review).",
 )
 @click.option(
+    "--thread",
+    "use_thread",
+    is_flag=True,
+    default=False,
+    help="Keep one stored review session per PR and continue it on the next run "
+    "(see `franky threads`).",
+)
+@click.option(
+    "--rubric-version",
+    "rubric_version",
+    default="",
+    help="Rubric label pinned to the --thread session; a different value starts a new session.",
+)
+@click.option(
     "--engine",
     "engine",
     default=None,
@@ -854,6 +868,8 @@ def review_pr(
     instructions: str,
     expected_head_sha: str | None,
     no_publish: bool,
+    use_thread: bool,
+    rubric_version: str,
     engine: str | None,
     verbose: bool,
     as_json: bool,
@@ -875,6 +891,11 @@ def review_pr(
     BEFORE the pass starts, and again immediately BEFORE publishing) refuses rather than
     reviewing or publishing stale state. --no-publish reviews without writing anything to
     GitHub - read the findings from the --json result or the redacted log instead.
+
+    --thread keeps one review session per PR (repo + PR number, role reviewer) under
+    ~/.franky/threads. A later run resumes it natively when the engine supports it (claude),
+    otherwise starts a new session seeded with the stored findings, and never blocks the review.
+    A run that finds the thread held by another process exits 4 (`thread_busy`).
 
     --json emits one machine-readable result/error object on stdout (status review_published or
     review_complete on success, including reviewed_sha/findings_summary/checks and, once
@@ -915,6 +936,19 @@ def review_pr(
         except ValueError as exc:
             raise NetworkError(redact(str(exc), cfg_secrets_safe())) from exc
 
+        # Lock the thread BEFORE the head pin, so two runs for one PR can never interleave.
+        thread = None
+        if use_thread:
+            try:
+                thread = threads.open_thread(repo, pr_number, "reviewer")
+            except FrankyError:
+                raise
+            except ValueError as exc:
+                raise TaskRejected(str(exc)) from exc
+            except OSError as exc:
+                raise ConfigError(f"thread store is not writable: {exc}") from exc
+            ctx.call_on_close(thread.close)
+
         # Pin the LIVE head SHA before anything else runs - the review is grounded against
         # exactly this commit. A caller-supplied --expected-head-sha must agree with it now, or
         # we refuse rather than reviewing state the caller no longer expects (issue: review-pr
@@ -944,23 +978,106 @@ def review_pr(
         nonce = _make_nonce()
         job_id = jobs.new_job_id()
         _record_run_start(
-            job_id, command="review-pr", cfg=cfg, repo=repo, summary=canonical_pr_url, branch=None
+            job_id,
+            command="review-pr",
+            cfg=cfg,
+            repo=repo,
+            summary=canonical_pr_url,
+            branch=None,
+            thread_id=thread.id if thread else None,
         )
         if not quiet:
             click.echo(f"franky: job {job_id} started", err=True)
 
-        diagnostics: dict = {}
-        code, output, duration = _run_pass(
-            cfg,
-            build_review_pr_prompt(repo, canonical_pr_url, instructions, nonce),
-            franky_img,
-            proxy_img,
-            bundle,
-            progress=progress,
-            timeout=max_duration,
-            run_id=job_id,
-            diagnostics_sink=diagnostics,
+        # Thread plan: the session id is written to record.json before the container starts.
+        record = prior_sha = prior_handoff = incoming = None
+        mode = plan_reason = ""
+        run_kwargs: dict = {}
+        now = datetime.now(timezone.utc)
+        if thread is not None:
+            record = threads.read_record(thread.path)
+            prior_sha = (record or {}).get("last_sha")
+            prior_handoff = (record or {}).get("handoff")
+            mode, plan_reason = threads.plan_run(
+                record,
+                engine=cfg.engine.name,
+                native=bool(cfg.engine.session_dir),
+                model=cfg.model,
+                rubric=rubric_version,
+                session_bytes=threads.session_bytes(thread),
+                now=now,
+            )
+        prompt = build_review_pr_prompt(
+            repo, canonical_pr_url, instructions, nonce, handoff=prior_handoff, last_sha=prior_sha
         )
+
+        diagnostics: dict = {}
+        duration = 0.0
+        retried = False
+        while True:
+            if thread is not None:
+                record, mode, plan_reason, run_kwargs, incoming = _thread_launch(
+                    thread,
+                    record,
+                    cfg,
+                    mode=mode,
+                    reason=plan_reason,
+                    repo=repo,
+                    pr=pr_number,
+                    rubric=rubric_version,
+                    job_id=job_id,
+                    now=now,
+                )
+            try:
+                code, output, attempt_duration = _run_pass(
+                    cfg,
+                    prompt,
+                    franky_img,
+                    proxy_img,
+                    bundle,
+                    progress=progress,
+                    timeout=max_duration,
+                    run_id=job_id,
+                    diagnostics_sink=diagnostics,
+                    **run_kwargs,
+                )
+            finally:
+                if run_kwargs.get("session_tar"):
+                    Path(run_kwargs["session_tar"]).unlink(missing_ok=True)
+            duration += attempt_duration
+            # A failed resumed attempt never blocks the review: drop that session and retry once
+            # in this run as a seeded session (new id, prior findings in the prompt).
+            if (
+                thread is not None
+                and mode == "resumed"
+                and code not in (0, CONTAINER_TIMEOUT_CODE)
+                and not retried
+            ):
+                record, _label = threads.finish_run(
+                    thread,
+                    record,
+                    mode=mode,
+                    code=code,
+                    shaped=None,
+                    sha=pinned_sha,
+                    tail=_output_tail(output),
+                    incoming=incoming,
+                    copy_status=None,
+                    secrets=secrets,
+                    now=datetime.now(timezone.utc),
+                )
+                failed_log = _write_log(
+                    output, secrets, run_id=f"{job_id}-resume-failed", env=os.environ
+                )
+                if not quiet:
+                    click.echo(
+                        f"franky: resumed review session failed (log: {failed_log}) - "
+                        "retrying once with a seeded session",
+                        err=True,
+                    )
+                mode, plan_reason, retried = threads.seed_mode(record), "resume_failed", True
+                continue
+            break
 
         usage = _parse_usage_safe(output)
         econ = _economics_line(usage, duration, secrets)
@@ -972,6 +1089,7 @@ def review_pr(
         review_id: int | None = None
         findings_summary: str | None = None
         checks: list | None = None
+        shaped: dict | None = None
 
         # Timeout first (124 is nonzero) -> dedicated timeout contract, before generic agent_error.
         if code == CONTAINER_TIMEOUT_CODE:
@@ -991,7 +1109,7 @@ def review_pr(
                 )
                 exit_code = EXIT_AGENT
             else:
-                shaped = build_review_findings(parsed)
+                shaped = build_review_findings(parsed, threaded=thread is not None)
                 findings_summary = shaped["summary"]
                 checks = shaped["checks"]
                 if no_publish:
@@ -1055,6 +1173,35 @@ def review_pr(
                             reason = f"published a {event} review"
                             exit_code = EXIT_SUCCESS
 
+        thread_result = handoff = None
+        if thread is not None:
+            sink = run_kwargs.get("session_sink") or {}
+            record, override = threads.finish_run(
+                thread,
+                record,
+                mode=mode,
+                code=code,
+                shaped=shaped,
+                sha=pinned_sha,
+                tail=_output_tail(output),
+                incoming=incoming,
+                copy_status=sink.get("status"),
+                secrets=secrets,
+                now=datetime.now(timezone.utc),
+            )
+            handoff = record.get("handoff")
+            thread_result = {
+                "id": thread.id,
+                "role": "reviewer",
+                "engine": cfg.engine.name,
+                "model": cfg.model,
+                "rubric_version": rubric_version,
+                "session_id": record.get("session_id"),
+                "session": mode,
+                "session_reason": override or plan_reason,
+                "last_sha_before": prior_sha,
+            }
+
         _record_run_end(
             job_id,
             status=status,
@@ -1081,6 +1228,8 @@ def review_pr(
             checks=checks,
             review_url=review_url,
             review_id=review_id,
+            thread=thread_result,
+            handoff=handoff,
         )
         _emit_result(
             result,
@@ -1308,6 +1457,56 @@ def _ensure_images(env: Mapping[str, str], engine: str) -> tuple[str, str]:
     return franky_img, proxy_img
 
 
+def _output_tail(output) -> str:
+    """The last 64 KiB of a pass's output, for engine error detection."""
+    return output.tail(65536) if isinstance(output, Transcript) else output[-65536:]
+
+
+def _thread_launch(thread, record, cfg, *, mode, reason, repo, pr, rubric, job_id, now):
+    """Pin one `review-pr --thread` attempt's session before launch.
+
+    Returns (record, mode, reason, run_kwargs for _run_pass, copy-out dir or None). A resumed
+    session that cannot be packed downgrades to a seeded one; a record that cannot be written
+    runs with no session flags at all, so a known id is never missing from record.json."""
+    tar = None
+    if mode == "resumed":
+        tar = threads.session_tar(
+            thread, threads.session_paths(cfg.engine.name, record["session_id"])
+        )
+        if tar is None:
+            mode, reason = threads.seed_mode(record), "session_pack_failed"
+    record, written = threads.begin_run(
+        thread,
+        record,
+        repo=repo,
+        pr=pr,
+        role="reviewer",
+        engine=cfg.engine.name,
+        native=bool(cfg.engine.session_dir),
+        model=cfg.model,
+        rubric=rubric,
+        mode=mode,
+        job_id=job_id,
+        now=now,
+    )
+    paths = threads.session_paths(cfg.engine.name, record["session_id"])
+    if not written or not paths:
+        if tar is not None:
+            tar.unlink(missing_ok=True)
+        return record, mode, (reason if written else "record_write_failed"), {}, None
+    incoming = threads.new_incoming(thread)
+    run_kwargs = {
+        "session": (record["session_id"], mode == "resumed"),
+        "session_tar": str(tar) if tar else None,
+        "session_sink": {
+            "paths": paths,
+            "dest": str(incoming),
+            "max_bytes": threads.MAX_SESSION_BYTES,
+        },
+    }
+    return record, mode, reason, run_kwargs, incoming
+
+
 def _run_pass(
     cfg,
     prompt: str,
@@ -1320,6 +1519,9 @@ def _run_pass(
     diagnostics_sink: dict | None = None,
     snapshot_sink: dict | None = None,
     resume_workspace: str | None = None,
+    session: tuple[str, bool] | None = None,
+    session_tar: str | None = None,
+    session_sink: dict | None = None,
 ) -> tuple[int, str, float]:
     """Run one container pass for `prompt` and return (exit_code, output, duration_secs).
 
@@ -1335,13 +1537,21 @@ def _run_pass(
     docstring; None (the default) means no capture, byte-identical to pre-#69 behavior.
     `snapshot_sink`/`resume_workspace` (issue #71) are likewise forwarded unchanged - a
     snapshot-on-timeout sink and a workspace-to-restore path respectively; both None by default.
+    `session` = (session_id, resume) reaches the engine argv; `session_tar`/`session_sink` are
+    forwarded to run_in_container (`review-pr --thread`). Each is passed on only when set, so a
+    run without them is unchanged.
     """
-    inner_argv = cfg.engine.inner_argv(prompt, model=cfg.model)
+    session_kwargs = {} if session is None else {"session_id": session[0], "resume": session[1]}
+    inner_argv = cfg.engine.inner_argv(prompt, model=cfg.model, **session_kwargs)
     for override in cfg.codex_mcp_overrides:
         inner_argv += ["-c", override]
     if cfg.claude_mcp_config_path:
         inner_argv += ["--mcp-config", cfg.claude_mcp_config_path, "--strict-mcp-config"]
     extra = {} if timeout is None else {"timeout": timeout}
+    if session_tar is not None:
+        extra["session_tar"] = session_tar
+    if session_sink is not None:
+        extra["session_sink"] = session_sink
     t0 = time.monotonic()
     code, output = run_in_container(
         cfg,
@@ -1502,6 +1712,7 @@ def _record_run_start(
     base_sha=None,
     replay_of=None,
     resumed_from=None,
+    thread_id=None,
     env=None,
 ) -> None:
     """Write a status=running registry record before the container pass (issues #63, #64).
@@ -1538,6 +1749,7 @@ def _record_run_start(
             base_sha=base_sha,
             replay_of=replay_of,
             resumed_from=resumed_from,
+            thread_id=thread_id,
         )
         jobs.write_record(record, env)
         jobs.prune(env)  # only on the write path; never a side effect of a read
@@ -3324,6 +3536,181 @@ def _clear_codex_auth_marker() -> None:
         unset_value(path, CODEX_SUBSCRIPTION_VAR)
     except ValueError as exc:
         raise click.ClickException(f"could not update config: {exc}") from exc
+
+
+@main.group("threads")
+def threads_group() -> None:
+    """List, prune, and purge stored review threads (`franky review-pr --thread`)."""
+
+
+def _parse_amount(text: str, units: dict[str, int], flag: str) -> int:
+    """Parse `<N><unit>` (e.g. 30d, 2G) into N * units[unit]; the empty unit is the base."""
+    match = re.fullmatch(r"(\d+)([A-Za-z]?)", (text or "").strip())
+    if not match or match[2].lower() not in units:
+        raise FrankyError(
+            f"{flag} {text!r} is not valid (expected e.g. {'30d' if 'd' in units else '2G'})",
+            code=EXIT_USAGE,
+            kind="usage_error",
+        )
+    return int(match[1]) * units[match[2].lower()]
+
+
+@threads_group.command("list")
+@click.option("--json", "as_json", is_flag=True, help="Emit the thread records as a JSON array.")
+def threads_list(as_json: bool) -> None:
+    """List stored threads with their pinned engine, last reviewed head, and session size."""
+    records = threads.list_threads()
+    if as_json:
+        click.echo(json.dumps(records))
+        return
+    for record in records:
+        click.echo(
+            f"{record['thread']}  {record.get('engine')}  "
+            f"session={'ok' if record.get('session_ok') else 'none'}  "
+            f"last_sha={(record.get('last_sha') or '-')[:12]}  "
+            f"updated={record.get('updated_at')}  bytes={record['session_bytes']}"
+        )
+
+
+@threads_group.command("prune")
+@click.option(
+    "--closed",
+    is_flag=True,
+    help="Also purge threads whose PR is merged or closed (read-only GitHub query).",
+)
+@click.option(
+    "--older-than",
+    "older_than",
+    default="30d",
+    show_default=True,
+    help="Purge threads with no successful review for this many days.",
+)
+@click.option(
+    "--max-bytes",
+    "max_bytes",
+    default="2G",
+    show_default=True,
+    help="Drop stored sessions, oldest first, while their total exceeds this (K, M, G).",
+)
+@click.option(
+    "--repo",
+    "repo",
+    default=None,
+    help="Consider only this owner/repo's threads in every pass; skips the disk cap.",
+)
+@click.option("--json", "as_json", is_flag=True, help="Emit the prune result as a JSON object.")
+@click.pass_context
+def threads_prune(
+    ctx: click.Context,
+    closed: bool,
+    older_than: str,
+    max_bytes: str,
+    repo: str | None,
+    as_json: bool,
+) -> None:
+    """Bound the thread store: orphans, closed PRs (--closed), idle threads, then the disk cap.
+
+    A thread held by a running review is skipped. The disk cap deletes session files only and
+    keeps each record and handoff. Each deletion prints one stderr line, never content.
+
+    --repo limits every pass to one repository, so a token scoped to that repository covers
+    --closed. The disk cap is global, so it is skipped with --repo (`disk_skipped` in --json).
+    """
+    try:
+        days = _parse_amount(older_than, {"": 1, "d": 1}, "--older-than")
+        cap = _parse_amount(
+            max_bytes, {"": 1, "k": 1024, "m": 1024**2, "g": 1024**3}, "--max-bytes"
+        )
+        if repo is not None:
+            try:
+                threads.thread_id(repo, 1, threads.ROLES[0])
+            except ValueError as exc:
+                raise FrankyError(str(exc), code=EXIT_USAGE, kind="usage_error") from exc
+        if closed:
+            # Same token source as review publishing: the host GH_TOKEN after the config merge.
+            try:
+                load_config_file(os.environ)
+            except FrankyError:
+                raise
+            except ValueError as exc:
+                raise ConfigError(f"config file error: {exc}") from exc
+            if not os.environ.get(GH_TOKEN_VAR):
+                click.echo(
+                    "franky: threads prune: GH_TOKEN is not set - skipping the --closed pass",
+                    err=True,
+                )
+                closed = False
+        result = threads.prune(
+            closed=closed,
+            older_than_days=days,
+            max_bytes=cap,
+            repo=repo,
+            warn=lambda message: click.echo(message, err=True),
+        )
+        for entry in result["purged"]:
+            click.echo(
+                f"franky: threads prune: purged {entry['thread']} reason={entry['reason']} "
+                f"bytes={entry['bytes']}",
+                err=True,
+            )
+        if as_json:
+            click.echo(json.dumps(result))
+        else:
+            skipped = " (disk cap skipped: --repo)" if result["disk_skipped"] else ""
+            click.echo(
+                f"franky: threads prune: kept {result['kept']} thread(s), "
+                f"{result['bytes']} session bytes{skipped}",
+                err=True,
+            )
+    except FrankyError as exc:
+        _emit_error(exc, as_json, [])
+        ctx.exit(exc.code)
+
+
+@threads_group.command("purge")
+@click.argument("ref", required=False)
+@click.option(
+    "--role",
+    type=click.Choice(threads.ROLES),
+    default=None,
+    help="Purge only this role's thread (default: both).",
+)
+@click.option("--all", "purge_all", is_flag=True, help="Purge every stored thread.")
+@click.option("--json", "as_json", is_flag=True, help="Emit the purge result as a JSON object.")
+@click.pass_context
+def threads_purge(
+    ctx: click.Context, ref: str | None, role: str | None, purge_all: bool, as_json: bool
+) -> None:
+    """Delete the stored threads of one PR (OWNER/REPO#N) or, with --all, every thread.
+
+    Example:
+      franky threads purge you/repo#42
+    """
+    try:
+        if bool(ref) == purge_all or (purge_all and role):
+            raise FrankyError(
+                "pass exactly one of OWNER/REPO#N or --all (--role needs OWNER/REPO#N)",
+                code=EXIT_USAGE,
+                kind="usage_error",
+            )
+        try:
+            result = threads.purge(ref=ref, role=role)
+        except FrankyError:
+            raise
+        except ValueError as exc:
+            raise FrankyError(str(exc), code=EXIT_USAGE, kind="usage_error") from exc
+        for entry in result["purged"]:
+            click.echo(
+                f"franky: threads purge: purged {entry['thread']} bytes={entry['bytes']}",
+                err=True,
+            )
+        for tid in result["busy"]:
+            click.echo(f"franky: threads purge: skipped {tid} (busy)", err=True)
+        if as_json:
+            click.echo(json.dumps(result))
+    except FrankyError as exc:
+        _emit_error(exc, as_json, [])
+        ctx.exit(exc.code)
 
 
 @main.group("auth")

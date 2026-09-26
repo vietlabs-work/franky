@@ -38,7 +38,8 @@ EXIT_CODES: dict[int, str] = {
     EXIT_SUCCESS: "success",
     EXIT_USAGE: "usage/flag error, or interactive input required in a non-TTY (never-hang)",
     EXIT_CONFIG: "bad config file, allowlist unset/empty/malformed, or unknown engine",
-    EXIT_TASK_REJECTED: "task rejected: off-allowlist repo, missing --repo, or bad URL/key",
+    EXIT_TASK_REJECTED: "task rejected: off-allowlist repo, missing --repo, or bad URL/key, "
+    "or a busy review thread",
     EXIT_AUTH: "missing creds (GH_TOKEN, engine creds, JIRA creds) or JIRA 401/403",
     EXIT_DOCKER: "docker or image unavailable, or a required host tool (e.g. gh) is missing",
     EXIT_AGENT: "agent/result failure, including no PR, invalid output, or stale review head",
@@ -125,6 +126,8 @@ def build_result(
     checks: list | None = None,
     review_url: str | None = None,
     review_id: int | None = None,
+    thread: dict | None = None,
+    handoff: dict | None = None,
 ) -> dict:
     """Shape the success/agent-result object emitted on stdout under `--json`.
 
@@ -160,6 +163,10 @@ def build_result(
     ran; `review_url`/`review_id` identify the GitHub review Franky posted, present only when
     `publish=True` actually posted one (never on a `--no-publish` run, which writes nothing to
     GitHub - see the `review-pr` command).
+
+    `thread`/`handoff` are `review-pr --thread`-only: both keys appear exactly when `thread` is
+    not None (a thread with no stored handoff yet reports `handoff: null`), so a run without
+    `--thread` emits the exact same keys as before.
     """
     result = {
         "status": status,
@@ -194,6 +201,9 @@ def build_result(
         result["review_url"] = review_url
     if review_id is not None:
         result["review_id"] = review_id
+    if thread is not None:
+        result["thread"] = thread
+        result["handoff"] = handoff
     return result
 
 

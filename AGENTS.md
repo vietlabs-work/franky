@@ -31,6 +31,7 @@ make smoke-security
 make smoke-dind
 make smoke-resume
 make smoke-profile
+make smoke-thread
 make smoke-memory
 make smoke-memory ARGS="--jobs 4"
 
@@ -58,6 +59,7 @@ CLI -> config and task policy -> prompt -> engine command -> container runtime -
 | Runtime | `container.py`, `security.py`, `egress.py`, `franky-dind-entrypoint.sh`, `proxy/` | Docker lifecycle, isolation, policies, proxy |
 | Transfer | `profile.py`, `setups.py`, `snapshot.py` | Bounded, secret-scanned profile and workspace bundles |
 | Runs | `jobs.py`, `transcript.py`, `economics.py` | Records, redacted logs, diagnostics, usage |
+| Review threads | `threads.py` | Per-PR review sessions, handoffs, locks, prune and purge |
 | Host helpers | `github.py`, `update_check.py`, `_install.py` | `gh` passthrough, updates, install detection |
 
 Keep policy code pure where practical. Keep subprocess calls injectable so tests remain hermetic.
@@ -68,7 +70,7 @@ Keep policy code pure where practical. Keep subprocess calls injectable so tests
 - State the effect on two and four concurrent jobs in each PR.
 - Run `make footprint` for fixed host comparisons.
 - Run two-job and four-job memory smokes after container or storage changes.
-- Run all relevant security, DinD, resume, and profile smokes after runtime changes.
+- Run all relevant security, DinD, resume, profile, and thread smokes after runtime changes.
 - Do not increase `scripts/footprint-budgets.json` without measured before-and-after evidence.
 - Keep shared runtime layers separate from engine payloads. Do not add a tool to every image without need.
 - Keep the proxy user as numeric `13:13` across image bases.
@@ -149,6 +151,8 @@ Any policy delta must pass pinned-policy tests, `make smoke-security`, and `make
 - Disable each engine's own approval and sandbox prompts. The container is the autonomous safety boundary.
 - Keep `claude --dangerously-skip-permissions`, `codex --dangerously-bypass-approvals-and-sandbox`, and OpenCode `--auto --pure`.
 - Stream profile and snapshot archives through `docker exec -i`. Never place archive data in arguments or environment values.
+- Thread sessions move by stream-in (tar over docker exec) and copy-out (docker cp) only - never mounted, regular files only, scrubbed and verified, host-only, never exported.
+- Thread transfer carries only the engine session file and its side directory. Never carry an engine's project memory between runs.
 - Secret-scan every injected profile file. Resolve symlinks before deny checks.
 - Skip unscannable setup files. Never inject setup MCP configuration automatically.
 - Keep Codex `--ignore-user-config`. Pass validated MCP servers as explicit overrides.

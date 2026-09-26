@@ -725,3 +725,37 @@ def test_codex_auth_volume_rejects_empty_string():
 def test_codex_auth_volume_rejects_trailing_newline():
     with pytest.raises(ValueError, match=FRANKY_CODEX_AUTH_VOLUME_VAR):
         codex_auth_volume({FRANKY_CODEX_AUTH_VOLUME_VAR: "myvol\n"})
+
+
+# --- review thread sessions (`review-pr --thread`) ---------------------------------------------
+
+SESSION = "11111111-2222-3333-4444-555555555555"
+
+
+def test_claude_fresh_session_pins_the_session_id():
+    argv = ClaudeEngine().inner_argv("go", "opus", session_id=SESSION)
+    assert argv[-4:] == ["--session-id", SESSION, "--model", "opus"]
+    assert "--resume" not in argv
+
+
+def test_claude_resumed_session_uses_resume_with_the_same_id():
+    argv = ClaudeEngine().inner_argv("go", None, session_id=SESSION, resume=True)
+    assert argv[-2:] == ["--resume", SESSION]
+    assert "--session-id" not in argv and "--fork-session" not in argv
+
+
+def test_claude_session_dir_and_no_session_by_default():
+    assert ClaudeEngine.session_dir == ".claude/projects/-work"
+    assert ClaudeEngine().inner_argv("go", None) == ClaudeEngine().inner_argv(
+        "go", None, session_id=None, resume=True
+    )
+
+
+@pytest.mark.parametrize("cls", [PiEngine, CodexEngine, OpenCodeEngine])
+def test_engines_without_native_resume_ignore_session_kwargs(cls):
+    assert cls.session_dir == ""
+    engine = cls()
+    for model in (None, "moonshotai/kimi-k3"):
+        assert engine.inner_argv("go", model, session_id=SESSION, resume=True) == engine.inner_argv(
+            "go", model
+        )

@@ -2,6 +2,7 @@ import json
 import os
 import stat
 import subprocess
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -3954,3 +3955,471 @@ def test_review_pr_matches_bridge_argv_contract(monkeypatch):
     assert data["review_id"] == 555
     assert data["repo"] == "me/repo"
     assert isinstance(data["job_id"], str) and data["job_id"]
+
+
+# ---------------------------------------------------------------------------
+# `franky review-pr --thread` + `franky threads` (stored per-PR review sessions)
+# ---------------------------------------------------------------------------
+
+import franky.threads as threads_mod  # noqa: E402
+
+THREAD_ID = f"me__repo__{REVIEW_PR_NUMBER}__reviewer"
+BLOCKING = {
+    "summary": "one bug",
+    "findings": [{"title": "race", "body": "b", "severity": "blocking", "file": "a.py", "line": 3}],
+    "checks": [],
+}
+
+
+def _thread_env(tmp_path, engine_token=True):
+    env = _review_env()
+    env["FRANKY_THREADS_DIR"] = str(tmp_path / "threads")
+    env["FRANKY_CONFIG_FILE"] = str(tmp_path / "no-config")  # never merge a real config file
+    if engine_token:
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = "claude-fake"
+    return env
+
+
+def _thread_dir(tmp_path):
+    return tmp_path / "threads" / THREAD_ID
+
+
+def _fake_thread_run(monkeypatch, tmp_path, *, code=0, output=None, seen=None, results=None):
+    """A run_in_container fake that asserts the record is on disk BEFORE the run, records argv
+    and kwargs, and plays the container side of copy-out (a session file per run). `results`
+    is an optional list of (code, output) per call, for multi-attempt runs."""
+    seen = [] if seen is None else seen
+    results = list(results) if results else None
+
+    def fake(cfg, inner_argv, *a, **k):
+        record = threads_mod.read_record(_thread_dir(tmp_path))
+        call = {"argv": list(inner_argv), "kwargs": k, "record_before": record}
+        if k.get("session_tar"):
+            call["tar_existed"] = Path(k["session_tar"]).exists()
+            with tarfile.open(k["session_tar"]) as archive:
+                call["tar_names"] = archive.getnames()
+        seen.append(call)
+        run_code, run_output = results.pop(0) if results else (code, output)
+        sink = k.get("session_sink")
+        if sink and run_code == 0:
+            path = Path(sink["dest"], sink["paths"][0])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(f'{{"run": {len(seen)}}}\n')
+            sink["status"] = "ok"
+        return run_code, run_output if run_output is not None else _review_block(BLOCKING)
+
+    monkeypatch.setattr(cli, "run_in_container", fake)
+    return seen
+
+
+def _review(args):
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        return runner.invoke(cli.main, ["review-pr", *args, "--json", PR_URL])
+
+
+def test_review_pr_thread_first_run_pins_session_before_launch(monkeypatch, tmp_path):
+    _fix_review_nonce(monkeypatch)
+    _mc_review_setup(monkeypatch, env=_thread_env(tmp_path))
+    seen = _fake_thread_run(monkeypatch, tmp_path)
+    res = _review(["--thread", "--engine", "claude", "--no-publish"])
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.stdout)
+    before = seen[0]["record_before"]
+    assert before is not None and before["session_ok"] is False  # written before the run
+    sid = before["session_id"]
+    assert seen[0]["argv"][seen[0]["argv"].index("--session-id") + 1] == sid
+    assert "--resume" not in seen[0]["argv"] and "session_tar" not in seen[0]["kwargs"]
+    assert data["thread"] == {
+        "id": THREAD_ID,
+        "role": "reviewer",
+        "engine": "claude",
+        "model": None,
+        "rubric_version": "",
+        "session_id": sid,
+        "session": "fresh",
+        "session_reason": "new_thread",
+        "last_sha_before": None,
+    }
+    assert data["handoff"]["sha"] == LIVE_SHA
+    assert data["handoff"]["findings"][0]["title"] == "race"
+    record = threads_mod.read_record(_thread_dir(tmp_path))
+    assert record["session_ok"] is True and record["last_sha"] == LIVE_SHA
+    assert (_thread_dir(tmp_path) / "session/.claude/projects/-work" / f"{sid}.jsonl").exists()
+    job = jobs.read_record(data["job_id"])
+    assert job["thread_id"] == THREAD_ID
+
+
+def test_review_pr_thread_second_run_resumes_the_same_session(monkeypatch, tmp_path):
+    _fix_review_nonce(monkeypatch)
+    _mc_review_setup(monkeypatch, env=_thread_env(tmp_path))
+    seen = _fake_thread_run(monkeypatch, tmp_path)
+    assert _review(["--thread", "--engine", "claude", "--no-publish"]).exit_code == 0
+    res = _review(["--thread", "--engine", "claude", "--no-publish"])
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.stdout)
+    sid = seen[0]["record_before"]["session_id"]
+    argv = seen[1]["argv"]
+    assert argv[argv.index("--resume") + 1] == sid and "--session-id" not in argv
+    assert seen[1]["tar_existed"] is True
+    assert not Path(seen[1]["kwargs"]["session_tar"]).exists()  # cleaned after the run
+    assert data["thread"]["session"] == "resumed" and data["thread"]["session_id"] == sid
+    assert data["thread"]["last_sha_before"] == LIVE_SHA
+    # The prior findings ride into the prompt (fenced) on the second run.
+    assert "Prior review context" not in seen[0]["argv"][2]
+    assert f"FRANKY_PRIOR_{REVIEW_NONCE}_BEGIN" in argv[2] and "race" in argv[2]
+
+
+def test_review_pr_thread_engine_change_seeds_and_drops_old_session(monkeypatch, tmp_path):
+    _fix_review_nonce(monkeypatch)
+    _mc_review_setup(monkeypatch, env=_thread_env(tmp_path))
+    seen = _fake_thread_run(monkeypatch, tmp_path)
+    assert _review(["--thread", "--engine", "claude", "--no-publish"]).exit_code == 0
+    res = _review(["--thread", "--engine", "pi", "--no-publish"])
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.stdout)
+    assert data["thread"]["session"] == "seeded"
+    assert data["thread"]["session_reason"] == "engine_changed:claude->pi"
+    assert data["thread"]["session_id"] is None
+    assert not (_thread_dir(tmp_path) / "session").exists()
+    assert "--session-id" not in seen[1]["argv"] and "session_sink" not in seen[1]["kwargs"]
+    assert "Prior review context" in seen[1]["argv"][2]
+
+
+def test_review_pr_thread_busy_exits_4_with_json_error(monkeypatch, tmp_path):
+    _fix_review_nonce(monkeypatch)
+    env = _thread_env(tmp_path)
+    _mc_review_setup(monkeypatch, env=env)
+    seen = _fake_thread_run(monkeypatch, tmp_path)
+    held = threads_mod.open_thread("me/repo", REVIEW_PR_NUMBER, "reviewer", env)
+    try:
+        res = _review(["--thread", "--engine", "claude"])
+    finally:
+        held.close()
+    assert res.exit_code == 4
+    assert json.loads(res.stdout)["error"]["kind"] == "thread_busy"
+    assert seen == []
+
+
+RESUME_ERROR = "Error: No conversation found with session ID: x"
+
+
+def _two_runs(monkeypatch, tmp_path, second_results, args=("--no-publish",)):
+    """One successful run to store a session, then a second run with `second_results`."""
+    _fix_review_nonce(monkeypatch)
+    _mc_review_setup(monkeypatch, env=_thread_env(tmp_path))
+    _fake_thread_run(monkeypatch, tmp_path)
+    assert _review(["--thread", "--engine", "claude", *args]).exit_code == 0
+    first_sid = threads_mod.read_record(_thread_dir(tmp_path))["session_id"]
+    seen = _fake_thread_run(monkeypatch, tmp_path, results=second_results)
+    res = _review(["--thread", "--engine", "claude", *args])
+    return first_sid, seen, res
+
+
+def test_review_pr_thread_failed_resume_retries_once_seeded(monkeypatch, tmp_path):
+    first_sid, seen, res = _two_runs(monkeypatch, tmp_path, [(1, RESUME_ERROR), (0, None)])
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.stdout)
+    assert data["status"] == "review_complete"
+    assert data["thread"]["session"] == "seeded"
+    assert data["thread"]["session_reason"] == "resume_failed"
+    assert len(seen) == 2
+    assert seen[0]["argv"][seen[0]["argv"].index("--resume") + 1] == first_sid
+    retry = seen[1]["argv"]
+    new_sid = retry[retry.index("--session-id") + 1]
+    assert new_sid != first_sid and "--resume" not in retry
+    assert "session_tar" not in seen[1]["kwargs"] or not seen[1]["kwargs"]["session_tar"]
+    assert f"FRANKY_PRIOR_{REVIEW_NONCE}_BEGIN" in retry[2]
+    assert seen[1]["record_before"]["session_id"] == new_sid  # pinned before the retry
+    record = threads_mod.read_record(_thread_dir(tmp_path))
+    assert record["session_id"] == new_sid and record["session_ok"] is True
+    # The failed attempt keeps its own redacted log (quiet under --json, so no stderr note).
+    assert list((tmp_path / "test-franky-runs").rglob(f"*{data['job_id']}-resume-failed.log"))
+
+
+def test_review_pr_thread_failed_retry_reports_the_retry_and_never_loops(monkeypatch, tmp_path):
+    _sid, seen, res = _two_runs(monkeypatch, tmp_path, [(1, "boom"), (1, "boom again")])
+    data = json.loads(res.stdout)
+    assert len(seen) == 2 and data["status"] == "agent_error" and res.exit_code == 7
+    assert data["thread"]["session"] == "seeded"
+    assert data["thread"]["session_reason"] == "resume_failed"
+    record = threads_mod.read_record(_thread_dir(tmp_path))
+    assert record["session_ok"] is False and record["handoff"] is not None
+
+
+def test_review_pr_thread_resume_timeout_keeps_session_without_retry(monkeypatch, tmp_path):
+    first_sid, seen, res = _two_runs(monkeypatch, tmp_path, [(124, "franky: container timed out")])
+    assert len(seen) == 1 and json.loads(res.stdout)["status"] == "timeout"
+    record = threads_mod.read_record(_thread_dir(tmp_path))
+    assert record["session_id"] == first_sid and record["session_ok"] is True
+
+
+def test_review_pr_thread_unpackable_session_downgrades_to_seeded(monkeypatch, tmp_path):
+    _fix_review_nonce(monkeypatch)
+    _mc_review_setup(monkeypatch, env=_thread_env(tmp_path))
+    _fake_thread_run(monkeypatch, tmp_path)
+    assert _review(["--thread", "--engine", "claude", "--no-publish"]).exit_code == 0
+    monkeypatch.setattr(threads_mod, "session_tar", lambda *a, **k: None)
+    seen = _fake_thread_run(monkeypatch, tmp_path)
+    data = json.loads(_review(["--thread", "--engine", "claude", "--no-publish"]).stdout)
+    assert data["thread"]["session"] == "seeded"
+    assert data["thread"]["session_reason"] == "session_pack_failed"
+    assert "--session-id" in seen[0]["argv"] and "--resume" not in seen[0]["argv"]
+
+
+def test_review_pr_thread_record_write_failure_runs_without_session_flags(monkeypatch, tmp_path):
+    _fix_review_nonce(monkeypatch)
+    _mc_review_setup(monkeypatch, env=_thread_env(tmp_path))
+    seen = _fake_thread_run(monkeypatch, tmp_path)
+    monkeypatch.setattr(threads_mod, "write_record", lambda *a, **k: False)
+    res = _review(["--thread", "--engine", "claude", "--no-publish"])
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.stdout)
+    assert data["thread"]["session_reason"] == "record_write_failed"
+    assert "--session-id" not in seen[0]["argv"] and "--resume" not in seen[0]["argv"]
+    assert "session_sink" not in seen[0]["kwargs"]
+    assert "record not updated reason=write_failed" in res.stderr
+
+
+def test_review_pr_thread_is_case_insensitive_on_the_repo(monkeypatch, tmp_path):
+    _fix_review_nonce(monkeypatch)
+    env = _thread_env(tmp_path)
+    _mc_review_setup(monkeypatch, env=env)
+    _fake_thread_run(monkeypatch, tmp_path)
+    runner = CliRunner()
+    for url in ("https://github.com/Me/Repo/pull/11", "https://github.com/me/REPO/pull/11"):
+        with runner.isolated_filesystem():
+            res = runner.invoke(
+                cli.main,
+                ["review-pr", "--thread", "--engine", "claude", "--no-publish", "--json", url],
+            )
+        assert res.exit_code == 0, res.output
+    assert [p.name for p in (tmp_path / "threads").iterdir()] == [THREAD_ID]
+    assert threads_mod.read_record(_thread_dir(tmp_path))["repo"] == "me/repo"
+    assert json.loads(res.stdout)["thread"]["session"] == "resumed"
+
+
+def test_review_pr_thread_handoff_redacts_token_patterns(monkeypatch, tmp_path):
+    token = "ghp_" + "B" * 36
+    payload = {
+        "summary": "s",
+        "findings": [{"title": f"leaked {token}", "severity": "blocking", "body": "b"}],
+        "checks": [],
+    }
+    _fix_review_nonce(monkeypatch)
+    _mc_review_setup(monkeypatch, env=_thread_env(tmp_path))
+    _fake_thread_run(monkeypatch, tmp_path, output=_review_block(payload))
+    res = _review(["--thread", "--engine", "claude", "--no-publish"])
+    assert token not in json.dumps(json.loads(res.stdout)["handoff"])
+    assert token not in (_thread_dir(tmp_path) / "record.json").read_text()
+    seen = _fake_thread_run(monkeypatch, tmp_path)
+    _review(["--thread", "--engine", "claude", "--no-publish"])
+    assert "leaked [redacted]" in seen[0]["argv"][2] and token not in seen[0]["argv"][2]
+
+
+def test_review_pr_without_thread_forces_status_new(monkeypatch, tmp_path):
+    _fix_review_nonce(monkeypatch)
+    payload = {
+        "summary": "s",
+        "findings": [{"title": "bug", "severity": "blocking", "status": "resolved", "body": "b"}],
+        "checks": [],
+    }
+    calls = _mc_review_setup(monkeypatch, container=(0, _review_block(payload)))
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["review-pr", "--json", PR_URL])
+    assert res.exit_code == 0, res.output
+    args = " ".join(calls[0])
+    assert "event=REQUEST_CHANGES" in args and "[resolved]" not in args
+
+
+def test_review_pr_without_thread_is_unchanged(monkeypatch, tmp_path):
+    _fix_review_nonce(monkeypatch)
+    _mc_review_setup(monkeypatch, env=_thread_env(tmp_path))
+    seen = []
+
+    def fake(cfg, inner_argv, *a, **k):
+        seen.append((list(inner_argv), set(k)))
+        return 0, _review_block(BLOCKING)
+
+    monkeypatch.setattr(cli, "run_in_container", fake)
+    res = _review(["--engine", "claude"])
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.stdout)
+    assert set(data) == {
+        "status",
+        "pr_url",
+        "branch",
+        "reason",
+        "exit_code",
+        "economics",
+        "log_path",
+        "engine",
+        "repo",
+        "job_id",
+        "reviewed_sha",
+        "findings_summary",
+        "checks",
+        "review_url",
+        "review_id",
+    }
+    argv, kwargs = seen[0]
+    assert argv[:7] == [
+        "claude",
+        "-p",
+        argv[2],
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--dangerously-skip-permissions",
+    ]
+    assert len(argv) == 7 and "Prior review context" not in argv[2]
+    assert not {"session_tar", "session_sink"} & kwargs
+    assert not (tmp_path / "threads").exists()
+
+
+def _seed_thread(env, pr=REVIEW_PR_NUMBER, repo="me/repo"):
+    thread = threads_mod.open_thread(repo, pr, "reviewer", env)
+    record, _written = threads_mod.begin_run(
+        thread,
+        None,
+        repo=repo,
+        pr=pr,
+        role="reviewer",
+        engine="claude",
+        native=True,
+        model=None,
+        rubric="",
+        mode="fresh",
+        job_id="job1",
+        now=threads_mod.datetime(2020, 1, 1, tzinfo=threads_mod.timezone.utc),
+    )
+    record["handoff"] = {"schema": 1, "sha": "a", "summary": "SECRET-CONTENT", "findings": []}
+    threads_mod.write_record(thread, record)
+    (thread.session_dir).mkdir()
+    (thread.session_dir / "s.jsonl").write_text("SECRET-CONTENT")
+    thread.close()
+    return thread.path
+
+
+def test_threads_list_json_includes_repo_and_session_bytes(monkeypatch, tmp_path):
+    env = _thread_env(tmp_path)
+    monkeypatch.setattr(cli.os, "environ", env)
+    _seed_thread(env)
+    res = CliRunner().invoke(cli.main, ["threads", "list", "--json"])
+    assert res.exit_code == 0, res.output
+    [entry] = json.loads(res.stdout)
+    assert entry["thread"] == THREAD_ID and entry["repo"] == "me/repo"
+    assert entry["session_bytes"] == len("SECRET-CONTENT")
+
+
+def test_threads_prune_json_shape_and_stderr_lines(monkeypatch, tmp_path):
+    env = _thread_env(tmp_path)
+    monkeypatch.setattr(cli.os, "environ", env)
+    path = _seed_thread(env)  # updated 2020 -> idle
+    res = CliRunner().invoke(cli.main, ["threads", "prune", "--json"])
+    assert res.exit_code == 0, res.output
+    assert json.loads(res.stdout) == {
+        "purged": [{"thread": THREAD_ID, "reason": "idle", "bytes": 14}],
+        "kept": 0,
+        "bytes": 0,
+        "disk_skipped": False,
+    }
+    assert f"purged {THREAD_ID} reason=idle bytes=14" in res.stderr
+    assert "SECRET-CONTENT" not in res.output
+    assert not path.exists()
+
+
+def test_threads_prune_closed_without_token_skips_that_pass(monkeypatch, tmp_path):
+    env = _thread_env(tmp_path)
+    del env["GH_TOKEN"]
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(threads_mod, "run_gh", lambda *a, **k: pytest.fail("gh must not run"))
+    res = CliRunner().invoke(cli.main, ["threads", "prune", "--closed", "--repo", "me/repo"])
+    assert res.exit_code == 0, res.output
+    assert "skipping the --closed pass" in res.stderr
+
+
+def test_threads_prune_repo_is_validated(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli.os, "environ", _thread_env(tmp_path))
+    for args in (["--repo", "../etc"], ["--older-than", "soon"], ["--max-bytes", "2T"]):
+        res = CliRunner().invoke(cli.main, ["threads", "prune", "--json", *args])
+        assert res.exit_code == 2, args
+        assert json.loads(res.stdout)["error"]["kind"] == "usage_error"
+
+
+def test_threads_prune_repo_reports_disk_skipped(monkeypatch, tmp_path):
+    env = _thread_env(tmp_path)
+    monkeypatch.setattr(cli.os, "environ", env)
+    _seed_thread(env)
+    res = CliRunner().invoke(
+        cli.main, ["threads", "prune", "--repo", "me/other", "--max-bytes", "0", "--json"]
+    )
+    assert json.loads(res.stdout) == {"purged": [], "kept": 0, "bytes": 0, "disk_skipped": True}
+
+
+def test_threads_purge_json_shape_never_prints_content(monkeypatch, tmp_path):
+    env = _thread_env(tmp_path)
+    monkeypatch.setattr(cli.os, "environ", env)
+    _seed_thread(env)
+    res = CliRunner().invoke(
+        cli.main, ["threads", "purge", f"me/repo#{REVIEW_PR_NUMBER}", "--json"]
+    )
+    assert res.exit_code == 0, res.output
+    assert json.loads(res.stdout) == {
+        "purged": [{"thread": THREAD_ID, "reason": "manual", "bytes": 14}],
+        "busy": [],
+    }
+    assert "SECRET-CONTENT" not in res.output
+    assert f"purged {THREAD_ID} bytes=14" in res.stderr
+
+
+@pytest.mark.parametrize(
+    "args", [[], ["me/repo#1", "--all"], ["--all", "--role", "author"], ["not-a-ref"]]
+)
+def test_threads_purge_usage_errors(monkeypatch, tmp_path, args):
+    monkeypatch.setattr(cli.os, "environ", _thread_env(tmp_path))
+    res = CliRunner().invoke(cli.main, ["threads", "purge", "--json", *args])
+    assert res.exit_code == 2
+    assert json.loads(res.stdout)["error"]["kind"] == "usage_error"
+
+
+@pytest.mark.parametrize("extra", [[], ["--repo", "me/repo"]])
+def test_threads_prune_closed_uses_the_process_env_for_gh(monkeypatch, tmp_path, extra):
+    from collections.abc import Mapping
+
+    env = _thread_env(tmp_path)
+    monkeypatch.setattr(cli.os, "environ", env)
+    _seed_thread(env)
+    seen = []
+
+    def fake_gh(args, gh_env, **kwargs):
+        assert isinstance(gh_env, Mapping) and gh_env.get("GH_TOKEN") == "ghp_fake"
+        seen.append(args)
+        return 0, json.dumps({"data": {"t0": {"pullRequest": {"state": "MERGED"}}}}), ""
+
+    monkeypatch.setattr(threads_mod, "run_gh", fake_gh)
+    res = CliRunner().invoke(
+        cli.main, ["threads", "prune", "--closed", "--older-than", "100000d", "--json", *extra]
+    )
+    assert res.exit_code == 0, res.output
+    assert json.loads(res.stdout)["purged"] == [
+        {"thread": THREAD_ID, "reason": "closed", "bytes": 14}
+    ]
+    assert len(seen) == 1
+
+
+def test_review_pr_thread_copies_out_only_the_session_file_and_side_dir(monkeypatch, tmp_path):
+    _fix_review_nonce(monkeypatch)
+    _mc_review_setup(monkeypatch, env=_thread_env(tmp_path))
+    seen = _fake_thread_run(monkeypatch, tmp_path)
+    assert _review(["--thread", "--engine", "claude", "--no-publish"]).exit_code == 0
+    sid = seen[0]["record_before"]["session_id"]
+    assert seen[0]["kwargs"]["session_sink"]["paths"] == [
+        f".claude/projects/-work/{sid}.jsonl",
+        f".claude/projects/-work/{sid}",
+    ]
+    seen = _fake_thread_run(monkeypatch, tmp_path)
+    assert _review(["--thread", "--engine", "claude", "--no-publish"]).exit_code == 0
+    assert seen[0]["tar_names"] == [f".claude/projects/-work/{sid}.jsonl"]
+    assert not Path(seen[0]["kwargs"]["session_tar"]).exists()

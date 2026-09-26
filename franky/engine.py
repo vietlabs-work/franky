@@ -210,7 +210,16 @@ class Engine:
     # enough for this best-effort channel to work.
     supports_steering: bool = False
 
-    def inner_argv(self, prompt: str, model: str | None) -> list[str]:
+    # HOME-relative directory holding the engine's resumable session files (`review-pr
+    # --thread`, threads.py). Empty means the engine has no native resume, so a thread seeds a
+    # fresh session from its stored handoff instead.
+    session_dir: str = ""
+
+    def inner_argv(
+        self, prompt: str, model: str | None, *, session_id: str | None = None, resume: bool = False
+    ) -> list[str]:
+        """Headless argv. `session_id`/`resume` matter only when `session_dir` is set; every
+        other engine ignores them and returns the same argv as without them."""
         raise NotImplementedError
 
     def parse_pr_url(self, output: str, repo: str | None = None) -> str | None:
@@ -252,7 +261,9 @@ class PiEngine(Engine):
     name = "pi"
     supports_steering = True
 
-    def inner_argv(self, prompt: str, model: str | None) -> list[str]:
+    def inner_argv(
+        self, prompt: str, model: str | None, *, session_id: str | None = None, resume: bool = False
+    ) -> list[str]:
         argv = ["pi", "-p", prompt, "--mode", "json"]
         if model:
             argv += ["--model", model]
@@ -325,8 +336,12 @@ class PiEngine(Engine):
 class ClaudeEngine(Engine):
     name = "claude"
     supports_steering = True
+    # Claude keys sessions by the slugged cwd; the engine always runs in /work.
+    session_dir = ".claude/projects/-work"
 
-    def inner_argv(self, prompt: str, model: str | None) -> list[str]:
+    def inner_argv(
+        self, prompt: str, model: str | None, *, session_id: str | None = None, resume: bool = False
+    ) -> list[str]:
         argv = [
             "claude",
             "-p",
@@ -338,6 +353,9 @@ class ClaudeEngine(Engine):
             "--verbose",
             "--dangerously-skip-permissions",
         ]
+        if session_id:
+            # Plain --resume keeps the id (only --fork-session mints a new one).
+            argv += ["--resume" if resume else "--session-id", session_id]
         if model:
             argv += ["--model", model]
         return argv
@@ -388,7 +406,9 @@ class CodexEngine(Engine):
     name = "codex"
     supports_steering = True
 
-    def inner_argv(self, prompt: str, model: str | None) -> list[str]:
+    def inner_argv(
+        self, prompt: str, model: str | None, *, session_id: str | None = None, resume: bool = False
+    ) -> list[str]:
         # --dangerously-bypass-approvals-and-sandbox is load-bearing, not a convenience: codex
         # both prompts for approval AND self-sandboxes (Landlock/seccomp). A headless run must
         # have approvals off, and the nested self-sandbox is redundant-and-fragile inside
@@ -467,7 +487,9 @@ class CodexEngine(Engine):
 class OpenCodeEngine(Engine):
     name = "opencode"
 
-    def inner_argv(self, prompt: str, model: str | None) -> list[str]:
+    def inner_argv(
+        self, prompt: str, model: str | None, *, session_id: str | None = None, resume: bool = False
+    ) -> list[str]:
         return [
             "opencode",
             "run",

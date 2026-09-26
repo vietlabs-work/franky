@@ -116,7 +116,7 @@ Run `franky COMMAND --help` for flags and examples. Run `franky schema` for the 
 |---------|---------|
 | `franky build TASK` | Implement a GitHub issue, JIRA task, prose task, or stdin task. Open one PR. |
 | `franky iterate PR_URL` | Address review or CI feedback with additive commits on Franky's existing PR. |
-| `franky review-pr PR_URL [INSTRUCTIONS]` | Review a PR. Publish findings unless `--no-publish` is set. |
+| `franky review-pr PR_URL [INSTRUCTIONS]` | Review a PR. Publish findings unless `--no-publish` is set. Add `--thread` to continue one stored review session per PR. |
 | `franky plan TASK` | Request a read-only scope assessment and return PR-sized tasks. |
 | `franky jobs` | List runs. Add `--stats` for success, hang, duration, and cost data. |
 | `franky gh ARGS...` | Run the host `gh` CLI with Franky's token. |
@@ -141,6 +141,16 @@ Run `franky COMMAND --help` for flags and examples. Run `franky schema` for the 
 `replay` starts from saved inputs. `resume` restores `/work`. Use `replay --open-pr` only when the reproduced run should open a PR.
 
 `attach` supports `pi`, `claude`, and `codex`. OpenCode does not support steering.
+
+### Thread commands
+
+| Command | Purpose |
+|---------|---------|
+| `franky threads list` | List stored review threads with engine, last reviewed head, and session size. |
+| `franky threads prune` | Remove orphaned, idle (`--older-than`, default 30d), and optionally closed-PR (`--closed`) threads. Cap stored sessions (`--max-bytes`, default 2G). |
+| `franky threads purge OWNER/REPO#N` | Delete one PR's threads. `--role` limits it to one role. `--all` deletes every thread. |
+
+`prune --repo OWNER/REPO` applies every pass to one repository, so a token scoped to that repository covers `--closed`. It skips the global disk cap and reports `disk_skipped`.
 
 ### Authentication, configuration, and profile commands
 
@@ -179,6 +189,24 @@ The `review-pr` prompt tells the agent to inspect only. The host publishes comme
 Scope `GH_TOKEN` permissions because they are the enforced GitHub boundary for the autonomous container.
 
 Use `--expected-head-sha` to reject a changed PR head. Use `--no-publish` for a read-only GitHub run.
+
+### Review threads
+
+`review-pr --thread` keeps one review session per PR and role under `~/.franky/threads` (override: `FRANKY_THREADS_DIR`). The next run continues it:
+
+- With `claude`, Franky resumes the same session (`--resume`). Its id is saved before the container starts, so a crash leaves a known id.
+- Other engines, and a session that is stale, changed, or rejected, start a new session seeded with the stored findings. A thread never blocks the review.
+- If a resumed session fails, Franky drops it and retries once in the same run with a seeded session. The result reports `session: seeded` with `session_reason: resume_failed`.
+- A new session is stored only after a clean run with parsed findings. A failed run keeps the previous session and findings.
+- The prompt tells the agent to verify each prior finding (`open` or `resolved`), review the delta since the last reviewed head, and report new findings on unchanged code only at blocking severity.
+- A second run for the same PR while one is active exits 4 (`thread_busy`).
+- Thread ids are lowercase, so `Me/Repo` and `me/repo` share one thread.
+- Without `--thread`, Franky ignores any finding `status` the agent reports.
+- `--rubric-version` pins a rubric label. Changing it, the engine, or the model starts a new session.
+
+Sessions move by stream-in (tar over `docker exec`) and copy-out (a `docker cp ... -` tar stream, capped at 64 MiB) only. No volume or mount is added. Only the session file and its side directory move. Claude's project memory never moves between runs. Stored sessions contain regular files only, are scrubbed of known secret values and token patterns, and are refused on any finding. They stay host-only (0700/0600) and are never exported. The stored findings are redacted the same way. `threads prune` and `threads purge` delete them.
+
+A resumed session replays earlier content from the same PR to the read-only reviewer. It never crosses PRs or roles. Resume stops after 14 days without a successful review, or above 64 MiB of session files.
 
 ## Agent and script interface
 
