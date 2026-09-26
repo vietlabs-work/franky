@@ -2071,7 +2071,7 @@ def _session_tar_bytes(name, data=b"{}"):
     return buffer.getvalue()
 
 
-def _copy_out_run(tmp_path, *, task_code=0, cp=None, paths=None):
+def _copy_out_run(tmp_path, *, task_code=0, cp=None, paths=None, timeout=None, on_timeout=None):
     calls = []
     runner, runner_calls = _orchestration_runner(lambda *a, **k: None)
 
@@ -2090,6 +2090,8 @@ def _copy_out_run(tmp_path, *, task_code=0, cp=None, paths=None):
         "dest": str(tmp_path),
         "max_bytes": 10**6,
     }
+    if on_timeout is not None:
+        sink["on_timeout"] = on_timeout
     run_in_container(
         _cfg(),
         ["claude"],
@@ -2099,6 +2101,7 @@ def _copy_out_run(tmp_path, *, task_code=0, cp=None, paths=None):
         popen=popen,
         run_id="abc123def456",
         session_sink=sink,
+        **({} if timeout is None else {"timeout": timeout}),
     )
     return calls, sink
 
@@ -2135,3 +2138,56 @@ def test_run_in_container_session_copy_out_reports_failure_and_too_large(tmp_pat
     big = _session_tar_bytes("s1.jsonl", b"x" * 2_000_000)
     _calls, sink = _copy_out_run(tmp_path / "b", cp=lambda argv: _CpPopen(big))
     assert sink["status"] == "too_large"
+
+
+@pytest.mark.parametrize("on_timeout", [True, False])
+def test_run_in_container_session_copy_out_on_timeout_only_when_opted_in(tmp_path, on_timeout):
+    def cp(argv):
+        if argv[2].endswith("s1.jsonl"):
+            return _CpPopen(_session_tar_bytes("s1.jsonl"))
+        return _CpPopen(b"", returncode=1)
+
+    calls, sink = _copy_out_run(tmp_path, cp=cp, timeout=0, on_timeout=on_timeout)
+    task = "franky-run-abc123def456"
+    cps = [i for i, c in enumerate(calls) if c[:2] == ["docker", "cp"]]
+    reap = next(i for i, c in enumerate(calls) if c[:3] == ["docker", "rm", "-f"] and task in c)
+    assert bool(cps) is on_timeout
+    assert all(i < reap for i in cps)
+    assert sink.get("status") == ("ok" if on_timeout else None)
+
+
+def test_run_in_container_session_and_workspace_restore_wait_in_order(monkeypatch, tmp_path):
+    """`job resume` V2: a session tar and a workspace in one container. The task starts in BOTH
+    wait modes; the session streams in (profile channel, HOME marker) before /work is restored."""
+    from franky import snapshot
+
+    order, argvs = [], []
+    monkeypatch.setattr(
+        container_mod,
+        "deliver_profile",
+        lambda task, bundle, runner, **k: order.append(("profile", bundle, k["session_tar"])),
+    )
+    monkeypatch.setattr(
+        snapshot, "restore_into_container", lambda task, snap, runner, **k: order.append("work")
+    )
+    runner, _ = _orchestration_runner(lambda *a, **k: None)
+    popen = _fake_popen_factory(["event\n"])
+
+    def logged_popen(argv, **kwargs):
+        argvs.append(argv)
+        return popen(argv, **kwargs)
+
+    run_in_container(
+        _cfg(),
+        ["claude"],
+        runner=runner,
+        env={},
+        sleeper=NOOP_SLEEP,
+        popen=logged_popen,
+        run_id="abc123def456",
+        session_tar="s.tar.gz",
+        resume_workspace="w.tar.gz",
+    )
+    assert order == [("profile", None, "s.tar.gz"), "work"]
+    task_argv = argvs[0]
+    assert f"{PROFILE_WAIT_VAR}=1" in task_argv and f"{snapshot.RESUME_WAIT_ENV}=1" in task_argv

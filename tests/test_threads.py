@@ -1,5 +1,6 @@
 """Tests for the review thread store (franky/threads.py). Filesystem only, no Docker or network."""
 
+import io
 import json
 import os
 import stat
@@ -775,3 +776,147 @@ def test_prune_resolves_the_process_env_when_none_is_given(env, monkeypatch):
 
     result = threads.prune(None, closed=True, now=NOW, gh=gh)
     assert isinstance(seen[0], Mapping) and result["purged"][0]["reason"] == "closed"
+
+
+# --- author role -------------------------------------------------------------------------------
+
+
+def _author(thread, record, mode, **extra):
+    record, written = threads.begin_run(
+        thread,
+        record,
+        repo="me/repo",
+        pr=7,
+        role="author",
+        engine="claude",
+        native=True,
+        model=None,
+        rubric="",
+        mode=mode,
+        job_id="job1",
+        now=NOW,
+        **extra,
+    )
+    assert written
+    return record
+
+
+@pytest.mark.parametrize(
+    "resumes,role,expected",
+    [
+        (9, "author", ("resumed", "")),
+        (10, "author", ("seeded", "resume_cap")),
+        (10, "reviewer", ("resumed", "")),
+    ],
+)
+def test_plan_run_caps_author_resumes_only(resumes, role, expected):
+    assert _plan(_record(role=role, resumes=resumes), role=role) == expected
+
+
+def test_author_resumes_ten_times_then_reseeds_and_counts_failed_runs(env):
+    thread = _open(env, role="author")
+    record = _author(thread, None, "fresh")
+    assert record["resumes"] == 0
+    for run in range(1, 12):
+        record = {**record, "session_ok": True, "handoff": {"schema": 1, "sha": None}}
+        mode, reason = _plan(record, role="author")
+        if run <= 10:
+            assert (mode, reason) == ("resumed", "")
+        else:
+            assert (mode, reason) == ("seeded", "resume_cap")
+        # Counted in begin_run, before launch: a run that then fails or crashes still counts.
+        record = _author(thread, record, mode)
+        assert record["resumes"] == (run if run <= 10 else 0)
+        assert threads.read_record(thread.path)["resumes"] == record["resumes"]
+    thread.close()
+
+
+def test_reviewer_records_never_get_a_resume_counter(env):
+    thread = _open(env)
+    assert "resumes" not in _begin(thread, _record(), "resumed")
+    thread.close()
+
+
+def test_begin_run_pins_a_given_session_id_for_a_bound_build(env):
+    thread = _open(env, role="author")
+    record = _author(thread, None, "fresh", session_id=SID)
+    assert record["session_id"] == SID and record["session_ok"] is False
+    thread.close()
+
+
+def _sidecar(tmp_path, members):
+    path = tmp_path / "side.session.tar.gz"
+    with tarfile.open(path, "w:gz") as tar:
+        for name, data in members.items():
+            info = tarfile.TarInfo(name)
+            if data is None:
+                info.type, info.linkname = tarfile.SYMTYPE, "/etc/passwd"
+                tar.addfile(info)
+            else:
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+    return path
+
+
+def test_extract_session_keeps_only_the_session_file_and_side_dir(tmp_path):
+    paths = threads.session_paths("claude", SID)
+    side = f".claude/projects/-work/{SID}"
+    archive = _sidecar(
+        tmp_path,
+        {
+            SFILE: b"{}\n",
+            f"{side}/sub.jsonl": b"{}\n",
+            ".claude/projects/-work/memory/MEMORY.md": b"planted\n",
+            f"{side}/link": None,
+            "../escape": b"x",
+        },
+    )
+    dest = tmp_path / "in"
+    dest.mkdir()
+    assert threads.extract_session(archive, dest, paths) is True
+    found = sorted(str(p.relative_to(dest)) for p in dest.rglob("*") if p.is_file())
+    assert found == [SFILE, f"{side}/sub.jsonl"]
+    assert not (dest / side / "link").exists() and not (tmp_path / "escape").exists()
+
+
+def test_extract_session_refuses_corrupt_or_sessionless_archives(tmp_path):
+    paths = threads.session_paths("claude", SID)
+    corrupt = tmp_path / "bad.tar.gz"
+    corrupt.write_bytes(b"not a tar")
+    (tmp_path / "a").mkdir()
+    assert threads.extract_session(corrupt, tmp_path / "a", paths) is False
+    other = _sidecar(tmp_path, {".claude/projects/-work/other.jsonl": b"{}"})
+    (tmp_path / "b").mkdir()
+    assert threads.extract_session(other, tmp_path / "b", paths) is False
+    assert threads.extract_session(other, tmp_path / "b", []) is False
+
+
+EVENT = '{"type":"system","subtype":"init"}'
+
+
+@pytest.mark.parametrize(
+    "tail,truncated,expected",
+    [
+        ("Error: No conversation found with session ID: x", False, True),
+        ("error: unknown option '--resume'", False, True),
+        ('{"type":"text","text":"No conversation found with session ID"}', False, False),
+        ("tests failed after git push", False, False),
+        # A tail cut mid-event: its first line is a fragment that must not pass as an error.
+        ('n found with session ID: x"}\n{"type":"result"}', True, False),
+        ('No conversation found with session ID: x"}\nexit 1', True, False),
+        # The engine emitted events, so it ran: never a startup rejection.
+        (f"{EVENT}\nError: No conversation found with session ID: x", False, False),
+        ("{not json\nError: No conversation found with session ID: x", False, True),
+    ],
+)
+def test_startup_rejected_matches_only_a_pure_engine_startup_error(tail, truncated, expected):
+    assert threads.startup_rejected(tail, truncated=truncated) is expected
+
+
+def test_extract_session_refuses_a_sidecar_over_the_session_cap(tmp_path, monkeypatch):
+    monkeypatch.setattr(threads, "MAX_SESSION_BYTES", 10)
+    archive = _sidecar(tmp_path, {SFILE: b"x" * 11})
+    (tmp_path / "in").mkdir()
+    assert threads.extract_session(
+        archive, tmp_path / "in", threads.session_paths("claude", SID)
+    ) is (False)

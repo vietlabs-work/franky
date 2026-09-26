@@ -78,6 +78,10 @@ _GIT_URL_USERINFO_RE = re.compile(rb"://[^/@\s]*@")
 # The bytes we substitute a matched secret VALUE with when redacting non-.git files in the tree.
 _REDACTED = b"[REDACTED]"
 
+# Prefix of the temp tar finalize_snapshot packs beside its destination; jobs.prune sweeps
+# stale `.tmp-` leftovers in the runs dir.
+TMP_PACK_PREFIX = ".tmp-pack-"
+
 _CHUNK_BYTES = 64 * 1024
 _MAX_SCAN_BYTES = 4 * 1024 * 1024
 _MAX_ENTRIES = 100_000
@@ -216,24 +220,37 @@ def build_home_extract_argv(task: str, rel: str) -> list[str]:
     return ["docker", "cp", f"{task}:{CONTAINER_HOME}/{rel}", "-"]
 
 
-def _extract_plain(stream, dest: Path) -> None:
+def _extract_plain(
+    stream, dest: Path, only: list[str] | None = None, max_bytes: int | None = None
+) -> None:
     """Extract a tar stream into `dest`, keeping only regular files and directories with
     relative names and no `..`. Links, hard links, devices, FIFOs and anything else are skipped,
-    and files are opened O_NOFOLLOW, so nothing can land outside `dest`."""
+    and files are opened O_NOFOLLOW, so nothing can land outside `dest`. `only` (relative paths)
+    further keeps just those paths and what sits under them. More than `max_bytes` of extracted
+    file data raises ValueError."""
+    total = 0
     with tarfile.open(fileobj=stream, mode="r|") as tar:
         for member in tar:
             parts = Path(member.name).parts
+            name = "/".join(parts)
             if (
                 not parts
                 or member.name.startswith("/")
                 or ".." in parts
                 or not (member.isreg() or member.isdir())
+                or (
+                    only is not None
+                    and not any(name == p or name.startswith(p + "/") for p in only)
+                )
             ):
                 continue
             target = dest.joinpath(*parts)
             if member.isdir():
                 target.mkdir(mode=0o700, parents=True, exist_ok=True)
                 continue
+            total += member.size
+            if max_bytes is not None and total > max_bytes:
+                raise ValueError("archive size limit exceeded")
             target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             source = tar.extractfile(member)
             fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
@@ -292,6 +309,30 @@ def copy_home_path(
     return "ok", total
 
 
+def copy_session(
+    task: str, paths: list[str], dest, *, max_bytes: int, popen=subprocess.Popen
+) -> str:
+    """Stream an engine session (`paths`: the session file, then its optional side dir) out of a
+    live container into `dest` with `copy_home_path`, all paths sharing one `max_bytes` budget.
+    Returns ok, too_large, or failed. The first path is required, the rest optional; no paths,
+    or a session file that did not land as a regular file, is failed."""
+    if not paths:
+        return "failed"
+    budget = max_bytes + 1
+    for index, rel in enumerate(paths):
+        target = Path(dest) / Path(rel).parent
+        target.mkdir(mode=0o700, parents=True, exist_ok=True)
+        result, used = copy_home_path(task, rel, target, max_bytes=budget, popen=popen)
+        budget -= used
+        if result == "too_large" or (result != "ok" and index == 0):
+            return result
+    try:
+        landed = stat.S_ISREG(os.lstat(Path(dest) / paths[0]).st_mode)
+    except OSError:
+        landed = False
+    return "ok" if landed else "failed"
+
+
 def build_untar_argv(task: str, target: str = "/work") -> list[str]:
     """`docker exec -i <task> tar --no-same-owner -xzf - -C <target>` - extract from STDIN as uid 1001.
 
@@ -339,6 +380,13 @@ def snapshot_path_for(job_id: str, env=None) -> Path:
     if not jobs._JOB_ID_RE.match(job_id):
         raise ValueError(f"invalid job id: {job_id!r}")
     return jobs.runs_dir(env) / f"{job_id}.snapshot.tar.gz"
+
+
+def session_path_for(job_id: str, env=None) -> Path:
+    """The host-local engine-session sidecar of a `--thread` run:
+    `<runs_dir>/<job_id>.session.tar.gz`. Same validation and directory as `snapshot_path_for`;
+    never exported."""
+    return snapshot_path_for(job_id, env).with_name(f"{job_id}.session.tar.gz")
 
 
 # ---------------------------------------------------------------------------
@@ -582,25 +630,29 @@ def finalize_snapshot(src_dir: Path, dest_tar: Path, secrets, runner=subprocess.
     timeout path), so the potentially slower scrub/verify/pack never delays teardown. Fail-closed:
     if `verify_no_secrets` reports ANYTHING, no tar is written and None is returned (nothing
     sensitive is logged - only the count of findings is knowable to the caller via the None).
-    On success the tar is written 0600 under a 0700 parent. The whole body is wrapped so any
-    failure degrades to None (a partial dest_tar is unlinked), and `src_dir` is always removed at
-    the end."""
+    On success the tar is written 0600 under a 0700 parent, packed to a temp file beside it and
+    renamed into place. The whole body is wrapped so any failure degrades to None (the temp file
+    is unlinked, `dest_tar` is never partial), and `src_dir` is always removed at the end."""
     src_dir = Path(src_dir)
     dest_tar = Path(dest_tar)
+    tmp_tar = None
     try:
         scrub_workspace(src_dir, list(secrets))
         findings = verify_no_secrets(src_dir, list(secrets), runner=runner)
         if findings:
             return None
         dest_tar.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        _pack_dir(src_dir, dest_tar)
-        dest_tar.chmod(0o600)
+        # Pack beside the destination and rename, so a failed pack never leaves a partial tar.
+        fd, name = tempfile.mkstemp(prefix=TMP_PACK_PREFIX, suffix=".tar.gz", dir=dest_tar.parent)
+        os.close(fd)
+        tmp_tar = Path(name)
+        _pack_dir(src_dir, tmp_tar)
+        tmp_tar.chmod(0o600)
+        os.replace(tmp_tar, dest_tar)
         return str(dest_tar)
     except Exception:
-        try:
-            dest_tar.unlink(missing_ok=True)
-        except OSError:
-            pass
+        if tmp_tar is not None:
+            tmp_tar.unlink(missing_ok=True)
         return None
     finally:
         _rmtree(src_dir)

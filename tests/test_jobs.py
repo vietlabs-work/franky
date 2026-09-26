@@ -13,10 +13,13 @@ import json
 import subprocess
 import tarfile
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import franky.cli as cli
+import franky.profile
 import franky.container as container
 import franky.jobs as jobs
+import pytest
 from click.testing import CliRunner
 
 
@@ -376,8 +379,13 @@ def test_run_in_container_run_id_pins_names():
 # ---------------------------------------------------------------------------
 
 
-def _cli(monkeypatch, tmp_path, args):
-    monkeypatch.setattr(cli.os, "environ", _env(tmp_path))
+def _cli(monkeypatch, tmp_path, args, extra=None):
+    # `job kill` loads the config for its scrub secrets: never the developer's real config file.
+    env = {**_env(tmp_path), "FRANKY_CONFIG_FILE": str(tmp_path / "no-config"), **(extra or {})}
+    monkeypatch.setattr(cli.os, "environ", env)
+    # ...nor the developer's real ~/.franky/profile.toml (the kill scrub reads MCP credentials).
+    if cli.profile_path is franky.profile.profile_path:  # unless a test stubbed it already
+        monkeypatch.setattr(cli, "profile_path", lambda *a, **k: None)
     return CliRunner().invoke(cli.main, args)
 
 
@@ -957,3 +965,201 @@ def test_new_record_adds_thread_id_only_when_given():
         thread_id="o__r__1__reviewer",
     )
     assert record["thread_id"] == "o__r__1__reviewer"
+
+
+def test_new_record_adds_session_keys_only_when_a_session_is_set():
+    assert not {"session_id", "model", "session_path", "thread_bound"} & set(_rec())
+    record = jobs.new_record(
+        job_id="abc",
+        command="build",
+        repo="o/r",
+        engine="claude",
+        task="t",
+        container="c",
+        network="n",
+        proxy="p",
+        branch=None,
+        started_at="2026-07-05T10:00:00+00:00",
+        session_id="11111111-2222-3333-4444-555555555555",
+        model="opus",
+    )
+    assert record["session_id"] == "11111111-2222-3333-4444-555555555555"
+    assert record["model"] == "opus"
+
+
+def test_prune_removes_session_sidecars_with_the_record_and_as_orphans(tmp_path):
+    env = _env(tmp_path)
+    now = datetime.now(timezone.utc)
+    jobs.write_record(_rec("aa0002", status="pr_opened", started_at=now.isoformat()), env)
+    jobs.write_record(
+        _rec("aa0001", status="timeout", started_at=(now - timedelta(hours=1)).isoformat()), env
+    )
+    runs = jobs.runs_dir(env)
+    kept = runs / "aa0002.session.tar.gz"
+    pruned = runs / "aa0001.session.tar.gz"
+    orphan = runs / "0badf00d.session.tar.gz"
+    for path in (kept, pruned, orphan):
+        path.write_bytes(b"session")
+    jobs.prune(env, keep=1)
+    assert kept.exists() and not pruned.exists() and not orphan.exists()
+
+
+def test_export_bundle_excludes_the_session_sidecar(tmp_path):
+    env = _env(tmp_path)
+    rec = _rec("da7a06", status="timeout")
+    rec["session_path"] = str(jobs.runs_dir(env) / "da7a06.session.tar.gz")
+    jobs.write_record(rec, env)
+    (jobs.runs_dir(env) / "da7a06.session.tar.gz").write_bytes(b"session bytes")
+    dest = tmp_path / "bundle.tar.gz"
+    assert jobs.export_bundle(rec, dest)["included"] == ["record.json"]
+    with tarfile.open(dest, "r:gz") as tar:
+        assert tar.getnames() == ["record.json"]
+
+
+SID = "11111111-2222-3333-4444-555555555555"
+KILL_ENV = {
+    "FRANKY_ALLOWED_REPOS": "o/r",
+    "GH_TOKEN": "ghp_kill",
+    "CLAUDE_CODE_OAUTH_TOKEN": "claude-kill-secret",
+}
+
+
+def _threaded_running(env, job_id):
+    rec = _rec(job_id, status="running")
+    rec.update(engine="claude", session_id=SID, model=None)
+    jobs.write_record(rec, env)
+
+
+def _kill_session_env(monkeypatch, order=None, seen=None):
+    order = [] if order is None else order
+    seen = {} if seen is None else seen
+    monkeypatch.setattr(cli, "capture_diagnostics", lambda *a, **k: {})
+    monkeypatch.setattr(cli, "reap_run", lambda job_id: (order.append("reap"), True)[1])
+    monkeypatch.setattr(
+        cli.snapshot,
+        "snapshot_workspace",
+        lambda container, dest, secrets, runner, **k: seen.update(workspace=secrets),
+    )
+
+    def fake_copy(container, paths, dest, **kwargs):
+        order.append("copy")
+        seen.update(paths=paths, container=container, dest=dest)
+        Path(dest, paths[0]).parent.mkdir(parents=True)
+        Path(dest, paths[0]).write_text("{}\n")
+        return "ok"
+
+    real_finalize = cli.snapshot.finalize_snapshot
+
+    def fake_finalize(src, dest, secrets, *a, **k):
+        order.append("finalize")
+        seen.update(session=secrets)
+        return real_finalize(src, dest, secrets, *a, **k)
+
+    monkeypatch.setattr(cli.snapshot, "copy_session", fake_copy)
+    monkeypatch.setattr(cli.snapshot, "finalize_snapshot", fake_finalize)
+    return order, seen
+
+
+def _mcp_profile(monkeypatch, value):
+    """Stub the profile loaders: one MCP credential, or a profile that fails to load."""
+    monkeypatch.setattr(cli, "profile_path", lambda *a, **k: Path("/nonexistent/profile.toml"))
+    if value is None:
+        monkeypatch.setattr(cli, "load_profile", lambda path: (_ for _ in ()).throw(ValueError()))
+    else:
+        monkeypatch.setattr(cli, "load_profile", lambda path: object())
+        monkeypatch.setattr(cli, "resolve_mcp_credentials", lambda spec, env: {"MCP_T": value})
+
+
+def test_job_kill_copies_before_the_reap_and_finalizes_after_with_the_full_secret_set(
+    monkeypatch, tmp_path
+):
+    env = _env(tmp_path)
+    _threaded_running(env, "ab0100")
+    order, seen = _kill_session_env(monkeypatch)
+    _mcp_profile(monkeypatch, "mcp-kill-secret")
+    res = _cli(monkeypatch, tmp_path, ["job", "kill", "ab0100"], KILL_ENV)
+    assert res.exit_code == 0, res.output
+    assert order == ["copy", "reap", "finalize"]
+    assert seen["paths"] == [f".claude/projects/-work/{SID}.jsonl", f".claude/projects/-work/{SID}"]
+    # The temp copy lives in the runs dir under the swept prefix, and is gone afterwards.
+    assert Path(seen["dest"]).parent == jobs.runs_dir(env)
+    assert Path(seen["dest"]).name.startswith(".tmp-session-") and not Path(seen["dest"]).exists()
+    # The config's secrets, the profile's MCP credentials, and the env's secret keys.
+    for key in ("session", "workspace"):
+        assert {"ghp_kill", "claude-kill-secret", "mcp-kill-secret"} <= set(seen[key])
+    persisted = jobs.read_record("ab0100", env)
+    assert persisted["session_path"] == str(jobs.runs_dir(env) / "ab0100.session.tar.gz")
+    assert (jobs.runs_dir(env) / "ab0100.session.tar.gz").is_file()
+
+
+@pytest.mark.parametrize("broken", ["config", "profile"])
+def test_job_kill_skips_the_session_capture_without_the_full_secret_set(
+    monkeypatch, tmp_path, broken
+):
+    env = _env(tmp_path)
+    _threaded_running(env, "ab0101")
+    order, _seen = _kill_session_env(monkeypatch)
+    extra = KILL_ENV
+    if broken == "config":
+        extra = {}  # no allowlist -> the config cannot load
+    else:
+        _mcp_profile(monkeypatch, None)
+    res = _cli(monkeypatch, tmp_path, ["job", "kill", "ab0101"], extra)
+    assert res.exit_code == 0, res.output
+    assert order == ["reap"]
+    assert "session_path" not in jobs.read_record("ab0101", env)
+
+
+def test_job_kill_session_copy_failure_records_nothing(monkeypatch, tmp_path):
+    env = _env(tmp_path)
+    _threaded_running(env, "ab0102")
+    monkeypatch.setattr(cli, "capture_diagnostics", lambda *a, **k: {})
+    monkeypatch.setattr(cli, "reap_run", lambda job_id: True)
+    monkeypatch.setattr(cli.snapshot, "snapshot_workspace", lambda *a, **k: None)
+    monkeypatch.setattr(cli.snapshot, "copy_home_path", lambda *a, **k: ("failed", 0))
+    res = _cli(monkeypatch, tmp_path, ["job", "kill", "ab0102"], KILL_ENV)
+    assert res.exit_code == 0, res.output
+    persisted = jobs.read_record("ab0102", env)
+    assert persisted["status"] == "killed" and "session_path" not in persisted
+    assert not (jobs.runs_dir(env) / "ab0102.session.tar.gz").exists()
+    assert not list(jobs.runs_dir(env).glob(".tmp-*"))
+
+
+def test_prune_sweeps_stale_temp_session_leftovers_only(tmp_path):
+    import os
+
+    env = _env(tmp_path)
+    runs = jobs.runs_dir(env)
+    runs.mkdir(parents=True)
+    stale_dir, stale_tar, young = (
+        runs / ".tmp-session-a",
+        runs / ".tmp-pack-b.tar.gz",
+        runs / ".tmp-session-c",
+    )
+    stale_dir.mkdir()
+    (stale_dir / "s.jsonl").write_text("x")
+    stale_tar.write_bytes(b"x")
+    young.mkdir()
+    old = datetime.now(timezone.utc).timestamp() - jobs.STALE_RUNNING_SECS - 60
+    for path in (stale_dir, stale_tar):
+        os.utime(path, (old, old))
+    jobs.prune(env)
+    assert not stale_dir.exists() and not stale_tar.exists() and young.exists()
+
+
+def test_new_record_marks_threaded_runs_only():
+    assert "threaded" not in _rec()
+    record = jobs.new_record(
+        job_id="abc",
+        command="build",
+        repo="o/r",
+        engine="pi",
+        task="t",
+        container="c",
+        network="n",
+        proxy="p",
+        branch=None,
+        started_at="2026-07-05T10:00:00+00:00",
+        threaded=True,
+    )
+    assert record["threaded"] is True and "session_id" not in record

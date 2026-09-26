@@ -17,15 +17,23 @@
 #   - extraction as the default uid 1001 lands a tree uid 1001 can READ and WRITE (no chown step)
 #   - the git repo survives the round-trip
 #   - touching the marker lets the resume-wait entrypoint proceed and exec the engine
+#   - V2 (`job resume` of a `--thread` build): in BOTH wait modes, the session tar streams in
+#     with deliver_profile first, then /work with restore_into_container, and the engine starts
+#     with the session readable by uid 1001
 #
 # Usage: scripts/smoke-resume.sh   (needs Docker running + the `franky` image built)
 set -uo pipefail
 
 FRANKY_IMG="${FRANKY_IMG:-franky}"
 TASK="smoke-resume-task-$$"
+TASK2="smoke-resume-v2-task-$$"
+SID="11111111-2222-3333-4444-555555555555"
 WORKDIR="$(mktemp -d)"
 TARBALL="$WORKDIR/ws.tar.gz"
-cleanup() { docker rm -f -v "$TASK" >/dev/null 2>&1 || true; rm -rf "$WORKDIR"; }
+cleanup() {
+  docker rm -f -v "$TASK" "$TASK2" >/dev/null 2>&1 || true
+  rm -rf "$WORKDIR"
+}
 trap cleanup EXIT
 fail() { echo "RESUME SMOKE FAIL: $*" >&2; exit 1; }
 
@@ -65,5 +73,36 @@ for _ in $(seq 1 15); do
 done
 [ "$ran" = 1 ] || fail "engine never ran after marker (resume-wait stuck)"
 echo "   OK (engine ran after restore)"
+
+echo "== 4. V2: session + workspace in one container (profile-wait, then resume-wait) =="
+python3 scripts/smoke-task.py "$FRANKY_IMG" "$TASK2" both \
+  sh -c 'touch /tmp/resume-engine-ran; sleep 30' >/dev/null \
+  || fail "V2 container did not start"
+python3 - "$TASK2" "$SID" "$TARBALL" "$WORKDIR" <<'PY' || fail "V2 session + workspace delivery failed"
+import subprocess, sys
+from pathlib import Path
+from franky import container, snapshot
+task, sid, workspace, workdir = sys.argv[1:5]
+src = Path(workdir, "session")
+session = src / ".claude/projects/-work" / f"{sid}.jsonl"
+session.parent.mkdir(parents=True)
+session.write_text('{"type":"user","message":"prior build"}\n')
+tar = snapshot.finalize_snapshot(src, Path(workdir, "session.tar.gz"), [])
+assert tar, "finalize_snapshot refused the session"
+ok = container.deliver_profile(task, None, session_tar=tar)
+ok = snapshot.restore_into_container(task, Path(workspace), subprocess.run) and ok
+sys.exit(0 if ok else 1)
+PY
+CHOME="$(python3 -c 'from franky.profile import CONTAINER_HOME; print(CONTAINER_HOME)')"
+ran=0
+for _ in $(seq 1 15); do
+  docker exec "$TASK2" test -f /tmp/resume-engine-ran && { ran=1; break; }
+  sleep 1
+done
+[ "$ran" = 1 ] || fail "engine never ran after the V2 session + workspace delivery"
+docker exec "$TASK2" sh -c "grep -q 'prior build' $CHOME/.claude/projects/-work/$SID.jsonl" \
+  || fail "uid 1001 cannot READ the streamed session"
+docker exec "$TASK2" sh -c 'grep -q hello /work/file.txt' || fail "V2 /work not restored"
+echo "   OK (session readable by uid 1001, /work restored, engine ran)"
 
 echo "SMOKE PASS: resume restore works into the real hardened container (stdin untar as uid 1001)."

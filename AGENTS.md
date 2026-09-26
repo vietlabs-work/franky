@@ -59,7 +59,7 @@ CLI -> config and task policy -> prompt -> engine command -> container runtime -
 | Runtime | `container.py`, `security.py`, `egress.py`, `franky-dind-entrypoint.sh`, `proxy/` | Docker lifecycle, isolation, policies, proxy |
 | Transfer | `profile.py`, `setups.py`, `snapshot.py` | Bounded, secret-scanned profile and workspace bundles |
 | Runs | `jobs.py`, `transcript.py`, `economics.py` | Records, redacted logs, diagnostics, usage |
-| Review threads | `threads.py` | Per-PR review sessions, handoffs, locks, prune and purge |
+| Threads | `threads.py` | Per-PR reviewer and author sessions, handoffs, locks, prune and purge |
 | Host helpers | `github.py`, `update_check.py`, `_install.py` | `gh` passthrough, updates, install detection |
 
 Keep policy code pure where practical. Keep subprocess calls injectable so tests remain hermetic.
@@ -153,6 +153,9 @@ Any policy delta must pass pinned-policy tests, `make smoke-security`, and `make
 - Stream profile and snapshot archives through `docker exec -i`. Never place archive data in arguments or environment values.
 - Thread sessions move by stream-in (tar over docker exec) and copy-out (docker cp) only - never mounted, regular files only, scrubbed and verified, host-only, never exported.
 - Thread transfer carries only the engine session file and its side directory. Never carry an engine's project memory between runs.
+- The session sidecar of a timed-out or killed `--thread` build (`<job_id>.session.tar.gz`) is regular files only, scrubbed with the run's full secret set, fail-closed verified, host-only, and never exported. A bind or `job resume` re-extracts it through the same regular-file-only filter; never copy it with links.
+- Reviewer and author sessions never mix. An author run retries only on an engine startup rejection of its session. Never re-run a write pass blindly.
+- Bind a session to an author thread only after the host confirms that the open PR on the run's branch is the PR the agent reported. Agent output alone never picks the thread.
 - Secret-scan every injected profile file. Resolve symlinks before deny checks.
 - Skip unscannable setup files. Never inject setup MCP configuration automatically.
 - Keep Codex `--ignore-user-config`. Pass validated MCP servers as explicit overrides.

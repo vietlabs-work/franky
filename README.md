@@ -114,8 +114,8 @@ Run `franky COMMAND --help` for flags and examples. Run `franky schema` for the 
 
 | Command | Purpose |
 |---------|---------|
-| `franky build TASK` | Implement a GitHub issue, JIRA task, prose task, or stdin task. Open one PR. |
-| `franky iterate PR_URL` | Address review or CI feedback with additive commits on Franky's existing PR. |
+| `franky build TASK` | Implement a GitHub issue, JIRA task, prose task, or stdin task. Open one PR. Add `--thread` to hand the engine session to the PR's author thread. |
+| `franky iterate PR_URL` | Address review or CI feedback with additive commits on Franky's existing PR. Add `--thread` to continue the PR's author session. |
 | `franky review-pr PR_URL [INSTRUCTIONS]` | Review a PR. Publish findings unless `--no-publish` is set. Add `--thread` to continue one stored review session per PR. |
 | `franky plan TASK` | Request a read-only scope assessment and return PR-sized tasks. |
 | `franky jobs` | List runs. Add `--stats` for success, hang, duration, and cost data. |
@@ -131,14 +131,14 @@ Run `franky COMMAND --help` for flags and examples. Run `franky schema` for the 
 |---------|---------|
 | `franky job status JOB_ID` | Show the record, live state, and runtime diagnostics. |
 | `franky job logs JOB_ID` | Print the redacted transcript. |
-| `franky job kill JOB_ID` | Stop a run and remove its task, proxy, network, and volumes. |
+| `franky job kill JOB_ID` | Stop a run and remove its task, proxy, network, and volumes. A `--thread` build also keeps its engine session. |
 | `franky job export JOB_ID` | Export the record and redacted transcript as a portable archive. |
 | `franky job diagnose JOB_ID` | Request a read-only failure analysis. |
 | `franky job replay JOB_ID` | Reproduce a build from saved inputs in a fresh container. |
-| `franky job resume JOB_ID` | Continue a stopped run from its saved workspace. |
+| `franky job resume JOB_ID` | Continue a stopped run from its saved workspace, and for a `--thread` build also its engine session. |
 | `franky job attach JOB_ID` | Send one correction to a running steerable engine. |
 
-`replay` starts from saved inputs. `resume` restores `/work`. Use `replay --open-pr` only when the reproduced run should open a PR.
+`replay` starts from saved inputs. `resume` restores `/work`, plus the engine session when it can (see [Author threads](#author-threads)). Use `replay --open-pr` only when the reproduced run should open a PR.
 
 `attach` supports `pi`, `claude`, and `codex`. OpenCode does not support steering.
 
@@ -146,9 +146,9 @@ Run `franky COMMAND --help` for flags and examples. Run `franky schema` for the 
 
 | Command | Purpose |
 |---------|---------|
-| `franky threads list` | List stored review threads with engine, last reviewed head, and session size. |
+| `franky threads list` | List stored review and author threads with engine, last head, and session size. |
 | `franky threads prune` | Remove orphaned, idle (`--older-than`, default 30d), and optionally closed-PR (`--closed`) threads. Cap stored sessions (`--max-bytes`, default 2G). |
-| `franky threads purge OWNER/REPO#N` | Delete one PR's threads. `--role` limits it to one role. `--all` deletes every thread. |
+| `franky threads purge OWNER/REPO#N` | Delete one PR's threads. `--role reviewer` or `--role author` limits it to one role. `--all` deletes every thread. |
 
 `prune --repo OWNER/REPO` applies every pass to one repository, so a token scoped to that repository covers `--closed`. It skips the global disk cap and reports `disk_skipped`.
 
@@ -207,6 +207,25 @@ Use `--expected-head-sha` to reject a changed PR head. Use `--no-publish` for a 
 Sessions move by stream-in (tar over `docker exec`) and copy-out (a `docker cp ... -` tar stream, capped at 64 MiB) only. No volume or mount is added. Only the session file and its side directory move. Claude's project memory never moves between runs. Stored sessions contain regular files only, are scrubbed of known secret values and token patterns, and are refused on any finding. They stay host-only (0700/0600) and are never exported. The stored findings are redacted the same way. `threads prune` and `threads purge` delete them.
 
 A resumed session replays earlier content from the same PR to the read-only reviewer. It never crosses PRs or roles. Resume stops after 14 days without a successful review, or above 64 MiB of session files.
+
+### Author threads
+
+`build --thread` and `iterate --thread` keep one author session per PR (role `author`). The reviewer and author roles never share a session.
+
+- `build --thread` with `claude` saves a session id in the job record before the container starts. When the PR exists, the session becomes the PR's author thread (`thread.id`). The result reports `session_reason: new_thread`.
+- Before the bind, the host confirms that the open PR on the build's branch is the PR the agent reported, and records the session sidecar and PR URL in the job record. If either step fails, the bind stays pending (`bind_pending`).
+- The bind waits at most 60 seconds for a busy author thread. After that it stays pending; the job record keeps the session sidecar and the PR URL. It never overwrites a stored author session (`thread_exists`). A session that is not stored is deleted unless `job resume` can still use it (a workspace snapshot exists).
+- `iterate --thread` resumes the author session with `claude`. Other engines, and a session that is stale, changed, or too large, start a new session seeded with the stored PR head. The prompt fences that context as untrusted data and says that its own conventions override the earlier conversation.
+- If `iterate --thread` finds no author thread, or one whose bind never finished, it first binds the newest unbound session sidecar of a `build --thread` for that PR whose branch the host confirms. A sidecar that fails to extract or verify is skipped for the next one. This recovers a build that stopped between its record write and the end of its bind.
+- An author run retries only when the engine refuses the stored session at startup (`resume_failed`, one seeded retry). Any other failure never re-runs the pass, because it can already have pushed.
+- An author session resumes at most 10 times in a row. The next run starts a seeded session (`resume_cap`) and resets the count.
+- A second author run for the same PR while one is active exits 4 (`thread_busy`).
+
+A timed-out `build --thread` copies its session out with its workspace. `job kill` copies it out before it removes the container, then scrubs it with the loaded configuration's secrets, the profile's MCP credentials, and every secret key in the environment. If the configuration or the profile cannot load, `job kill` captures no session. Each session goes to a `<job_id>.session.tar.gz` sidecar beside the run record: regular files only, scrubbed, fail-closed verified, host-only (0600), and never exported. Run-record pruning deletes it with its record.
+
+`job resume` of such a run restores `/work` and the session in one container, and resumes the session (V2). Before it streams the session in, it verifies it again, with the profile's MCP credentials too. It falls back to a workspace-only resume (V1) with `thread.session: fresh` plus the reason: `session_missing`, `session_corrupt`, `engine_changed`, `model_changed`, `no_native_resume`, or `verify_failed` (also when the profile cannot load). The fallback also prints one stderr line, except under `--json` or `--quiet`, where the JSON reason carries it. If the engine refuses the restored session at startup, Franky retries once as V1 in a new container with a new session id (`resume_failed`). A resumed run that opens the PR binds its session like `build --thread`.
+
+`threads purge OWNER/REPO#N --role author` deletes only the author thread.
 
 ## Agent and script interface
 

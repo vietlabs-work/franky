@@ -14,8 +14,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add `franky threads list`, `prune`, and `purge`. `prune` removes orphaned, idle, and (with `--closed`) merged or closed threads, and caps stored session bytes. `--repo` limits every pass to one repository and skips the disk cap.
 - Add `thread` and `handoff` keys to the `review-pr --json` result, only with `--thread`, and `thread_id` to run records.
 - Add an optional per-finding `status` (`new`, `open`, `resolved`) for `--thread` runs. A resolved finding never requests changes. Runs without `--thread` ignore it.
-- Exit code 4 now also covers a busy review thread (`thread_busy`).
+- Exit code 4 now also covers a busy thread (`thread_busy`).
 - Add `make smoke-thread`, which also checks that the image's `claude` accepts `--session-id` and `--resume`.
+- Add `build --thread` and `iterate --thread`: one author session per PR (role `author`). A `build --thread` session binds to the PR's author thread once the PR exists, crash-safely: the id is saved before launch, the session sidecar and PR URL are recorded before the bind, and `iterate --thread` binds a session a crashed build left behind. The bind waits at most 60 seconds for a busy thread and never overwrites a stored author session. `iterate --thread` resumes it with Claude or seeds other engines with the PR head, fenced as untrusted data. An author run retries only when the engine refuses the stored session at startup, and resumes at most 10 times in a row.
+- `job resume` of a timed-out or killed `--thread` build now also restores the engine session (V2) when the engine and model match and support native resume. Every fallback to the workspace-only resume is reported with its reason, and a refused session retries once as a workspace-only resume.
+- `job kill` of a `--thread` build copies its engine session out before the reap and scrubs it after, with the configuration's secrets, the profile's MCP credentials, and the environment's secret keys. Session sidecars (`<job_id>.session.tar.gz`) are scrubbed, fail-closed verified, host-only, pruned with their run record, and never exported.
+- A bind happens only after the host confirms that the open PR on the build's branch is the reported PR.
+- Add `threaded`, `session_id`, `model`, `session_path`, and `thread_bound` to run records, only for `--thread` runs.
+
+### Changed
+
+- `job kill` scrubs its workspace snapshot with the loaded configuration's secrets, the profile's MCP credentials, and the process environment's secret keys, not only the process environment.
+- Workspace snapshots are packed to a temp file and renamed into place, so a failed pack never leaves a partial tar. Run-record pruning also removes stale `.tmp-` leftovers in the runs directory.
+- The busy-thread error now reads `thread <id> is busy` for both roles.
 
 ## [0.2.1] - 2026-09-21
 

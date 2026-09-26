@@ -1133,7 +1133,8 @@ def run_in_container(
     "dest": host dir, "max_bytes": int}: after a clean exit (code 0), before the reap, each path
     is streamed out (`docker cp ... -`, 20s cap each) and extracted as plain files and dirs under
     `dest`. The first path is required, the rest optional; the sink gains `"status"`: ok,
-    too_large (the combined stream passed `max_bytes`), or failed.
+    too_large (the combined stream passed `max_bytes`), or failed. `"on_timeout": True` also
+    copies the session out of a timed-out run (`build --thread`, `job resume`).
 
     Topology: an --internal network (no internet route) hosts a Squid proxy (default-deny
     allowlist) and the task container. The task's HTTP(S)_PROXY points at the proxy and its
@@ -1463,22 +1464,21 @@ def run_in_container(
             except Exception:
                 _snapshot_tmp = None
         # Thread session copy-out: like the snapshot extract, it needs the live container, so it
-        # runs before the reap, capped, and only after a clean exit. Any failure is swallowed.
-        if session_sink is not None and task_launched and code == 0:
+        # runs before the reap, capped, after a clean exit (or a timeout when the sink opts in
+        # with `on_timeout`, for a resumable `--thread` build). Any failure is swallowed.
+        if (
+            session_sink is not None
+            and task_launched
+            and (code == 0 or (session_sink.get("on_timeout") and code == CONTAINER_TIMEOUT_CODE))
+        ):
             try:
-                budget = session_sink["max_bytes"] + 1
-                status = "ok"
-                for index, rel in enumerate(session_sink["paths"]):
-                    target = Path(session_sink["dest"]) / Path(rel).parent
-                    target.mkdir(mode=0o700, parents=True, exist_ok=True)
-                    result, used = snapshot.copy_home_path(
-                        task, rel, target, max_bytes=budget, popen=popen
-                    )
-                    budget -= used
-                    if result == "too_large" or (result != "ok" and index == 0):
-                        status = result
-                        break
-                session_sink["status"] = status
+                session_sink["status"] = snapshot.copy_session(
+                    task,
+                    session_sink["paths"],
+                    session_sink["dest"],
+                    max_bytes=session_sink["max_bytes"],
+                    popen=popen,
+                )
             except Exception:
                 pass
         # Best-effort teardown, ALWAYS, in order task -> proxy -> net. A reap FAILURE on the

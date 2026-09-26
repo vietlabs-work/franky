@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tarfile
 import tracemalloc
+from pathlib import Path
 
 import pytest
 
@@ -692,3 +693,87 @@ def test_copy_home_path_kills_an_over_cap_stream(tmp_path):
 def test_copy_home_path_reports_a_docker_failure(tmp_path):
     popen = _TarPopen(b"", returncode=1)
     assert snapshot.copy_home_path("t1", "u", tmp_path, max_bytes=10, popen=popen)[0] == "failed"
+
+
+# ---------------------------------------------------------------------------
+# Session sidecar (`build --thread` timeout / `job kill` capture)
+# ---------------------------------------------------------------------------
+
+_SID_PATHS = [".claude/projects/-work/u.jsonl", ".claude/projects/-work/u"]
+
+
+def _session_popen(data):
+    """`docker cp` fake: the session file serves `data`; the optional side dir is absent."""
+
+    def popen(argv, **kwargs):
+        if argv[2].endswith("u.jsonl"):
+            return _TarPopen(_tar_bytes(lambda tar: _member(tar, "u.jsonl", data)))(argv)
+        return _TarPopen(b"", returncode=1)(argv)
+
+    return popen
+
+
+def test_session_path_for_sits_beside_the_record_and_validates_the_id(tmp_path):
+    env = {"FRANKY_RUNS_DIR": str(tmp_path)}
+    assert snapshot.session_path_for("abc123", env) == tmp_path / "abc123.session.tar.gz"
+    with pytest.raises(ValueError):
+        snapshot.session_path_for("../x", env)
+
+
+def test_copy_session_lands_the_session_file_and_shares_one_budget(tmp_path):
+    status = snapshot.copy_session(
+        "t1", _SID_PATHS, tmp_path, max_bytes=10**6, popen=_session_popen(b"{}\n")
+    )
+    assert status == "ok"
+    assert (tmp_path / _SID_PATHS[0]).read_bytes() == b"{}\n"
+
+
+def test_copy_session_fails_without_paths_or_without_a_regular_session_file(tmp_path):
+    assert snapshot.copy_session("t1", [], tmp_path, max_bytes=10) == "failed"
+
+    def dir_only(argv, **kwargs):  # the session "file" arrives as a directory
+        data = _tar_bytes(lambda tar: _member(tar, "u.jsonl", kind=tarfile.DIRTYPE))
+        return _TarPopen(data)(argv)
+
+    assert snapshot.copy_session("t1", _SID_PATHS, tmp_path, max_bytes=10**6, popen=dir_only) == (
+        "failed"
+    )
+
+
+def test_finalize_snapshot_scrubs_and_refuses_a_session_like_a_workspace(tmp_path):
+    src = tmp_path / "src" / ".claude/projects/-work"
+    src.mkdir(parents=True)
+    (src / "u.jsonl").write_text('{"m": "sekrit-value"}\n')
+    dest = tmp_path / "j1.session.tar.gz"
+    assert snapshot.finalize_snapshot(tmp_path / "src", dest, ["sekrit-value"]) == str(dest)
+    assert oct(dest.stat().st_mode & 0o777) == oct(0o600)
+    with tarfile.open(dest) as tar:
+        assert tar.getnames() == [".claude/projects/-work/u.jsonl"]
+        assert b"sekrit-value" not in tar.extractfile(tar.getmembers()[0]).read()
+    src.mkdir(parents=True)
+    (src / "u.jsonl").write_text("ghp_" + "A" * 36)
+    other = tmp_path / "j2.session.tar.gz"
+    assert snapshot.finalize_snapshot(tmp_path / "src", other, []) is None
+    assert not other.exists()
+
+
+def test_finalize_snapshot_never_leaves_a_partial_tar(tmp_path, monkeypatch):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.txt").write_text("x")
+    dest = tmp_path / "out" / "j1.snapshot.tar.gz"
+
+    def broken_pack(src_dir, dest_tar):
+        Path(dest_tar).write_bytes(b"partial")
+        raise OSError("disk full")
+
+    monkeypatch.setattr(snapshot, "_pack_dir", broken_pack)
+    assert snapshot.finalize_snapshot(tmp_path / "src", dest, []) is None
+    assert list(dest.parent.iterdir()) == []
+
+
+def test_extract_plain_refuses_more_than_max_bytes(tmp_path):
+    data = _tar_bytes(lambda tar: (_member(tar, "a", b"x" * 60), _member(tar, "b", b"x" * 60)))
+    with pytest.raises(ValueError):
+        snapshot._extract_plain(io.BytesIO(data), tmp_path, max_bytes=100)
+    snapshot._extract_plain(io.BytesIO(data), tmp_path / "ok", max_bytes=120)
+    assert (tmp_path / "ok" / "b").read_bytes() == b"x" * 60

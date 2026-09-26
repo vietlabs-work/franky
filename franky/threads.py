@@ -1,10 +1,17 @@
-"""Per-PR review thread store for `franky review-pr --thread` and `franky threads`.
+"""Per-PR thread store for `review-pr --thread`, `build --thread`, `iterate --thread` and
+`franky threads`.
 
-WHY this exists: a team wants one AI review conversation per pull request, resumed on the next
-push or after a crash, so a re-review verifies its own earlier findings instead of starting
-cold. For each (repo, PR, role) the store keeps a small record, a bounded handoff (the last
-review's findings, no bodies) and, for an engine with native resume, that engine's own session
-files.
+WHY this exists: a team wants one AI conversation per pull request and role, resumed on the next
+push or after a crash, so a re-review verifies its own earlier findings and a follow-up author
+pass continues the session that wrote the PR instead of starting cold. For each (repo, PR, role)
+the store keeps a small record, a bounded handoff (the last review's findings, no bodies; for the
+author role only the PR head) and, for an engine with native resume, that engine's own session
+files. The reviewer and author roles never share a session.
+
+AUTHOR ROLE: a `build --thread` session is handed to the author thread once its PR exists
+(`begin_run` with the build's `session_id`, the sidecar extracted by `extract_session`, then the
+normal `finish_run` commit). Author runs resume at most MAX_AUTHOR_RESUMES times in a row
+(`resumes` in the record, counted before launch); the next run re-seeds.
 
 LAYOUT: <root>/<owner>__<repo>__<pr>__<role>/ (lowercase) holds `record.json` (0600),
 `session/` (0700, a HOME-relative tree holding exactly one session:
@@ -33,6 +40,7 @@ staged as `session.new/` and swapped in by renames; `open_thread` repairs an int
 from __future__ import annotations
 
 import fcntl
+import gzip
 import json
 import os
 import re
@@ -60,6 +68,7 @@ ROLES = ("reviewer", "author")
 SCHEMA = 1
 MAX_AGE = timedelta(days=14)
 MAX_SESSION_BYTES = 64 * 1024**2
+MAX_AUTHOR_RESUMES = 10
 HANDOFF_MAX_FINDINGS = 40
 ORPHAN_SECS = 3600
 _GRAPHQL_BATCH = 50
@@ -202,7 +211,7 @@ def open_thread(repo: str, pr: int, role: str, env: Mapping[str, str] | None = N
     fd = _lock(path)
     if fd is None:
         raise TaskRejected(
-            f"review thread {tid} is busy (another run, prune or purge holds it) - refusing",
+            f"thread {tid} is busy (another run, prune or purge holds it) - refusing",
             kind="thread_busy",
         )
     _recover(path)
@@ -263,13 +272,15 @@ def plan_run(
     rubric: str,
     session_bytes: int,
     now: datetime,
+    role: str = "reviewer",
 ) -> tuple[str, str]:
     """Decide how this run starts: ("resumed" | "seeded" | "fresh", reason).
 
     resumed: the stored session is usable as-is (same engine/model/rubric, native resume, marked
-    ok, non-empty, within the size cap, touched within 14 days). seeded: a record with a handoff
-    exists but some condition fails; the prompt carries the handoff into a new session. fresh:
-    nothing to carry. Pure."""
+    ok, non-empty, within the size cap, touched within 14 days, and for the author role fewer
+    than MAX_AUTHOR_RESUMES resumes in a row). seeded: a record with a handoff exists but some
+    condition fails; the prompt carries the handoff into a new session. fresh: nothing to carry.
+    Pure."""
     if record is None:
         return "fresh", "new_thread"
     age = _age(record, now)
@@ -289,6 +300,8 @@ def plan_run(
         reason = "too_large"
     elif age is None or age >= MAX_AGE:
         reason = "stale"
+    elif role == "author" and record.get("resumes", 0) >= MAX_AUTHOR_RESUMES:
+        reason = "resume_cap"
     else:
         return "resumed", ""
     return seed_mode(record), reason
@@ -313,20 +326,23 @@ def begin_run(
     mode: str,
     job_id: str,
     now: datetime,
+    session_id: str | None = None,
 ) -> tuple[dict, bool]:
     """Pin this run's session id in record.json BEFORE the container starts. Returns (record,
     written); the caller runs without session flags when the write failed.
 
     A crash at any later point leaves a known id. A non-resumed run never uses the old session,
     so it is deleted here; the handoff and last_sha carry over. `updated_at` moves only on a
-    successful finish."""
+    successful finish. `session_id` pins a known id for a non-resumed run (a `build --thread`
+    session being bound) instead of minting one. An author record counts `resumes` in a row,
+    incremented here so a crashed resumed run counts too."""
     if mode != "resumed":
         _remove(thread.session_dir)
     stamp = now.isoformat(timespec="seconds")
     prior = record or {}
     if mode == "resumed":
         session_id = prior.get("session_id")
-    else:
+    elif session_id is None:
         session_id = str(uuid.uuid4()) if native else None
     new = {
         "schema": SCHEMA,
@@ -344,6 +360,8 @@ def begin_run(
         "created_at": prior.get("created_at") or stamp,
         "updated_at": prior.get("updated_at") or stamp,
     }
+    if role == "author":
+        new["resumes"] = prior.get("resumes", 0) + 1 if mode == "resumed" else 0
     return new, write_record(thread, new)
 
 
@@ -379,6 +397,22 @@ def session_tar(thread: Thread, paths: list[str]) -> Path | None:
         Path(name).unlink(missing_ok=True)
         return None
     return Path(name)
+
+
+def extract_session(archive: Path, dest: Path, paths: list[str]) -> bool:
+    """Extract only `paths` (the session file and its side dir) from a gzip session sidecar into
+    `dest`: regular files and directories only (snapshot._extract_plain), so an adopted sidecar
+    takes the same regular-file-only path as a copy-out. False on a corrupt archive, more than
+    MAX_SESSION_BYTES of files, or a missing session file; the caller then commits nothing."""
+    if not paths:
+        return False
+    try:
+        with gzip.open(archive, "rb") as stream:
+            snapshot._extract_plain(stream, dest, only=paths, max_bytes=MAX_SESSION_BYTES)
+    except (OSError, EOFError, ValueError, tarfile.TarError):
+        return False
+    target = dest / paths[0]
+    return target.is_file() and not target.is_symlink()
 
 
 def _sanitize(root: Path) -> None:
@@ -470,6 +504,30 @@ def build_handoff(shaped: dict, sha: str, secrets) -> dict:
 def _error_lines(tail: str) -> str:
     """The non-JSON lines of an output tail (engine and CLI errors, not streamed events)."""
     return "\n".join(line for line in tail.splitlines() if not line.lstrip().startswith(("{", "[")))
+
+
+def _is_event(line: str) -> bool:
+    try:
+        json.loads(line)
+    except ValueError:
+        return False
+    return True
+
+
+def startup_rejected(tail: str, *, truncated: bool = False) -> bool:
+    """True when the engine refused its session flags at startup (the stored session is unknown,
+    or the CLI lacks the flags). Nothing ran, so an author run may safely retry; any other
+    failure of a write pass never re-runs.
+
+    A real startup rejection exits before the engine emits any event, so a tail holding a line
+    that parses as a JSON event is never a rejection, and the patterns match only non-JSON
+    lines. `truncated` (the tail is cut from a longer output) drops its first, partial line, so
+    a fragment of an event cannot pass as an error line."""
+    lines = tail.splitlines()[1:] if truncated else tail.splitlines()
+    if any(line.lstrip().startswith(("{", "[")) and _is_event(line) for line in lines):
+        return False
+    errors = _error_lines("\n".join(lines))
+    return bool(_RESUME_FAILED_RE.search(errors) or _FLAGS_UNSUPPORTED_RE.search(errors))
 
 
 def _drop_session(thread: Thread, record: dict) -> None:

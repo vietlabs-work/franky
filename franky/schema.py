@@ -59,9 +59,11 @@ _RESULT_SCHEMA: dict = {
     "review_url": "string; present ONLY when `review-pr` publishes a GitHub review",
     "review_id": "integer; present ONLY when `review-pr` publishes a GitHub review",
     "thread": {
-        "id": "string; thread id `<owner>__<repo>__<pr>__<role>`. The whole `thread` object is "
-        "present ONLY for `review-pr --thread`.",
-        "role": "string: reviewer",
+        "id": "string or null; thread id `<owner>__<repo>__<pr>__<role>`, null until a `build "
+        "--thread` session is bound (no PR yet, or bind left pending). The whole `thread` object "
+        "is present ONLY for `review-pr --thread`, `build --thread`, `iterate --thread`, and a "
+        "`job resume` of a `--thread` build.",
+        "role": "string: reviewer | author",
         "engine": "string; engine pinned to the thread for this run",
         "model": "string or null; model pinned to the thread for this run",
         "rubric_version": "string; --rubric-version pinned to the thread (default empty)",
@@ -73,14 +75,25 @@ _RESULT_SCHEMA: dict = {
         "engine_flags_unsupported when the engine rejected its session flags, or "
         "session_pack_failed / record_write_failed when the stored session could not be used; "
         "empty when resumed. resume_failed with session seeded means the resumed attempt failed "
-        "and this result is from one seeded retry in the same run",
+        "and this result is from one seeded retry in the same run (an author run retries only "
+        "when the engine refused the session at startup). Author runs add resume_cap (10 "
+        "resumes in a row, this run re-seeds). `build --thread` and `job resume` report the "
+        "bind: new_thread (bound), thread_exists (a stored author session was not overwritten), "
+        "bind_pending (thread busy, the sidecar could not be recorded, the host could not "
+        "confirm the PR as the open PR on the run's branch, or a timeout whose sidecar awaits "
+        "`job resume`), no_pr, or "
+        "verify_failed / too_large / copy_failed / session_corrupt when the session was not "
+        "kept. A `job resume` that fell back to workspace-only (V1) reports session fresh with "
+        "session_missing, session_corrupt, engine_changed, model_changed, no_native_resume, "
+        "verify_failed (also when the profile's MCP credentials cannot be loaded), or "
+        "resume_failed (the engine refused the restored session; one V1 retry ran)",
         "last_sha_before": "string or null; the head the previous successful review covered",
     },
     "handoff": {
-        "schema": "integer: 1. The whole `handoff` value is present ONLY for `review-pr "
-        "--thread`, null until a review succeeds: the bounded, redacted context the next run is "
-        "seeded with.",
-        "sha": "string; the reviewed head",
+        "schema": "integer: 1. The whole `handoff` value is present exactly when `thread` is, "
+        "null until a run succeeds (or the thread is unbound): the bounded, redacted context "
+        "the next run is seeded with. An author handoff has an empty summary and no findings.",
+        "sha": "string or null; the reviewed head, or for an author the PR head after the run",
         "summary": "string; review summary, at most 500 chars",
         "findings": [
             {
@@ -182,11 +195,21 @@ _JOB_RECORD_SCHEMA: dict = {
     "steer_notes": "operator corrections injected via `franky job attach` while the run was "
     "live (issue #72): a bounded list of {message (redacted), delivered} - or null if none. "
     "Audit trail only.",
-    "thread_id": "present ONLY on a `review-pr --thread` run: the review thread it belongs to "
-    "(see thread_record_schema). Absent on every other run.",
+    "thread_id": "present ONLY on a `review-pr --thread` or `iterate --thread` run, or a "
+    "`build --thread` / resumed run once its session is bound: the thread it belongs to (see "
+    "thread_record_schema). Absent on every other run.",
+    "threaded": "present ONLY on a `build --thread` run or a `job resume` of one: true.",
+    "session_id": "present ONLY on a `build --thread` run with native resume, or a `job resume` "
+    "of one: the engine session id, written BEFORE launch.",
+    "model": "present ONLY with session_id: the model that session runs on.",
+    "session_path": "present ONLY on a `--thread` run whose session was captured (timeout, kill, "
+    "or a PR not yet bound): the scrubbed, fail-closed-verified, host-local "
+    "`<job_id>.session.tar.gz` sidecar; never exported; null once bound into a thread.",
+    "thread_bound": "present ONLY once a `--thread` run's session was handed to the PR's author "
+    "thread: true.",
 }
 
-# Static description of one stored review thread (~/.franky/threads/<id>/record.json), as
+# Static description of one stored thread (~/.franky/threads/<id>/record.json), as
 # `franky threads list --json` emits it (plus `thread` and `session_bytes`).
 _THREAD_RECORD_SCHEMA: dict = {
     "thread": "string; thread id `<owner>__<repo>__<pr>__<role>`",
@@ -199,12 +222,15 @@ _THREAD_RECORD_SCHEMA: dict = {
     "rubric_version": "string; rubric label pinned to the stored session",
     "session_id": "string or null; engine session id, written before each run starts",
     "session_ok": "boolean; whether the stored session can be resumed",
-    "last_sha": "string or null; head covered by the last successful review",
+    "last_sha": "string or null; head covered by the last successful review (author: the PR "
+    "head after the last successful run)",
     "last_job_id": "string; job id of the last run on this thread",
     "handoff": "object or null; see result_schema.handoff",
     "created_at": "ISO-8601 UTC timestamp",
     "updated_at": "ISO-8601 UTC timestamp of the last successful review",
     "session_bytes": "integer; bytes of stored session files",
+    "resumes": "integer; author threads only: resumed runs in a row, counted before launch; at "
+    "10 the next run re-seeds and resets it",
 }
 
 _THREADS_LIST_SCHEMA: dict = {"type": "array", "items": "thread_record_schema"}

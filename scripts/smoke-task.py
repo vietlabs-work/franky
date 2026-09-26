@@ -21,8 +21,8 @@ else:
         name=name,
         network=os.environ.get("SMOKE_NETWORK"),
         proxy_url=os.environ.get("SMOKE_PROXY_URL"),
-        profile_wait=mode == "profile",
-        resume_wait=mode == "resume",
+        profile_wait=mode in ("profile", "both"),
+        resume_wait=mode in ("resume", "both"),
         apparmor_profile=select_task_apparmor(),
     )
     argv.insert(2, "-d")

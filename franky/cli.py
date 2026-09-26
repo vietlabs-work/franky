@@ -17,7 +17,9 @@ import secrets
 import subprocess
 import sys
 import tarfile
+import tempfile
 import time
+import uuid
 from collections.abc import Mapping
 from dataclasses import replace as dc_replace
 from datetime import datetime, timezone
@@ -104,7 +106,14 @@ from .result import (
 )
 from .security import TASK_APPARMOR
 from .schema import build_schema
-from .task import PROSE_MAX_CHARS, TaskSpec, parse_pr_task, parse_review_pr_task, parse_task
+from .task import (
+    GH_PR_RE,
+    PROSE_MAX_CHARS,
+    TaskSpec,
+    parse_pr_task,
+    parse_review_pr_task,
+    parse_task,
+)
 from .update_check import force_update, maybe_auto_update
 from .userconfig import (
     SECRET_KEYS,
@@ -372,6 +381,14 @@ def apparmor_profile() -> None:
     help="On a retryable failure (timeout/agent-error/no-PR), diagnose it and retry up to N "
     "times, feeding the root-cause back in (issue #64). Default 0 = no retry.",
 )
+@click.option(
+    "--thread",
+    "use_thread",
+    is_flag=True,
+    default=False,
+    help="Hand this run's engine session to the PR's author thread once the PR exists, so "
+    "`iterate --thread` continues it (see `franky threads`).",
+)
 @click.pass_context
 def build(
     ctx: click.Context,
@@ -387,6 +404,7 @@ def build(
     max_duration: int | None,
     force: bool,
     retry: int,
+    use_thread: bool,
 ) -> None:
     """Build TASK_INPUT (a GitHub issue URL, a JIRA key, or a prose request) and open a PR.
 
@@ -401,6 +419,10 @@ def build(
 
     With --plan-first, Franky first asks the engine for a plan. The host starts no build pass
     until you confirm. --yes auto-approves. A non-interactive run without --yes exits 2.
+
+    --thread keeps the build's engine session: once the PR exists it becomes the PR's author
+    thread (repo + PR number, role author), which `franky iterate --thread` resumes. A timed-out
+    or killed --thread build keeps its session for `franky job resume`.
 
     --json emits one machine-readable result/error object on stdout; exit codes follow the
     documented taxonomy (0 ok, 2 usage, 3 config, 4 task, 5 auth, 6 docker, 7 agent, 8 net,
@@ -567,6 +589,7 @@ def build(
                 source=spec.source,
                 task_full=task_full,
                 base_sha=base_sha,
+                thread=use_thread,
             )
             attempts.append(
                 {"job_id": final["job_id"], "status": final["status"], "retry_hint": ""}
@@ -631,6 +654,8 @@ def build(
             branch=branch,
             job_id=final["job_id"],
             attempts=attempts if retry > 0 else None,
+            thread=final.get("thread"),
+            handoff=final.get("handoff"),
         )
         _emit_result(
             result, as_json, secrets, pr_url=final["pr_url"], status=final["status"], quiet=quiet
@@ -676,6 +701,13 @@ def build(
     default=None,
     help="Abort the run after N seconds (default 1800).",
 )
+@click.option(
+    "--thread",
+    "use_thread",
+    is_flag=True,
+    default=False,
+    help="Continue the PR's author session (see `build --thread` and `franky threads`).",
+)
 @click.pass_context
 def iterate(
     ctx: click.Context,
@@ -685,6 +717,7 @@ def iterate(
     as_json: bool,
     quiet: bool,
     max_duration: int | None,
+    use_thread: bool,
 ) -> None:
     """Address review feedback / failing CI on an existing Franky PR with follow-up commits.
 
@@ -695,6 +728,11 @@ def iterate(
     starting fresh it checks out the PR's existing branch, reads review comments and failing
     checks, and pushes additive commits. The prompt forbids force pushes, merges, and new PRs.
     The PR URL is authoritative, so there is no --repo flag.
+
+    --thread continues the PR's author thread (repo + PR number, role author): it resumes the
+    stored session natively when the engine supports it (claude), otherwise starts a new session
+    seeded with the stored context. A resumed session that the engine refuses at startup retries
+    once seeded; any other failure never re-runs the pass. A busy thread exits 4 (`thread_busy`).
 
     --json emits one machine-readable result/error object on stdout (status iterate_complete
     on exit 0; the input PR URL is echoed back as pr_url). Exit codes follow the documented
@@ -724,6 +762,12 @@ def iterate(
         except ValueError as exc:
             raise NetworkError(redact(str(exc), cfg_secrets_safe())) from exc
 
+        thread = None
+        pr_number = int(spec.text.rsplit("/", 1)[1])
+        if use_thread:
+            thread = _open_thread(spec.repo, pr_number, "author")
+            ctx.call_on_close(thread.close)
+
         franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
 
         bundle, setup_block = _load_profile_bundle(None, process_env, secrets, cfg)
@@ -733,22 +777,77 @@ def iterate(
         # host-predicted branch, so branch is None in the record.
         job_id = jobs.new_job_id()
         _record_run_start(
-            job_id, command="iterate", cfg=cfg, repo=spec.repo, summary=spec.text, branch=None
+            job_id,
+            command="iterate",
+            cfg=cfg,
+            repo=spec.repo,
+            summary=spec.text,
+            branch=None,
+            thread_id=thread.id if thread else None,
         )
         if not quiet:
             click.echo(f"franky: job {job_id} started", err=True)
+
+        # Author thread plan. No record yet may mean a `build --thread` crashed between its job
+        # record write and the end of its bind (no record, or one that never got a handoff):
+        # recover that session first. A resumed or seeded session gets the fenced prior-author
+        # block.
+        record = prior_sha = prior = None
+        mode = plan_reason = nonce = ""
+        now = datetime.now(timezone.utc)
+        if thread is not None:
+            record = threads.read_record(thread.path)
+            if record is None or not record.get("handoff"):
+                record = (
+                    _recover_author_bind(
+                        thread,
+                        record,
+                        pr_url=spec.text,
+                        repo=spec.repo,
+                        pr=pr_number,
+                        secrets=secrets,
+                        env=os.environ,
+                    )
+                    or record
+                )
+            prior_sha = (record or {}).get("last_sha")
+            mode, plan_reason = threads.plan_run(
+                record,
+                engine=cfg.engine.name,
+                native=bool(cfg.engine.session_dir),
+                model=cfg.model,
+                rubric="",
+                session_bytes=threads.session_bytes(thread),
+                now=now,
+                role="author",
+            )
+            if mode != "fresh":
+                prior = (record or {}).get("handoff") or {}
+            nonce = _make_nonce()
         # Populated (best-effort) by run_in_container just before container teardown (issue #69).
         diagnostics: dict = {}
-        code, output, duration = _run_pass(
+        code, output, duration, record, mode, plan_reason, run_kwargs, incoming = _thread_pass(
             cfg,
-            build_iterate_prompt(spec, operator_setup=setup_block),
+            build_iterate_prompt(spec, operator_setup=setup_block, prior=prior, nonce=nonce),
             franky_img,
             proxy_img,
             bundle,
+            thread=thread,
+            record=record,
+            mode=mode,
+            reason=plan_reason,
+            role="author",
+            repo=spec.repo,
+            pr=pr_number,
+            rubric="",
+            job_id=job_id,
+            now=now,
+            sha=None,
+            secrets=secrets,
+            quiet=quiet,
             progress=progress,
             timeout=max_duration,
-            run_id=job_id,
-            diagnostics_sink=diagnostics,
+            diagnostics=diagnostics,
         )
 
         usage = _parse_usage_safe(output)
@@ -768,6 +867,35 @@ def iterate(
             status, reason, exit_code = "agent_error", f"agent exited {code}", EXIT_AGENT
         else:
             status, reason, exit_code = "iterate_complete", "iterate pass complete", EXIT_SUCCESS
+
+        thread_result = handoff = None
+        if thread is not None:
+            sink = run_kwargs.get("session_sink") or {}
+            record, override = threads.finish_run(
+                thread,
+                record,
+                mode=mode,
+                code=code,
+                shaped=dict(_AUTHOR_SHAPED) if code == 0 else None,
+                # An unreadable head keeps the previous one rather than recording null.
+                sha=(fetch_pr_head_sha(spec.repo, pr_number, os.environ) or record.get("last_sha"))
+                if code == 0
+                else None,
+                tail=_output_tail(output),
+                incoming=incoming,
+                copy_status=sink.get("status"),
+                secrets=secrets,
+                now=datetime.now(timezone.utc),
+            )
+            handoff = record.get("handoff")
+            thread_result = _author_thread_result(
+                cfg,
+                thread.id,
+                record.get("session_id"),
+                mode,
+                override or plan_reason,
+                prior_sha,
+            )
 
         _record_run_end(
             job_id,
@@ -790,6 +918,8 @@ def iterate(
             engine=cfg.engine.name,
             repo=spec.repo,
             job_id=job_id,
+            thread=thread_result,
+            handoff=handoff,
         )
         _emit_result(result, as_json, secrets, pr_url=spec.text, status=status, quiet=quiet)
         ctx.exit(exit_code)
@@ -939,14 +1069,7 @@ def review_pr(
         # Lock the thread BEFORE the head pin, so two runs for one PR can never interleave.
         thread = None
         if use_thread:
-            try:
-                thread = threads.open_thread(repo, pr_number, "reviewer")
-            except FrankyError:
-                raise
-            except ValueError as exc:
-                raise TaskRejected(str(exc)) from exc
-            except OSError as exc:
-                raise ConfigError(f"thread store is not writable: {exc}") from exc
+            thread = _open_thread(repo, pr_number, "reviewer")
             ctx.call_on_close(thread.close)
 
         # Pin the LIVE head SHA before anything else runs - the review is grounded against
@@ -1012,72 +1135,31 @@ def review_pr(
         )
 
         diagnostics: dict = {}
-        duration = 0.0
-        retried = False
-        while True:
-            if thread is not None:
-                record, mode, plan_reason, run_kwargs, incoming = _thread_launch(
-                    thread,
-                    record,
-                    cfg,
-                    mode=mode,
-                    reason=plan_reason,
-                    repo=repo,
-                    pr=pr_number,
-                    rubric=rubric_version,
-                    job_id=job_id,
-                    now=now,
-                )
-            try:
-                code, output, attempt_duration = _run_pass(
-                    cfg,
-                    prompt,
-                    franky_img,
-                    proxy_img,
-                    bundle,
-                    progress=progress,
-                    timeout=max_duration,
-                    run_id=job_id,
-                    diagnostics_sink=diagnostics,
-                    **run_kwargs,
-                )
-            finally:
-                if run_kwargs.get("session_tar"):
-                    Path(run_kwargs["session_tar"]).unlink(missing_ok=True)
-            duration += attempt_duration
-            # A failed resumed attempt never blocks the review: drop that session and retry once
-            # in this run as a seeded session (new id, prior findings in the prompt).
-            if (
-                thread is not None
-                and mode == "resumed"
-                and code not in (0, CONTAINER_TIMEOUT_CODE)
-                and not retried
-            ):
-                record, _label = threads.finish_run(
-                    thread,
-                    record,
-                    mode=mode,
-                    code=code,
-                    shaped=None,
-                    sha=pinned_sha,
-                    tail=_output_tail(output),
-                    incoming=incoming,
-                    copy_status=None,
-                    secrets=secrets,
-                    now=datetime.now(timezone.utc),
-                )
-                failed_log = _write_log(
-                    output, secrets, run_id=f"{job_id}-resume-failed", env=os.environ
-                )
-                if not quiet:
-                    click.echo(
-                        f"franky: resumed review session failed (log: {failed_log}) - "
-                        "retrying once with a seeded session",
-                        err=True,
-                    )
-                mode, plan_reason, retried = threads.seed_mode(record), "resume_failed", True
-                continue
-            break
+        # A failed resumed attempt never blocks the review: _thread_pass drops that session and
+        # retries once in this run as a seeded session (new id, prior findings in the prompt).
+        code, output, duration, record, mode, plan_reason, run_kwargs, incoming = _thread_pass(
+            cfg,
+            prompt,
+            franky_img,
+            proxy_img,
+            bundle,
+            thread=thread,
+            record=record,
+            mode=mode,
+            reason=plan_reason,
+            role="reviewer",
+            repo=repo,
+            pr=pr_number,
+            rubric=rubric_version,
+            job_id=job_id,
+            now=now,
+            sha=pinned_sha,
+            secrets=secrets,
+            quiet=quiet,
+            progress=progress,
+            timeout=max_duration,
+            diagnostics=diagnostics,
+        )
 
         usage = _parse_usage_safe(output)
         econ = _economics_line(usage, duration, secrets)
@@ -1457,13 +1539,36 @@ def _ensure_images(env: Mapping[str, str], engine: str) -> tuple[str, str]:
     return franky_img, proxy_img
 
 
+_TAIL_CHARS = 65536
+
+
 def _output_tail(output) -> str:
     """The last 64 KiB of a pass's output, for engine error detection."""
-    return output.tail(65536) if isinstance(output, Transcript) else output[-65536:]
+    return output.tail(_TAIL_CHARS) if isinstance(output, Transcript) else output[-_TAIL_CHARS:]
 
 
-def _thread_launch(thread, record, cfg, *, mode, reason, repo, pr, rubric, job_id, now):
-    """Pin one `review-pr --thread` attempt's session before launch.
+def _startup_rejected(output) -> bool:
+    """threads.startup_rejected over a pass's output tail, which is cut from a longer output
+    when it fills the whole tail window."""
+    tail = _output_tail(output)
+    return threads.startup_rejected(tail, truncated=len(tail) >= _TAIL_CHARS)
+
+
+def _open_thread(repo: str, pr: int, role: str):
+    """Open and lock one thread, mapping store errors onto the CLI contract (exit 4 when busy
+    or invalid, exit 3 when the store is not writable)."""
+    try:
+        return threads.open_thread(repo, pr, role)
+    except FrankyError:
+        raise
+    except ValueError as exc:
+        raise TaskRejected(str(exc)) from exc
+    except OSError as exc:
+        raise ConfigError(f"thread store is not writable: {exc}") from exc
+
+
+def _thread_launch(thread, record, cfg, *, mode, reason, repo, pr, role, rubric, job_id, now):
+    """Pin one `--thread` attempt's session (review-pr reviewer, iterate author) before launch.
 
     Returns (record, mode, reason, run_kwargs for _run_pass, copy-out dir or None). A resumed
     session that cannot be packed downgrades to a seeded one; a record that cannot be written
@@ -1480,7 +1585,7 @@ def _thread_launch(thread, record, cfg, *, mode, reason, repo, pr, rubric, job_i
         record,
         repo=repo,
         pr=pr,
-        role="reviewer",
+        role=role,
         engine=cfg.engine.name,
         native=bool(cfg.engine.session_dir),
         model=cfg.model,
@@ -1505,6 +1610,507 @@ def _thread_launch(thread, record, cfg, *, mode, reason, repo, pr, rubric, job_i
         },
     }
     return record, mode, reason, run_kwargs, incoming
+
+
+def _thread_retry(
+    thread, record, *, role, mode, code, output, retried, incoming, sha, secrets, job_id, quiet
+):
+    """After one attempt: settle a failed resumed attempt and allow ONE seeded retry. Returns
+    (record, mode, reason) for the retry, or None to keep this attempt's result.
+
+    reviewer: any failure but a timeout retries (a review is read-only). author: only an engine
+    startup rejection (threads.startup_rejected: the stored session is unknown or the flags are
+    unsupported) retries - the engine never ran, so nothing was pushed. Any other failure of an
+    author (write) pass is never re-run."""
+    if thread is None or mode != "resumed" or retried or code in (0, CONTAINER_TIMEOUT_CODE):
+        return None
+    tail = _output_tail(output)
+    if role == "author" and not _startup_rejected(output):
+        return None
+    record, _label = threads.finish_run(
+        thread,
+        record,
+        mode=mode,
+        code=code,
+        shaped=None,
+        sha=sha,
+        tail=tail,
+        incoming=incoming,
+        copy_status=None,
+        secrets=secrets,
+        now=datetime.now(timezone.utc),
+    )
+    failed_log = _write_log(output, secrets, run_id=f"{job_id}-resume-failed", env=os.environ)
+    if not quiet:
+        click.echo(
+            f"franky: resumed {'review' if role == 'reviewer' else 'author'} session failed "
+            f"(log: {failed_log}) - retrying once with a seeded session",
+            err=True,
+        )
+    return record, threads.seed_mode(record), "resume_failed"
+
+
+def _thread_pass(
+    cfg,
+    prompt,
+    franky_img,
+    proxy_img,
+    bundle,
+    *,
+    thread,
+    record,
+    mode,
+    reason,
+    role,
+    repo,
+    pr,
+    rubric,
+    job_id,
+    now,
+    sha,
+    secrets,
+    quiet,
+    progress,
+    timeout,
+    diagnostics,
+):
+    """Run a `review-pr` or `iterate` pass: one attempt, plus the one seeded retry
+    `_thread_retry` allows on a thread. Without a thread it is exactly one plain `_run_pass`.
+
+    Returns (code, output, duration, record, mode, reason, run_kwargs, copy-out dir or None)."""
+    duration = 0.0
+    retried = False
+    run_kwargs: dict = {}
+    incoming = None
+    while True:
+        if thread is not None:
+            record, mode, reason, run_kwargs, incoming = _thread_launch(
+                thread,
+                record,
+                cfg,
+                mode=mode,
+                reason=reason,
+                repo=repo,
+                pr=pr,
+                role=role,
+                rubric=rubric,
+                job_id=job_id,
+                now=now,
+            )
+        try:
+            code, output, attempt_duration = _run_pass(
+                cfg,
+                prompt,
+                franky_img,
+                proxy_img,
+                bundle,
+                progress=progress,
+                timeout=timeout,
+                run_id=job_id,
+                diagnostics_sink=diagnostics,
+                **run_kwargs,
+            )
+        finally:
+            if run_kwargs.get("session_tar"):
+                Path(run_kwargs["session_tar"]).unlink(missing_ok=True)
+        duration += attempt_duration
+        retry = _thread_retry(
+            thread,
+            record,
+            role=role,
+            mode=mode,
+            code=code,
+            output=output,
+            retried=retried,
+            incoming=incoming,
+            sha=sha,
+            secrets=secrets,
+            job_id=job_id,
+            quiet=quiet,
+        )
+        if retry is None:
+            return code, output, duration, record, mode, reason, run_kwargs, incoming
+        record, mode, reason = retry
+        retried = True
+
+
+# `build --thread` / `job resume`: how long a bind waits for a busy author thread before it is
+# left pending for `iterate --thread` to recover, and the shaped result an author pass commits
+# (an author run has no structured output; its handoff is the PR head).
+_BIND_WAIT_SECS = 60
+_AUTHOR_SHAPED = {"summary": "", "findings": []}
+# Temp session dirs and tars live in the runs dir under this prefix; jobs.prune sweeps leftovers.
+_SESSION_TMP_PREFIX = ".tmp-session-"
+
+
+def _valid_session_id(value) -> bool:
+    """A session id read back from a run record is used in paths and argv: only a canonical
+    UUID (what Franky mints) is accepted."""
+    try:
+        return isinstance(value, str) and str(uuid.UUID(value)) == value
+    except ValueError:
+        return False
+
+
+def _session_tmpdir(env) -> Path:
+    """A 0700 temp dir for session bytes, inside the runs dir (host-only, swept by prune)."""
+    root = jobs.runs_dir(env)
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix=_SESSION_TMP_PREFIX, dir=root))
+
+
+def _session_capture(cfg, session_id: str, *, resume: bool, env) -> dict:
+    """_run_pass kwargs for an author session that is copied out on a clean exit AND on a
+    timeout (a timed-out `--thread` build stays resumable with its session)."""
+    return {
+        "session": (session_id, resume),
+        "session_sink": {
+            "paths": threads.session_paths(cfg.engine.name, session_id),
+            "dest": str(_session_tmpdir(env)),
+            "max_bytes": threads.MAX_SESSION_BYTES,
+            "on_timeout": True,
+        },
+    }
+
+
+def _profile_secrets(env) -> list[str] | None:
+    """The operator profile's MCP credential values, resolved like _load_profile_bundle, so a
+    session scrub outside a normal run knows them too. [] without a profile; None when the
+    profile cannot be loaded (the caller then fails closed)."""
+    try:
+        ppath = profile_path(dict(env))
+        if ppath is None:
+            return []
+        return [v for v in resolve_mcp_credentials(load_profile(ppath), dict(env)).values() if v]
+    except Exception:
+        return None
+
+
+def _pr_key(url):
+    """(lowercase owner/repo, number) of a GitHub PR URL, or None."""
+    match = GH_PR_RE.match((url or "").strip())
+    if not match:
+        return None
+    return f"{match.group('owner')}/{match.group('repo')}".lower(), int(match.group("number"))
+
+
+def _pr_verified(repo, branch, pr_url, env) -> bool:
+    """Host-side check before a bind: the open PR on the run's recorded branch is the PR the
+    agent reported, so agent output alone can never pick the thread a session lands in."""
+    key = _pr_key(pr_url)
+    return bool(branch) and key is not None and _pr_key(find_open_pr(repo, branch, env)) == key
+
+
+def _author_thread_result(cfg, tid, session_id, session, reason, last_sha_before=None) -> dict:
+    """The `thread` result object for an author run (build, iterate, job resume)."""
+    return {
+        "id": tid,
+        "role": "author",
+        "engine": cfg.engine.name,
+        "model": cfg.model,
+        "rubric_version": "",
+        "session_id": session_id,
+        "session": session,
+        "session_reason": reason,
+        "last_sha_before": last_sha_before,
+    }
+
+
+def _adopt_author(
+    thread,
+    record,
+    *,
+    engine,
+    model,
+    session_id,
+    sidecar,
+    repo,
+    pr,
+    job_id,
+    secrets,
+    env,
+    strict=False,
+) -> str:
+    """Bind one `build --thread` session to a LOCKED author thread and mark its job bound.
+
+    Pins it first (begin_run with the build's own id), extracts only its session file and side
+    dir from the sidecar (regular files only, size-capped), then commits it through finish_run's
+    sanitize, scrub and fail-closed verify, with the PR head as the handoff. Never a copytree.
+    Returns "" when the session was stored, else why not. A bind whose session is not stored
+    still binds (the next run seeds) and deletes a sidecar `job resume` cannot use. `strict`
+    (recovery) instead restores the previous thread record and leaves the job untouched, so a
+    failed adopt leaves no session-less author record behind."""
+    prior = record
+    now = datetime.now(timezone.utc)
+    record, written = threads.begin_run(
+        thread,
+        record,
+        repo=repo,
+        pr=pr,
+        role="author",
+        engine=engine,
+        native=session_id is not None,
+        model=model,
+        rubric="",
+        mode="fresh",
+        job_id=job_id,
+        now=now,
+        session_id=session_id,
+    )
+    if not written:
+        return "record_write_failed"
+    paths = threads.session_paths(engine, session_id)
+    incoming = status = None
+    if sidecar is not None and paths:
+        incoming = threads.new_incoming(thread)
+        status = "ok" if threads.extract_session(sidecar, incoming, paths) else "failed"
+    record, _label = threads.finish_run(
+        thread,
+        record,
+        mode="fresh",
+        code=0,
+        shaped=dict(_AUTHOR_SHAPED),
+        sha=fetch_pr_head_sha(repo, pr, env) or record.get("last_sha"),
+        tail="",
+        incoming=incoming,
+        copy_status=status,
+        secrets=secrets,
+        now=now,
+    )
+    reason = ""
+    if status == "failed":
+        reason = "session_corrupt"
+    elif incoming is not None and not record.get("session_ok"):
+        reason = "verify_failed"
+    if strict and reason:
+        if prior is None:
+            (thread.path / "record.json").unlink(missing_ok=True)
+        else:
+            threads.write_record(thread, prior)
+        return reason
+    patch = {"thread_bound": True, "thread_id": thread.id}
+    if sidecar is not None and (
+        record.get("session_ok") or not snapshot.snapshot_path_for(job_id, env).exists()
+    ):
+        # Stored in the thread, or unusable by `job resume` (no workspace snapshot beside it).
+        Path(sidecar).unlink(missing_ok=True)
+        patch["session_path"] = None
+    jobs.update_record(job_id, patch, env)
+    return reason
+
+
+# A separate function (not inlined in _settle_author_session) so tests can crash a run between
+# its checked record write and its bind, the window `iterate --thread` recovery covers.
+def _bind_author(cfg, *, repo, pr, job_id, session_id, sidecar, secrets, env):
+    """Hand a finished `build --thread` (or resumed) session to the PR's author thread.
+
+    Waits at most _BIND_WAIT_SECS for a busy thread, then leaves the bind pending (the job
+    record keeps session_path + pr_url for `iterate --thread` to recover). Never overwrites a
+    stored author session. Returns (thread id or None, session_reason, thread record or None)."""
+    deadline = time.monotonic() + _BIND_WAIT_SECS
+    while True:
+        try:
+            thread = threads.open_thread(repo, pr, "author", env)
+            break
+        except TaskRejected:
+            if time.monotonic() >= deadline:
+                click.echo(
+                    f"franky: author thread for {repo}#{pr} stayed busy - bind left pending "
+                    "(`franky iterate --thread` binds it later)",
+                    err=True,
+                )
+                return None, "bind_pending", None
+            time.sleep(1)
+        except (OSError, ValueError):
+            click.echo(f"franky: author thread for {repo}#{pr} is unavailable", err=True)
+            return None, "bind_pending", None
+    try:
+        record = threads.read_record(thread.path)
+        if record is not None and threads.session_bytes(thread):
+            kept = sidecar is None or snapshot.snapshot_path_for(job_id, env).exists()
+            if not kept:
+                Path(sidecar).unlink(missing_ok=True)
+                jobs.update_record(job_id, {"session_path": None}, env)
+            click.echo(
+                f"franky: author thread {thread.id} already holds a session - not overwritten"
+                + (
+                    " (this run's session sidecar stays for `franky job resume`)"
+                    if sidecar is not None and kept
+                    else " (this run's session is discarded)"
+                ),
+                err=True,
+            )
+            return None, "thread_exists", None
+        reason = _adopt_author(
+            thread,
+            record,
+            engine=cfg.engine.name,
+            model=cfg.model,
+            session_id=session_id,
+            sidecar=sidecar,
+            repo=repo,
+            pr=pr,
+            job_id=job_id,
+            secrets=secrets,
+            env=env,
+        )
+        if reason == "record_write_failed":
+            return None, "bind_pending", None
+        return thread.id, reason or "new_thread", threads.read_record(thread.path)
+    finally:
+        thread.close()
+
+
+def _settle_author_session(
+    cfg, *, job_id, repo, branch, session_id, sink, code, pr_url, status, secrets, env
+):
+    """After a `build --thread` (or resumed) pass: finalize the copied session into the job's
+    sidecar (scrub, fail-closed verify, 0600) when it is still useful - a PR to bind or a timeout
+    to resume - and record session_path + pr_url with a checked write BEFORE binding, so a crash
+    mid-bind leaves a recoverable record. A failed write, or a PR the host cannot confirm as the
+    open PR on the run's branch, leaves the bind pending. Returns (thread, handoff)."""
+    sidecar, captured = None, ""
+    if sink:
+        tmp = Path(sink["dest"])
+        if pr_url or code == CONTAINER_TIMEOUT_CODE:
+            if sink.get("status") == "ok":
+                path = snapshot.finalize_snapshot(
+                    tmp, snapshot.session_path_for(job_id, env), secrets
+                )
+                sidecar = Path(path) if path else None
+                captured = "" if path else "verify_failed"
+            else:
+                captured = "too_large" if sink.get("status") == "too_large" else "copy_failed"
+        snapshot._rmtree(tmp)
+    recorded = sidecar is None or jobs.update_record(
+        job_id, {"session_path": str(sidecar), "pr_url": pr_url}, env
+    )
+    if not recorded:
+        click.echo(
+            f"franky: job {job_id}: session sidecar not recorded - bind left pending", err=True
+        )
+    tid = record = None
+    if status == "pr_opened":
+        try:
+            _repo, _url, pr = parse_review_pr_task(pr_url, cfg.allowed_repos)
+        except TaskRejected:
+            pr = None
+        if pr is None or not recorded:
+            reason = "bind_pending"
+        elif not _pr_verified(repo, branch, pr_url, env):
+            click.echo(
+                f"franky: job {job_id}: {pr_url} is not the open PR on branch {branch} - "
+                "bind left pending",
+                err=True,
+            )
+            reason = "bind_pending"
+        else:
+            tid, reason, record = _bind_author(
+                cfg,
+                repo=repo,
+                pr=pr,
+                job_id=job_id,
+                session_id=session_id,
+                sidecar=sidecar,
+                secrets=secrets,
+                env=env,
+            )
+            if tid is not None:
+                reason = captured or reason
+    elif code == CONTAINER_TIMEOUT_CODE:
+        reason = captured or "bind_pending"
+    else:
+        reason = "no_pr"
+    thread = _author_thread_result(cfg, tid, session_id, "fresh", reason)
+    return thread, (record or {}).get("handoff") if tid else None
+
+
+def _recover_author_bind(thread, record, *, pr_url, repo, pr, secrets, env):
+    """`iterate --thread` on a PR whose author thread was never finished (no record, or no
+    handoff): bind the newest unbound `build --thread` (or resume) session for that PR whose
+    sidecar still exists and whose recorded branch the host confirms is that PR's head - a crash
+    between the build's record write and the end of its bind. A candidate that fails to adopt
+    is skipped for the next one. Returns the new thread record, or None."""
+    for rec in jobs.list_records(env):
+        if (
+            rec.get("command") not in ("build", "resume")
+            or rec.get("thread_bound")
+            or not rec.get("session_path")
+            or not _valid_session_id(rec.get("session_id"))
+            or _pr_key(rec.get("pr_url")) != _pr_key(pr_url)
+        ):
+            continue
+        try:
+            sidecar = snapshot.session_path_for(rec.get("job_id", ""), env)
+        except ValueError:
+            continue
+        if not sidecar.is_file() or not _pr_verified(repo, rec.get("branch"), pr_url, env):
+            continue
+        reason = _adopt_author(
+            thread,
+            record,
+            engine=rec.get("engine"),
+            model=rec.get("model"),
+            session_id=rec["session_id"],
+            sidecar=sidecar,
+            repo=repo,
+            pr=pr,
+            job_id=rec["job_id"],
+            secrets=secrets,
+            env=env,
+            strict=True,
+        )
+        if not reason:
+            return threads.read_record(thread.path)
+    return None
+
+
+def _resume_session(record, job_id, cfg, secrets):
+    """The `job resume` V2 gate. Returns (host tar of the session to stream in, "") or (None,
+    V1 fallback reason). The sidecar is re-extracted through the regular-file-only filter and
+    re-scrubbed + verified (with the profile's MCP credentials too) into a fresh temp tar, so
+    exactly what was checked is streamed. A profile that cannot load fails closed."""
+    sid = record.get("session_id")
+    if record.get("engine") != cfg.engine.name:
+        return None, "engine_changed"
+    if record.get("model") != cfg.model:
+        return None, "model_changed"
+    if not cfg.engine.session_dir:
+        return None, "no_native_resume"
+    sidecar = snapshot.session_path_for(job_id, os.environ)
+    if not _valid_session_id(sid) or not sidecar.is_file():
+        return None, "session_missing"
+    extra = _profile_secrets(os.environ)
+    if extra is None:
+        return None, "verify_failed"
+    tmp = _session_tmpdir(os.environ)
+    if not threads.extract_session(sidecar, tmp, threads.session_paths(cfg.engine.name, sid)):
+        snapshot._rmtree(tmp)
+        return None, "session_corrupt"
+    fd, name = tempfile.mkstemp(prefix=_SESSION_TMP_PREFIX, suffix=".tar.gz", dir=tmp.parent)
+    os.close(fd)
+    path = snapshot.finalize_snapshot(tmp, Path(name), [*secrets, *extra])
+    if path is None:
+        Path(name).unlink(missing_ok=True)
+        return None, "verify_failed"
+    return path, ""
+
+
+def _kill_secrets(engine):
+    """The secrets a `job kill` capture scrubs with: the loaded configuration's values (config
+    file merged, cfg.secret_values()), the profile's MCP credentials, and every SECRET_KEYS value
+    in the process env. Returns (secrets, complete); `complete` is False when the config or the
+    profile cannot load, and the caller then skips the session capture."""
+    loaded: list[str] = []
+    try:
+        load_config_file(os.environ)
+        loaded = load_config(engine, os.environ).secret_values()
+        ok = True
+    except Exception:
+        ok = False
+    extra = _profile_secrets(os.environ)
+    values = [os.environ[k] for k in SECRET_KEYS if os.environ.get(k)]
+    return list(dict.fromkeys([*values, *loaded, *(extra or [])])), ok and extra is not None
 
 
 def _run_pass(
@@ -1713,6 +2319,8 @@ def _record_run_start(
     replay_of=None,
     resumed_from=None,
     thread_id=None,
+    session_id=None,
+    threaded=False,
     env=None,
 ) -> None:
     """Write a status=running registry record before the container pass (issues #63, #64).
@@ -1750,6 +2358,9 @@ def _record_run_start(
             replay_of=replay_of,
             resumed_from=resumed_from,
             thread_id=thread_id,
+            session_id=session_id,
+            model=cfg.model if session_id else None,
+            threaded=threaded,
         )
         jobs.write_record(record, env)
         jobs.prune(env)  # only on the write path; never a side effect of a read
@@ -1825,6 +2436,7 @@ def _build_once(
     task_full=None,
     base_sha=None,
     setup_block="",
+    thread=False,
 ) -> dict:
     """Run ONE build attempt end to end and return its outcome (issue #64 #5).
 
@@ -1837,8 +2449,14 @@ def _build_once(
     `source`/`task_full`/`base_sha` (issue #70) are threaded straight into `_record_run_start`
     so every build attempt's record carries the saved inputs a later `job replay` needs; all
     default to None (a caller that omits them records byte-identical to before).
+
+    `thread` (`build --thread`): on an engine with native resume a session id is pinned in the
+    job record BEFORE launch and copied out on a clean exit or a timeout; `_settle_author_session`
+    then stores it as the job's sidecar and binds it to the PR's author thread. The outcome gains
+    `thread`/`handoff` only then.
     """
     job_id = jobs.new_job_id()
+    session_id = str(uuid.uuid4()) if thread and cfg.engine.session_dir else None
     _record_run_start(
         job_id,
         command="build",
@@ -1849,6 +2467,8 @@ def _build_once(
         source=source,
         task_full=task_full,
         base_sha=base_sha,
+        session_id=session_id,
+        threaded=thread,
         env=env,
     )
     if not quiet:
@@ -1857,6 +2477,7 @@ def _build_once(
     diagnostics: dict = {}
     # A timed-out build leaves a resumable workspace snapshot (issue #71) keyed to this job id.
     snapshot_sink: dict = {"dest": str(snapshot.snapshot_path_for(job_id, env))}
+    run_kwargs = _session_capture(cfg, session_id, resume=False, env=env) if session_id else {}
     code, output, duration = _run_pass(
         cfg,
         build_prompt(
@@ -1870,6 +2491,7 @@ def _build_once(
         run_id=job_id,
         diagnostics_sink=diagnostics,
         snapshot_sink=snapshot_sink,
+        **run_kwargs,
     )
 
     # Parse usage ONCE; both the prose econ line and the JSON economics block come from it.
@@ -1905,7 +2527,7 @@ def _build_once(
         snapshot_path=snapshot_sink.get("snapshot_path"),
         env=env,
     )
-    return {
+    outcome = {
         "job_id": job_id,
         "status": status,
         "reason": reason,
@@ -1917,6 +2539,21 @@ def _build_once(
         "duration": duration,
         "diagnostics": diagnostics,
     }
+    if thread:
+        outcome["thread"], outcome["handoff"] = _settle_author_session(
+            cfg,
+            job_id=job_id,
+            repo=spec.repo,
+            branch=branch,
+            session_id=session_id,
+            sink=run_kwargs.get("session_sink"),
+            code=code,
+            pr_url=pr_url,
+            status=status,
+            secrets=secrets,
+            env=env,
+        )
+    return outcome
 
 
 def _diagnose(
@@ -2554,7 +3191,8 @@ def job_kill(ctx: click.Context, job_id: str, as_json: bool) -> None:
     run, so it is the primary place a stuck run's diagnostics (issue #69) get captured at all -
     the in-process capture in run_in_container never fires for a process that never returns.
     Capture happens BEFORE reap_run so the containers still exist to inspect; best-effort, same
-    as everywhere else this dict is built.
+    as everywhere else this dict is built. A `--thread` run's engine session is captured the
+    same way, as a scrubbed, verified `<job_id>.session.tar.gz` sidecar for `job resume`.
     """
     try:
         record = _require_record(job_id)
@@ -2565,9 +3203,10 @@ def job_kill(ctx: click.Context, job_id: str, as_json: bool) -> None:
         # to read (we pass ""), so dind_ready/tmpfs_full are NOT populated here - only the
         # docker-inspect (exit/OOM/state) + squid-log (egress) signals are.
         diag: dict = {}
-        snapshot_path = None
+        snapshot_path = session_path = session_tmp = None
         if record.get("status") == "running":
-            kill_secrets = [os.environ[k] for k in SECRET_KEYS if os.environ.get(k)]
+            # Scrub with the same effective secrets as a normal run (config file included).
+            kill_secrets, config_loaded = _kill_secrets(record.get("engine"))
             try:
                 diag = capture_diagnostics(
                     record.get("container", ""),
@@ -2595,13 +3234,42 @@ def job_kill(ctx: click.Context, job_id: str, as_json: bool) -> None:
                     )
                 except Exception:
                     snapshot_path = None
+            # A `--thread` build (or resume of one) keeps its engine session too: copied out
+            # before the reap (the only step that needs the container), then scrubbed,
+            # fail-closed verified and packed after it, like run_in_container. Skipped when the
+            # config or profile cannot load, since the full secret set is then unknown.
+            sid = record.get("session_id")
+            if (
+                config_loaded
+                and _valid_session_id(sid)
+                and record.get("command") in ("build", "resume")
+            ):
+                try:
+                    session_tmp = _session_tmpdir(os.environ)
+                    session_status = snapshot.copy_session(
+                        record.get("container", ""),
+                        threads.session_paths(record.get("engine"), sid),
+                        session_tmp,
+                        max_bytes=threads.MAX_SESSION_BYTES,
+                    )
+                except Exception:
+                    session_status = None
         reaped = reap_run(job_id)
+        if session_tmp is not None:
+            if session_status == "ok":
+                session_path = snapshot.finalize_snapshot(
+                    session_tmp, snapshot.session_path_for(job_id, os.environ), kill_secrets
+                )
+            else:
+                snapshot._rmtree(session_tmp)
         if record.get("status") == "running" or reaped:
             patch = {"status": "killed", "ended_at": jobs.now_iso()}
             if diag:
                 patch["diagnostics"] = diag
             if snapshot_path:
                 patch["snapshot_path"] = snapshot_path
+            if session_path:
+                patch["session_path"] = session_path
             jobs.update_record(job_id, patch, os.environ)
         if as_json:
             click.echo(
@@ -3109,9 +3777,14 @@ def job_resume(
     Only build/replay runs are resumable (a fresh engine continues from the restored `/work`
     branch state); iterate/diagnose runs have no such workspace to carry forward.
 
-    V1 LIMITATION: resume restores the FILESYSTEM, NOT the agent's LLM/session state. A fresh
-    engine re-orients from the branch state on disk and continues; it does not remember the prior
-    run's reasoning. Only timeout/killed runs produce a snapshot, so only those are resumable.
+    V1 (the default) restores the FILESYSTEM, NOT the agent's LLM/session state: a fresh engine
+    re-orients from the branch state on disk and continues. V2: when the run was a `build
+    --thread` whose engine session was captured (a `<job_id>.session.tar.gz` sidecar), the same
+    engine and model with native resume (claude) also get that session back and continue it.
+    Every fallback to V1 is reported (stderr line; thread.session fresh plus the reason) and
+    never blocks. A V2 session the engine refuses at startup retries once as V1 in a new
+    container with a new session id; any other failure never re-runs. Only timeout/killed runs
+    produce a snapshot, so only those are resumable.
     (Git push still works after resume: the tokenized remote URL is stripped from the snapshot's
     `.git/config`, but the container re-authenticates from GH_TOKEN, so a bare remote is fine.)
 
@@ -3219,6 +3892,25 @@ def job_resume(
                 )
                 ctx.exit(EXIT_SUCCESS)
 
+        # V2 gate: a `--thread` run's record carries its session id. Without one this is V1,
+        # byte-identical to before. A native engine gets a session either way (resumed in V2, a
+        # new id in V1) so a PR this run opens can still be bound.
+        threaded = bool(record.get("threaded") or record.get("session_id"))
+        session_tar, fallback = (None, "")
+        session_id = None
+        if threaded:
+            session_tar, fallback = _resume_session(record, job_id, cfg, secrets)
+            if session_tar:
+                session_id = record["session_id"]
+            elif cfg.engine.session_dir:
+                session_id = str(uuid.uuid4())
+            if fallback and not quiet:
+                click.echo(
+                    f"franky: resuming {job_id} without its engine session "
+                    f"(reason={fallback}) - workspace-only (V1) resume",
+                    err=True,
+                )
+
         new_id = jobs.new_job_id()
         _record_run_start(
             new_id,
@@ -3231,6 +3923,8 @@ def job_resume(
             task_full=text,
             base_sha=record.get("base_sha"),
             resumed_from=job_id,
+            session_id=session_id,
+            threaded=threaded,
             env=os.environ,
         )
         if not quiet:
@@ -3242,19 +3936,54 @@ def job_resume(
         snapshot_sink: dict = {"dest": str(snapshot.snapshot_path_for(new_id, os.environ))}
         # No profile bundle for resume (mirrors job_replay): the restored /work already carries
         # the prior run's state, and resume is a continuation tool, not a full build re-run.
-        code, output, duration = _run_pass(
-            cfg,
-            build_resume_prompt(spec, branch=branch),
-            franky_img,
-            proxy_img,
-            None,
-            progress=progress,
-            timeout=max_duration,
-            run_id=new_id,
-            diagnostics_sink=diagnostics,
-            snapshot_sink=snapshot_sink,
-            resume_workspace=str(snap),
+        run_kwargs = (
+            _session_capture(cfg, session_id, resume=session_tar is not None, env=os.environ)
+            if session_id
+            else {}
         )
+        if session_tar:
+            run_kwargs["session_tar"] = session_tar
+
+        def launch(kwargs):
+            return _run_pass(
+                cfg,
+                build_resume_prompt(spec, branch=branch),
+                franky_img,
+                proxy_img,
+                None,
+                progress=progress,
+                timeout=max_duration,
+                run_id=new_id,
+                diagnostics_sink=diagnostics,
+                snapshot_sink=snapshot_sink,
+                resume_workspace=str(snap),
+                **kwargs,
+            )
+
+        try:
+            code, output, duration = launch(run_kwargs)
+        finally:
+            if session_tar:
+                Path(session_tar).unlink(missing_ok=True)
+        # The engine refused the restored session at startup (nothing ran, nothing pushed):
+        # exactly one V1 retry in a new container, /work restored again, a new session id
+        # recorded BEFORE launch. Any other failure is a write pass and never re-runs.
+        if session_tar and code not in (0, CONTAINER_TIMEOUT_CODE) and _startup_rejected(output):
+            failed_log = _write_log(
+                output, secrets, run_id=f"{new_id}-resume-failed", env=os.environ
+            )
+            if not quiet:
+                click.echo(
+                    f"franky: resumed engine session was refused (log: {failed_log}) - "
+                    "retrying once as a workspace-only (V1) resume",
+                    err=True,
+                )
+            snapshot._rmtree(Path(run_kwargs["session_sink"]["dest"]))
+            session_tar, fallback, session_id = None, "resume_failed", str(uuid.uuid4())
+            jobs.update_record(new_id, {"session_id": session_id}, os.environ)
+            run_kwargs = _session_capture(cfg, session_id, resume=False, env=os.environ)
+            code, output, retry_duration = launch(run_kwargs)
+            duration += retry_duration
 
         usage = _parse_usage_safe(output)
         econ = _economics_line(usage, duration, secrets)
@@ -3289,6 +4018,23 @@ def job_resume(
             snapshot_path=snapshot_sink.get("snapshot_path"),
             env=os.environ,
         )
+        thread_result = handoff = None
+        if threaded:
+            thread_result, handoff = _settle_author_session(
+                cfg,
+                job_id=new_id,
+                repo=spec.repo,
+                branch=branch,
+                session_id=session_id,
+                sink=run_kwargs.get("session_sink"),
+                code=code,
+                pr_url=pr_url,
+                status=status,
+                secrets=secrets,
+                env=os.environ,
+            )
+            thread_result["session"] = "resumed" if session_tar else "fresh"
+            thread_result["session_reason"] = fallback or thread_result["session_reason"]
 
         result = build_result(
             status=status,
@@ -3303,6 +4049,8 @@ def job_resume(
             branch=branch,
             job_id=new_id,
             resumed_from=job_id,
+            thread=thread_result,
+            handoff=handoff,
         )
         # Non-JSON output mirrors build's discipline: a real PR URL on stdout, a "no PR URL" note
         # for a clean pass that produced none, and NOTHING extra for timeout/agent_error.
@@ -3540,7 +4288,8 @@ def _clear_codex_auth_marker() -> None:
 
 @main.group("threads")
 def threads_group() -> None:
-    """List, prune, and purge stored review threads (`franky review-pr --thread`)."""
+    """List, prune, and purge stored threads (`review-pr --thread`, `build --thread`,
+    `iterate --thread`)."""
 
 
 def _parse_amount(text: str, units: dict[str, int], flag: str) -> int:
@@ -3558,7 +4307,7 @@ def _parse_amount(text: str, units: dict[str, int], flag: str) -> int:
 @threads_group.command("list")
 @click.option("--json", "as_json", is_flag=True, help="Emit the thread records as a JSON array.")
 def threads_list(as_json: bool) -> None:
-    """List stored threads with their pinned engine, last reviewed head, and session size."""
+    """List stored threads with their pinned engine, last head, and session size."""
     records = threads.list_threads()
     if as_json:
         click.echo(json.dumps(records))
@@ -3610,8 +4359,9 @@ def threads_prune(
 ) -> None:
     """Bound the thread store: orphans, closed PRs (--closed), idle threads, then the disk cap.
 
-    A thread held by a running review is skipped. The disk cap deletes session files only and
-    keeps each record and handoff. Each deletion prints one stderr line, never content.
+    A thread held by a running review or author run is skipped. The disk cap deletes session
+    files only and keeps each record and handoff. Each deletion prints one stderr line, never
+    content.
 
     --repo limits every pass to one repository, so a token scoped to that repository covers
     --closed. The disk cap is global, so it is skipped with --repo (`disk_skipped` in --json).

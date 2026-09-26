@@ -24,6 +24,7 @@ import io
 import json
 import os
 import re
+import shutil
 import stat
 import statistics
 import tarfile
@@ -48,6 +49,14 @@ DEFAULT_KEEP = 200
 # real run never lasts anywhere near this long (the --max-duration default is 30 min), so a
 # "running" record older than this is a crash orphan and becomes eligible for pruning.
 STALE_RUNNING_SECS = 24 * 3600
+
+# Host-local sidecars that live beside a run record: the workspace snapshot (issue #71) and the
+# engine session of a `--thread` run. Pruned with the record, never exported.
+_SIDECAR_SUFFIXES = (".snapshot.tar.gz", ".session.tar.gz")
+
+# Temp session dirs and packed tars that `--thread` runs create in the runs dir (`.tmp-session-`,
+# `.tmp-pack-`). A crash can leave one behind; prune sweeps those older than a real run can last.
+TMP_PREFIX = ".tmp-"
 
 # Terminal-status classification for `compute_stats` (issue #64). `running` is non-terminal (it
 # is neither, and is reported separately as running_fresh / hangs). `already_open` never reaches
@@ -115,6 +124,9 @@ def new_record(
     replay_of: str | None = None,
     resumed_from: str | None = None,
     thread_id: str | None = None,
+    session_id: str | None = None,
+    model: str | None = None,
+    threaded: bool = False,
 ) -> dict:
     """Shape the initial (status=running) record written before the container pass starts.
 
@@ -140,8 +152,15 @@ def new_record(
     `franky job attach` while this run was live - null until (and unless) `job attach`
     annotates it via update_record. See cli.job_attach.
 
-    `thread_id` names the review thread (threads.py) a `review-pr --thread` run belongs to. It
-    is added ONLY when set, so every other record keeps exactly its previous keys.
+    `thread_id` names the thread (threads.py) a run belongs to: a `review-pr --thread` or
+    `iterate --thread` run, or a `build --thread` / resumed run once its session is bound. It is
+    added ONLY when set, so every other record keeps exactly its previous keys. `threaded` (only
+    when true) marks a `build --thread` run and a resume of one, native resume or not.
+
+    `session_id` (with the `model` it runs on) is the engine session a `build --thread` or a
+    resume of one pins BEFORE launch, so `job kill`, `job resume` and a later bind know it. Both
+    are added ONLY when a session is set. `session_path` (the scrubbed, verified session sidecar
+    `<job_id>.session.tar.gz`, never exported) and `thread_bound` are patched in later.
     """
     record = {
         "job_id": job_id,
@@ -174,6 +193,11 @@ def new_record(
     }
     if thread_id is not None:
         record["thread_id"] = thread_id
+    if threaded:
+        record["threaded"] = True
+    if session_id is not None:
+        record["session_id"] = session_id
+        record["model"] = model
     return record
 
 
@@ -313,28 +337,44 @@ def prune(env: Mapping[str, str] | None = None, keep: int = DEFAULT_KEEP) -> int
             removed += 1
         except OSError:
             pass
-        # Remove the run's workspace snapshot sidecar (issue #71) alongside its record. The
-        # sidecar path is inlined here (NOT via snapshot.snapshot_path_for) to avoid an import
-        # cycle: snapshot imports jobs.runs_dir, so jobs must not import snapshot.
-        try:
-            (directory / f"{job_id}.snapshot.tar.gz").unlink(missing_ok=True)
-        except OSError:
-            pass
-    # Sweep ORPHAN snapshots (issue #71): a snapshot whose <id>.json record no longer exists (a
+        # Remove the run's workspace snapshot (issue #71) and session sidecars alongside its
+        # record. The sidecar paths are inlined here (NOT via snapshot.snapshot_path_for) to
+        # avoid an import cycle: snapshot imports jobs.runs_dir, so jobs must not import snapshot.
+        for suffix in _SIDECAR_SUFFIXES:
+            try:
+                (directory / f"{job_id}{suffix}").unlink(missing_ok=True)
+            except OSError:
+                pass
+    # Sweep ORPHAN sidecars (issue #71): a sidecar whose <id>.json record no longer exists (a
     # failed record-write, or a record pruned in an earlier pass) would otherwise leak disk
-    # forever. A snapshot whose record IS a fresh `running` one is never touched (its record
+    # forever. A sidecar whose record IS a fresh `running` one is never touched (its record
     # survives above, so its id is in `live_ids`).
     live_ids = {r.get("job_id", "") for r in records}
-    try:
-        snapshots = sorted(directory.glob("*.snapshot.tar.gz"))
-    except OSError:
-        snapshots = []
-    for snap in snapshots:
-        snap_id = snap.name[: -len(".snapshot.tar.gz")]
-        if snap_id in live_ids:
-            continue
+    for suffix in _SIDECAR_SUFFIXES:
         try:
-            snap.unlink(missing_ok=True)
+            sidecars = sorted(directory.glob(f"*{suffix}"))
+        except OSError:
+            sidecars = []
+        for sidecar in sidecars:
+            if sidecar.name[: -len(suffix)] in live_ids:
+                continue
+            try:
+                sidecar.unlink(missing_ok=True)
+            except OSError:
+                pass
+    now = datetime.now(timezone.utc).timestamp()
+    try:
+        leftovers = sorted(directory.glob(f"{TMP_PREFIX}*"))
+    except OSError:
+        leftovers = []
+    for leftover in leftovers:
+        try:
+            if now - leftover.lstat().st_mtime <= STALE_RUNNING_SECS:
+                continue
+            if leftover.is_dir() and not leftover.is_symlink():
+                shutil.rmtree(leftover, ignore_errors=True)
+            else:
+                leftover.unlink(missing_ok=True)
         except OSError:
             pass
     return removed
@@ -456,8 +496,9 @@ def export_bundle(record: dict, dest: Path) -> dict:
     DELIBERATELY EXCLUDED (issue #71): the run's workspace snapshot sidecar
     (`<id>.snapshot.tar.gz`, sitting right beside the record) is NEVER added to the bundle. It is
     a host-local resume artifact that may contain workspace bytes; unlike record.json and the
-    redacted transcript it is not a secret-free forensic artifact, so it stays on the host. Only
-    the two members below are ever packed - do not extend this to pick up the sidecar.
+    redacted transcript it is not a secret-free forensic artifact, so it stays on the host. The
+    same holds for the engine session sidecar (`<id>.session.tar.gz`). Only the two members
+    below are ever packed - do not extend this to pick up either sidecar.
     """
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
