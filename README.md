@@ -189,6 +189,15 @@ The `review-pr` prompt tells the agent to inspect only. The host publishes comme
 Scope `GH_TOKEN` permissions because they are the enforced GitHub boundary for the autonomous container.
 
 Use `--expected-head-sha` to reject a changed PR head. Use `--no-publish` for a read-only GitHub run.
+`--no-publish --json` returns a `review_body` with the complete rendered findings.
+Franky refuses an unpublished body above 8,000 characters or more than 10 findings.
+The caller must protect and remove Franky's run files when the review uses private context.
+
+Use `--instructions-file PATH` to keep review instructions out of command arguments.
+This mode requires `--no-publish --json` and refuses threads and verbose output.
+The file must be a regular UTF-8 file owned by the caller with mode `0600`.
+It can contain at most 4,000 characters. The caller must remove it after the run.
+Do not combine the file with inline instructions.
 
 ### Review threads
 

@@ -49,6 +49,7 @@ _RESULT_SCHEMA: dict = {
     "whose workspace was restored. Absent on build/iterate.",
     "reviewed_sha": "string; present ONLY for `review-pr`: the reviewed PR head commit",
     "findings_summary": "string; present ONLY for `review-pr`: the review findings summary",
+    "review_body": "string; present ONLY for a successful unpublished `review-pr`: the complete rendered review",
     "checks": [
         {
             "name": "string; check name",

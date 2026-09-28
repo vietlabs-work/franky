@@ -263,3 +263,22 @@ def test_build_result_thread_keys_are_absent_without_thread_and_both_present_wit
     assert "thread" not in plain and "handoff" not in plain
     threaded = result_mod.build_result(**base, thread={"id": "o__r__1__reviewer"}, handoff=None)
     assert threaded["thread"] == {"id": "o__r__1__reviewer"} and threaded["handoff"] is None
+
+
+def test_build_result_includes_review_body_only_when_supplied():
+    base = dict(
+        status="review_complete",
+        pr_url="u",
+        reason="r",
+        exit_code=0,
+        usage=Usage(),
+        duration=1.0,
+        log_path="/l",
+        engine="claude",
+        repo="o/r",
+    )
+    assert "review_body" not in result_mod.build_result(**base)
+    assert (
+        result_mod.build_result(**base, review_body="complete finding")["review_body"]
+        == "complete finding"
+    )

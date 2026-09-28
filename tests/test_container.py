@@ -2002,6 +2002,30 @@ def test_deliver_profile_session_only_and_marker_survives_a_failed_session_untar
     assert len(execs) == 2 and "touch" in execs[-1]
 
 
+def test_deliver_profile_streams_private_prompt_before_marker_and_fails_closed():
+    runner, calls = _session_runner()
+    assert container_mod.deliver_profile(
+        "t1", None, runner, sleeper=NOOP_SLEEP, private_prompt_tar=b"private-archive"
+    )
+    execs = [(argv, kw) for argv, kw in calls if argv[:2] == ["docker", "exec"]]
+    assert execs[0][1]["input"] == b"private-archive"
+    assert "/tmp" in execs[0][0]
+    assert "touch" in execs[-1][0]
+
+    runner, calls = _session_runner()
+
+    def failed_untar(argv, **kwargs):
+        if "-xzf" in argv:
+            calls.append((argv, kwargs))
+            return subprocess.CompletedProcess(argv, 2, stdout="", stderr="")
+        return runner(argv, **kwargs)
+
+    assert not container_mod.deliver_profile(
+        "t1", None, failed_untar, sleeper=NOOP_SLEEP, private_prompt_tar=b"private-archive"
+    )
+    assert not any("touch" in argv for argv, _ in calls)
+
+
 def test_run_in_container_session_tar_alone_uses_injection_mode_without_new_mounts(tmp_path):
     tar = tmp_path / "session.tar.gz"
     tar.write_bytes(b"session-bytes")

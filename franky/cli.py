@@ -11,9 +11,11 @@ operator commands can reveal local configuration. Interactive prompts fail fast 
 from __future__ import annotations
 
 import json
+import io
 import os
 import re
 import secrets
+import stat
 import subprocess
 import sys
 import tarfile
@@ -928,9 +930,40 @@ def iterate(
         ctx.exit(exc.code)
 
 
+def _read_review_instructions_file(path: Path) -> str:
+    """Read bounded private instructions without following a file symlink."""
+    error = (
+        "--instructions-file must be an owner-only regular UTF-8 file "
+        f"of at most {PROSE_MAX_CHARS} characters"
+    )
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as source:
+            info = os.fstat(source.fileno())
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or info.st_mode & 0o077
+            ):
+                raise ValueError(error)
+            raw = source.read(PROSE_MAX_CHARS * 4 + 1)
+        text = raw.decode("utf-8").strip()
+        if len(raw) > PROSE_MAX_CHARS * 4 or len(text) > PROSE_MAX_CHARS:
+            raise ValueError(error)
+        return text
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise FrankyError(error, code=EXIT_USAGE, kind="usage_error") from exc
+
+
 @main.command("review-pr")
 @click.argument("pr_url")
 @click.argument("instructions", required=False, default="")
+@click.option(
+    "--instructions-file",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="Read review instructions from an owner-only UTF-8 file instead of an argument.",
+)
 @click.option(
     "--expected-head-sha",
     "expected_head_sha",
@@ -996,6 +1029,7 @@ def review_pr(
     ctx: click.Context,
     pr_url: str,
     instructions: str,
+    instructions_file: Path | None,
     expected_head_sha: str | None,
     no_publish: bool,
     use_thread: bool,
@@ -1011,6 +1045,7 @@ def review_pr(
     Example:
       franky review-pr https://github.com/you/repo/pull/42
       franky review-pr --no-publish -- https://github.com/you/repo/pull/42 "focus on error handling"
+      franky review-pr --no-publish --instructions-file /private/path -- https://github.com/you/repo/pull/42
 
     Runs the SAME hardened, egress-controlled container as `build`/`iterate`. The prompt directs
     the agent to inspect the PR and run existing checks without changing GitHub or the checkout.
@@ -1021,6 +1056,7 @@ def review_pr(
     BEFORE the pass starts, and again immediately BEFORE publishing) refuses rather than
     reviewing or publishing stale state. --no-publish reviews without writing anything to
     GitHub - read the findings from the --json result or the redacted log instead.
+    --instructions-file reads an owner-only UTF-8 file instead of inline instructions.
 
     --thread keeps one review session per PR (repo + PR number, role reviewer) under
     ~/.franky/threads. A later run resumes it natively when the engine supports it (claude),
@@ -1031,6 +1067,7 @@ def review_pr(
     review_complete on success, including reviewed_sha/findings_summary/checks and, once
     published, review_url/review_id). Exit codes follow the documented taxonomy (0 ok, 2 usage,
     3 config, 4 task, 5 auth, 6 docker, 7 agent, 8 net, 9 timeout).
+    A successful unpublished result also includes a bounded `review_body`.
     """
     quiet = quiet or as_json
     secrets = cfg_secrets_safe()
@@ -1047,7 +1084,28 @@ def review_pr(
                 code=EXIT_USAGE,
                 kind="usage_error",
             )
-        instructions = (instructions or "").strip()[:PROSE_MAX_CHARS].strip()
+        if instructions_file is not None:
+            if instructions:
+                raise FrankyError(
+                    "--instructions-file and inline instructions are mutually exclusive",
+                    code=EXIT_USAGE,
+                    kind="usage_error",
+                )
+            if (
+                not no_publish
+                or use_thread
+                or verbose
+                or not as_json
+                or os.environ.get(FRANKY_VERBOSE_VAR)
+            ):
+                raise FrankyError(
+                    "--instructions-file requires --no-publish --json without --thread or --verbose",
+                    code=EXIT_USAGE,
+                    kind="usage_error",
+                )
+            instructions = _read_review_instructions_file(instructions_file)
+        else:
+            instructions = (instructions or "").strip()[:PROSE_MAX_CHARS].strip()
 
         # Same config-file injection as `build`/`iterate` (see build's WHY comment).
         try:
@@ -1159,6 +1217,7 @@ def review_pr(
             progress=progress,
             timeout=max_duration,
             diagnostics=diagnostics,
+            private_prompt=instructions_file is not None,
         )
 
         usage = _parse_usage_safe(output)
@@ -1170,6 +1229,7 @@ def review_pr(
         review_url: str | None = None
         review_id: int | None = None
         findings_summary: str | None = None
+        review_body: str | None = None
         checks: list | None = None
         shaped: dict | None = None
 
@@ -1195,9 +1255,20 @@ def review_pr(
                 findings_summary = shaped["summary"]
                 checks = shaped["checks"]
                 if no_publish:
-                    status = "review_complete"
-                    reason = "review pass complete (publish=False, nothing written to GitHub)"
-                    exit_code = EXIT_SUCCESS
+                    review_body = render_review_body(shaped)
+                    if (
+                        len(review_body) > 8000
+                        or len(shaped["findings"]) > 10
+                        or len(shaped["checks"]) > 20
+                    ):
+                        review_body = None
+                        status = "agent_error"
+                        reason = "unpublished review exceeds the private result limit"
+                        exit_code = EXIT_AGENT
+                    else:
+                        status = "review_complete"
+                        reason = "review pass complete (publish=False, nothing written to GitHub)"
+                        exit_code = EXIT_SUCCESS
                 else:
                     # Re-check the LIVE head immediately before publishing - never post a review
                     # over a PR that moved on mid-run (same register as --expected-head-sha above).
@@ -1307,6 +1378,7 @@ def review_pr(
             job_id=job_id,
             reviewed_sha=pinned_sha,
             findings_summary=findings_summary,
+            review_body=review_body,
             checks=checks,
             review_url=review_url,
             review_id=review_id,
@@ -1673,6 +1745,7 @@ def _thread_pass(
     progress,
     timeout,
     diagnostics,
+    private_prompt=False,
 ):
     """Run a `review-pr` or `iterate` pass: one attempt, plus the one seeded retry
     `_thread_retry` allows on a thread. Without a thread it is exactly one plain `_run_pass`.
@@ -1708,6 +1781,7 @@ def _thread_pass(
                 timeout=timeout,
                 run_id=job_id,
                 diagnostics_sink=diagnostics,
+                private_prompt=private_prompt,
                 **run_kwargs,
             )
         finally:
@@ -2128,6 +2202,7 @@ def _run_pass(
     session: tuple[str, bool] | None = None,
     session_tar: str | None = None,
     session_sink: dict | None = None,
+    private_prompt: bool = False,
 ) -> tuple[int, str, float]:
     """Run one container pass for `prompt` and return (exit_code, output, duration_secs).
 
@@ -2148,12 +2223,35 @@ def _run_pass(
     run without them is unchanged.
     """
     session_kwargs = {} if session is None else {"session_id": session[0], "resume": session[1]}
-    inner_argv = cfg.engine.inner_argv(prompt, model=cfg.model, **session_kwargs)
+    inner_argv = cfg.engine.inner_argv(
+        "__FRANKY_PRIVATE_PROMPT__" if private_prompt else prompt,
+        model=cfg.model,
+        **session_kwargs,
+    )
     for override in cfg.codex_mcp_overrides:
         inner_argv += ["-c", override]
     if cfg.claude_mcp_config_path:
         inner_argv += ["--mcp-config", cfg.claude_mcp_config_path, "--strict-mcp-config"]
     extra = {} if timeout is None else {"timeout": timeout}
+    if private_prompt:
+        prompt_bytes = prompt.encode("utf-8")
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+            entry = tarfile.TarInfo("franky-private-prompt")
+            entry.mode = 0o600
+            entry.size = len(prompt_bytes)
+            archive.addfile(entry, io.BytesIO(prompt_bytes))
+        extra["private_prompt_tar"] = buffer.getvalue()
+        inner_argv = [
+            "python3",
+            "-c",
+            "import os,sys; path,marker,*argv=sys.argv[1:]; "
+            "prompt=open(path,encoding='utf-8').read(); os.unlink(path); "
+            "os.execvp(argv[0],[prompt if arg==marker else arg for arg in argv])",
+            "/tmp/franky-private-prompt",
+            "__FRANKY_PRIVATE_PROMPT__",
+            *inner_argv,
+        ]
     if session_tar is not None:
         extra["session_tar"] = session_tar
     if session_sink is not None:

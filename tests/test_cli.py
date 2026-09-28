@@ -3,6 +3,7 @@ import os
 import stat
 import subprocess
 import tarfile
+import io
 from pathlib import Path
 
 import pytest
@@ -3671,6 +3672,93 @@ def test_review_pr_help_shows_no_publish_flag():
     assert res.exit_code == 0
     assert "--no-publish" in res.output
     assert "--expected-head-sha" in res.output
+    assert "--instructions-file" in res.output
+
+
+def test_review_pr_reads_private_instructions_from_owner_only_file(monkeypatch, tmp_path):
+    _fix_review_nonce(monkeypatch)
+    _mc_review_setup(monkeypatch, env={**_review_env(), "FRANKY_RUNS_DIR": str(tmp_path / "runs")})
+    private_text = "Review with this private acceptance criterion."
+    source = tmp_path / "instructions"
+    source.write_text(private_text)
+    source.chmod(0o600)
+    seen = {}
+    original = cli.build_review_pr_prompt
+
+    def capture(repo, pr_url, instructions, nonce, **kwargs):
+        seen["instructions"] = instructions
+        return original(repo, pr_url, instructions, nonce, **kwargs)
+
+    monkeypatch.setattr(cli, "build_review_pr_prompt", capture)
+
+    def fake_run(_cfg, inner_argv, **kwargs):
+        seen["argv"] = inner_argv
+        seen["private_prompt_tar"] = kwargs.get("private_prompt_tar")
+        return 0, _review_block({"summary": "ok", "findings": [], "checks": []})
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+    res = CliRunner().invoke(
+        cli.main,
+        ["review-pr", "--instructions-file", str(source), "--no-publish", "--json", "--", PR_URL],
+    )
+    assert res.exit_code == 0, res.output
+    assert seen["instructions"] == private_text
+    assert private_text not in res.output
+    assert private_text not in " ".join(seen["argv"])
+    with tarfile.open(fileobj=io.BytesIO(seen["private_prompt_tar"]), mode="r:gz") as archive:
+        prompt = archive.extractfile("franky-private-prompt").read().decode()
+    assert private_text in prompt
+
+
+@pytest.mark.parametrize("kind", ["symlink", "fifo", "group_readable", "oversized", "invalid_utf8"])
+def test_review_pr_refuses_unsafe_instructions_file(monkeypatch, tmp_path, kind):
+    monkeypatch.setattr(cli.os, "environ", _review_env())
+    source = tmp_path / "instructions"
+    if kind == "symlink":
+        target = tmp_path / "target"
+        target.write_text("private")
+        target.chmod(0o600)
+        source.symlink_to(target)
+    elif kind == "fifo":
+        os.mkfifo(source, 0o600)
+    elif kind == "invalid_utf8":
+        source.write_bytes(b"\xff")
+        source.chmod(0o600)
+    else:
+        source.write_text("x" * (4001 if kind == "oversized" else 1))
+        source.chmod(0o640 if kind == "group_readable" else 0o600)
+    res = CliRunner().invoke(
+        cli.main,
+        ["review-pr", "--instructions-file", str(source), "--no-publish", "--json", "--", PR_URL],
+    )
+    assert res.exit_code == 2
+    assert str(source) not in res.output
+
+
+def test_review_pr_refuses_file_and_inline_instructions_together(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli.os, "environ", _review_env())
+    source = tmp_path / "instructions"
+    source.write_text("private")
+    source.chmod(0o600)
+    res = CliRunner().invoke(
+        cli.main,
+        ["review-pr", "--instructions-file", str(source), "--json", "--", PR_URL, "inline"],
+    )
+    assert res.exit_code == 2
+
+
+@pytest.mark.parametrize("flags", [[], ["--no-publish", "--thread"], ["--no-publish", "--verbose"]])
+def test_review_pr_private_file_requires_unpublished_unthreaded_quiet_run(
+    monkeypatch, tmp_path, flags
+):
+    monkeypatch.setattr(cli.os, "environ", _review_env())
+    source = tmp_path / "instructions"
+    source.write_text("private")
+    source.chmod(0o600)
+    res = CliRunner().invoke(
+        cli.main, ["review-pr", "--instructions-file", str(source), *flags, "--json", "--", PR_URL]
+    )
+    assert res.exit_code == 2
 
 
 def test_review_pr_published_echoes_review_url_and_never_approves(monkeypatch):
@@ -3718,6 +3806,7 @@ def test_review_pr_json_success_reports_reviewed_sha_and_review_url(monkeypatch)
     assert data["reviewed_sha"] == LIVE_SHA
     assert data["review_url"] == REVIEW_URL
     assert data["review_id"] == 555
+    assert "review_body" not in data
     assert data["findings_summary"] == "solid change"
     assert data["checks"] == [{"name": "pytest", "outcome": "pass", "detail": "120 passed"}]
     assert data["repo"] == "me/repo"
@@ -3760,7 +3849,27 @@ def test_review_pr_blocking_finding_requests_changes_never_approve(monkeypatch):
 def test_review_pr_no_publish_makes_zero_github_writes(monkeypatch):
     """publish=false (--no-publish) must never call the GitHub review API."""
     _fix_review_nonce(monkeypatch)
-    calls = _mc_review_setup(monkeypatch)
+    calls = _mc_review_setup(
+        monkeypatch,
+        container=(
+            0,
+            _review_block(
+                {
+                    "summary": "private summary",
+                    "findings": [
+                        {
+                            "title": "wrong total",
+                            "body": "recalculate tax",
+                            "severity": "blocking",
+                            "file": "fare.py",
+                            "line": 7,
+                        }
+                    ],
+                    "checks": [{"name": "pytest", "outcome": "pass", "detail": "12 passed"}],
+                }
+            ),
+        ),
+    )
     runner = CliRunner()
     with runner.isolated_filesystem():
         res = runner.invoke(cli.main, ["review-pr", "--no-publish", "--json", "--", PR_URL])
@@ -3769,7 +3878,50 @@ def test_review_pr_no_publish_makes_zero_github_writes(monkeypatch):
     assert data["status"] == "review_complete"
     assert "review_url" not in data
     assert "review_id" not in data
+    assert data["review_body"] == (
+        "private summary\n\n**Checks run:**\n- pytest: pass - 12 passed\n\n"
+        "**Findings:**\n- [blocking] wrong total (fare.py:7)\n  recalculate tax"
+    )
     assert calls == []  # zero GitHub writes
+
+
+def test_review_pr_no_publish_refuses_oversized_review_body(monkeypatch):
+    _fix_review_nonce(monkeypatch)
+    calls = _mc_review_setup(
+        monkeypatch,
+        container=(0, _review_block({"summary": "x" * 8001, "findings": [], "checks": []})),
+    )
+    with CliRunner().isolated_filesystem():
+        res = CliRunner().invoke(cli.main, ["review-pr", "--no-publish", "--json", "--", PR_URL])
+    assert res.exit_code == 7
+    data = json.loads(res.stdout)
+    assert data["status"] == "agent_error"
+    assert "review_body" not in data
+    assert calls == []
+
+
+def test_review_pr_no_publish_refuses_too_many_findings(monkeypatch):
+    _fix_review_nonce(monkeypatch)
+    _mc_review_setup(
+        monkeypatch,
+        container=(
+            0,
+            _review_block(
+                {
+                    "summary": "many findings",
+                    "findings": [
+                        {"title": f"issue {n}", "body": "bad", "severity": "normal"}
+                        for n in range(11)
+                    ],
+                    "checks": [],
+                }
+            ),
+        ),
+    )
+    with CliRunner().isolated_filesystem():
+        res = CliRunner().invoke(cli.main, ["review-pr", "--no-publish", "--json", "--", PR_URL])
+    assert res.exit_code == 7
+    assert json.loads(res.stdout)["status"] == "agent_error"
 
 
 def test_review_pr_never_invokes_commit_push_merge(monkeypatch):

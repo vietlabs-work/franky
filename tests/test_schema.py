@@ -226,6 +226,7 @@ def test_result_schemas_document_review_outputs():
     ):
         assert field in schema["result_schema"]
     checks = schema["result_schema"]["checks"]
+    assert "review_body" in schema["result_schema"]
     assert isinstance(checks, list)
     assert set(checks[0]) == {"name", "outcome", "detail"}
 

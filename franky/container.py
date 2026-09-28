@@ -556,6 +556,7 @@ def deliver_profile(
     sleeper=time.sleep,
     session_tar: str | None = None,
     session_timeout: float = 20.0,
+    private_prompt_tar: bytes | None = None,
 ) -> bool:
     """Stream the operator profile tar into a freshly launched container, then signal it.
 
@@ -603,6 +604,15 @@ def deliver_profile(
                     )
             except Exception:
                 pass
+        if private_prompt_tar is not None:
+            untar = runner(
+                snapshot.build_untar_argv(task, target="/tmp"),
+                input=private_prompt_tar,
+                capture_output=True,
+                timeout=timeout,
+            )
+            if getattr(untar, "returncode", 1) != 0:
+                return False
         marker = runner(
             snapshot.build_marker_argv(task, marker=PROFILE_READY_MARKER),
             capture_output=True,
@@ -1108,6 +1118,7 @@ def run_in_container(
     apparmor_selector=select_task_apparmor,
     session_tar: str | None = None,
     session_sink: dict | None = None,
+    private_prompt_tar: bytes | None = None,
 ) -> tuple[int, str | Transcript]:
     """Run the inner engine in a hardened, egress-controlled container; return
     (returncode, redacted_output).
@@ -1227,7 +1238,9 @@ def run_in_container(
         # Production always streams, including quiet runs. Runner-only test doubles keep
         # their injected capture boundary; profile/restore and injected Popen use streaming.
         resuming = resume_workspace is not None
-        injecting = profile_bundle is not None or session_tar is not None
+        injecting = (
+            profile_bundle is not None or session_tar is not None or private_prompt_tar is not None
+        )
         effective_progress = progress
         if (
             resuming or injecting or runner is subprocess.run or popen is not subprocess.Popen
@@ -1298,7 +1311,12 @@ def run_in_container(
                 # setup) and the run classifies as agent_error; do NOT abort the stream, drain it.
                 if injecting:
                     deliver_profile(
-                        task, profile_bundle, runner, sleeper=sleeper, session_tar=session_tar
+                        task,
+                        profile_bundle,
+                        runner,
+                        sleeper=sleeper,
+                        session_tar=session_tar,
+                        private_prompt_tar=private_prompt_tar,
                     )
                 # Restore the prior workspace into the just-launched container (issue #71) BEFORE
                 # draining stdout: the container is waiting on the ready marker in resume-wait
