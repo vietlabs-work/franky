@@ -167,10 +167,16 @@ jobs:
                 for repeat in 1 2 3; do
                   base_report="/tmp/footprint-runtime-base-$jobs-$repeat.json"
                   head_report="/tmp/footprint-runtime-head-$jobs-$repeat.json"
-                  python3 scripts/smoke-memory.py \
-                    --repo "$base" --source-sha "$BASE_SHA" --allow-missing-helper \
-                    --image "$RUN_TAG:base-pi" --proxy-image "$RUN_TAG:base-proxy" \
-                    --jobs "$jobs" --output "$base_report" || return 1
+                  # Tag and schedule runs compare a commit to itself: reuse the head run as
+                  # base (absolute budgets still apply) instead of measuring it twice.
+                  if [ "$BASE_SHA" = "$GITHUB_SHA" ]; then
+                    base_report="$head_report"
+                  else
+                    python3 scripts/smoke-memory.py \
+                      --repo "$base" --source-sha "$BASE_SHA" --allow-missing-helper \
+                      --image "$RUN_TAG:base-pi" --proxy-image "$RUN_TAG:base-proxy" \
+                      --jobs "$jobs" --output "$base_report" || return 1
+                  fi
                   python3 scripts/smoke-memory.py \
                     --repo . --source-sha "$GITHUB_SHA" \
                     --image "$RUN_TAG:pi" --proxy-image "$RUN_TAG:proxy" \

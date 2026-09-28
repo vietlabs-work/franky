@@ -41,7 +41,9 @@ The command requires matching package versions, an absent tag, and a clean tree.
 
 ## CI release gate
 
-Each tag push first runs the complete footprint workflow. It then verifies that the tag and both package version files match.
+Each tag push runs the complete footprint workflow and checks that the tag and both package version files match.
+
+Images build in parallel with that gate, on native amd64 and arm64 runners. Each build pushes an untagged digest. The version and `latest` tags are applied only after the gate passes.
 
 A successful `vX.Y.Z` workflow publishes:
 

@@ -1,7 +1,7 @@
 name: Release
 
 # Triggered by a vX.Y.Z tag push (the real release path) or workflow_dispatch for a
-# no-push dry run: single-arch build, push:false, the release job is skipped.
+# no-push dry run: both arches build natively, nothing pushes, merge and release are skipped.
 on:
   push:
     tags:
@@ -12,9 +12,10 @@ on:
         description: "X.Y.Z to validate (no-push dry run)"
         required: true
 
+# Read-only by default: guard, wheel and image run before the gate, so each job grants
+# only the write scope it needs.
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 jobs:
   footprint:
@@ -24,9 +25,8 @@ jobs:
     permissions:
       contents: read
 
-  # guard-before-publish: assert the three version sources agree before touching GHCR or PyPI.
+  # guard-before-publish: assert the three version sources agree before any tag or PyPI publish.
   guard:
-    needs: footprint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -49,7 +49,6 @@ jobs:
           fi
 
   wheel:
-    needs: guard
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -70,7 +69,7 @@ jobs:
   # one-time PyPI "trusted publisher" registered for this repo + workflow + the `pypi`
   # environment (see docs/releasing.md).
   pypi:
-    needs: wheel
+    needs: [footprint, guard, wheel]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     environment: pypi
@@ -88,76 +87,105 @@ jobs:
         with:
           skip-existing: true
 
+  # One native runner per variant and arch (no QEMU), started at t=0 in parallel with the
+  # footprint gate. A tag push publishes UNTAGGED digests only; `merge` applies the version and
+  # latest tags after footprint + guard pass, so nothing is pullable by tag before the gate.
   image:
-    needs: guard
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    permissions:
+      contents: read
+      packages: write
     strategy:
       matrix:
-        include:
-          - name: franky
-            context: .
-            dockerfile: Dockerfile
-            engine: all
-            suffix: ""
-          - name: franky
-            context: .
-            dockerfile: Dockerfile
-            engine: pi
-            suffix: -pi
-          - name: franky
-            context: .
-            dockerfile: Dockerfile
-            engine: claude
-            suffix: -claude
-          - name: franky
-            context: .
-            dockerfile: Dockerfile
-            engine: codex
-            suffix: -codex
-          - name: franky
-            context: .
-            dockerfile: Dockerfile
-            engine: opencode
-            suffix: -opencode
-          - name: franky-proxy
-            context: proxy
-            dockerfile: proxy/Dockerfile
-            engine: all
-            suffix: ""
+        arch: [amd64, arm64]
+        variant:
+          - { name: franky, context: ., dockerfile: Dockerfile, engine: all, suffix: "" }
+          - { name: franky, context: ., dockerfile: Dockerfile, engine: pi, suffix: -pi }
+          - { name: franky, context: ., dockerfile: Dockerfile, engine: claude, suffix: -claude }
+          - { name: franky, context: ., dockerfile: Dockerfile, engine: codex, suffix: -codex }
+          - { name: franky, context: ., dockerfile: Dockerfile, engine: opencode, suffix: -opencode }
+          - { name: franky-proxy, context: proxy, dockerfile: proxy/Dockerfile, engine: all, suffix: "" }
     steps:
       - uses: actions/checkout@v5
-      - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
-      - name: Compute version
-        run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
-          else
-            echo "VERSION=${{ inputs.version }}" >> "$GITHUB_ENV"
-          fi
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # Namespace tracks the repo's owning org, so moving the repo retargets the images with no
+      # edit. The CLI's DEFAULT_GHCR_REPO (franky/container.py) must match that org.
       - uses: docker/build-push-action@v6
+        id: build
         with:
-          context: ${{ matrix.context }}
-          file: ${{ matrix.dockerfile }}
-          build-args: FRANKY_ENGINE=${{ matrix.engine }}
-          platforms: ${{ github.event_name == 'push' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
-          push: ${{ github.event_name == 'push' }}
-          # Namespace tracks the repo's owning org, so moving the repo retargets the images
-          # with no edit. The CLI's DEFAULT_GHCR_REPO (franky/container.py) must match that org.
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}:${{ env.VERSION }}${{ matrix.suffix }}
-            ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}:latest${{ matrix.suffix }}
+          context: ${{ matrix.variant.context }}
+          file: ${{ matrix.variant.dockerfile }}
+          build-args: FRANKY_ENGINE=${{ matrix.variant.engine }}
+          platforms: linux/${{ matrix.arch }}
+          outputs: ${{ github.event_name == 'push' && format('type=image,name=ghcr.io/{0}/{1},push-by-digest=true,name-canonical=true,push=true', github.repository_owner, matrix.variant.name) || 'type=cacheonly' }}
+      - name: Export digest
+        if: github.event_name == 'push'
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+      - uses: actions/upload-artifact@v6
+        if: github.event_name == 'push'
+        with:
+          # arch first, so `digests-*-franky` never also matches `digests-*-franky-pi`.
+          name: digests-${{ matrix.arch }}-${{ matrix.variant.name }}${{ matrix.variant.suffix }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # The publish gate: tag each multi-arch manifest only after footprint, guard and every image
+  # build succeeded.
+  merge:
+    needs: [footprint, guard, image]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    strategy:
+      matrix:
+        include:
+          - { name: franky, suffix: "" }
+          - { name: franky, suffix: -pi }
+          - { name: franky, suffix: -claude }
+          - { name: franky, suffix: -codex }
+          - { name: franky, suffix: -opencode }
+          - { name: franky-proxy, suffix: "" }
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: digests-*-${{ matrix.name }}${{ matrix.suffix }}
+          merge-multiple: true
+          path: /tmp/digests
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tag multi-arch manifest
+        env:
+          REF: ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}
+          SUFFIX: ${{ matrix.suffix }}
+        working-directory: /tmp/digests
+        run: |
+          set -- *
+          [ "$#" -eq 2 ] || { echo "expected 2 arch digests, got $#" >&2; exit 1; }
+          docker buildx imagetools create \
+            -t "$REF:${GITHUB_REF_NAME#v}$SUFFIX" -t "$REF:latest$SUFFIX" \
+            "$REF@sha256:$1" "$REF@sha256:$2"
 
   # GitHub Release is created last - its existence implies the wheel + PyPI + images shipped.
   release:
-    needs: [wheel, pypi, image]
+    needs: [wheel, pypi, merge]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v5
       - uses: actions/download-artifact@v7

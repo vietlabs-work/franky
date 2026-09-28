@@ -31,36 +31,31 @@ main = release.main
 
 
 def test_release_image_matrix_routes_each_tag_to_its_engine():
-    lines = (ROOT / ".github" / "workflows" / "release.yml").read_text().splitlines()
-    start = lines.index("        include:") + 1
-    rows = []
-    for line in lines[start:]:
-        if line.startswith("    steps:"):
-            break
-        key, value = line.strip().removeprefix("- ").split(":", 1)
-        if line.lstrip().startswith("- "):
-            rows.append({})
-        rows[-1][key] = value.strip().strip('"')
+    text = (ROOT / ".github" / "workflows" / "release.yml").read_text()
+    image_job = text[text.index("\n  image:\n") : text.index("\n  merge:\n")]
+    merge_job = text[text.index("\n  merge:\n") : text.index("\n  release:\n")]
 
-    action = lines.index("      - uses: docker/build-push-action@v6")
-    build_args = next(
-        line.strip().split(": ", 1)[1]
-        for line in lines[action:]
-        if line.strip().startswith("build-args:")
-    )
-    tags = lines.index("          tags: |", action)
-    tag_templates = [line.strip() for line in lines[tags + 1 :] if line.strip()][:2]
+    def rows(job):
+        # Flow-mapping matrix rows: `- { name: franky, suffix: -pi, ... }`.
+        out = []
+        for line in job.splitlines():
+            line = line.strip()
+            if line.startswith("- {") and line.endswith("}"):
+                pairs = (item.split(":", 1) for item in line[3:-1].split(","))
+                out.append({k.strip(): v.strip().strip('"') for k, v in pairs})
+        return out
 
-    def render(template, row):
-        return (
-            template.replace("${{ github.repository_owner }}", "owner")
-            .replace("${{ matrix.name }}", row["name"])
-            .replace("${{ matrix.engine }}", row["engine"])
-            .replace("${{ matrix.suffix }}", row["suffix"])
-            .replace("${{ env.VERSION }}", "1.2.3")
-        )
+    built = {(row["name"], row["suffix"]): row["engine"] for row in rows(image_job)}
+    tagged = {(row["name"], row["suffix"]) for row in rows(merge_job)}
+    assert tagged == set(built)
+    assert "build-args: FRANKY_ENGINE=${{ matrix.variant.engine }}" in image_job
+    assert "platforms: linux/${{ matrix.arch }}" in image_job
+    assert "ghcr.io/${{ github.repository_owner }}/${{ matrix.name }}" in merge_job
+    assert '-t "$REF:${GITHUB_REF_NAME#v}$SUFFIX" -t "$REF:latest$SUFFIX"' in merge_job
 
-    published = {render(tag_templates[0], row): row["engine"] for row in rows}
+    published = {
+        f"ghcr.io/owner/{name}:1.2.3{suffix}": built[name, suffix] for name, suffix in tagged
+    }
     assert published == {
         "ghcr.io/owner/franky:1.2.3": "all",
         "ghcr.io/owner/franky:1.2.3-pi": "pi",
@@ -69,21 +64,22 @@ def test_release_image_matrix_routes_each_tag_to_its_engine():
         "ghcr.io/owner/franky:1.2.3-opencode": "opencode",
         "ghcr.io/owner/franky-proxy:1.2.3": "all",
     }
-    assert {render(build_args, row) for row in rows} == {
-        "FRANKY_ENGINE=all",
-        "FRANKY_ENGINE=pi",
-        "FRANKY_ENGINE=claude",
-        "FRANKY_ENGINE=codex",
-        "FRANKY_ENGINE=opencode",
-    }
-    assert {render(tag_templates[1], row) for row in rows} == {
-        "ghcr.io/owner/franky:latest",
-        "ghcr.io/owner/franky:latest-pi",
-        "ghcr.io/owner/franky:latest-claude",
-        "ghcr.io/owner/franky:latest-codex",
-        "ghcr.io/owner/franky:latest-opencode",
-        "ghcr.io/owner/franky-proxy:latest",
-    }
+
+
+def test_release_tags_images_only_after_the_gate():
+    text = (ROOT / ".github" / "workflows" / "release.yml").read_text()
+    merge_job = text[text.index("\n  merge:\n") : text.index("\n  release:\n")]
+    image_job = text[text.index("\n  image:\n") : text.index("\n  merge:\n")]
+    assert "needs: [footprint, guard, image]" in merge_job
+    assert "  pypi:\n    needs: [footprint, guard, wheel]\n" in text
+    assert "  release:\n    needs: [wheel, pypi, merge]\n" in text
+    assert "push-by-digest=true" in image_job
+    assert "tags:" not in image_job
+    assert "arch: [amd64, arm64]" in image_job
+    assert "matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04'" in image_job
+    assert "setup-qemu" not in text
+    assert "|| 'type=cacheonly' }}" in image_job
+    assert "\npermissions:\n  contents: read\n\njobs:" in text
 
 
 @pytest.fixture
