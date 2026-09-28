@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-09-28
+
 ### Added
 
 - `review-pr --instructions-file` reads bounded, owner-only instructions without putting their text in command arguments. It requires `--no-publish --json` and refuses threads or verbose output.
