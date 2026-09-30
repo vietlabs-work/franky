@@ -42,6 +42,8 @@ Unit tests must not use real Docker, networks, GitHub, or credentials. Inject ru
 
 Real Docker gates stay outside the unit suite. The footprint workflow uses fixed credential-free workloads on Ubuntu 24.04.
 
+A PR that changes shipped code (`franky/`, `proxy/`, `Dockerfile`, the entrypoint or install scripts, `pyproject.toml`) must add a bullet under `## [Unreleased]` in `CHANGELOG.md`. The `changelog` workflow runs `scripts/release.py changelog-check` and fails otherwise. Label the PR `no-changelog` only when users see no change.
+
 ## Architecture
 
 ```text

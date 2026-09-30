@@ -2,6 +2,8 @@
 
 Describe the problem and the smallest solution.
 
+- [ ] `CHANGELOG.md` has a new `## [Unreleased]` bullet, or the PR has the `no-changelog` label.
+
 ## Verification
 
 List the commands and results.

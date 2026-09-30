@@ -6,6 +6,7 @@ Subcommands:
   tag X.Y.Z [--dry-run]  - recovery: tag + push only (when commit exists but tag/push failed)
   guard <tag>        - assert pyproject==__init__==tag (CI gate, exits nonzero on skew)
   notes X.Y.Z        - print the changelog section body for X.Y.Z (used as release notes)
+  changelog-check --base SHA - PR gate: shipped code changed => a new ## [Unreleased] bullet
 """
 
 import argparse
@@ -140,6 +141,55 @@ def extract_notes(root: Path, v: str) -> str:
         print(f"release.py: changelog section for {v} is empty", file=sys.stderr)
         raise SystemExit(1)
     return body
+
+
+# Paths that ship to users (the package, the images, the install metadata). A PR touching any
+# of them must add a ## [Unreleased] bullet, or `make release` later finds an empty section.
+_SHIPPED = (
+    "franky/",
+    "proxy/",
+    "Dockerfile",
+    "franky-dind-entrypoint.sh",
+    "install-codex-native-launcher.sh",
+    "pyproject.toml",
+)
+
+
+# Any unordered-list item (`-`, `*`, `+`, indented or not); captures its text for comparison.
+_BULLET_RE = re.compile(r"^[ \t]*[-*+][ \t]+(\S.*)$", re.MULTILINE)
+
+
+def _unreleased_bullets(text: str) -> set[str]:
+    """The bullet texts of the ## [Unreleased] section (empty set if there is none)."""
+    idx = text.find("## [Unreleased]")
+    if idx == -1:
+        return set()
+    body = text[idx:].split("\n", 1)[-1]
+    nxt = re.search(r"^## ", body, re.MULTILINE)
+    body = body[: nxt.start()] if nxt else body
+    return {m.group(1).strip() for m in _BULLET_RE.finditer(body)}
+
+
+def cmd_changelog_check(args, run, root: Path) -> None:
+    files = _git(run, ["diff", "--name-only", f"{args.base}...HEAD"]).stdout.split()
+    shipped = [f for f in files if f.startswith(_SHIPPED)]
+    if not shipped:
+        print("release.py: no shipped files changed; no changelog entry needed")
+        return
+    # A missing base CHANGELOG.md (first commit) counts as no prior bullets.
+    base = _git(run, ["show", f"{args.base}:CHANGELOG.md"], check=False)
+    before = _unreleased_bullets(base.stdout if base.returncode == 0 else "")
+    after = _unreleased_bullets((root / "CHANGELOG.md").read_text(encoding="utf-8"))
+    if after - before:
+        print("release.py: changelog entry found under ## [Unreleased]")
+        return
+    print(
+        "release.py: this PR changes shipped files but adds no bullet under ## [Unreleased] "
+        f"in CHANGELOG.md ({', '.join(shipped[:5])}). Add one under Added / Changed / Fixed, "
+        "or label the PR `no-changelog` if users see no change.",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
 
 
 def assert_versions_match(root: Path, tag: str) -> None:
@@ -474,6 +524,12 @@ def main(argv=None, run=None, root=None, sleep=None) -> None:
     notes_parser = subparsers.add_parser("notes", help="Print changelog section for a version.")
     notes_parser.add_argument("version", metavar="X.Y.Z")
 
+    # changelog-check subcommand
+    check_parser = subparsers.add_parser(
+        "changelog-check", help="PR gate: shipped changes need a new ## [Unreleased] bullet."
+    )
+    check_parser.add_argument("--base", required=True, metavar="SHA")
+
     args = parser.parse_args(argv)
 
     if args.subcommand == "tag":
@@ -482,6 +538,8 @@ def main(argv=None, run=None, root=None, sleep=None) -> None:
         cmd_guard(args, run, root)
     elif args.subcommand == "notes":
         cmd_notes(args, run, root)
+    elif args.subcommand == "changelog-check":
+        cmd_changelog_check(args, run, root)
     else:
         parser.print_help()
         raise SystemExit(2)

@@ -571,3 +571,54 @@ def test_tag_recovery_dry_run_no_mutations(repo):
     git_calls = [c for c in calls if c[0] == "git"]
     mutating = [c for c in git_calls if c[1] in ("tag", "push")]
     assert mutating == []
+
+
+# --- changelog-check ---
+
+_BASE_CHANGELOG = "# Changelog\n\n## [Unreleased]\n\n## [0.0.1] - 2026-01-01\n\n- Old stuff.\n"
+
+
+def _check(repo, changed, head_changelog, base_changelog=_BASE_CHANGELOG):
+    (repo / "CHANGELOG.md").write_text(head_changelog)
+    runner, _calls = make_fake_run(
+        [
+            (["git", "diff", "--name-only"], 0, "\n".join(changed) + "\n", ""),
+            (["git", "show"], 0, base_changelog, ""),
+        ]
+    )
+    main(["changelog-check", "--base", "abc123"], run=runner, root=repo)
+
+
+def test_changelog_check_fails_when_code_changes_without_entry(repo, capsys):
+    with pytest.raises(SystemExit) as exc:
+        _check(repo, ["franky/cli.py", "tests/test_cli.py"], _BASE_CHANGELOG)
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert "## [Unreleased]" in err and "franky/cli.py" in err and "no-changelog" in err
+
+
+def test_changelog_check_passes_with_new_entry(repo):
+    head = _BASE_CHANGELOG.replace("## [Unreleased]\n", "## [Unreleased]\n\n### Added\n\n- New.\n")
+    _check(repo, ["franky/jobs.py", "Dockerfile"], head)
+
+
+def test_changelog_check_ignores_non_shipped_changes(repo):
+    _check(repo, ["tests/test_cli.py", "README.md", ".github/workflows/ci.yml"], _BASE_CHANGELOG)
+
+
+def test_changelog_check_fails_when_entry_predates_the_pr(repo):
+    filled = _BASE_CHANGELOG.replace("## [Unreleased]\n", "## [Unreleased]\n\n- Earlier PR.\n")
+    with pytest.raises(SystemExit):
+        _check(repo, ["franky/cli.py"], filled, base_changelog=filled)
+
+
+def test_changelog_check_ignores_bullets_in_released_sections(repo):
+    head = _BASE_CHANGELOG.replace("- Old stuff.", "- Old stuff.\n- Edited history.")
+    with pytest.raises(SystemExit):
+        _check(repo, ["proxy/squid.conf"], head)
+
+
+@pytest.mark.parametrize("bullet", ["- New.", "* New.", "+  New.", "  - Nested new."])
+def test_changelog_check_accepts_any_bullet_marker(repo, bullet):
+    head = _BASE_CHANGELOG.replace("## [Unreleased]\n", f"## [Unreleased]\n\n{bullet}\n")
+    _check(repo, ["franky/cli.py"], head)

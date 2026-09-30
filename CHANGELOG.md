@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `franky job status` reports a run's `state` (`active`, `quiet`, `unknown`, `orphaned`, `finished`) and one structured `next` step with its exact command and whether a retry is safe. An uncertain check gives `unknown`, never a kill or a rerun.
+- Each run writes a throttled progress file with its phase, attempt, retry reason, last output time, and last tool name (never its arguments). The run record also stores the owner pid and host.
+- With `--json`, every run prints one `started` JSON line on stderr with its `job_id`, also with `--quiet`. stdout still holds only the result.
+- A `review-pr` record keeps `review_url`, `reviewed_sha`, and `no_publish`, so a rerun keeps its publish guards.
+
+### Changed
+
+- `franky job logs` on a live run names its state and points to `franky job status`. The `job_not_found` hint explains the 12-hex job id.
+
 ## [0.3.3] - 2026-09-30
 
 ### Added

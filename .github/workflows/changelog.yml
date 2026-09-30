@@ -1,0 +1,32 @@
+name: Changelog
+
+# A PR that changes shipped code must add a bullet under ## [Unreleased] in CHANGELOG.md, or
+# `make release` later refuses an empty section. The `no-changelog` label skips the check for
+# a change users never see. Separate from ci.yml so a label change re-runs only this job.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: changelog-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changelog:
+    name: changelog
+    if: ${{ !contains(github.event.pull_request.labels.*.name, 'no-changelog') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Require an Unreleased entry
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: python3 scripts/release.py changelog-check --base "$BASE_SHA"
