@@ -130,14 +130,19 @@ def _install_command(install: Install, version: str) -> list[str] | None:
 
     pip targets `install.path` (the resolved interpreter) so the upgrade lands in the exact
     running env - never a blind install into the wrong one.
+
+    The version comes from the PyPI JSON API, which can be newer than the installer's cached
+    PyPI simple-index page (PyPI allows 10 minutes), so each command bypasses that cache or the
+    pinned version reads as missing right after a release.
     """
     spec = _spec(version)
     if install.kind == "uv tool":
-        return ["uv", "tool", "install", "--force", spec]
+        return ["uv", "tool", "install", "--force", "--refresh-package", DIST_NAME, spec]
     if install.kind == "pipx":
-        return ["pipx", "install", "--force", spec]
+        return ["pipx", "install", "--force", "--pip-args=--no-cache-dir", spec]
     if install.kind == "pip":
-        return [install.path or sys.executable, "-m", "pip", "install", "--upgrade", spec]
+        py = install.path or sys.executable
+        return [py, "-m", "pip", "install", "--upgrade", "--no-cache-dir", spec]
     return None
 
 
@@ -190,8 +195,8 @@ def force_update(
     if argv is None:
         out(
             "franky: could not detect how franky was installed - update manually:\n"
-            f"  uv tool install --force {_spec(tag)}\n"
-            f"  # or: pipx install --force {_spec(tag)}"
+            f"  uv tool install --force --refresh-package {DIST_NAME} {_spec(tag)}\n"
+            f"  # or: pipx install --force --pip-args=--no-cache-dir {_spec(tag)}"
         )
         return 1
 

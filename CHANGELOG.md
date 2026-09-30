@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `franky update` no longer fails with "no version of franky-agent==X" right after a release. It now bypasses the installer's cached PyPI index (`uv --refresh-package`, pip and pipx `--no-cache-dir`).
+
 ## [0.3.5] - 2026-09-30
 
 ### Fixed

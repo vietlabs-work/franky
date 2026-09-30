@@ -82,18 +82,34 @@ def test_spec_strips_leading_v():
 
 def test_install_command_uv_tool():
     cmd = _install_command(Install("uv tool", "/x/uv/tools/franky/bin/python"), "v1.2.3")
-    assert cmd == ["uv", "tool", "install", "--force", _spec("v1.2.3")]
+    assert cmd == [
+        "uv",
+        "tool",
+        "install",
+        "--force",
+        "--refresh-package",
+        "franky-agent",
+        _spec("v1.2.3"),
+    ]
 
 
 def test_install_command_pipx():
     cmd = _install_command(Install("pipx", "/x/pipx/venvs/franky/bin/python"), "v1.2.3")
-    assert cmd == ["pipx", "install", "--force", _spec("v1.2.3")]
+    assert cmd == ["pipx", "install", "--force", "--pip-args=--no-cache-dir", _spec("v1.2.3")]
 
 
 def test_install_command_pip_targets_resolved_interpreter():
     # pip must upgrade the EXACT running env, not a blind global install.
     cmd = _install_command(Install("pip", "/usr/bin/python3"), "v1.2.3")
-    assert cmd == ["/usr/bin/python3", "-m", "pip", "install", "--upgrade", _spec("v1.2.3")]
+    assert cmd == [
+        "/usr/bin/python3",
+        "-m",
+        "pip",
+        "install",
+        "--upgrade",
+        "--no-cache-dir",
+        _spec("v1.2.3"),
+    ]
 
 
 def test_install_command_unknown_kind_is_none():
@@ -208,7 +224,15 @@ def test_force_update_upgrades_and_reports_version():
         out=out,
     )
     assert code == 0
-    assert calls["argv"] == ["uv", "tool", "install", "--force", _spec("v0.2.0")]
+    assert calls["argv"] == [
+        "uv",
+        "tool",
+        "install",
+        "--force",
+        "--refresh-package",
+        "franky-agent",
+        _spec("v0.2.0"),
+    ]
     assert any("updated to v0.2.0" in ln for ln in lines)
 
 
@@ -229,7 +253,13 @@ def test_force_update_force_reinstalls_same_version():
         out=out,
     )
     assert code == 0
-    assert calls["argv"] == ["pipx", "install", "--force", _spec("v0.2.0")]
+    assert calls["argv"] == [
+        "pipx",
+        "install",
+        "--force",
+        "--pip-args=--no-cache-dir",
+        _spec("v0.2.0"),
+    ]
     assert any("reinstalled v0.2.0" in ln for ln in lines)
 
 
@@ -245,7 +275,8 @@ def test_force_update_undetectable_installer_exits_one():
     assert code == 1
     blob = "\n".join(lines)
     assert "could not detect how franky was installed" in blob
-    assert "uv tool install --force" in blob
+    assert "uv tool install --force --refresh-package franky-agent franky-agent==0.2.0" in blob
+    assert "pipx install --force --pip-args=--no-cache-dir franky-agent==0.2.0" in blob
 
 
 def test_force_update_fetch_failure_exits_one():
@@ -483,7 +514,15 @@ def test_auto_update_opt_in_installs_for_next_run(tmp_path):
     assert "v0.2.0 available" in blob  # hint still printed
     assert "installing v0.2.0 for your next build" in blob
     assert "next `franky build`" in blob
-    assert calls["argv"] == ["uv", "tool", "install", "--force", _spec("v0.2.0")]
+    assert calls["argv"] == [
+        "uv",
+        "tool",
+        "install",
+        "--force",
+        "--refresh-package",
+        "franky-agent",
+        _spec("v0.2.0"),
+    ]
 
 
 def test_auto_update_opt_in_install_failure_is_soft(tmp_path):
