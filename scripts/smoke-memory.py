@@ -74,7 +74,7 @@ for _ in range(10):
         'vm_available_kib': int(info['MemAvailable'].split()[0]),
         'time': time.time(),
     }), flush=True)
-    time.sleep(2)
+    time.sleep(1)
 assert len(held) == 256 * 1024 * 1024
 print('WORKLOAD PASSED', flush=True)
 """
