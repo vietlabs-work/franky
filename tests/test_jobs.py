@@ -428,7 +428,7 @@ def test_jobs_list_limit(monkeypatch, tmp_path):
 def test_job_status_found(monkeypatch, tmp_path):
     env = _env(tmp_path)
     jobs.write_record(_rec("ccdd03"), env)
-    monkeypatch.setattr(cli, "container_running", lambda name: True)
+    monkeypatch.setattr(cli, "container_state", lambda name: True)
     res = _cli(monkeypatch, tmp_path, ["job", "status", "ccdd03"])
     assert res.exit_code == 0
     assert "ccdd03" in res.stdout
@@ -438,7 +438,7 @@ def test_job_status_found(monkeypatch, tmp_path):
 def test_job_status_json_includes_live_flag(monkeypatch, tmp_path):
     env = _env(tmp_path)
     jobs.write_record(_rec("ddee04"), env)
-    monkeypatch.setattr(cli, "container_running", lambda name: False)
+    monkeypatch.setattr(cli, "container_state", lambda name: False)
     res = _cli(monkeypatch, tmp_path, ["job", "status", "ddee04", "--json"])
     assert res.exit_code == 0
     assert json.loads(res.stdout)["container_running"] is False
@@ -457,7 +457,7 @@ def test_job_status_renders_diagnostics_block(monkeypatch, tmp_path):
         "egress_denied": [{"host": "evil.example.com", "count": 2}],
     }
     jobs.write_record(rec, env)
-    monkeypatch.setattr(cli, "container_running", lambda name: False)
+    monkeypatch.setattr(cli, "container_state", lambda name: False)
     res = _cli(monkeypatch, tmp_path, ["job", "status", "ee0100"])
     assert res.exit_code == 0
     assert "diagnostics:" in res.stdout
@@ -471,7 +471,7 @@ def test_job_status_json_includes_diagnostics(monkeypatch, tmp_path):
     rec = _rec("ee0101", status="killed")
     rec["diagnostics"] = {"task_exit_code": 1, "oom_killed": False}
     jobs.write_record(rec, env)
-    monkeypatch.setattr(cli, "container_running", lambda name: False)
+    monkeypatch.setattr(cli, "container_state", lambda name: False)
     res = _cli(monkeypatch, tmp_path, ["job", "status", "ee0101", "--json"])
     assert res.exit_code == 0
     data = json.loads(res.stdout)

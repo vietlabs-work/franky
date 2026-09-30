@@ -129,7 +129,7 @@ Run `franky COMMAND --help` for flags and examples. Run `franky schema` for the 
 
 | Command | Purpose |
 |---------|---------|
-| `franky job status JOB_ID` | Show the record, live state, and runtime diagnostics. |
+| `franky job status JOB_ID` | Show the state, the one next step, the record, and runtime diagnostics. |
 | `franky job logs JOB_ID` | Print the redacted transcript. |
 | `franky job kill JOB_ID` | Stop a run and remove its task, proxy, network, and volumes. A `--thread` build also keeps its engine session. |
 | `franky job export JOB_ID` | Export the record and redacted transcript as a portable archive. |
@@ -141,6 +141,14 @@ Run `franky COMMAND --help` for flags and examples. Run `franky schema` for the 
 `replay` starts from saved inputs. `resume` restores `/work`, plus the engine session when it can (see [Author threads](#author-threads)). Use `replay --open-pr` only when the reproduced run should open a PR.
 
 `attach` supports `pi`, `claude`, and `codex`. OpenCode does not support steering.
+
+### Track a run
+
+With `--json`, every run prints one `{"event":"started","job_id":...,"status_command":...}` line on stderr when it starts, even with `--quiet`. Stdout stays one result object. Poll with `franky job status JOB_ID --json`.
+
+`state` is `active` (output in the last 120 s), `quiet` (alive, silent), `orphaned` (the owning process is gone), `unknown` (liveness cannot be confirmed), or `finished`. `next` gives one `action` (`wait`, `check`, `kill`, `resume`, `rerun`, `inspect`, `done`), its `command`, `retry_safe`, and `check_after`. Do not rerun unless `retry_safe` is true. `unknown` is never proof of death.
+
+A run also keeps `<job_id>.progress.json` beside its record: phase, attempt, last tool name (never arguments), and last output time. It is host-only, never exported, and pruned with the record.
 
 ### Thread commands
 

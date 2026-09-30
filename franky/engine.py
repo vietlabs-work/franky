@@ -195,6 +195,40 @@ def _tool_use_summary(name: object, inp: dict) -> str:
     return "franky: tool call"
 
 
+def tool_name(line: str) -> str | None:
+    """The tool NAME a JSONL event calls (any engine's shape), or None.
+
+    Feeds the liveness heartbeat. Reads only the name, never the arguments, because arguments
+    can carry decoded secret fragments that must not reach a stored file.
+    """
+    line = line.strip()
+    if not line.startswith("{"):
+        return None
+    try:
+        event = json.loads(line)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(event, dict):
+        return None
+    if event.get("type") == "tool_use":
+        part = event.get("part")
+        name = event.get("name") or (part.get("tool") if isinstance(part, dict) else None)
+        return name if isinstance(name, str) and name else None
+    item = event.get("item")
+    if isinstance(item, dict) and item.get("type") == "command_execution":
+        return "command_execution"  # codex
+    message = event.get("message")
+    for content in (
+        event.get("content"),
+        message.get("content") if isinstance(message, dict) else None,
+    ):
+        for block in content if isinstance(content, list) else []:
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                name = block.get("name")
+                return name if isinstance(name, str) and name else None
+    return None
+
+
 class Engine:
     """Base engine. Subclasses set `name` and implement the required behaviours."""
 

@@ -208,6 +208,21 @@ _JOB_RECORD_SCHEMA: dict = {
     "`<job_id>.session.tar.gz` sidecar; never exported; null once bound into a thread.",
     "thread_bound": "present ONLY once a `--thread` run's session was handed to the PR's author "
     "thread: true.",
+    "pid": "the franky process that owns the run, on `host`; `job status` probes it",
+    "host": "hostname the run started on; a pid probe only counts on this host",
+    "pid_started_at": "process start marker (Linux only, else null) so a reused pid is not "
+    "mistaken for the run",
+    "review_url": "present ONLY on a published `review-pr` run: the GitHub review URL",
+    "reviewed_sha": "present ONLY on a `review-pr` run: the PR head commit that was reviewed",
+}
+
+_STARTED_EVENT_SCHEMA: dict = {
+    "event": "string; always started",
+    "job_id": "string; the 12-hex handle to poll",
+    "command": "string; build | iterate | review-pr | replay | resume",
+    "status_command": "string; the exact command to poll this run",
+    "where": "ONE JSON line on stderr at job start with --json (even with --quiet); stdout "
+    "stays exactly one result object",
 }
 
 # Static description of one stored thread (~/.franky/threads/<id>/record.json), as
@@ -302,6 +317,23 @@ _JOB_STATS_SCHEMA: dict = {
 _JOB_STATUS_SCHEMA: dict = {
     "includes": "all job_record_schema fields",
     "container_running": "boolean; live Docker container state",
+    "state": "finished (record status is not running) | orphaned (the owning franky process is "
+    "confirmed gone while the record says running) | unknown (liveness cannot be confirmed: "
+    "other host, older record, docker error; never assume dead) | active (output within 120s) | "
+    "quiet (alive, no output for 120s or more)",
+    "elapsed_secs": "integer; seconds since start (to ended_at when finished)",
+    "idle_secs": "integer or null; seconds since the last agent output (null when finished)",
+    "phase": "string or null: setup | agent | publish (from the heartbeat sidecar)",
+    "attempt": "integer or null; 2 after a retry",
+    "retry_reason": "string or null; why attempt 2 ran",
+    "last_tool": "string or null; name of the last tool the agent called (no arguments)",
+    "next": {
+        "action": "wait | check | kill | resume | rerun | inspect | done",
+        "command": "string or null; the one command to run next",
+        "retry_safe": "boolean; true only when rerunning or resuming cannot duplicate work",
+        "why": "string; the reason, in one sentence",
+        "check_after": "ISO-8601 UTC timestamp or null; when to poll again",
+    },
 }
 
 _JOB_KILL_SCHEMA: dict = {
@@ -435,6 +467,7 @@ def build_schema(group: click.Group) -> dict:
         "job_stats_group_schema": _JOB_STATS_GROUP_SCHEMA,
         "job_stats_schema": _JOB_STATS_SCHEMA,
         "job_status_schema": _JOB_STATUS_SCHEMA,
+        "started_event_schema": _STARTED_EVENT_SCHEMA,
         "job_kill_schema": _JOB_KILL_SCHEMA,
         "job_export_schema": _JOB_EXPORT_SCHEMA,
         "job_attach_schema": _JOB_ATTACH_SCHEMA,

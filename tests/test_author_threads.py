@@ -149,6 +149,9 @@ RECORD_KEYS = {
     "resumed_from",
     "snapshot_path",
     "steer_notes",
+    "pid",
+    "host",
+    "pid_started_at",
 }
 PLAIN_KWARGS = {
     "image",

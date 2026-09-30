@@ -50,7 +50,7 @@ from .container import (
     run_in_container,
 )
 from . import jobs, snapshot, threads
-from .container import container_running, deliver_steer, reap_run, run_names
+from .container import container_running, container_state, deliver_steer, reap_run, run_names
 from .engine import (
     CODEX_SUBSCRIPTION_VAR,
     ENGINES,
@@ -58,6 +58,7 @@ from .engine import (
     codex_auth_volume,
     opencode_provider,
     resolve_engine,
+    tool_name,
 )
 from .github import run_gh
 from .idempotency import fetch_pr_head_sha, find_open_pr
@@ -788,8 +789,7 @@ def iterate(
             branch=None,
             thread_id=thread.id if thread else None,
         )
-        if not quiet:
-            click.echo(f"franky: job {job_id} started", err=True)
+        _announce_start(job_id, "iterate", as_json, quiet)
 
         # Author thread plan. No record yet may mean a `build --thread` crashed between its job
         # record write and the end of its bind (no record, or one that never got a handoff):
@@ -1168,8 +1168,7 @@ def review_pr(
             branch=None,
             thread_id=thread.id if thread else None,
         )
-        if not quiet:
-            click.echo(f"franky: job {job_id} started", err=True)
+        _announce_start(job_id, "review-pr", as_json, quiet)
 
         # Thread plan: the session id is written to record.json before the container starts.
         record = prior_sha = prior_handoff = incoming = None
@@ -1273,6 +1272,7 @@ def review_pr(
                 else:
                     # Re-check the LIVE head immediately before publishing - never post a review
                     # over a PR that moved on mid-run (same register as --expected-head-sha above).
+                    _liveness(job_id, phase="publish")
                     recheck_sha = fetch_pr_head_sha(repo, pr_number, os.environ)
                     if recheck_sha is None or recheck_sha.lower() != pinned_sha.lower():
                         status = "publish_blocked_stale_head"
@@ -1365,6 +1365,11 @@ def review_pr(
             exit_code=exit_code,
             log_path=log_path,
             diagnostics=diagnostics,
+            extra={
+                "review_url": review_url,
+                "reviewed_sha": pinned_sha,
+                "no_publish": True if no_publish else None,
+            },
         )
         result = build_result(
             status=status,
@@ -1813,6 +1818,7 @@ def _thread_pass(
             return code, output, duration, record, mode, reason, run_kwargs, incoming
         record, mode, reason = retry
         retried = True
+        _liveness(job_id, phase="setup", attempt=2, retry_reason=reason)
 
 
 # `build --thread` / `job resume`: how long a bind waits for a busy author thread before it is
@@ -2263,6 +2269,9 @@ def _run_pass(
         extra["session_tar"] = session_tar
     if session_sink is not None:
         extra["session_sink"] = session_sink
+    hb = _HEARTBEATS.get(run_id) if run_id else None
+    if hb is not None:
+        progress = _liveness_progress(hb, progress, cfg.secret_values())
     t0 = time.monotonic()
     code, output = run_in_container(
         cfg,
@@ -2410,6 +2419,49 @@ def cfg_secrets_safe() -> list[str]:
     return [v for v in (os.environ.get(JIRA_API_TOKEN_VAR), os.environ.get(JIRA_EMAIL_VAR)) if v]
 
 
+# Heartbeats of the runs this process owns, keyed by job id (see jobs.Heartbeat). Populated by
+# _record_run_start, fed by _run_pass, flushed and dropped by _record_run_end.
+_HEARTBEATS: dict[str, jobs.Heartbeat] = {}
+
+
+def _announce_start(job_id, command, as_json, quiet, suffix="") -> None:
+    """Tell the caller the job id the moment it exists.
+
+    --json: ALWAYS one machine-readable line on stderr (stdout stays exactly one result object),
+    even with --quiet, so a bot learns the handle to poll. Otherwise the prose line, unless quiet.
+    """
+    if as_json:
+        event = {
+            "event": "started",
+            "job_id": job_id,
+            "command": command,
+            "status_command": f"franky job status {job_id} --json",
+        }
+        click.echo(json.dumps(event), err=True)
+    elif not quiet:
+        click.echo(f"franky: job {job_id} started{suffix}", err=True)
+
+
+def _liveness(job_id, **fields) -> None:
+    """Update this run's heartbeat (phase/attempt/retry_reason). No-op for an unknown run."""
+    hb = _HEARTBEATS.get(job_id)
+    if hb is not None:
+        hb.set(**fields)
+
+
+def _liveness_progress(hb, progress, secrets):
+    """Wrap the progress callback so the heartbeat sees every line even when progress is None
+    (--quiet/--json). Stores the redacted tool NAME only, never its arguments."""
+
+    def cb(line: str) -> None:
+        name = tool_name(line)
+        hb.output(redact(name, secrets)[:64] if name else None)
+        if progress is not None:
+            progress(line)
+
+    return cb
+
+
 def _record_run_start(
     job_id,
     *,
@@ -2469,6 +2521,8 @@ def _record_run_start(
         )
         jobs.write_record(record, env)
         jobs.prune(env)  # only on the write path; never a side effect of a read
+        hb = _HEARTBEATS[job_id] = jobs.Heartbeat(job_id, env)
+        hb.flush()
     except Exception:
         pass
 
@@ -2484,9 +2538,13 @@ def _record_run_end(
     log_path,
     diagnostics=None,
     snapshot_path=None,
+    extra=None,
     env=None,
 ) -> None:
     """Update the run record once the pass finishes. Best-effort - never raises into a build.
+
+    `extra` holds optional result keys (review-pr's review_url/reviewed_sha), stored only when
+    set. The heartbeat gets a final flush so its last phase survives for `job status`.
 
     `diagnostics` (issue #69) is the best-effort runtime-signal dict populated (or left empty)
     by a `diagnostics_sink` passed through `_run_pass`; an empty dict is normalized to None so
@@ -2515,9 +2573,13 @@ def _record_run_end(
                 "log_path": str(log_path),
                 "diagnostics": diagnostics or None,
                 "snapshot_path": snapshot_path or None,
+                **{k: v for k, v in (extra or {}).items() if v is not None},
             },
             env,
         )
+        hb = _HEARTBEATS.pop(job_id, None)
+        if hb is not None:
+            hb.flush()
     except Exception:
         pass
 
@@ -2576,8 +2638,7 @@ def _build_once(
         threaded=thread,
         env=env,
     )
-    if not quiet:
-        click.echo(f"franky: job {job_id} started", err=True)
+    _announce_start(job_id, "build", as_json, quiet)
     # Populated (best-effort) by run_in_container just before container teardown (issue #69).
     diagnostics: dict = {}
     # A timed-out build leaves a resumable workspace snapshot (issue #71) keyed to this job id.
@@ -2696,7 +2757,9 @@ def _diagnose(
         branch=None,
         env=env,
     )
-    if not quiet:
+    if as_json:
+        _announce_start(job_id, "diagnose", as_json, quiet)
+    elif not quiet:
         click.echo(f"franky: diagnosing job {diagnosed_job_id} (job {job_id})", err=True)
 
     nonce = _make_nonce()
@@ -3103,7 +3166,8 @@ def _require_record(job_id: str) -> dict:
             f"no run found for job id {job_id!r} (see `franky jobs`)",
             code=EXIT_USAGE,
             kind="job_not_found",
-            hint="run `franky jobs` to list known job ids",
+            hint="job ids are 12 hex characters from the `started` event or result `job_id`; "
+            "list them with `franky jobs --json`",
         )
     return record
 
@@ -3204,29 +3268,56 @@ def job_group() -> None:
     """Inspect and control a single Franky run by its job id (see `franky jobs`)."""
 
 
+def _job_liveness(record: dict) -> tuple[dict, bool | None]:
+    """Probe a run (owner pid, docker, snapshot) and derive its state + next step."""
+    container = container_state(record.get("container", ""))
+    snap = record.get("snapshot_path")
+    live = jobs.derive_liveness(
+        record,
+        jobs.read_progress(record.get("job_id", ""), os.environ),
+        now=datetime.now(timezone.utc),
+        alive=jobs.pid_alive(record),
+        container=container,
+        snapshot_exists=bool(snap) and Path(snap).exists(),
+    )
+    return live, container
+
+
 @job_group.command("status")
 @click.argument("job_id")
 @click.option("--json", "as_json", is_flag=True, help="Emit the run record as a JSON object.")
 @click.pass_context
 def job_status(ctx: click.Context, job_id: str, as_json: bool) -> None:
-    """Show one run's record plus whether its container is still alive.
+    """Show one run's state, the single next step to take, and its record.
 
-    `container_running` is a live `docker inspect` on the recorded container name - it
-    distinguishes a still-running (possibly stuck) run from one that has finished or been reaped.
+    `state` is finished | orphaned | unknown | active | quiet (see `franky schema`); `next` is one
+    structured action (wait, check, kill, resume, rerun, inspect, done) with its command and
+    whether a retry is safe. `container_running` is a live `docker inspect` on the recorded
+    container name.
     """
     try:
         record = _require_record(job_id)
-        alive = container_running(record.get("container", ""))
+        live, container = _job_liveness(record)
+        alive = container is True
         if as_json:
-            click.echo(json.dumps({**record, "container_running": alive}))
+            click.echo(json.dumps({**record, "container_running": alive, **live}))
         else:
-            live = "running" if alive else "not running (container gone)"
+            nxt = live["next"]
+            click.echo(f"state:      {live['state']}")
+            click.echo(f"next:       {nxt['action']} {nxt['command'] or ''}".rstrip())
+            click.echo(f"why:        {nxt['why']}")
+            click.echo(
+                f"progress:   phase={live['phase']} attempt={live['attempt']} "
+                f"elapsed={live['elapsed_secs']}s idle={live['idle_secs']}s "
+                f"last_tool={live['last_tool']}"
+            )
+            where = "running" if alive else "not running (container gone)"
             click.echo(f"job:        {record.get('job_id')}")
             click.echo(f"command:    {record.get('command')}")
             click.echo(f"repo:       {record.get('repo')}")
             click.echo(f"engine:     {record.get('engine')}")
             click.echo(f"status:     {record.get('status')}")
-            click.echo(f"container:  {record.get('container')} ({live})")
+            click.echo(f"container:  {record.get('container')} ({where})")
             click.echo(f"started:    {record.get('started_at')}")
             click.echo(f"ended:      {record.get('ended_at')}")
             click.echo(f"pr_url:     {record.get('pr_url')}")
@@ -3267,11 +3358,15 @@ def job_logs(ctx: click.Context, job_id: str) -> None:
         record = _require_record(job_id)
         log_path = record.get("log_path") or ""
         if not log_path or not Path(log_path).exists():
+            live, _container = _job_liveness(record)
+            status_cmd = f"franky job status {job_id} --json"
             raise FrankyError(
-                f"no log available yet for job {job_id} - the run may still be in progress",
+                f"no log available yet for job {job_id} (state={live['state']}, "
+                f"last_tool={live['last_tool']}) - the transcript is written when the pass "
+                f"finishes; run `{status_cmd}` for the next step",
                 code=EXIT_USAGE,
                 kind="log_unavailable",
-                hint="the transcript is written when the pass finishes; see `franky job status`",
+                hint=f"run `{status_cmd}`",
             )
         # The on-disk log was written via _write_log and is ALREADY redacted; print verbatim.
         for chunk in Transcript(Path(log_path)).chunks():
@@ -3732,8 +3827,7 @@ def job_replay(
             replay_of=job_id,
             env=os.environ,
         )
-        if not quiet:
-            click.echo(f"franky: job {new_id} started (replay of {job_id})", err=True)
+        _announce_start(new_id, "replay", as_json, quiet, f" (replay of {job_id})")
 
         # Populated (best-effort) by run_in_container just before container teardown (issue #69).
         # Replay is the debugging command, so capturing runtime signals matters MORE here, not
@@ -4032,8 +4126,7 @@ def job_resume(
             threaded=threaded,
             env=os.environ,
         )
-        if not quiet:
-            click.echo(f"franky: job {new_id} started (resume of {job_id})", err=True)
+        _announce_start(new_id, "resume", as_json, quiet, f" (resume of {job_id})")
 
         # Populated (best-effort) by run_in_container just before container teardown (issue #69).
         diagnostics: dict = {}

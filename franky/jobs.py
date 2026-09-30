@@ -25,13 +25,15 @@ import json
 import os
 import re
 import shutil
+import socket
 import stat
 import statistics
 import tarfile
 import tempfile
+import time
 import uuid
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 RUNS_DIR_VAR = "FRANKY_RUNS_DIR"
@@ -50,9 +52,10 @@ DEFAULT_KEEP = 200
 # "running" record older than this is a crash orphan and becomes eligible for pruning.
 STALE_RUNNING_SECS = 24 * 3600
 
-# Host-local sidecars that live beside a run record: the workspace snapshot (issue #71) and the
-# engine session of a `--thread` run. Pruned with the record, never exported.
-_SIDECAR_SUFFIXES = (".snapshot.tar.gz", ".session.tar.gz")
+# Host-local sidecars that live beside a run record: the workspace snapshot (issue #71), the
+# engine session of a `--thread` run, and the liveness heartbeat. Pruned with the record, never
+# exported. The heartbeat file carries no `job_id` key so list_records never mistakes it for a run.
+_SIDECAR_SUFFIXES = (".snapshot.tar.gz", ".session.tar.gz", ".progress.json")
 
 # Temp session dirs and packed tars that `--thread` runs create in the runs dir (`.tmp-session-`,
 # `.tmp-pack-`). A crash can leave one behind; prune sweeps those older than a real run can last.
@@ -165,6 +168,11 @@ def new_record(
     record = {
         "job_id": job_id,
         "command": command,
+        # Liveness identity for `job status`: which process owns this run, on which host, and a
+        # process start marker so a reused pid is not mistaken for the run (see pid_alive).
+        "pid": os.getpid(),
+        "host": socket.gethostname(),
+        "pid_started_at": pid_start_marker(os.getpid()),
         "repo": repo,
         "engine": engine,
         "task": task,
@@ -521,3 +529,281 @@ def export_bundle(record: dict, dest: Path) -> dict:
                     tar.addfile(info, source)
                     included.append("transcript.log")
     return {"output_path": str(dest), "bytes": dest.stat().st_size, "included": included}
+
+
+# ---------------------------------------------------------------------------
+# Liveness (issue: agents polling a run could not tell "working" from "dead" or what to do next).
+# A heartbeat sidecar records progress; `derive_liveness` turns record + sidecar + probes into a
+# state and one safe next step. Both stay stdlib-only and take every input by injection.
+# ---------------------------------------------------------------------------
+
+# No agent output for this long marks an alive run `quiet` (still alive, worth a slower poll).
+QUIET_AFTER_SECS = 120
+# At most one heartbeat write per this many seconds, so a chatty agent costs ~nothing.
+HEARTBEAT_THROTTLE_SECS = 15
+_DONE_STATUSES = _SUCCESS_STATUSES | {"replay_complete", "diagnosed"}
+_REVIEW_PRE_PUBLISH_STATUSES = frozenset({"timeout", "agent_error", "no_findings"})
+
+
+def _review_rerun_command(record: dict) -> str:
+    """Rebuild a review-pr rerun with the options that guard publishing."""
+    # review-pr records the canonical PR URL as its task until the run ends.
+    argv = ["franky", "review-pr", str(record.get("pr_url") or record.get("task"))]
+    if record.get("reviewed_sha"):
+        argv += ["--expected-head-sha", str(record["reviewed_sha"])]
+    if record.get("no_publish"):
+        argv.append("--no-publish")
+    if record.get("thread_id"):
+        argv.append("--thread")
+    return " ".join(argv + ["--json"])
+
+
+def progress_path(job_id: str, env: Mapping[str, str] | None = None) -> Path | None:
+    """Path of the heartbeat sidecar for `job_id`, or None if the id is not a safe handle."""
+    if not _JOB_ID_RE.match(job_id):
+        return None
+    return runs_dir(env) / f"{job_id}.progress.json"
+
+
+def read_progress(job_id: str, env: Mapping[str, str] | None = None) -> dict | None:
+    """The heartbeat sidecar as a dict, or None if missing/corrupt. Never raises."""
+    path = progress_path(job_id, env)
+    if path is None:
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+class Heartbeat:
+    """Best-effort progress sidecar for one run: `<job_id>.progress.json`.
+
+    A SEPARATE file from the run record on purpose: the record is an unlocked read-modify-write
+    that `job kill` also updates, so a periodic heartbeat writing it could resurrect a finished
+    run's status. It stores the tool NAME only (never arguments, which can carry decoded secret
+    fragments), and never raises into a run.
+    """
+
+    def __init__(self, job_id: str, env: Mapping[str, str] | None = None, clock=time.monotonic):
+        self._job_id = job_id
+        self._env = env
+        self._clock = clock
+        self._last_write: float | None = None
+        self.state: dict = {
+            "phase": "setup",
+            "attempt": 1,
+            "retry_reason": None,
+            "last_output_at": None,
+            "last_tool": None,
+            "output_lines": 0,
+        }
+
+    def output(self, tool: str | None = None) -> None:
+        """Note one agent output line (`tool` = already-redacted tool name, if the line had one)."""
+        s = self.state
+        s["output_lines"] += 1
+        s["last_output_at"] = now_iso()
+        if tool:
+            s["last_tool"] = tool
+        if s["phase"] == "setup":
+            s["phase"] = "agent"
+            self.flush()
+        elif (
+            self._last_write is None or self._clock() - self._last_write >= HEARTBEAT_THROTTLE_SECS
+        ):
+            self.flush()
+
+    def set(self, **fields) -> None:
+        """Change phase/attempt/retry_reason and write immediately."""
+        self.state.update(fields)
+        self.flush()
+
+    def flush(self) -> None:
+        try:
+            path = progress_path(self._job_id, self._env)
+            if path is not None:
+                _atomic_write(
+                    path, {**self.state, "updated_at": now_iso()}, prefix=".franky-progress-"
+                )
+            self._last_write = self._clock()
+        except Exception:
+            pass
+
+
+def pid_start_marker(pid: int) -> str | None:
+    """Process start time in clock ticks from /proc (Linux), else None (e.g. macOS)."""
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        return raw.rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        return None
+
+
+def pid_alive(
+    record: dict, *, kill=os.kill, marker_of=pid_start_marker, hostname=socket.gethostname
+) -> bool | None:
+    """Is the franky process that owns `record` still running? True / False / None (unknown).
+
+    None for a legacy record with no pid or a run started on another host - we cannot probe
+    it, so callers must not treat that as dead. A pid whose start marker changed was reused.
+    """
+    pid = record.get("pid")
+    if not isinstance(pid, int) or pid <= 0 or record.get("host") != hostname():
+        return None
+    try:
+        kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass  # exists, owned by someone else
+    except OSError:
+        return None
+    marker = record.get("pid_started_at")
+    current = marker_of(pid) if marker else None
+    return not (current is not None and current != marker)
+
+
+def _secs_between(start: str | None, end: datetime) -> int | None:
+    try:
+        return max(0, int((end - datetime.fromisoformat(start)).total_seconds()))
+    except (TypeError, ValueError):
+        return None
+
+
+def derive_liveness(
+    record: dict,
+    progress: dict | None,
+    *,
+    now: datetime,
+    alive: bool | None,
+    container: bool | None,
+    snapshot_exists: bool,
+) -> dict:
+    """Turn a run record + heartbeat + probe results into `state` and one structured `next` step.
+
+    Pure: `now`, the pid probe (`alive`), the docker probe (`container`) and the snapshot check
+    are all injected. Each probe is True/False/None (None = could not tell).
+    States: finished, orphaned (owner process confirmed gone while the record says running),
+    unknown (a probe is uncertain - never guess), active (output in the last QUIET_AFTER_SECS),
+    quiet (alive, silent longer than that).
+    """
+    progress = progress or {}
+    status = record.get("status")
+    running = status == "running"
+    elapsed = _secs_between(record.get("started_at"), now if running else _end_of(record, now))
+    idle = None
+    if running:
+        idle = _secs_between(progress.get("last_output_at") or record.get("started_at"), now)
+    if not running:
+        state = "finished"
+    elif alive is None or container is None:
+        state = "unknown"
+    elif alive is False:
+        state = "orphaned"
+    else:
+        state = "active" if idle is not None and idle < QUIET_AFTER_SECS else "quiet"
+    return {
+        "state": state,
+        "elapsed_secs": elapsed,
+        "idle_secs": idle,
+        "phase": progress.get("phase"),
+        "attempt": progress.get("attempt"),
+        "retry_reason": progress.get("retry_reason"),
+        "last_tool": progress.get("last_tool"),
+        "next": _next_step(record, progress, state, now, snapshot_exists),
+    }
+
+
+def _end_of(record: dict, default: datetime) -> datetime:
+    try:
+        return datetime.fromisoformat(record.get("ended_at"))
+    except (TypeError, ValueError):
+        return default
+
+
+def _next_step(
+    record: dict, progress: dict, state: str, now: datetime, snapshot_exists: bool
+) -> dict:
+    """The single next action for a caller. One step at a time: never chains commands."""
+    job_id = record.get("job_id", "")
+    status_cmd = f"franky job status {job_id} --json"
+
+    def step(action, command, retry_safe, why, wait=None):
+        after = (now + timedelta(seconds=wait)).isoformat(timespec="seconds") if wait else None
+        return {
+            "action": action,
+            "command": command,
+            "retry_safe": retry_safe,
+            "why": why,
+            "check_after": after,
+        }
+
+    if state in ("active", "quiet"):
+        return step(
+            "wait",
+            status_cmd,
+            False,
+            "the run is alive"
+            + (" but silent" if state == "quiet" else "")
+            + "; the watchdog stops it at --max-duration (default 30m)",
+            60 if state == "quiet" else 120,
+        )
+    if state == "unknown":
+        return step(
+            "check",
+            status_cmd,
+            False,
+            "cannot confirm whether the run is alive (other host, older record or docker error); "
+            "do not kill or rerun on a guess",
+            60,
+        )
+    if state == "orphaned":
+        return step(
+            "kill",
+            f"franky job kill {job_id} --json",
+            False,
+            "the franky process that owns this run is gone; kill reaps its containers and "
+            "snapshots the workspace. Run status again after the kill for the recovery step",
+        )
+    status = record.get("status")
+    command = record.get("command")
+    if status in _DONE_STATUSES:
+        url = record.get("review_url") or record.get("pr_url")
+        return step(
+            "done", None, False, f"finished with status {status}" + (f": {url}" if url else "")
+        )
+    if command in ("build", "resume", "replay") and record.get("snapshot_path") and snapshot_exists:
+        return step(
+            "resume",
+            f"franky job resume {job_id} --json",
+            True,
+            f"status {status}; the workspace snapshot is intact, resume continues from it",
+        )
+    if command == "review-pr":
+        # These statuses are set before review-pr reaches its publish step, so no review can
+        # be on the PR. Decided from the final status, never from the best-effort heartbeat.
+        if status in _REVIEW_PRE_PUBLISH_STATUSES:
+            return step(
+                "rerun",
+                _review_rerun_command(record),
+                True,
+                f"status {status} before any publish step, so no review was posted; the command "
+                "keeps the stored --expected-head-sha, --no-publish and --thread options, add any "
+                "other original options",
+            )
+        return step(
+            "inspect",
+            f"franky job logs {job_id}",
+            False,
+            f"status {status}; a review may already be on the PR, check it before rerunning",
+        )
+    if command == "iterate":
+        return step(
+            "inspect",
+            f"franky job logs {job_id}",
+            False,
+            f"status {status}; it may already have pushed, check the branch before any rerun",
+        )
+    return step("inspect", f"franky job logs {job_id}", False, f"status {status}; read the log")

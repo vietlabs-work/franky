@@ -1818,7 +1818,9 @@ def test_build_quiet_suppresses_update_hint_and_progress(monkeypatch):
         res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo", "--quiet"])
     assert res.exit_code == 0, res.output
     assert called["update"] is False  # no update hint under --quiet
-    assert called["progress_passed"] is None  # no progress callback under --quiet
+    # --quiet prints nothing, but the liveness heartbeat still needs to see the agent's lines.
+    called["progress_passed"]("not a tool event\n")
+    assert "not a tool event" not in res.output
 
 
 def test_build_json_implies_quiet_no_update_hint(monkeypatch):
@@ -2435,7 +2437,7 @@ def test_build_timeout_maps_to_status_timeout_exit_9(monkeypatch):
             cli.main, ["build", "do it", "--repo", "me/repo", "--max-duration", "1", "--json"]
         )
     assert res.exit_code == 9, res.output
-    data = json.loads(res.output)
+    data = json.loads(res.stdout)
     assert data["status"] == "timeout"
     assert data["exit_code"] == 9
 
@@ -2492,7 +2494,7 @@ def test_iterate_timeout_maps_to_status_timeout_exit_9(monkeypatch):
     with runner.isolated_filesystem():
         res = runner.invoke(cli.main, ["iterate", PR_URL, "--max-duration", "1", "--json"])
     assert res.exit_code == 9, res.output
-    data = json.loads(res.output)
+    data = json.loads(res.stdout)
     assert data["status"] == "timeout"
 
 
@@ -2586,7 +2588,7 @@ def test_build_normal_result_populates_predicted_branch(monkeypatch):
     with runner.isolated_filesystem():
         res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo", "--json"])
     assert res.exit_code == 0, res.output
-    data = json.loads(res.output)
+    data = json.loads(res.stdout)
     assert data["branch"] == "franky/do-it"
 
 
@@ -3001,6 +3003,19 @@ def test_job_diagnose_emits_diagnosis(monkeypatch, tmp_path):
     assert data["category"] == "test_failure" and data["retryable"] is True
     assert data["job_id"] == job_id
     assert captured["image"].endswith(f":{__version__}-pi")
+
+
+def test_job_diagnose_json_quiet_announces_its_job_id(monkeypatch, tmp_path):
+    nonce = "fixednonce"
+    diag = '{"root_cause": "x", "category": "other", "retryable": false, "confidence": "low"}'
+    output = f"FRANKY_DIAG_{nonce}_BEGIN{diag}FRANKY_DIAG_{nonce}_END"
+    env = _diag_setup(monkeypatch, tmp_path, (0, output), nonce, {})
+    job_id = _write_failed_run(env, tmp_path)
+    res = CliRunner().invoke(cli.main, ["job", "diagnose", job_id, "--json", "--quiet"])
+    assert res.exit_code == 0, res.output
+    event = json.loads(res.stderr.strip().splitlines()[-1])
+    assert event["event"] == "started" and event["command"] == "diagnose"
+    assert event["job_id"] != job_id and json.loads(res.stdout)["job_id"] == job_id
 
 
 def test_job_diagnose_not_found_exits_2(monkeypatch, tmp_path):

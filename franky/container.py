@@ -480,6 +480,13 @@ def container_running(name: str, runner=subprocess.run, timeout: float = 3) -> b
     return _container_running_state(name, runner, timeout) is True
 
 
+def container_state(name: str, runner=subprocess.run, timeout: float = 3) -> bool | None:
+    """Tri-state `container_running`: True / False, or None when Docker could not answer.
+
+    For `job status`, which must not read "docker is down" as "the run is dead"."""
+    return _container_running_state(name, runner, timeout)
+
+
 def _container_running_state(name: str, runner, timeout: float = 3) -> bool | None:
     """Separate confirmed task death from an unavailable Docker daemon."""
     try:
