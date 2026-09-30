@@ -113,6 +113,56 @@ def test_load_config_propagates_model_for_other_engines_without_opencode_validat
 
 
 @pytest.mark.parametrize(
+    ("engine", "model"),
+    [
+        ("claude", "claude-opus-5-5"),
+        ("claude", "claude-sonnet-4-5-20250929"),
+        ("claude", "claude-fable-5.1"),
+        ("claude", "opus"),
+        ("claude", "best"),
+        ("claude", "fable[1m]"),
+        ("claude", "opusplan[1m]"),
+        ("claude", "sonnet[1m]"),
+        ("claude", "claude-sonnet-5[1m]"),
+        ("codex", "gpt-5.6-sol"),
+        ("codex", "gpt-6-luna"),
+        ("codex", "o4-mini"),
+        ("codex", "codex-mini-latest"),
+        ("claude", ""),
+        ("codex", ""),
+    ],
+)
+def test_load_config_accepts_engine_model_names(engine, model):
+    env = _env(
+        FRANKY_MODEL=model, CLAUDE_CODE_OAUTH_TOKEN="oauth-fake", CODEX_API_KEY="sk-codex-fake"
+    )
+    assert load_config(engine, env).model == (model or None)
+
+
+@pytest.mark.parametrize(
+    ("engine", "model"),
+    [
+        ("claude", "opus-5-5"),
+        ("claude", "Claude-Opus-5-5"),
+        ("claude", "claude-"),
+        ("claude", "claude-opus 5"),
+        ("claude", "gpt-5.6-sol"),
+        ("claude", "anthropic/claude-opus-5-5"),
+        ("codex", "claude-opus-5-5"),
+        ("codex", "gpt-5.6-sol-900k"),
+        ("codex", "gpt-"),
+        ("codex", "sonnet"),
+    ],
+)
+def test_load_config_rejects_wrong_engine_model_names(engine, model):
+    env = _env(
+        FRANKY_MODEL=model, CLAUDE_CODE_OAUTH_TOKEN="oauth-fake", CODEX_API_KEY="sk-codex-fake"
+    )
+    with pytest.raises(ConfigError, match=f"FRANKY_MODEL: .* is not a {engine} model name"):
+        load_config(engine, env)
+
+
+@pytest.mark.parametrize(
     "model",
     [
         "",

@@ -17,6 +17,7 @@ from .engine import (
     CODEX_SUBSCRIPTION_VAR,
     Engine,
     codex_auth_volume,
+    model_name_error,
     opencode_provider,
     resolve_engine,
 )
@@ -118,7 +119,8 @@ def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
     only the VAR name):
       1. allowlist unset/blank -> refuse (we will not act on an open set of repos)
       2. GH_TOKEN missing -> refuse (cannot clone or open a PR without it)
-      3. OpenCode model missing/invalid -> refuse
+      3. model not a name the engine accepts (claude, codex) -> refuse;
+         OpenCode model missing/invalid -> refuse
       4. engine creds missing -> refuse (pi: no provider var set; claude: token missing;
          codex: CODEX_API_KEY unset; opencode: selected provider key unset)
     """
@@ -150,6 +152,9 @@ def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
         )
 
     model = env.get(MODEL_VAR) or None
+    model_error = model_name_error(engine.name, model)
+    if model_error:
+        raise ConfigError(f"{MODEL_VAR}: {model_error}")
     opencode_credential: str | None = None
     if engine.name == "opencode":
         provider = opencode_provider(model)

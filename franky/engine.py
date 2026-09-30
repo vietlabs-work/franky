@@ -104,6 +104,35 @@ def opencode_provider(model: str | None) -> tuple[str, str] | None:
     return OPENCODE_PROVIDERS.get(prefix)
 
 
+# The shapes each CLI accepts for --model. A wrong name (`opus-5-5`) otherwise reaches the
+# engine and fails the run only after the container is up. Shape only, not a live list:
+# a well-formed but unknown id still fails inside the engine.
+_CLAUDE_MODEL_RE = re.compile(
+    r"^(?:default|best|fable|sonnet|opus|haiku|opusplan"
+    r"|claude-[a-z0-9]+(?:[.-][a-z0-9]+)*)(?:\[1m\])?$"
+)
+# `-<n>k` context variants (gpt-5.6-sol-900k) are a Hermes naming convention, not codex ids.
+_CODEX_MODEL_RE = re.compile(
+    r"^(?!.*-\d+k$)(?:gpt-[a-z0-9]+|codex-[a-z0-9]+|o\d[a-z0-9]*)(?:[.-][a-z0-9]+)*$"
+)
+_MODEL_SHAPES = {
+    "claude": (
+        _CLAUDE_MODEL_RE,
+        "an alias (best, fable, opus, sonnet, haiku, opusplan) or a claude-* id",
+    ),
+    "codex": (_CODEX_MODEL_RE, "a gpt-*, o<N> or codex-* id"),
+}
+
+
+def model_name_error(engine: str, model: str | None) -> str | None:
+    """Why `model` cannot be an --model for `engine`, or None when it can (or when the
+    engine takes free-form names). An empty model means the engine's default."""
+    shape = _MODEL_SHAPES.get(engine)
+    if not model or shape is None or shape[0].fullmatch(model):
+        return None
+    return f"{model!r} is not a {engine} model name; use {shape[1]}"
+
+
 def _ollama_host(value: str) -> str | None:
     """Parse the host out of an OLLAMA_HOST value. The value is a URL (e.g.
     http://host:11434); urlparse gives us its netloc host. If there is no scheme, urlparse

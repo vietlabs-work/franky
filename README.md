@@ -88,6 +88,8 @@ franky config set MOONSHOT_API_KEY
 
 OpenRouter uses `FRANKY_MODEL=openrouter/<model-id>` with `OPENROUTER_API_KEY`.
 
+`FRANKY_MODEL` is optional for `claude` and `codex`: unset, the engine uses its own default. When it is set, a run refuses a name of the wrong shape before it starts a container. `claude` takes an alias (`best`, `fable`, `opus`, `sonnet`, `haiku`, `opusplan`, each with an optional `[1m]`) or a `claude-*` id, for example `claude-opus-5-5`. `codex` takes a `gpt-*`, `o<N>` or `codex-*` id. The check is on the shape only, so a well-formed id that does not exist still fails inside the engine.
+
 Codex subscription authentication stays in a Docker named volume:
 
 ```bash
