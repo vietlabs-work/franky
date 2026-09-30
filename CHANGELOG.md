@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-09-30
+
 ### Added
 
 - `franky update` now pre-pulls the new version's task and proxy images after a successful install, so the first run does not stall on a 1.2 GB pull. It is best effort: a failed or slow pull never fails the update.
