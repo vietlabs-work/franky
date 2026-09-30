@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-09-30
+
 ### Fixed
 
 - A run refuses a `FRANKY_MODEL` that the selected engine cannot take, before any container starts. `claude` needs an alias or a `claude-*` id, and `codex` needs a `gpt-*`, `o<N>` or `codex-*` id. A name like `opus-5-5` used to reach `claude --model` and fail the run later.
