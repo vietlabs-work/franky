@@ -1131,6 +1131,78 @@ def test_config_set_secret_via_hidden_prompt(tmp_path, monkeypatch):
     assert read_config_file(cfg_path)["GH_TOKEN"] == "ghp_from_prompt"
 
 
+def _stdin_set(tmp_path, monkeypatch, args, data, tty=False):
+    cfg_path = tmp_path / "franky-config"
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: tty)
+    res = CliRunner().invoke(cli.main, ["config", "set", *args], input=data)
+    return res, cfg_path
+
+
+def _stored(cfg_path, key):
+    from franky.userconfig import read_config_file
+
+    return read_config_file(cfg_path)[key]
+
+
+def test_config_set_stdin_success_strips_crlf_keeps_spaces_mode_0600(tmp_path, monkeypatch):
+    res, cfg = _stdin_set(tmp_path, monkeypatch, ["GH_TOKEN", "--stdin"], " tok en \r\n\n")
+    assert res.exit_code == 0, res.output
+    assert _stored(cfg, "GH_TOKEN") == " tok en "
+    assert "wrote GH_TOKEN to" in res.output
+    assert "tok en" not in res.output
+    assert stat.S_IMODE(cfg.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize(
+    ("args", "data", "tty"),
+    [
+        (["GH_TOKEN", "--stdin"], "\r\n", False),
+        (["GH_TOKEN", "--stdin"], "SECRETa\nSECRETb\n", False),
+        (["GH_TOKEN", "--stdin"], "SECRETa\rSECRETb\n", False),
+        (["GH_TOKEN", "--stdin"], "SECRET" + "x" * 70000, False),
+        (["GH_TOKEN", "--stdin"], b"SECRET\xff\n", False),
+        (["GH_TOKEN", "--stdin"], "SECRET x\n", False),
+        (["GH_TOKEN", "--stdin"], "SECRET\tx\n", False),
+        (["GH_TOKEN", "--stdin"], "SECRET\n", True),
+        (["GH_TOKEN", "SECRET", "--stdin"], "SECRET\n", False),
+        (["FRANKY_ENGINE", "--stdin"], "SECRET\n", False),
+    ],
+    ids=[
+        "empty",
+        "embedded-newline",
+        "embedded-cr",
+        "oversize",
+        "invalid-utf8",
+        "non-ascii",
+        "control-char",
+        "tty",
+        "positional",
+        "non-secret",
+    ],
+)
+def test_config_set_stdin_refusals_never_echo_value(tmp_path, monkeypatch, args, data, tty):
+    res, cfg = _stdin_set(tmp_path, monkeypatch, args, data, tty)
+    assert res.exit_code == 2, res.output
+    assert "SECRET" not in res.output
+    assert "Traceback" not in res.output
+    assert not cfg.exists()
+
+
+def test_config_set_stdin_size_boundary(tmp_path, monkeypatch):
+    res, cfg = _stdin_set(
+        tmp_path, monkeypatch, ["GH_TOKEN", "--stdin"], "x" * cli._STDIN_SECRET_MAX
+    )
+    assert res.exit_code == 0, res.output
+    assert len(_stored(cfg, "GH_TOKEN")) == cli._STDIN_SECRET_MAX
+    cfg.unlink()
+    res, cfg = _stdin_set(
+        tmp_path, monkeypatch, ["GH_TOKEN", "--stdin"], "x" * (cli._STDIN_SECRET_MAX + 1)
+    )
+    assert res.exit_code == 2
+    assert not cfg.exists()
+
+
 def test_config_set_moonshot_key_requires_hidden_prompt(tmp_path, monkeypatch):
     cfg_path = tmp_path / "franky-config"
     monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))

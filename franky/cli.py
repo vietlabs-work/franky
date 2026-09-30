@@ -4676,20 +4676,61 @@ def config_list(reveal: bool) -> None:
         click.echo(f"{key} = {display}")
 
 
+_STDIN_SECRET_MAX = 64 * 1024
+
+
+def _read_secret_from_stdin(key: str, value: str | None) -> str:
+    """Validate and read `config set --stdin`. Errors never include the value."""
+    if key not in SECRET_KEYS:
+        raise click.UsageError(f"--stdin is only for secret keys; {key} is not one")
+    if value is not None:
+        raise click.UsageError("--stdin cannot be combined with a positional VALUE")
+    if _stdin_is_interactive():
+        raise click.UsageError(
+            f"--stdin reads a piped value, but stdin is a TTY. Run `franky config set {key}` "
+            "for the hidden prompt, or pipe the value in."
+        )
+    # Bytes, not the text stream: universal newlines would hide a CR, and a strict decode
+    # error must not surface as a traceback that quotes the offending byte.
+    data = sys.stdin.buffer.read(_STDIN_SECRET_MAX + 1)
+    if len(data) > _STDIN_SECRET_MAX:
+        raise click.UsageError(f"stdin value for {key} is longer than {_STDIN_SECRET_MAX} bytes")
+    try:
+        raw = data.decode("ascii")
+    except UnicodeDecodeError:
+        raise click.UsageError(f"stdin value for {key} must be ASCII") from None
+    raw = raw.rstrip("\r\n")
+    if not raw:
+        raise click.UsageError(f"stdin value for {key} is empty")
+    if "\n" in raw or "\r" in raw:
+        raise click.UsageError(f"stdin for {key} must be exactly one line")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in raw):
+        raise click.UsageError(f"stdin value for {key} contains a control character")
+    return raw
+
+
 @config_group.command("set")
 @click.argument("key")
 @click.argument("value", required=False, default=None)
-def config_set(key: str, value: str | None) -> None:
+@click.option(
+    "--stdin",
+    "from_stdin",
+    is_flag=True,
+    help="Read a secret value from piped stdin (secret keys only; never a TTY).",
+)
+def config_set(key: str, value: str | None, from_stdin: bool) -> None:
     """Set a config key.
 
-    Secrets (GH_TOKEN, API keys, etc.) must be entered at the prompt;
-    passing them as a positional VALUE leaks into shell history.
+    Secrets (GH_TOKEN, API keys, etc.) must be entered at the prompt, or piped
+    in with --stdin; passing them as a positional VALUE leaks into shell history.
     """
     if key not in SETTABLE_KEYS:
         sorted_keys = ", ".join(sorted(SETTABLE_KEYS))
         raise click.ClickException(f"unknown config key {key!r}. Valid keys: {sorted_keys}")
 
-    if key in SECRET_KEYS:
+    if from_stdin:
+        value = _read_secret_from_stdin(key, value)
+    elif key in SECRET_KEYS:
         if value is not None:
             # Refuse early: a secret value on argv is visible in `ps` and shell history.
             raise click.ClickException(
@@ -4700,7 +4741,8 @@ def config_set(key: str, value: str | None) -> None:
         if not _stdin_is_interactive():
             raise click.UsageError(
                 f"{key} is a secret and needs an interactive prompt, but stdin is not a TTY. "
-                f"Run `franky config set {key}` in a terminal, or edit the config file directly."
+                f"Run `franky config set {key}` in a terminal, pipe it in with "
+                f"`franky config set {key} --stdin`, or edit the config file directly."
             )
         # Hidden prompt - value never echoed to the terminal.
         value = click.prompt(key, hide_input=True)

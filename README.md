@@ -160,7 +160,7 @@ Run `franky COMMAND --help` for flags and examples. Run `franky schema` for the 
 | `franky auth status codex` | Check the stored Codex authentication. |
 | `franky auth logout codex` | Delete the Codex authentication volume. |
 | `franky config init` | Create or update the user configuration. |
-| `franky config set KEY [VALUE]` | Set one configuration value. Secret values use a hidden prompt. |
+| `franky config set KEY [VALUE]` | Set one configuration value. Secret values use a hidden prompt, or `--stdin` to read one piped line. |
 | `franky config list` | List configuration values with secrets masked. |
 | `franky config path` | Print the configuration path. |
 | `franky profile init` | Discover setups and merge profile selections. |
