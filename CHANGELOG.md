@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-09-30
+
 ### Fixed
 
 - An image pull that hangs no longer holds a run forever. `docker pull` now stops after 15 minutes, and the run exits with a "pull did not finish" error.
