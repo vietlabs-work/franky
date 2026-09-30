@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-09-30
+
 ### Added
 
 - `franky config set KEY --stdin` reads a secret from piped stdin, so a wrapper can hand over a token without a TTY. It accepts secret keys only. It refuses a TTY, a positional value, an empty or multi-line value, a non-ASCII or control character, and more than 64 KiB. Trailing newlines are stripped; no error prints the value.
