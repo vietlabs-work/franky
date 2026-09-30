@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-09-30
+
 ### Added
 
 - `franky job status` reports a run's `state` (`active`, `quiet`, `unknown`, `orphaned`, `finished`) and one structured `next` step with its exact command and whether a retry is safe. An uncertain check gives `unknown`, never a kill or a rerun.
