@@ -1034,6 +1034,12 @@ def test_engine_image_pull_failure_does_not_try_full_image(monkeypatch):
     assert images == [f"ghcr.io/vietlabs-work/franky:{__version__}-pi"]
 
 
+def test_engine_image_pull_timeout_names_the_timeout(monkeypatch):
+    monkeypatch.setattr(cli, "ensure_image_available", lambda image: (False, "pull-timeout"))
+    with pytest.raises(cli.DockerError, match="pull did not finish"):
+        cli._ensure_images({}, "codex")
+
+
 # ---------------------------------------------------------------------------
 # config subgroup
 # ---------------------------------------------------------------------------

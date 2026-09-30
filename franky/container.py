@@ -150,6 +150,9 @@ PROXY_READY_POLLS = 30
 PROXY_READY_INTERVAL = 0.5
 PROXY_READY_TIMEOUT = 15.0
 PROXY_PROBE_TIMEOUT = 2.0
+# A pull that hangs (registry or network stall) must end the run with an error, not hold it
+# forever: `docker pull` has no timeout of its own. 15 min covers a ~1.8 GB image at ~2 MB/s.
+PULL_TIMEOUT_SECS = 900
 
 # The mid-run steering mailbox (issue #72, `franky job attach`). HOME (/home/franky) is one of
 # the writable volumes under --read-only (see _HARDENING above), so a file written there by
@@ -1571,19 +1574,24 @@ def resolve_image(
     return f"{repo}/{name}:{tag}"
 
 
-def ensure_image_available(image: str, runner=subprocess.run) -> tuple[bool, str]:
+def ensure_image_available(
+    image: str, runner=subprocess.run, timeout: float = PULL_TIMEOUT_SECS
+) -> tuple[bool, str]:
     """Ensure `image` is available locally, pulling if needed.
     Returns (True, "") on success.
     Returns (False, "no-docker") if docker is not available (OSError).
     Returns (False, "auth") if the pull failed with an auth/credentials error.
+    Returns (False, "pull-timeout") if the pull did not finish within `timeout` seconds.
     Returns (False, "pull-failed") for any other pull failure.
     Never raises."""
     if image_exists(image, runner):
         return True, ""
     try:
-        proc = runner(["docker", "pull", image], capture_output=True, text=True)
+        proc = runner(["docker", "pull", image], capture_output=True, text=True, timeout=timeout)
     except OSError:
         return False, "no-docker"
+    except subprocess.TimeoutExpired:
+        return False, "pull-timeout"
     if proc.returncode == 0:
         return True, ""
     combined = ((proc.stdout or "") + (proc.stderr or "")).lower()

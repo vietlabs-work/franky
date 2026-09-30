@@ -8,6 +8,7 @@ from franky.container import (
     CODEX_AUTH_HOME,
     FRANKY_PROXY_IMAGE_VAR,
     GHCR_REPO_VAR,
+    PULL_TIMEOUT_SECS,
     STEER_FILE,
     build_docker_argv,
     build_codex_auth_scrub_argv,
@@ -831,6 +832,21 @@ def test_ensure_image_available_absent_pull_failed():
     ok, reason = ensure_image_available("ghcr.io/vietlabs-work/franky:0.1.0", runner=fake_runner)
     assert ok is False
     assert reason == "pull-failed"
+
+
+def test_ensure_image_available_pull_timeout():
+    seen = {}
+
+    def fake_runner(argv, **kwargs):
+        if argv[:3] == ["docker", "image", "inspect"]:
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="no such image")
+        seen["timeout"] = kwargs.get("timeout")
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=kwargs.get("timeout"))
+
+    ok, reason = ensure_image_available("franky:0.1.0", runner=fake_runner)
+    assert ok is False
+    assert reason == "pull-timeout"
+    assert seen["timeout"] == PULL_TIMEOUT_SECS
 
 
 def test_ensure_image_available_oserror():

@@ -43,6 +43,7 @@ from .container import (
     codex_auth_status,
     FRANKY_IMAGE_VAR,
     FRANKY_PROXY_IMAGE_VAR,
+    PULL_TIMEOUT_SECS,
     capture_diagnostics,
     ensure_image_available,
     resolve_image,
@@ -1603,6 +1604,12 @@ def _ensure_images(env: Mapping[str, str], engine: str) -> tuple[str, str]:
                     f"{label} image '{img}' needs auth to pull - run `docker login ghcr.io` "
                     f"(a PAT with read:packages), or for local dev `{dev_build}` "
                     f"and set {dev_var}=<local-tag>."
+                )
+            if reason == "pull-timeout":
+                raise DockerError(
+                    f"{label} image '{img}' pull did not finish in {PULL_TIMEOUT_SECS}s - "
+                    f"check the network and registry, then retry, or pre-pull with "
+                    f"`docker pull {img}`."
                 )
             raise DockerError(
                 f"{label} image '{img}' not found locally and could not be pulled. "
