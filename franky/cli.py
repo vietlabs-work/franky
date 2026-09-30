@@ -95,6 +95,7 @@ from .prompt import (
 from .reviewpr import build_review_findings, parse_review_findings, render_review_body, review_event
 from .result import (
     EXIT_AGENT,
+    EXIT_CONFIG,
     EXIT_NETWORK,
     EXIT_SUCCESS,
     EXIT_TIMEOUT,
@@ -103,6 +104,7 @@ from .result import (
     ConfigError,
     DockerError,
     FrankyError,
+    ImagePullTimeout,
     NetworkError,
     TaskRejected,
     build_error,
@@ -306,6 +308,28 @@ def _emit_result(
 @click.group()
 def main() -> None:
     """Franky - a lean personal coding agent that builds in a container and opens a PR."""
+
+
+@main.command("pull-images", hidden=True)
+def pull_images() -> None:
+    """Pull the task and proxy images for this version (run by `franky update`)."""
+    # Resolve the engine and image the way a real run does, config file included, on a
+    # copy so a pull never changes this process's environment.
+    env = dict(os.environ)
+    try:
+        load_config_file(env)
+        engine = resolve_engine(None, env).name
+    except ValueError as exc:
+        click.echo(f"franky: {exc}", err=True)
+        sys.exit(EXIT_CONFIG)
+    try:
+        click.echo("franky: pulling images ...", err=True)
+        franky_img, proxy_img = _ensure_images(env, engine)
+    except FrankyError as exc:
+        hint = f" ({exc.hint})" if exc.hint else ""
+        click.echo(f"franky: image pull failed: {exc}{hint}", err=True)
+        sys.exit(exc.code)
+    click.echo(f"franky: images ready: {franky_img}, {proxy_img}", err=True)
 
 
 @main.command("apparmor-profile")
@@ -1611,10 +1635,13 @@ def _ensure_images(env: Mapping[str, str], engine: str) -> tuple[str, str]:
                     f"and set {dev_var}=<local-tag>."
                 )
             if reason == "pull-timeout":
-                raise DockerError(
+                raise ImagePullTimeout(
                     f"{label} image '{img}' pull did not finish in {PULL_TIMEOUT_SECS}s - "
-                    f"check the network and registry, then retry, or pre-pull with "
-                    f"`docker pull {img}`."
+                    f"nothing ran, so retrying is safe. Pre-pull with `docker pull {img}`.",
+                    hint=(
+                        f"Nothing ran, so retrying is safe. Pre-pull with `docker pull {img}`, "
+                        "then run the command again."
+                    ),
                 )
             raise DockerError(
                 f"{label} image '{img}' not found locally and could not be pulled. "

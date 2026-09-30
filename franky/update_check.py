@@ -47,6 +47,7 @@ from pathlib import Path
 
 from . import franky_version
 from ._install import DIST_NAME, Install, detect_install
+from .container import PULL_TIMEOUT_SECS
 
 # Self-update reinstalls by the published distribution name (DIST_NAME, defined once in
 # _install.py); the latest version is read from PyPI's JSON API for the same package.
@@ -212,7 +213,32 @@ def force_update(
         return 1
 
     out(f"franky: {'reinstalled' if (not newer and force) else 'updated to'} {_vstr(tag)}")
+    _prepull_images(runner, out)
     return 0
+
+
+def _prepull_images(runner: Callable, out: Callable[[str], None]) -> None:
+    """Best-effort: pull the NEW version's images so the first run needs no 1.2 GB pull.
+
+    The install replaced the package in this interpreter's environment, so a child process
+    resolves the new version's tags. It inherits stderr for progress and caps each pull itself;
+    the outer timeout only guards a hung child. Never changes the update's exit code.
+    """
+    # -I (isolated): never import a `franky` from the current directory, so an update
+    # run inside a checkout still runs the newly installed code with the user's creds.
+    argv = [sys.executable, "-I", "-m", "franky.cli", "pull-images"]
+    try:
+        proc = runner(argv, timeout=2 * PULL_TIMEOUT_SECS + 60)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        proc = None
+        reason = f"({exc})"
+    else:
+        reason = f"(exit {proc.returncode})"
+    if proc is None or proc.returncode != 0:
+        out(
+            f"franky: image pre-pull did not finish {reason}. Update is installed. "
+            "The next run pulls the images, or pull them now with the `docker pull` command above."
+        )
 
 
 # ---------------------------------------------------------------------------

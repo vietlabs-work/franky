@@ -98,6 +98,12 @@ class DockerError(FrankyError):
     kind = "docker_error"
 
 
+class ImagePullTimeout(DockerError):
+    """The image pull hit its time cap. Nothing ran, so a retry is safe. Exit 6."""
+
+    kind = "image_pull_timeout"
+
+
 class NetworkError(FrankyError):
     """Network/timeout reaching JIRA, HTTP error, or unparseable response. Exit 8."""
 

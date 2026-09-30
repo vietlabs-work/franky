@@ -339,3 +339,8 @@ def test_schema_documents_thread_outputs():
     assert "thread_id" in schema["job_record_schema"]
     review_flags = {f["name"] for f in schema["commands"]["review-pr"]["flags"]}
     assert {"use_thread", "rubric_version"} <= review_flags
+
+
+def test_error_schema_lists_image_pull_timeout():
+    kind = build_schema(cli.main)["error_schema"]["error"]["kind"]
+    assert "image_pull_timeout" in kind

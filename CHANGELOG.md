@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `franky update` now pre-pulls the new version's task and proxy images after a successful install, so the first run does not stall on a 1.2 GB pull. It is best effort: a failed or slow pull never fails the update.
+
+### Changed
+
+- A pull that hits the time cap now fails with error kind `image_pull_timeout` (still exit 6) instead of `docker_error`. The hint says nothing ran, a retry is safe, and names `docker pull <image>`.
+
 ## [0.3.6] - 2026-09-30
 
 ### Fixed

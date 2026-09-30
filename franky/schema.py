@@ -380,7 +380,10 @@ _JSON_OUTPUTS: dict[tuple[str, ...], dict] = {
 _ERROR_SCHEMA: dict = {
     "error": {
         "code": "the process exit code (see exit_codes)",
-        "kind": "a stable machine slug for the failure class (e.g. config_error)",
+        "kind": (
+            "a stable machine slug for the failure class (e.g. config_error). "
+            "image_pull_timeout: the image pull hit its cap, nothing ran, retry is safe (exit 6)"
+        ),
         "message": "a redacted, human-readable message",
         "hint": "an optional operator-facing remediation hint (may be empty)",
     }

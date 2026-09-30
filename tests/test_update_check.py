@@ -3,6 +3,7 @@
 No real network, no real subprocess, no real `gh` - every side effect is injected.
 """
 
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -213,7 +214,7 @@ def test_force_update_upgrades_and_reports_version():
     lines, out = _collect()
 
     def runner(argv, **kw):
-        calls["argv"] = argv
+        calls.setdefault("argv", argv)
         return _proc(returncode=0)
 
     code = force_update(
@@ -241,7 +242,7 @@ def test_force_update_force_reinstalls_same_version():
     lines, out = _collect()
 
     def runner(argv, **kw):
-        calls["argv"] = argv
+        calls.setdefault("argv", argv)
         return _proc(returncode=0)
 
     code = force_update(
@@ -499,7 +500,7 @@ def test_auto_update_opt_in_installs_for_next_run(tmp_path):
     lines, out = _collect()
 
     def runner(argv, **kw):
-        calls["argv"] = argv
+        calls.setdefault("argv", argv)
         return _proc(returncode=0)
 
     _au(
@@ -542,3 +543,87 @@ def test_auto_update_opt_in_install_failure_is_soft(tmp_path):
     blob = "\n".join(lines)
     assert "v0.2.0 available" in blob
     assert "auto-install of v0.2.0 failed" in blob
+
+
+def _pull_argv():
+    import sys
+
+    return [sys.executable, "-I", "-m", "franky.cli", "pull-images"]
+
+
+def test_force_update_prepulls_after_install():
+    argvs = []
+    lines, out = _collect()
+
+    def runner(argv, **kw):
+        argvs.append((argv, kw))
+        return _proc(returncode=0)
+
+    code = force_update(
+        install=Install("uv tool", "/x/uv/tools/franky/bin/python"),
+        current="0.1.0",
+        fetch=lambda: "v0.2.0",
+        runner=runner,
+        out=out,
+    )
+    assert code == 0
+    assert [a for a, _ in argvs][1] == _pull_argv()  # after the install, via the new package
+    assert argvs[1][1]["timeout"] > 0
+    assert not any("pre-pull" in ln for ln in lines)
+
+
+def test_force_update_noop_does_not_prepull():
+    lines, out = _collect()
+    code = force_update(
+        install=Install("pip", "/usr/bin/python3"),
+        current="0.2.0",
+        fetch=lambda: "v0.2.0",
+        runner=lambda *a, **k: pytest.fail("no install and no pull when already current"),
+        out=out,
+    )
+    assert code == 0
+
+
+def test_force_update_failed_install_does_not_prepull():
+    argvs = []
+    _, out = _collect()
+
+    def runner(argv, **kw):
+        argvs.append(argv)
+        return _proc(returncode=1)
+
+    code = force_update(
+        install=Install("pip", "/usr/bin/python3"),
+        current="0.1.0",
+        fetch=lambda: "v0.2.0",
+        runner=runner,
+        out=out,
+    )
+    assert code == 1
+    assert len(argvs) == 1
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        lambda: _proc(returncode=6),
+        lambda: (_ for _ in ()).throw(subprocess.TimeoutExpired("pull", 1)),
+        lambda: (_ for _ in ()).throw(OSError("boom")),
+    ],
+)
+def test_force_update_prepull_failure_keeps_update_successful(failure):
+    lines, out = _collect()
+
+    def runner(argv, **kw):
+        return _proc(returncode=0) if argv[0] == "uv" else failure()
+
+    code = force_update(
+        install=Install("uv tool", "/x/uv/tools/franky/bin/python"),
+        current="0.1.0",
+        fetch=lambda: "v0.2.0",
+        runner=runner,
+        out=out,
+    )
+    assert code == 0
+    assert any("updated to v0.2.0" in ln for ln in lines)
+    assert any("pre-pull did not finish" in ln and "docker pull" in ln for ln in lines)

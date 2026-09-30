@@ -13,6 +13,7 @@ import franky.jobs as jobs
 from click.testing import CliRunner
 
 from franky import __version__
+from franky.schema import build_schema
 from franky._install import Install
 
 PR_URL = "https://github.com/me/repo/pull/11"
@@ -1036,8 +1037,73 @@ def test_engine_image_pull_failure_does_not_try_full_image(monkeypatch):
 
 def test_engine_image_pull_timeout_names_the_timeout(monkeypatch):
     monkeypatch.setattr(cli, "ensure_image_available", lambda image: (False, "pull-timeout"))
-    with pytest.raises(cli.DockerError, match="pull did not finish"):
+    with pytest.raises(cli.DockerError, match="pull did not finish") as info:
         cli._ensure_images({}, "codex")
+    exc = info.value
+    assert isinstance(exc, cli.ImagePullTimeout)
+    assert exc.kind == "image_pull_timeout"
+    assert exc.code == 6
+    assert "safe" in exc.hint and "docker pull ghcr.io/" in exc.hint
+    # Text output prints only the message, so the remediation must be there too.
+    assert "retrying is safe" in str(exc) and "docker pull ghcr.io/" in str(exc)
+
+
+@pytest.mark.parametrize("cmd", [["build", "do it", "--repo", "me/repo"], ["iterate", PR_URL]])
+def test_pull_timeout_json_error_kind_and_exit(monkeypatch, cmd):
+    env = {**_mc_env(), "FRANKY_CONFIG_FILE": os.environ["FRANKY_CONFIG_FILE"]}
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (False, "pull-timeout"))
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, [*cmd, "--json"])
+    assert res.exit_code == 6
+    err = json.loads(res.stdout)["error"]
+    assert err["kind"] == "image_pull_timeout"
+    assert err["code"] == 6
+    assert "docker pull" in err["hint"]
+
+
+def test_pull_images_pulls_both_and_reports_on_stderr(monkeypatch, tmp_path):
+    pulled = []
+    monkeypatch.setattr(cli.os, "environ", {"FRANKY_ENGINE": "codex", **_cfg_env(tmp_path)})
+    monkeypatch.setattr(
+        cli, "ensure_image_available", lambda image: pulled.append(image) or (True, "")
+    )
+    res = CliRunner().invoke(cli.main, ["pull-images"])
+    assert res.exit_code == 0, res.output
+    assert pulled == [
+        f"ghcr.io/vietlabs-work/franky:{__version__}-codex",
+        f"ghcr.io/vietlabs-work/franky-proxy:{__version__}",
+    ]
+    assert res.stdout == ""
+
+
+def test_pull_images_failure_exits_with_error_code_and_docker_pull(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli.os, "environ", _cfg_env(tmp_path))
+    monkeypatch.setattr(cli, "ensure_image_available", lambda image: (False, "pull-timeout"))
+    res = CliRunner().invoke(cli.main, ["pull-images"])
+    assert res.exit_code == 6
+    assert "docker pull ghcr.io/" in res.output
+
+
+def test_pull_images_uses_the_engine_from_the_config_file(monkeypatch, tmp_path):
+    # A bot sets its engine in the config file, not the shell: the pull must match a run.
+    env = _cfg_env(tmp_path)
+    Path(env["FRANKY_CONFIG_FILE"]).write_text('[franky]\nFRANKY_ENGINE = "claude"\n')
+    monkeypatch.setattr(cli.os, "environ", env)
+    pulled = []
+    monkeypatch.setattr(
+        cli, "ensure_image_available", lambda image: pulled.append(image) or (True, "")
+    )
+    res = CliRunner().invoke(cli.main, ["pull-images"])
+    assert res.exit_code == 0, res.output
+    assert pulled[0] == f"ghcr.io/vietlabs-work/franky:{__version__}-claude"
+    assert "FRANKY_ENGINE" not in cli.os.environ  # the copy was loaded, not the process env
+
+
+def test_pull_images_is_hidden_from_help_but_in_schema():
+    assert "pull-images" not in CliRunner().invoke(cli.main, ["--help"]).output
+    assert "pull-images" in build_schema(cli.main)["commands"]
 
 
 # ---------------------------------------------------------------------------
