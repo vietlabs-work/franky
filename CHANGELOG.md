@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `franky update` now removes old franky images after the update. It keeps the images of the version before the update and of the new version. Docker refuses to remove an image that a container uses, so a running job is safe.
+
 ## [0.3.8] - 2026-10-01
 
 ### Changed

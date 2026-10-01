@@ -627,3 +627,92 @@ def test_force_update_prepull_failure_keeps_update_successful(failure):
     assert code == 0
     assert any("updated to v0.2.0" in ln for ln in lines)
     assert any("pre-pull did not finish" in ln and "docker pull" in ln for ln in lines)
+
+
+def test_force_update_prunes_images_older_than_previous_version(monkeypatch):
+    monkeypatch.delenv("FRANKY_GHCR_REPO", raising=False)
+    monkeypatch.delenv("FRANKY_PROXY_IMAGE", raising=False)
+    monkeypatch.setenv("FRANKY_IMAGE", "ghcr.io/vietlabs-work/franky:0.3.5-pi")
+    listed = "\n".join(
+        [
+            "ghcr.io/vietlabs-work/franky:0.3.8-claude",
+            "ghcr.io/vietlabs-work/franky-proxy:0.3.8",
+            "ghcr.io/vietlabs-work/franky:0.3.7-claude",
+            "ghcr.io/vietlabs-work/franky-proxy:0.3.7",
+            "ghcr.io/vietlabs-work/franky:0.3.6-claude",
+            "ghcr.io/vietlabs-work/franky-proxy:0.3.6",
+            "ghcr.io/vietlabs-work/franky:0.3.5-pi",
+            "ghcr.io/vietlabs-work/franky:0.2.0-codex",
+            "ghcr.io/vietlabs-work/franky:0.2.0-claude",
+            "ghcr.io/other/franky:0.1.0-claude",
+            "franky:latest",
+            "franky-sandbox:claude",
+            "ghcr.io/vietlabs-work/franky:dev",
+        ]
+    )
+    removed = []
+    lines, out = _collect()
+
+    def runner(argv, **kw):
+        if argv[:3] == ["docker", "image", "ls"]:
+            return _proc(stdout=listed)
+        if argv[:3] == ["docker", "image", "rm"]:
+            removed.append(argv[3])
+            # In use by a stopped container: docker refuses, the update carries on.
+            return _proc(returncode=1 if argv[3].endswith("0.2.0-codex") else 0)
+        return _proc()
+
+    code = force_update(
+        install=Install("uv tool", "/x/uv/tools/franky/bin/python"),
+        current="0.3.7",
+        fetch=lambda: "v0.3.8",
+        runner=runner,
+        out=out,
+    )
+    assert code == 0
+    assert removed == [
+        "ghcr.io/vietlabs-work/franky:0.3.6-claude",
+        "ghcr.io/vietlabs-work/franky-proxy:0.3.6",
+        "ghcr.io/vietlabs-work/franky:0.2.0-codex",
+        "ghcr.io/vietlabs-work/franky:0.2.0-claude",
+    ]
+    assert "franky: removed 3 old images" in lines
+
+
+def test_force_update_prune_failure_keeps_update_successful():
+    lines, out = _collect()
+
+    def runner(argv, **kw):
+        if argv[0] == "docker":
+            raise OSError("no docker")
+        return _proc()
+
+    code = force_update(
+        install=Install("uv tool", "/x/uv/tools/franky/bin/python"),
+        current="0.3.7",
+        fetch=lambda: "v0.3.8",
+        runner=runner,
+        out=out,
+    )
+    assert code == 0
+    assert not any("removed" in ln for ln in lines)
+
+
+def test_force_update_skips_prune_when_config_is_malformed(monkeypatch, tmp_path):
+    bad = tmp_path / "config.toml"
+    bad.write_text("not = [valid")
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", str(bad))
+
+    def runner(argv, **kw):
+        if argv[0] == "docker":
+            pytest.fail("must not touch images when the config cannot load")
+        return _proc()
+
+    code = force_update(
+        install=Install("uv tool", "/x/uv/tools/franky/bin/python"),
+        current="0.3.7",
+        fetch=lambda: "v0.3.8",
+        runner=runner,
+        out=lambda _: None,
+    )
+    assert code == 0

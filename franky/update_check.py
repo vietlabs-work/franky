@@ -47,7 +47,14 @@ from pathlib import Path
 
 from . import franky_version
 from ._install import DIST_NAME, Install, detect_install
-from .container import PULL_TIMEOUT_SECS
+from .container import (
+    DEFAULT_GHCR_REPO,
+    FRANKY_IMAGE_VAR,
+    FRANKY_PROXY_IMAGE_VAR,
+    GHCR_REPO_VAR,
+    PULL_TIMEOUT_SECS,
+)
+from .userconfig import load_config_file
 
 # Self-update reinstalls by the published distribution name (DIST_NAME, defined once in
 # _install.py); the latest version is read from PyPI's JSON API for the same package.
@@ -214,6 +221,7 @@ def force_update(
 
     out(f"franky: {'reinstalled' if (not newer and force) else 'updated to'} {_vstr(tag)}")
     _prepull_images(runner, out)
+    _prune_old_images(runner, out, keep={_vstr(current), _vstr(tag)})
     return 0
 
 
@@ -239,6 +247,53 @@ def _prepull_images(runner: Callable, out: Callable[[str], None]) -> None:
             f"franky: image pre-pull did not finish {reason}. Update is installed. "
             "The next run pulls the images, or pull them now with the `docker pull` command above."
         )
+
+
+# `<repo>/franky:X.Y.Z-<engine>` or `<repo>/franky-proxy:X.Y.Z`. Dev tags never match.
+_IMAGE_TAG_RE = re.compile(r"^(franky:(\d+\.\d+\.\d+)-[a-z]+|franky-proxy:(\d+\.\d+\.\d+))$")
+
+
+def _prune_old_images(runner: Callable, out: Callable[[str], None], keep: set[str]) -> None:
+    """Best-effort: remove released franky images whose version is not in `keep`.
+
+    `keep` holds the version that ran before the update (jobs may still use it) and the new
+    one. Plain `docker image rm` (no -f) refuses images that a container uses, so a live job
+    is never broken. Never changes the update's exit code.
+    """
+    env = dict(os.environ)
+    try:
+        load_config_file(env)
+    except ValueError:
+        return  # unknown registry or overrides: deleting could hit the wrong images
+    pinned = {env.get(FRANKY_IMAGE_VAR), env.get(FRANKY_PROXY_IMAGE_VAR)}
+    prefix = (env.get(GHCR_REPO_VAR) or DEFAULT_GHCR_REPO).rstrip("/") + "/"
+    try:
+        proc = runner(
+            ["docker", "image", "ls", "--format", "{{.Repository}}:{{.Tag}}"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    if proc.returncode != 0:
+        return
+    stale = []
+    for ref in (proc.stdout or "").split():
+        if not ref.startswith(prefix) or ref in pinned:
+            continue
+        m = _IMAGE_TAG_RE.match(ref[len(prefix) :])
+        if m and f"v{m.group(2) or m.group(3)}" not in keep:
+            stale.append(ref)
+    removed = 0
+    for ref in stale:
+        try:
+            rm = runner(["docker", "image", "rm", ref], capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        removed += rm.returncode == 0
+    if removed:
+        out(f"franky: removed {removed} old image{'s' if removed != 1 else ''}")
 
 
 # ---------------------------------------------------------------------------
