@@ -325,6 +325,12 @@ def compare_runtime_reports(base: list[dict], head: list[dict], budgets: dict) -
         )
     for report in head:
         check_runtime(report, budgets)
+    # Reports arrive from several runners; pair drift would silently compare the wrong runs.
+    if len({report["jobs"] for report in base + head}) != 1:
+        raise FootprintError("job count drift makes runtime comparison unresolved")
+    for side, reports in (("base", base), ("head", head)):
+        if len({report["metadata"]["source_sha"] for report in reports}) != 1:
+            raise FootprintError(f"{side} source drift makes runtime comparison unresolved")
     sandboxes = [report["metadata"]["sandbox"] for report in base + head]
     signatures = {
         (
@@ -370,11 +376,13 @@ def compare_runtime_reports(base: list[dict], head: list[dict], budgets: dict) -
     results = {"helper": {"status": "absolute_only"}}
     if all(report["scopes"]["helper"].get("status") != "unavailable_historical" for report in base):
         extractors["helper"] = lambda report: report["scopes"]["helper"]["cpu_seconds"]
+    # base[i] and head[i] ran on the same runner. Paired medians cancel runner speed.
     for name, extract in extractors.items():
-        base_cpu = statistics.median(extract(report) for report in base)
-        head_cpu = statistics.median(extract(report) for report in head)
-        delta = head_cpu - base_cpu
-        ratio = head_cpu / base_cpu if base_cpu else math.inf
+        pairs = [(extract(b), extract(h)) for b, h in zip(base, head, strict=True)]
+        base_cpu = statistics.median(b for b, _ in pairs)
+        head_cpu = statistics.median(h for _, h in pairs)
+        delta = statistics.median(h - b for b, h in pairs)
+        ratio = statistics.median(h / b if b else math.inf for b, h in pairs)
         if delta > delta_limit and ratio > ratio_limit:
             raise FootprintError(f"{name} CPU regressed: {base_cpu:.6f}s -> {head_cpu:.6f}s")
         results[name] = {

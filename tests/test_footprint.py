@@ -1,7 +1,9 @@
 """Pure tests for the footprint policy and budget harness."""
 
 import importlib.util
+import math
 from pathlib import Path
+import shutil
 import subprocess
 
 import pytest
@@ -454,3 +456,99 @@ def test_compare_runtime_rejects_cpu_regression():
 
     with pytest.raises(footprint.FootprintError, match="task CPU regressed"):
         footprint.compare_runtime_reports(base, head, budgets)
+
+
+def _paired_task_cpu(base_cpu, head_cpu):
+    base = [_runtime() for _ in base_cpu]
+    head = [_runtime() for _ in head_cpu]
+    for report, cpu in zip(base + head, base_cpu + head_cpu, strict=True):
+        report["scopes"]["task"]["cpu_seconds"] = cpu
+    return base, head
+
+
+@pytest.mark.parametrize(
+    ("head_cpu", "regressed"),
+    [
+        ([1.05, 2.1, 3.15], False),  # 5% slower on every runner
+        ([1.2, 2.4, 3.6], True),  # 20% slower on every runner
+        ([1.0, 2.0, 9.0], False),  # one outlier pair
+    ],
+)
+def test_compare_runtime_pairs_each_base_with_its_runner_head(head_cpu, regressed):
+    budgets = footprint._read_json(str(footprint.ROOT / "scripts/footprint-budgets.json"))
+    # Runners differ threefold in speed; each pair shares one runner.
+    base, head = _paired_task_cpu([1.0, 2.0, 3.0], head_cpu)
+    if regressed:
+        with pytest.raises(footprint.FootprintError, match="task CPU regressed"):
+            footprint.compare_runtime_reports(base, head, budgets)
+    else:
+        result = footprint.compare_runtime_reports(base, head, budgets)
+        assert result["task"]["status"] == "pass"
+
+
+def test_compare_runtime_zero_baseline_passes_only_within_delta():
+    budgets = footprint._read_json(str(footprint.ROOT / "scripts/footprint-budgets.json"))
+    base, head = _paired_task_cpu([0.0, 0.0, 0.0], [0.01, 0.01, 0.01])
+    assert footprint.compare_runtime_reports(base, head, budgets)["task"]["ratio"] == math.inf
+    base, head = _paired_task_cpu([0.0, 0.0, 0.0], [1.0, 1.0, 1.0])
+    with pytest.raises(footprint.FootprintError, match="task CPU regressed"):
+        footprint.compare_runtime_reports(base, head, budgets)
+
+
+def test_compare_runtime_rejects_mixed_job_counts():
+    budgets = footprint._read_json(str(footprint.ROOT / "scripts/footprint-budgets.json"))
+    base = [_runtime() for _ in range(3)]
+    head = [_runtime(), _runtime(), _runtime(jobs=4)]
+    with pytest.raises(footprint.FootprintError, match="job count drift"):
+        footprint.compare_runtime_reports(base, head, budgets)
+
+
+def test_compare_runtime_rejects_mixed_head_sources():
+    budgets = footprint._read_json(str(footprint.ROOT / "scripts/footprint-budgets.json"))
+    base = [_runtime() for _ in range(3)]
+    head = [_runtime() for _ in range(3)]
+    head[2]["metadata"]["source_sha"] = "b" * 40
+    with pytest.raises(footprint.FootprintError, match="head source drift"):
+        footprint.compare_runtime_reports(base, head, budgets)
+
+
+IMAGE_INPUTS = (
+    "Dockerfile",
+    "install-codex-native-launcher.sh",
+    "franky-dind-entrypoint.sh",
+    "proxy/Dockerfile",
+    "proxy/entrypoint.sh",
+)
+
+
+def _image_key(root):
+    script = footprint.ROOT / "scripts/footprint-image-key.sh"
+    return subprocess.run(
+        ["bash", str(script), str(root)], capture_output=True, text=True, check=False
+    )
+
+
+@pytest.mark.skipif(shutil.which("sha256sum") is None, reason="needs GNU sha256sum")
+def test_image_key_covers_every_dockerfile_input(tmp_path):
+    for name in IMAGE_INPUTS:
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text(f"{name}\n")
+    key = _image_key(tmp_path).stdout.strip()
+    assert len(key) == 16 and _image_key(tmp_path).stdout.strip() == key
+    for name in IMAGE_INPUTS:
+        original = (tmp_path / name).read_text()
+        (tmp_path / name).write_text(original + "changed\n")
+        assert _image_key(tmp_path).stdout.strip() != key, name
+        (tmp_path / name).write_text(original)
+    (tmp_path / "proxy/entrypoint.sh").unlink()
+    assert _image_key(tmp_path).returncode != 0
+
+
+def test_image_key_lists_every_file_the_dockerfiles_copy():
+    copied = set()
+    for dockerfile, prefix in (("Dockerfile", ""), ("proxy/Dockerfile", "proxy/")):
+        for line in (footprint.ROOT / dockerfile).read_text().splitlines():
+            parts = line.split()
+            if parts[:1] in (["COPY"], ["ADD"]) and not parts[1].startswith("--from="):
+                copied.update(prefix + source for source in parts[1:-1])
+    assert copied | {"Dockerfile", "proxy/Dockerfile"} == set(IMAGE_INPUTS)

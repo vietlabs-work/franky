@@ -1,0 +1,53 @@
+name: Footprint cache
+
+# Refresh what pull request footprint runs reuse: the BuildKit layer cache for every image
+# variant, and prebuilt pi and proxy images keyed by scripts/footprint-image-key.sh.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: footprint-cache
+  cancel-in-progress: true
+
+env:
+  DOCKER_BUILD_SUMMARY: false
+  DOCKER_BUILD_RECORD_UPLOAD: false
+
+jobs:
+  cache:
+    name: cache (${{ matrix.variant }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [all, pi, claude, codex, opencode, proxy]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Compute the image key
+        id: key
+        run: echo "key=$(bash scripts/footprint-image-key.sh)" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        if: matrix.variant == 'pi' || matrix.variant == 'proxy'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Fresh apt and npm layers: this job reads no cache, so stale layers never persist.
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.variant == 'proxy' && 'proxy' || '.' }}
+          build-args: ${{ matrix.variant != 'proxy' && format('FRANKY_ENGINE={0}', matrix.variant) || '' }}
+          provenance: false
+          # zstd layers unpack several times faster than gzip on the pulling runner.
+          outputs: ${{ (matrix.variant == 'pi' || matrix.variant == 'proxy') && 'type=image,push=true,compression=zstd,force-compression=true' || 'type=cacheonly' }}
+          tags: ghcr.io/${{ github.repository_owner }}/franky-footprint-cache:${{ matrix.variant }}-${{ steps.key.outputs.key }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.variant }},ignore-error=true,timeout=5m

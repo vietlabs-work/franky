@@ -22,8 +22,11 @@ jobs:
     uses: ./.github/workflows/footprint.yml
     with:
       mode: full
+    # packages: read lets the runtime jobs declare the pull request image pull; release runs
+    # build their own images.
     permissions:
       contents: read
+      packages: read
 
   # guard-before-publish: assert the three version sources agree before any tag or PyPI publish.
   guard:

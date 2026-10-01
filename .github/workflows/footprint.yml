@@ -19,17 +19,25 @@ concurrency:
   group: footprint-${{ github.ref }}
   cancel-in-progress: true
 
-# Independent checks run on separate runners in parallel. Every base-vs-head comparison stays
-# on one runner, so runner variance never mixes into a comparison.
+# Every job starts at t=0 and selects its own work with scripts/footprint-select.sh. Every
+# base-vs-head measurement pair stays on one runner, so runner speed never mixes into a pair.
+# Pull request builds read the layer cache and the prebuilt images of footprint-cache.yml;
+# other events build fresh apt and npm layers.
+env:
+  DOCKER_BUILD_SUMMARY: false
+  DOCKER_BUILD_RECORD_UPLOAD: false
+  EVENT: ${{ github.event_name }}
+  REQUESTED_MODE: ${{ inputs.mode }}
+  BASE_SHA: ${{ github.event.pull_request.base.sha || github.sha }}
+  HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+  RUN_TAG: footprint-${{ github.run_id }}-${{ github.run_attempt }}
+
 jobs:
   policy:
     name: policy and host
     # Fixed benchmark host; never relax production hardening to make measurements pass.
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    outputs:
-      checks: ${{ steps.select.outputs.checks }}
-      variants: ${{ steps.select.outputs.variants }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -41,29 +49,11 @@ jobs:
         run: pip install -e ".[dev]"
       - name: Select bounded checks
         id: select
-        env:
-          EVENT: ${{ github.event_name }}
-          REQUESTED_MODE: ${{ inputs.mode }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          if [ "$EVENT" != "pull_request" ] || [ "$REQUESTED_MODE" = "full" ]; then
-            checks="host,images,runtime"
-            variants="all,pi,claude,codex,opencode,proxy"
-          else
-            mapfile -d '' paths < <(git diff --name-only -z "$BASE_SHA" "$HEAD_SHA")
-            checks=$(python3 scripts/footprint.py select "${paths[@]}")
-            variants=$(python3 scripts/footprint.py variants "${paths[@]}")
-          fi
-          echo "checks=$checks" >> "$GITHUB_OUTPUT"
-          echo "variants=$variants" >> "$GITHUB_OUTPUT"
-          echo "Selected: $checks; images: ${variants:-none}"
+        run: bash scripts/footprint-select.sh
       - name: Validate footprint policy
         run: pytest -q tests/test_footprint.py tests/test_smoke_memory.py
       - name: Compare fixed host workloads
         if: contains(steps.select.outputs.checks, 'host')
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.sha }}
         run: |
           scratch=$(mktemp -d)
           base="$scratch/base"
@@ -91,81 +81,145 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: footprint-${{ github.run_id }}-${{ github.run_attempt }}-host
+          name: footprint-host
           path: /tmp/footprint-*.json
           if-no-files-found: ignore
+          overwrite: true
           retention-days: 14
 
   images:
-    name: images
-    needs: policy
-    if: contains(needs.policy.outputs.checks, 'images')
+    name: image (${{ matrix.variant }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-      - name: Install test dependencies
-        run: pip install -e ".[dev]"
-      - name: Build and measure owned images
-        env:
-          VARIANTS: ${{ needs.policy.outputs.variants }}
-          RUN_TAG: footprint-${{ github.run_id }}-${{ github.run_attempt }}
-        run: |
-          cleanup() {
-            docker image ls --filter "label=franky.footprint.run=$RUN_TAG" -q \
-              | sort -u | xargs -r docker image rm -f
-          }
-          trap cleanup EXIT
-          image_args=()
-          for variant in ${VARIANTS//,/ }; do
-            if [ "$variant" = "proxy" ]; then
-              docker build --label "franky.footprint.run=$RUN_TAG" -t "$RUN_TAG:proxy" proxy
-            else
-              docker build \
-                --label "franky.footprint.run=$RUN_TAG" \
-                --build-arg "FRANKY_ENGINE=$variant" \
-                -t "$RUN_TAG:$variant" .
-            fi
-            image_args+=(--image "$variant=$RUN_TAG:$variant")
-          done
-          python3 scripts/footprint.py images \
-            "${image_args[@]}" \
-            --budgets scripts/footprint-budgets.json \
-            --output /tmp/footprint-images.json
-      - name: Upload bounded summary
-        if: always()
-        uses: actions/upload-artifact@v6
-        with:
-          name: footprint-${{ github.run_id }}-${{ github.run_attempt }}-images
-          path: /tmp/footprint-*.json
-          if-no-files-found: ignore
-          retention-days: 14
-
-  runtime:
-    # suite "smoke" runs the security, DinD, resume and profile smokes. A number runs the
-    # base-vs-head memory comparison with that many concurrent jobs.
-    name: runtime (${{ matrix.suite }})
-    needs: policy
-    if: contains(needs.policy.outputs.checks, 'runtime')
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
-        suite: [smoke, "2", "4"]
+        variant: [all, pi, claude, codex, opencode, proxy]
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
+      - name: Select bounded checks
+        id: select
+        run: bash scripts/footprint-select.sh
+      - name: Decide whether this variant is measured
+        id: want
+        env:
+          CHECKS: ${{ steps.select.outputs.checks }}
+          VARIANTS: ${{ steps.select.outputs.variants }}
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          if [[ ",$CHECKS," == *,images,* && ",$VARIANTS," == *",$VARIANT,"* ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: docker/setup-buildx-action@v3
+        if: steps.want.outputs.run
+      - uses: docker/build-push-action@v6
+        if: steps.want.outputs.run
+        with:
+          context: ${{ matrix.variant == 'proxy' && 'proxy' || '.' }}
+          build-args: ${{ matrix.variant != 'proxy' && format('FRANKY_ENGINE={0}', matrix.variant) || '' }}
+          load: true
+          provenance: false
+          tags: ${{ env.RUN_TAG }}:${{ matrix.variant }}
+          cache-from: ${{ github.event_name == 'pull_request' && format('type=gha,scope={0}', matrix.variant) || '' }}
+      - name: Measure the image
+        if: steps.want.outputs.run
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          python3 scripts/footprint.py images \
+            --image "$VARIANT=$RUN_TAG:$VARIANT" \
+            --budgets scripts/footprint-budgets.json \
+            --output "/tmp/footprint-images-$VARIANT.json"
+      - name: Upload bounded summary
+        if: always() && steps.want.outputs.run
+        uses: actions/upload-artifact@v6
+        with:
+          name: footprint-images-${{ matrix.variant }}
+          path: /tmp/footprint-*.json
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 14
+
+  runtime:
+    # suite "smoke" runs the security, DinD, resume and profile smokes. Other suites measure
+    # base and head memory runs for their repeats; runtime-compare judges all repeats together.
+    # Pull requests measure one base-and-head pair per runner. Other events compare a commit
+    # to itself, so one runner per job count measures the three head runs.
+    name: runtime (${{ matrix.suite }})
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(github.event_name == 'pull_request' && '[{"suite":"smoke"},{"suite":"2-1","jobs":2,"repeats":"1"},{"suite":"2-2","jobs":2,"repeats":"2"},{"suite":"2-3","jobs":2,"repeats":"3"},{"suite":"4-1","jobs":4,"repeats":"1"},{"suite":"4-2","jobs":4,"repeats":"2"},{"suite":"4-3","jobs":4,"repeats":"3"}]' || '[{"suite":"smoke"},{"suite":"2","jobs":2,"repeats":"1 2 3"},{"suite":"4","jobs":4,"repeats":"1 2 3"}]') }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Select bounded checks
+        id: select
+        run: bash scripts/footprint-select.sh
+      # Pull requests reuse the pi and proxy images that footprint-cache.yml built on main for
+      # the same image key. The pull runs in the background during the setup steps below, and a
+      # missing key falls back to a build.
+      - uses: docker/login-action@v3
+        if: github.event_name == 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Decide whether runtime is measured
+        id: want
+        env:
+          CHECKS: ${{ steps.select.outputs.checks }}
+          SUITE: ${{ matrix.suite }}
+          CACHE: ghcr.io/${{ github.repository_owner }}/franky-footprint-cache
+        run: |
+          if [[ ",$CHECKS," == *,runtime,* ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            head_key=$(bash scripts/footprint-image-key.sh)
+            echo "head_key=$head_key" >> "$GITHUB_OUTPUT"
+            if [ "$SUITE" != smoke ]; then
+              git worktree add --detach "$RUNNER_TEMP/base" "$BASE_SHA"
+              base_key=$(bash scripts/footprint-image-key.sh "$RUNNER_TEMP/base")
+              if [ "$base_key" != "$head_key" ]; then
+                echo "base_key=$base_key" >> "$GITHUB_OUTPUT"
+              else
+                base_key=
+              fi
+            fi
+            if [ "$EVENT" = pull_request ]; then
+              pull() {
+                docker pull -q "$CACHE:pi-$1" &
+                local pi=$!
+                docker pull -q "$CACHE:proxy-$1" || { wait "$pi"; return 1; }
+                wait "$pi" \
+                  && docker tag "$CACHE:pi-$1" "$RUN_TAG:${2}pi" \
+                  && docker tag "$CACHE:proxy-$1" "$RUN_TAG:${2}proxy"
+              }
+              pulls="$RUNNER_TEMP/pulls"
+              mkdir "$pulls"
+              {
+                if pull "$head_key" ""; then touch "$pulls/head"; fi
+                if [ -n "${base_key:-}" ] && pull "$base_key" base-; then touch "$pulls/base"; fi
+                touch "$pulls/done"
+              } < /dev/null > "$pulls/log" 2>&1 &
+            fi
+          fi
       - uses: actions/setup-python@v6
+        if: steps.want.outputs.run
         with:
           python-version: "3.12"
-      - name: Install test dependencies
-        run: pip install -e ".[dev]"
+      - name: Install Franky
+        if: steps.want.outputs.run
+        run: pip install -e .
       - name: Record runtime host prerequisites
+        if: steps.want.outputs.run
         run: |
           uname -a
           docker info --format '{{json .SecurityOptions}}'
@@ -173,100 +227,174 @@ jobs:
           sysctl user.max_user_namespaces || echo "userns limit unavailable"
           sysctl kernel.apparmor_restrict_unprivileged_userns || echo "AppArmor userns setting unavailable"
       - name: Load task AppArmor profile
+        if: steps.want.outputs.run
         run: |
           franky apparmor-profile > "$RUNNER_TEMP/franky-task.apparmor"
           sudo /usr/sbin/apparmor_parser -K -r "$RUNNER_TEMP/franky-task.apparmor"
-      - name: Run runtime checks
-        env:
-          SUITE: ${{ matrix.suite }}
-          RUN_TAG: footprint-${{ github.run_id }}-${{ github.run_attempt }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.sha }}
+      - name: Wait for prebuilt images
+        id: pull
+        if: steps.want.outputs.run && github.event_name == 'pull_request'
         run: |
-          scratch=$(mktemp -d)
-          base="$scratch/base"
-          base_build=
-          cleanup() {
-            if [ -n "$base_build" ]; then
-              kill "$base_build" 2>/dev/null || true
-            fi
-            git worktree remove --force "$base" 2>/dev/null || true
-            docker image ls --filter "label=franky.footprint.run=$RUN_TAG" -q \
-              | sort -u | xargs -r docker image rm -f
-            rm -rf "$scratch"
-          }
-          trap cleanup EXIT
-          label=(--label "franky.footprint.run=$RUN_TAG")
-          if [ "$SUITE" != smoke ]; then
-            git worktree add --detach "$base" "$BASE_SHA"
-            if ! git diff --quiet "$BASE_SHA" HEAD -- \
-              Dockerfile proxy/Dockerfile proxy/entrypoint.sh \
-              franky-dind-entrypoint.sh install-codex-native-launcher.sh; then
-              # Build the base images next to the head images to keep them off the critical path.
-              (
-                docker build "${label[@]}" --build-arg FRANKY_ENGINE=pi -t "$RUN_TAG:base-pi" "$base" \
-                  && docker build "${label[@]}" -t "$RUN_TAG:base-proxy" "$base/proxy"
-              ) &
-              base_build=$!
-            fi
+          pulls="$RUNNER_TEMP/pulls"
+          for _ in $(seq 1 300); do
+            test -e "$pulls/done" && break
+            sleep 1
+          done
+          cat "$pulls/log"
+          test -e "$pulls/done" || { echo "image pull did not finish in 300s"; exit 1; }
+          if [ -e "$pulls/head" ]; then
+            echo "head=true" >> "$GITHUB_OUTPUT"
           fi
-          docker build "${label[@]}" --build-arg FRANKY_ENGINE=pi -t "$RUN_TAG:pi" .
-          docker build "${label[@]}" -t "$RUN_TAG:proxy" proxy
-          if [ -n "$base_build" ]; then
-            wait "$base_build"
-          elif [ "$SUITE" != smoke ]; then
+          if [ -e "$pulls/base" ]; then
+            echo "base=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: docker/setup-buildx-action@v3
+        if: >-
+          steps.want.outputs.run
+          && (!steps.pull.outputs.head || (steps.want.outputs.base_key && !steps.pull.outputs.base))
+      - uses: docker/build-push-action@v6
+        if: steps.want.outputs.run && !steps.pull.outputs.head
+        with:
+          context: .
+          build-args: FRANKY_ENGINE=pi
+          load: true
+          provenance: false
+          tags: ${{ env.RUN_TAG }}:pi
+          cache-from: ${{ github.event_name == 'pull_request' && 'type=gha,scope=pi' || '' }}
+      - uses: docker/build-push-action@v6
+        if: steps.want.outputs.run && !steps.pull.outputs.head
+        with:
+          context: proxy
+          load: true
+          provenance: false
+          tags: ${{ env.RUN_TAG }}:proxy
+          cache-from: ${{ github.event_name == 'pull_request' && 'type=gha,scope=proxy' || '' }}
+      - uses: docker/build-push-action@v6
+        if: steps.want.outputs.base_key && !steps.pull.outputs.base
+        with:
+          context: ${{ runner.temp }}/base
+          build-args: FRANKY_ENGINE=pi
+          load: true
+          provenance: false
+          tags: ${{ env.RUN_TAG }}:base-pi
+          cache-from: type=gha,scope=pi
+      - uses: docker/build-push-action@v6
+        if: steps.want.outputs.base_key && !steps.pull.outputs.base
+        with:
+          context: ${{ runner.temp }}/base/proxy
+          load: true
+          provenance: false
+          tags: ${{ env.RUN_TAG }}:base-proxy
+          cache-from: type=gha,scope=proxy
+      - name: Stop the image builder
+        if: steps.want.outputs.run
+        # The BuildKit container must not share the host with the measurements. When every
+        # image was pulled, no builder runs and the stop is a no-op.
+        env:
+          BASE_KEY: ${{ steps.want.outputs.base_key }}
+        run: |
+          docker buildx stop || true
+          if [ -z "$BASE_KEY" ]; then
             docker tag "$RUN_TAG:pi" "$RUN_TAG:base-pi"
             docker tag "$RUN_TAG:proxy" "$RUN_TAG:base-proxy"
           fi
-          if [ "$SUITE" = smoke ]; then
-            python3 scripts/smoke-security.py \
-              --image "$RUN_TAG:pi" --proxy-image "$RUN_TAG:proxy"
-            FRANKY_IMG="$RUN_TAG:pi" PROXY_IMG="$RUN_TAG:proxy" SMOKE_SKIP_BUILD=1 \
-              bash scripts/smoke-dind.sh
-            FRANKY_IMG="$RUN_TAG:pi" bash scripts/smoke-resume.sh
-            FRANKY_IMG="$RUN_TAG:pi" bash scripts/smoke-profile.sh
-            exit 0
-          fi
-          jobs="$SUITE"
-          compare_runtime() {
-            base_args=()
-            head_args=()
-            for repeat in 1 2 3; do
-              base_report="/tmp/footprint-runtime-base-$jobs-$repeat.json"
-              head_report="/tmp/footprint-runtime-head-$jobs-$repeat.json"
-              # Tag and schedule runs compare a commit to itself: reuse the head run as
-              # base (absolute budgets still apply) instead of measuring it twice.
-              if [ "$BASE_SHA" = "$GITHUB_SHA" ]; then
-                base_report="$head_report"
-              else
+      - name: Run smokes
+        if: steps.want.outputs.run && matrix.suite == 'smoke'
+        run: |
+          python3 scripts/smoke-security.py \
+            --image "$RUN_TAG:pi" --proxy-image "$RUN_TAG:proxy"
+          FRANKY_IMG="$RUN_TAG:pi" PROXY_IMG="$RUN_TAG:proxy" SMOKE_SKIP_BUILD=1 \
+            bash scripts/smoke-dind.sh
+          FRANKY_IMG="$RUN_TAG:pi" bash scripts/smoke-resume.sh
+          FRANKY_IMG="$RUN_TAG:pi" bash scripts/smoke-profile.sh
+      - name: Measure memory runs
+        if: steps.want.outputs.run && matrix.suite != 'smoke'
+        env:
+          JOBS: ${{ matrix.jobs }}
+          REPEATS: ${{ matrix.repeats }}
+        run: |
+          measure() {
+            for repeat in $REPEATS; do
+              base_report="/tmp/footprint-runtime-base-$JOBS-$repeat.json"
+              head_report="/tmp/footprint-runtime-head-$JOBS-$repeat.json"
+              if [ "$BASE_SHA" != "$GITHUB_SHA" ]; then
                 python3 scripts/smoke-memory.py \
-                  --repo "$base" --source-sha "$BASE_SHA" --allow-missing-helper \
+                  --repo "$RUNNER_TEMP/base" --source-sha "$BASE_SHA" --allow-missing-helper \
                   --image "$RUN_TAG:base-pi" --proxy-image "$RUN_TAG:base-proxy" \
-                  --jobs "$jobs" --output "$base_report" || return 1
+                  --jobs "$JOBS" --output "$base_report" || return 1
               fi
               python3 scripts/smoke-memory.py \
                 --repo . --source-sha "$GITHUB_SHA" \
                 --image "$RUN_TAG:pi" --proxy-image "$RUN_TAG:proxy" \
-                --jobs "$jobs" --output "$head_report" || return 1
-              base_args+=(--base "$base_report")
-              head_args+=(--head "$head_report")
+                --jobs "$JOBS" --output "$head_report" || return 1
+              # Tag and schedule runs compare a commit to itself: the head run is also the
+              # base (absolute budgets still apply) instead of measuring it twice.
+              if [ "$BASE_SHA" = "$GITHUB_SHA" ]; then
+                cp "$head_report" "$base_report"
+              fi
+              python3 scripts/footprint.py check-runtime --report "$head_report" \
+                --budgets scripts/footprint-budgets.json || return 1
             done
-            python3 scripts/footprint.py compare-runtime \
-              "${base_args[@]}" "${head_args[@]}" \
-              --budgets scripts/footprint-budgets.json \
-              > "/tmp/footprint-runtime-$jobs-comparison.json" || return 1
           }
-          if ! compare_runtime; then
-            echo "First runtime comparison failed; retrying once on the same runner."
-            compare_runtime
+          if ! measure; then
+            echo "First measurement failed; retrying once on the same runner."
+            measure
           fi
       - name: Record bounded kernel denials
-        if: failure()
+        if: failure() && steps.want.outputs.run
         run: sudo dmesg | grep -E 'apparmor|audit|seccomp|DENIED' | tail -c 4096 || true
       - name: Upload bounded summary
-        if: always()
+        if: always() && steps.want.outputs.run
         uses: actions/upload-artifact@v6
         with:
-          name: footprint-${{ github.run_id }}-${{ github.run_attempt }}-runtime-${{ matrix.suite }}
+          name: footprint-runtime-${{ matrix.suite }}
           path: /tmp/footprint-*.json
           if-no-files-found: ignore
+          overwrite: true
+          retention-days: 14
+
+  runtime-compare:
+    name: runtime compare
+    needs: runtime
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Select bounded checks
+        id: select
+        run: bash scripts/footprint-select.sh
+      - uses: actions/download-artifact@v7
+        if: contains(steps.select.outputs.checks, 'runtime')
+        with:
+          pattern: footprint-runtime-*
+          merge-multiple: true
+          path: reports
+      - name: Compare base and head runs
+        if: contains(steps.select.outputs.checks, 'runtime')
+        run: |
+          for jobs in 2 4; do
+            args=()
+            for side in base head; do
+              for repeat in 1 2 3; do
+                # Pair by name, never by download order; a missing report fails the gate.
+                report="reports/footprint-runtime-$side-$jobs-$repeat.json"
+                test -f "$report" || { echo "missing $report"; exit 1; }
+                args+=("--$side" "$report")
+              done
+            done
+            python3 scripts/footprint.py compare-runtime "${args[@]}" \
+              --budgets scripts/footprint-budgets.json \
+              > "/tmp/footprint-runtime-$jobs-comparison.json"
+            cat "/tmp/footprint-runtime-$jobs-comparison.json"
+          done
+      - name: Upload bounded summary
+        if: always() && contains(steps.select.outputs.checks, 'runtime')
+        uses: actions/upload-artifact@v6
+        with:
+          name: footprint-runtime-comparison
+          path: /tmp/footprint-*.json
+          if-no-files-found: ignore
+          overwrite: true
           retention-days: 14

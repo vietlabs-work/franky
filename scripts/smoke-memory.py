@@ -18,6 +18,7 @@ import platform
 import resource
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
@@ -55,7 +56,8 @@ with open('/work/build-data', 'wb') as target:
     os.fsync(target.fileno())
     os.posix_fadvise(target.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
 held = bytearray(256 * 1024 * 1024)
-for _ in range(10):
+stop = pathlib.Path('/tmp/footprint-stop')
+for index in range(60):
     root = pathlib.Path('/sys/fs/cgroup')
     stat = dict(line.split() for line in (root / 'memory.stat').read_text().splitlines())
     events = dict(line.split() for line in (root / 'memory.events').read_text().splitlines())
@@ -74,7 +76,12 @@ for _ in range(10):
         'vm_available_kib': int(info['MemAvailable'].split()[0]),
         'time': time.time(),
     }), flush=True)
+    # The host creates the stop file once every job holds its memory (see _run_benchmark).
+    if index >= 2 and stop.exists():
+        break
     time.sleep(1)
+else:
+    raise SystemExit('the host never signalled that every job holds its memory')
 assert len(held) == 256 * 1024 * 1024
 print('WORKLOAD PASSED', flush=True)
 """
@@ -435,6 +442,21 @@ def _run_benchmark(args, repo, ids, task_names, sandbox):
     task_image = _image_metadata(args.image)
     proxy_image = _image_metadata(args.proxy_image, proxy=True)
     started = time.monotonic()
+    sampling = set()
+    sampling_lock = threading.Lock()
+
+    def stop_after_overlap():
+        # Each job allocates its memory before its first sample. Two seconds after the last
+        # job's first sample, every job has sampled under the full concurrent load.
+        time.sleep(2)
+        for job_id in ids:
+            # A failed signal leaves that job to hit its sample cap and fail the run.
+            subprocess.run(
+                ["docker", "exec", run_names(job_id)[2], "touch", "/tmp/footprint-stop"],
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
 
     def run(job_id):
         samples = []
@@ -448,6 +470,11 @@ def _run_benchmark(args, repo, ids, task_names, sandbox):
                 if sample["peak_bytes"] is None:
                     sample["peak_bytes"] = sample["bytes"]
                 samples.append(sample)
+                with sampling_lock:
+                    last_to_start = job_id not in sampling and len(sampling) == len(ids) - 1
+                    sampling.add(job_id)
+                if last_to_start:
+                    threading.Thread(target=stop_after_overlap, daemon=True).start()
                 scopes["task"].append(
                     {
                         "cpu_usage_usec": sample["cpu_usage_usec"],
@@ -474,7 +501,7 @@ def _run_benchmark(args, repo, ids, task_names, sandbox):
         )
         try:
             assert code == 0, output.tail(2000) if isinstance(output, Transcript) else output
-            assert len(samples) == 10, "workload did not complete its samples"
+            assert len(samples) >= 3, "workload did not complete its samples"
             return samples, scopes
         finally:
             if isinstance(output, Transcript):
