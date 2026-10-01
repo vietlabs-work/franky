@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.8] - 2026-10-01
+
 ### Changed
 
 - `review-pr` posts findings as inline comments on the diff, follows a logic-first review method, and caps findings and body length. It falls back to a body-only review if GitHub rejects the anchors. The review body, also the `--no-publish` `review_body`, lists only failed checks, and prior findings show by title only.
