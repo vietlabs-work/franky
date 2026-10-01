@@ -23,7 +23,12 @@ else:
         proxy_url=os.environ.get("SMOKE_PROXY_URL"),
         profile_wait=mode in ("profile", "both"),
         resume_wait=mode in ("resume", "both"),
+        session_hold="smoke" if mode == "hold" else "",
         apparmor_profile=select_task_apparmor(),
     )
+    if mode == "hold":
+        # Attached, as production runs it: the hardening's log driver cannot be read back
+        # with `docker logs`, so the hold line only exists on this process's own output.
+        os.execvp(argv[0], argv)
     argv.insert(2, "-d")
 subprocess.run(argv, check=True, timeout=60)

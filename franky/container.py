@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import subprocess
 import threading
 import time
@@ -176,6 +177,7 @@ def build_docker_argv(
     memory_mb: int = DEFAULT_MEMORY_MB,
     disk_mb: int = DEFAULT_DISK_MB,
     apparmor_profile: str | None = None,
+    session_hold: str = "",
 ) -> list[str]:
     """Build the full `docker run` argv. Pure - no docker invoked.
 
@@ -204,6 +206,11 @@ def build_docker_argv(
 
     `auth_volume` is the fixed Codex subscription named volume selected by fail-closed config.
     It is never a caller-supplied path or bind mount.
+
+    When `session_hold` (a per-run nonce) is set the container starts with
+    `-e FRANKY_SESSION_HOLD=<nonce>` (by-value, non-secret): after a clean engine exit the
+    entrypoint keeps the --rm container alive, capped, until the host has copied the engine
+    session out (see run_in_container).
     """
     container_name = name or f"franky-run-{uuid.uuid4().hex[:12]}"
     argv = [
@@ -254,6 +261,9 @@ def build_docker_argv(
     if resume_wait:
         # By-value (non-secret): puts the entrypoint into resume-wait mode (issue #71).
         argv += ["-e", f"{snapshot.RESUME_WAIT_ENV}=1"]
+    if session_hold:
+        # By-value (non-secret): the entrypoint holds after a clean exit for the session copy.
+        argv += ["-e", f"{snapshot.SESSION_HOLD_ENV}={session_hold}"]
     for key in passthrough_env:
         argv += ["-e", key]
     argv += [image, *inner_argv]
@@ -646,6 +656,39 @@ def reap_run(run_id: str, runner=subprocess.run) -> bool:
     _reap(proxy, runner)
     _reap_network(net, runner)
     return task_reaped
+
+
+# Longest unfinished line kept while looking for the hold line; a longer one is not it.
+_HOLD_LINE_MAX = 512
+
+
+def _hold_nonce() -> str:
+    return secrets.token_hex(8)
+
+
+def _copy_session_in_hold(task: str, sink: dict, nonce: str, runner, popen) -> None:
+    """The engine exited cleanly and the entrypoint holds the --rm container: copy the session
+    out while it still exists, then release the hold. The release runs even when the copy fails
+    or is interrupted, so the container exits; if the release itself fails, the entrypoint's cap
+    ends the hold and --rm still removes the container. Never raises an Exception."""
+    try:
+        sink["status"] = snapshot.copy_session(
+            task, sink["paths"], sink["dest"], max_bytes=sink["max_bytes"], popen=popen
+        )
+    except Exception:
+        pass
+    finally:
+        try:
+            runner(
+                snapshot.build_marker_argv(
+                    task, marker=f"{snapshot.SESSION_COPIED_MARKER}-{nonce}"
+                ),
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except Exception:
+            pass
 
 
 def capture_diagnostics(
@@ -1197,6 +1240,10 @@ def run_in_container(
     storage_stop = threading.Event()
     storage_failures: list[str] = []
     storage_thread = None
+    hold_copied = False  # the session was copied while the entrypoint held the container
+    hold_nonce = _hold_nonce() if session_sink is not None else ""
+    hold_want = f"{snapshot.SESSION_HOLD_LINE} {hold_nonce}"
+    hold_buf, hold_at_line_start = "", True
 
     try:
         try:
@@ -1269,6 +1316,7 @@ def run_in_container(
             memory_mb=cfg.memory_mb,
             disk_mb=cfg.disk_mb,
             apparmor_profile=apparmor_profile,
+            session_hold=hold_nonce,
         )
         if effective_progress is not None:
             # Redact before disk and callbacks, retaining only bounded unfinished fragments.
@@ -1369,7 +1417,23 @@ def run_in_container(
                     for line in source:
                         if not line:
                             break
-                        emit(decoder.decode(line) if isinstance(line, bytes) else line)
+                        text = decoder.decode(line) if isinstance(line, bytes) else line
+                        emit(text)
+                        if session_sink is not None and not hold_copied:
+                            # Only a WHOLE line equal to the hold line counts. The run timeout
+                            # stays armed: the agent can read the nonce and print the line, which
+                            # only buys an early, partial copy of its own session. Known limit:
+                            # an engine that exits seconds before the deadline can time out
+                            # mid-copy.
+                            *complete, hold_buf = (hold_buf + text).split("\n")
+                            for done_line in complete:
+                                if hold_at_line_start and done_line.rstrip("\r") == hold_want:
+                                    hold_copied = True
+                                hold_at_line_start = True
+                            if len(hold_buf) > _HOLD_LINE_MAX:
+                                hold_buf, hold_at_line_start = "", False
+                            if hold_copied:
+                                _copy_session_in_hold(task, session_sink, hold_nonce, runner, popen)
                         # Belt-and-suspenders: the per-line elapsed check still catches a slow
                         # trickle of output between deadline checks; the watchdog above catches a
                         # total silence.
@@ -1492,11 +1556,14 @@ def run_in_container(
             except Exception:
                 _snapshot_tmp = None
         # Thread session copy-out: like the snapshot extract, it needs the live container, so it
-        # runs before the reap, capped, after a clean exit (or a timeout when the sink opts in
-        # with `on_timeout`, for a resumable `--thread` build). Any failure is swallowed.
+        # runs before the reap, capped. A clean exit normally copied already, during the
+        # entrypoint's session hold (--rm removes the container once the engine exits); this
+        # covers a timeout when the sink opts in with `on_timeout` (the killed CLI leaves the
+        # container running until the reap), and an image without the hold. Failures are swallowed.
         if (
             session_sink is not None
             and task_launched
+            and not hold_copied
             and (code == 0 or (session_sink.get("on_timeout") and code == CONTAINER_TIMEOUT_CODE))
         ):
             try:

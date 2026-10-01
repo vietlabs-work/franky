@@ -10,11 +10,14 @@
 #   - snapshot.copy_home_path streams only those paths back out (`docker cp ... -`), extracting
 #     plain files and dirs; a planted symlink and the engine's project memory never come out
 #   - threads.commit_session sanitizes, scrubs, verifies, and swaps the copy in
+#   - after a CLEAN engine exit the entrypoint's session hold keeps the --rm container alive
+#     until the copy is done (without it, --rm deletes the container first), then it is gone
 # It also gates releases on the UNPINNED claude CLI: the image's `claude --help` must still list
 # `--session-id` and `--resume`, or resumed reviews would degrade to seeded ones.
 #
 # Run this gate before merging changes to container.deliver_profile, the session copy-out in
-# container.run_in_container, franky/threads.py, or the task `_HARDENING` profile.
+# container.run_in_container, the entrypoint's session hold, franky/threads.py, or the task
+# `_HARDENING` profile.
 #
 # Usage: scripts/smoke-thread.sh   (needs Docker running + an image with claude, default `franky`)
 set -uo pipefail
@@ -27,8 +30,11 @@ REL=".claude/projects/-work"
 CHOME="$(python3 -c 'from franky.profile import CONTAINER_HOME; print(CONTAINER_HOME)')"
 export FRANKY_THREADS_DIR="$WORKDIR/threads"
 
+HOLD="smoke-thread-hold-$$"
+HOLD_PID=""
 cleanup() {
-  docker rm -f -v "$TASK" >/dev/null 2>&1 || true
+  docker rm -f -v "$TASK" "$HOLD" >/dev/null 2>&1 || true
+  if [ -n "$HOLD_PID" ]; then kill "$HOLD_PID" 2>/dev/null || true; fi
   rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
@@ -111,5 +117,33 @@ assert "prior review" in text and "new turn" in text, text
 thread.close()
 print("   OK (session + side dir round trip intact; symlink and memory never copied)")
 PY
+
+echo "== 6. a clean engine exit holds the --rm container for the copy, then it is gone =="
+python3 scripts/smoke-task.py "$FRANKY_IMG" "$HOLD" hold \
+  sh -c "mkdir -p $CHOME/$REL && echo '{}' > $CHOME/$REL/$SID.jsonl" >"$WORKDIR/hold.log" 2>&1 &
+HOLD_PID=$!
+held=0
+for _ in $(seq 1 60); do
+  grep -qx "franky: engine exited, holding for session copy smoke" "$WORKDIR/hold.log" && { held=1; break; }
+  sleep 1
+done
+[ "$held" = 1 ] || fail "no hold line after a clean exit"
+python3 - "$HOLD" "$SID" "$REL" "$WORKDIR/held" <<'PY' || fail "copy during the hold failed"
+import sys
+from franky import snapshot, threads
+task, sid, rel, dest = sys.argv[1:5]
+status = snapshot.copy_session(task, threads.session_paths("claude", sid), dest, max_bytes=threads.MAX_SESSION_BYTES)
+assert status == "ok", status
+PY
+docker exec "$HOLD" touch /tmp/.franky-session-copied-smoke || fail "could not release the hold"
+gone=0
+for _ in $(seq 1 15); do
+  docker inspect "$HOLD" >/dev/null 2>&1 || { gone=1; break; }
+  sleep 1
+done
+[ "$gone" = 1 ] || fail "--rm did not remove the container after the release"
+wait "$HOLD_PID" || fail "the held engine run did not exit 0"
+HOLD_PID=""
+echo "   OK (copied while held; --rm removed the container after the release)"
 
 echo "SMOKE PASS: thread sessions stream in and copy out of the real hardened container."

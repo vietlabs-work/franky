@@ -57,6 +57,15 @@ SNAPSHOT_MARKER = ".franky-resume-ready"
 # passes `-e FRANKY_RESUME_WAIT=1` when resuming; the entrypoint unsets it after the marker lands.
 RESUME_WAIT_ENV = "FRANKY_RESUME_WAIT"
 
+# Session hold (see franky-dind-entrypoint.sh): with SESSION_HOLD_ENV=<nonce> the entrypoint
+# prints the line `SESSION_HOLD_LINE <nonce>` after a clean engine exit and keeps the --rm
+# container alive (capped) until the host has copied the session out and touched
+# `SESSION_COPIED_MARKER-<nonce>`. The nonce keeps engine output that merely quotes the phrase
+# (a review of this very file) from starting a copy mid-run. /tmp is a writable volume.
+SESSION_HOLD_ENV = "FRANKY_SESSION_HOLD"
+SESSION_HOLD_LINE = "franky: engine exited, holding for session copy"
+SESSION_COPIED_MARKER = "/tmp/.franky-session-copied"
+
 # Credential FILES that must never live inside a stored snapshot. HOME cred files are not
 # snapshotted (only /work is), but the autonomous agent COULD copy one into /work - so we delete
 # these defensively wherever they appear in the tree. `*.pem` (private keys) is handled separately

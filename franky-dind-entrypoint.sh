@@ -107,4 +107,44 @@ if [ -n "${FRANKY_RESUME_WAIT:-}" ]; then
     unset FRANKY_RESUME_WAIT
 fi
 
+# Session hold (FRANKY_SESSION_HOLD=<nonce>, set only for a run that copies its engine session
+# out): the container runs with --rm, so it vanishes the moment the engine exits and a post-exit
+# `docker cp` finds nothing. Instead, after a clean engine exit, print one line carrying the
+# per-run nonce and wait (capped) for the host to copy the session and touch the nonce marker. If
+# the host is gone, the cap runs out and --rm still removes the container, so no stopped
+# container keeps the tokens.
+if [ -n "${FRANKY_SESSION_HOLD:-}" ]; then
+    hold_nonce="${FRANKY_SESSION_HOLD}"
+    unset FRANKY_SESSION_HOLD
+    # Job control only for the launch: it starts the engine in its own process group with
+    # default signal dispositions (a plain `&` here starts it with SIGINT/SIGQUIT ignored).
+    # Off again at once, so `wait` does not return when the engine is merely stopped.
+    set -m
+    "$@" &
+    child=$!
+    set +m
+    # Bash is PID 1 here, and PID 1 ignores signals it has no handler for: forward them. A
+    # forwarded signal means the run is being stopped, so it never holds afterwards.
+    signalled=0
+    trap 'signalled=1; kill -INT "${child}" 2>/dev/null' INT
+    trap 'signalled=1; kill -TERM "${child}" 2>/dev/null' TERM
+    trap 'signalled=1; kill -HUP "${child}" 2>/dev/null' HUP
+    # A trapped signal makes `wait` return early; loop until the engine has really exited.
+    while :; do
+        wait "${child}"
+        rc=$?
+        kill -0 "${child}" 2>/dev/null || break
+    done
+    if [ "${rc}" = 0 ] && [ "${signalled}" = 0 ]; then
+        # Leftover engine processes must not run on, with the tokens, through the hold.
+        kill -KILL -- "-${child}" 2>/dev/null
+        echo "franky: engine exited, holding for session copy ${hold_nonce}" >&2
+        for _ in $(seq 1 60); do
+            [ -f "/tmp/.franky-session-copied-${hold_nonce}" ] && break
+            sleep 1
+        done
+    fi
+    exit "${rc}"
+fi
+
 exec "$@"

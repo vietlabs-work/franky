@@ -1,8 +1,9 @@
 import subprocess
+from unittest import mock
 
 import franky.container as container_mod
 import pytest
-from franky import franky_version
+from franky import franky_version, snapshot
 from franky.config import Config, load_config
 from franky.container import (
     CODEX_AUTH_HOME,
@@ -2111,19 +2112,32 @@ def _session_tar_bytes(name, data=b"{}"):
     return buffer.getvalue()
 
 
-def _copy_out_run(tmp_path, *, task_code=0, cp=None, paths=None, timeout=None, on_timeout=None):
-    calls = []
+def _copy_out_run(
+    tmp_path,
+    *,
+    task_code=0,
+    cp=None,
+    paths=None,
+    timeout=None,
+    on_timeout=None,
+    stream=None,
+    marker_raises=False,
+    calls=None,
+):
+    calls = [] if calls is None else calls
     runner, runner_calls = _orchestration_runner(lambda *a, **k: None)
 
     def logged_runner(argv, **kwargs):
         calls.append(argv)
+        if marker_raises and argv[-1].startswith(snapshot.SESSION_COPIED_MARKER):
+            raise subprocess.TimeoutExpired(argv, 10)
         return runner(argv, **kwargs)
 
     def popen(argv, **kwargs):
         calls.append(argv)
         if argv[:2] == ["docker", "cp"]:
             return cp(argv)
-        return _FakePopen(["event\n"], returncode=task_code)
+        return _FakePopen(stream or ["event\n"], returncode=task_code)
 
     sink = {
         "paths": paths or [".claude/projects/-work/s1.jsonl", ".claude/projects/-work/s1"],
@@ -2132,17 +2146,18 @@ def _copy_out_run(tmp_path, *, task_code=0, cp=None, paths=None, timeout=None, o
     }
     if on_timeout is not None:
         sink["on_timeout"] = on_timeout
-    run_in_container(
-        _cfg(),
-        ["claude"],
-        runner=logged_runner,
-        env={},
-        sleeper=NOOP_SLEEP,
-        popen=popen,
-        run_id="abc123def456",
-        session_sink=sink,
-        **({} if timeout is None else {"timeout": timeout}),
-    )
+    with mock.patch.object(container_mod, "_hold_nonce", return_value="n0nce"):
+        run_in_container(
+            _cfg(),
+            ["claude"],
+            runner=logged_runner,
+            env={},
+            sleeper=NOOP_SLEEP,
+            popen=popen,
+            run_id="abc123def456",
+            session_sink=sink,
+            **({} if timeout is None else {"timeout": timeout}),
+        )
     return calls, sink
 
 
@@ -2165,6 +2180,94 @@ def test_run_in_container_session_copy_out_streams_only_session_paths_before_rea
     assert not any(calls[i][2].endswith(("-work", "-work/.", "memory")) for i in cps)
     assert sink["status"] == "ok"
     assert (tmp_path / ".claude/projects/-work/s1.jsonl").read_text() == "{}"
+
+
+# The entrypoint's hold line (nonce pinned by _copy_out_run), split across two read chunks.
+_HOLD_STREAM = ["event\nfranky: engine exited, hol", "ding for session copy n0nce\n"]
+_MARKER = [
+    "docker",
+    "exec",
+    "franky-run-abc123def456",
+    "touch",
+    "/tmp/.franky-session-copied-n0nce",
+]
+
+
+def _ok_cp(argv):
+    if argv[2].endswith("s1.jsonl"):
+        return _CpPopen(_session_tar_bytes("s1.jsonl"))
+    return _CpPopen(b"", returncode=1)  # no side dir: optional
+
+
+def test_build_docker_argv_session_hold_flag_only_when_asked():
+    assert not any(
+        a.startswith("FRANKY_SESSION_HOLD") for a in build_docker_argv("franky", {}, ["pi"])
+    )
+    argv = build_docker_argv("franky", {}, ["pi"], session_hold="n0nce")
+    assert argv[argv.index("FRANKY_SESSION_HOLD=n0nce") - 1] == "-e"
+    assert "--rm" in argv  # the hold keeps --rm: a container never outlives its cap
+
+
+def test_run_in_container_copies_during_the_hold_then_releases_it(tmp_path):
+    # --rm removes the container as soon as the engine exits, so the copy must happen while the
+    # entrypoint holds it: after the hold line, before the release marker, never again later.
+    calls, sink = _copy_out_run(tmp_path, cp=_ok_cp, stream=_HOLD_STREAM)
+    task = "franky-run-abc123def456"
+    run = next(c for c in calls if c[:2] == ["docker", "run"] and task in c)
+    assert "FRANKY_SESSION_HOLD=n0nce" in run and "--rm" in run
+    cps = [i for i, c in enumerate(calls) if c[:2] == ["docker", "cp"]]
+    marker = calls.index(_MARKER)
+    reap = next(i for i, c in enumerate(calls) if c[:3] == ["docker", "rm", "-f"] and task in c)
+    assert len(cps) == 2 and cps[-1] < marker < reap
+    assert sink["status"] == "ok"
+
+
+def test_run_in_container_finds_the_hold_line_before_long_trailing_output(tmp_path):
+    # A leftover engine subprocess can write after the hold line in the same chunk.
+    stream = ["franky: engine exited, holding for session copy n0nce\n" + "x" * 2000]
+    calls, sink = _copy_out_run(tmp_path, cp=_ok_cp, stream=stream)
+    assert sink["status"] == "ok" and _MARKER in calls
+
+
+@pytest.mark.parametrize(
+    "stream",
+    [
+        # Engine output quoting the phrase, as in a review of this repository.
+        ['{"type":"user","content":"franky: engine exited, holding for session copy n0nce"}\n'],
+        # The phrase without this run's nonce.
+        ["franky: engine exited, holding for session copy\n"],
+        # The right line, but as the tail of a line too long to have been checked whole.
+        ["y" * 600, "franky: engine exited, holding for session copy n0nce\n"],
+    ],
+)
+def test_run_in_container_ignores_anything_but_the_whole_hold_line(tmp_path, stream):
+    calls, _sink = _copy_out_run(tmp_path, cp=_ok_cp, stream=stream)
+    assert _MARKER not in calls
+
+
+def test_run_in_container_releases_the_hold_when_the_copy_fails(tmp_path):
+    calls, sink = _copy_out_run(
+        tmp_path, cp=lambda argv: _CpPopen(b"", returncode=1), stream=_HOLD_STREAM
+    )
+    assert sink["status"] == "failed"
+    assert _MARKER in calls
+
+
+def test_run_in_container_hold_release_failure_still_reaps(tmp_path):
+    calls, sink = _copy_out_run(tmp_path, cp=_ok_cp, stream=_HOLD_STREAM, marker_raises=True)
+    assert sink["status"] == "ok"
+    assert any(c[:3] == ["docker", "rm", "-f"] and "franky-run-abc123def456" in c for c in calls)
+
+
+def test_run_in_container_interrupted_hold_copy_still_releases_and_reaps(tmp_path):
+    def cp(argv):
+        raise KeyboardInterrupt
+
+    calls = []
+    with pytest.raises(KeyboardInterrupt):
+        _copy_out_run(tmp_path, cp=cp, stream=_HOLD_STREAM, calls=calls)
+    assert _MARKER in calls
+    assert any(c[:3] == ["docker", "rm", "-f"] and "franky-run-abc123def456" in c for c in calls)
 
 
 def test_run_in_container_session_copy_out_skipped_on_failure(tmp_path):

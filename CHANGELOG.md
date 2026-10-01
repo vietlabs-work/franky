@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `franky update` now removes old franky images after the update. It keeps the images of the version before the update and of the new version. Docker refuses to remove an image that a container uses, so a running job is safe.
 
+### Fixed
+
+- A `--thread` run now keeps its engine session. The task container runs with `--rm`, so Docker deleted it as the engine exited, and every clean run lost its session as `copy_failed`. After a clean exit, the entrypoint now holds the container until the host copies the session out, for at most 60 seconds. If the host is gone, the cap ends the hold and `--rm` still removes the container.
+
 ## [0.3.8] - 2026-10-01
 
 ### Changed
