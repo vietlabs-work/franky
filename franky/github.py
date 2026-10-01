@@ -38,6 +38,7 @@ def run_gh(
     *,
     runner: Callable = subprocess.run,
     timeout: float | None = None,
+    input: str | None = None,
 ) -> tuple[int, str, str]:
     """Run `gh <args>` with the caller's env; return (returncode, stdout, stderr).
 
@@ -58,5 +59,6 @@ def run_gh(
         errors="replace",
         timeout=timeout,
         env=dict(env),
+        input=input,
     )
     return proc.returncode, (proc.stdout or ""), (proc.stderr or "")

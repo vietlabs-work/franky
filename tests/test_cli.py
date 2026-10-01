@@ -3783,6 +3783,15 @@ def _review_block(payload, nonce=REVIEW_NONCE):
     return f"FRANKY_REVIEW_{nonce}_BEGIN{json.dumps(payload)}FRANKY_REVIEW_{nonce}_END"
 
 
+class _GhCalls(list):
+    """POST calls (the list itself) plus the files fetches and the stdin bodies."""
+
+    def __init__(self):
+        super().__init__()
+        self.files = []
+        self.inputs = []
+
+
 def _mc_review_setup(
     monkeypatch,
     *,
@@ -3791,6 +3800,8 @@ def _mc_review_setup(
     recheck_sha=None,
     container=(0, None),
     gh=(0, None),
+    review_files=None,
+    later_sha=None,
 ):
     """Wire a hermetic review-pr: env, images present, live-head fetch + container + gh api all
     mocked. `recheck_sha` defaults to `live_sha` (head unchanged); pass a different value to
@@ -3802,8 +3813,11 @@ def _mc_review_setup(
     monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
 
     shas = [live_sha, recheck_sha if recheck_sha is not None else live_sha]
+    seen_gh_calls = _GhCalls()
 
     def fake_fetch(repo, number, e, **k):
+        if later_sha is not None and seen_gh_calls.files:
+            return later_sha
         return shas.pop(0) if shas else (recheck_sha if recheck_sha is not None else live_sha)
 
     monkeypatch.setattr(cli, "fetch_pr_head_sha", fake_fetch)
@@ -3816,10 +3830,13 @@ def _mc_review_setup(
     gcode, gout = gh
     if gout is None:
         gout = json.dumps({"html_url": REVIEW_URL, "id": 555})
-    seen_gh_calls = []
 
     def fake_run_gh(args, e, **k):
+        if "/files" in args[1]:
+            seen_gh_calls.files.append(list(args))
+            return 0, json.dumps([review_files or []]), ""
         seen_gh_calls.append(list(args))
+        seen_gh_calls.inputs.append(k.get("input"))
         return gcode, gout, ""
 
     monkeypatch.setattr(cli, "run_gh", fake_run_gh)
@@ -3933,10 +3950,9 @@ def test_review_pr_published_echoes_review_url_and_never_approves(monkeypatch):
     assert len(calls) == 1
     args = calls[0]
     assert args[0] == "api"
-    assert args[1] == f"repos/me/repo/pulls/{REVIEW_PR_NUMBER}/reviews"
-    event_field = next(a for a in args if a.startswith("event="))
-    assert event_field == "event=COMMENT"
-    assert "APPROVE" not in " ".join(args)
+    assert args[3] == f"repos/me/repo/pulls/{REVIEW_PR_NUMBER}/reviews"
+    assert json.loads(calls.inputs[0])["event"] == "COMMENT"
+    assert "APPROVE" not in " ".join(args) + calls.inputs[0]
 
 
 def test_review_pr_json_success_reports_reviewed_sha_and_review_url(monkeypatch):
@@ -4000,9 +4016,8 @@ def test_review_pr_blocking_finding_requests_changes_never_approve(monkeypatch):
     assert res.exit_code == 0, res.output
     data = json.loads(res.stdout)
     assert data["status"] == "review_published"
-    event_field = next(a for a in calls[0] if a.startswith("event="))
-    assert event_field == "event=REQUEST_CHANGES"
-    assert "APPROVE" not in " ".join(calls[0])
+    assert json.loads(calls.inputs[0])["event"] == "REQUEST_CHANGES"
+    assert "APPROVE" not in " ".join(calls[0]) + calls.inputs[0]
 
 
 def test_review_pr_no_publish_makes_zero_github_writes(monkeypatch):
@@ -4038,8 +4053,8 @@ def test_review_pr_no_publish_makes_zero_github_writes(monkeypatch):
     assert "review_url" not in data
     assert "review_id" not in data
     assert data["review_body"] == (
-        "private summary\n\n**Checks run:**\n- pytest: pass - 12 passed\n\n"
-        "**Findings:**\n- [blocking] wrong total (fare.py:7)\n  recalculate tax"
+        "private summary\n\n- **Blocking:** wrong total (fare.py:7) - recalculate tax\n\n"
+        "<sub>Automated review by Franky</sub>"
     )
     assert calls == []  # zero GitHub writes
 
@@ -4048,7 +4063,16 @@ def test_review_pr_no_publish_refuses_oversized_review_body(monkeypatch):
     _fix_review_nonce(monkeypatch)
     calls = _mc_review_setup(
         monkeypatch,
-        container=(0, _review_block({"summary": "x" * 8001, "findings": [], "checks": []})),
+        container=(
+            0,
+            _review_block(
+                {
+                    "summary": "s",
+                    "findings": [{"title": f"t{i}", "body": "x" * 1500} for i in range(8)],
+                    "checks": [],
+                }
+            ),
+        ),
     )
     with CliRunner().isolated_filesystem():
         res = CliRunner().invoke(cli.main, ["review-pr", "--no-publish", "--json", "--", PR_URL])
@@ -4096,6 +4120,8 @@ def test_review_pr_never_invokes_commit_push_merge(monkeypatch):
         return 0, _review_block({"summary": "ok", "findings": [], "checks": []})
 
     def fake_run_gh(a, e, **k):
+        if a[1].endswith("/files"):
+            return 0, "[]", ""
         gh_calls.append(list(a))
         return 0, json.dumps({"html_url": REVIEW_URL, "id": 1}), ""
 
@@ -4123,9 +4149,10 @@ def test_review_pr_never_invokes_commit_push_merge(monkeypatch):
     assert "read-only for this entire pass" in prompt_text
 
     # Franky's own host code performs exactly ONE GitHub write - the review POST - never a
-    # merge/close/approve/dismiss call.
+    # merge/close/approve/dismiss call. The only other gh call is the read of the PR files.
+    gh_calls = [c for c in gh_calls if "/files" not in c[1]]
     assert len(gh_calls) == 1
-    assert gh_calls[0][1] == f"repos/me/repo/pulls/{REVIEW_PR_NUMBER}/reviews"
+    assert gh_calls[0][3] == f"repos/me/repo/pulls/{REVIEW_PR_NUMBER}/reviews"
     joined = " ".join(gh_calls[0]).lower()
     for forbidden in ("merge", "close", "approve", "dismiss"):
         assert forbidden not in joined
@@ -4170,6 +4197,150 @@ def test_review_pr_head_change_blocks_stale_publication(monkeypatch):
     assert data["reviewed_sha"] == LIVE_SHA
     assert "review_url" not in data
     assert calls == []  # never posted despite publish defaulting True
+
+
+_ANCHOR_FILES = [
+    {"filename": "app.py", "status": "modified", "patch": "@@ -1,2 +1,3 @@\n a\n+b\n c"}
+]
+
+
+def _inline_review(findings=None):
+    f = findings or [
+        {"title": "Guard null", "body": "NPE", "severity": "blocking", "file": "app.py", "line": 2}
+    ]
+    return (0, _review_block({"summary": "risky", "findings": f, "checks": []}))
+
+
+def test_review_pr_posts_inline_comments_on_pinned_commit(monkeypatch):
+    _fix_review_nonce(monkeypatch)
+    calls = _mc_review_setup(monkeypatch, container=_inline_review(), review_files=_ANCHOR_FILES)
+    with CliRunner().isolated_filesystem():
+        res = CliRunner().invoke(cli.main, ["review-pr", PR_URL, "--json"])
+    assert res.exit_code == 0, res.output
+    assert calls.files == [
+        [
+            "api",
+            f"repos/me/repo/pulls/{REVIEW_PR_NUMBER}/files?per_page=100",
+            "--paginate",
+            "--slurp",
+        ]
+    ]
+    assert calls[0] == [
+        "api",
+        "-X",
+        "POST",
+        f"repos/me/repo/pulls/{REVIEW_PR_NUMBER}/reviews",
+        "--input",
+        "-",
+    ]
+    payload = json.loads(calls.inputs[0])
+    assert payload["commit_id"] == LIVE_SHA and payload["event"] == "REQUEST_CHANGES"
+    assert [(c["path"], c["line"], c["side"]) for c in payload["comments"]] == [
+        ("app.py", 2, "RIGHT")
+    ]
+    assert json.loads(res.stdout)["status"] == "review_published"
+
+
+def test_review_pr_head_moving_after_file_fetch_blocks_post(monkeypatch):
+    _fix_review_nonce(monkeypatch)
+    calls = _mc_review_setup(
+        monkeypatch, container=_inline_review(), review_files=_ANCHOR_FILES, later_sha="c" * 40
+    )
+    with CliRunner().isolated_filesystem():
+        res = CliRunner().invoke(cli.main, ["review-pr", PR_URL, "--json"])
+    assert res.exit_code == 7, res.output
+    assert json.loads(res.stdout)["status"] == "publish_blocked_stale_head"
+    assert len(calls.files) == 1 and calls == []
+
+
+def test_review_pr_422_retries_once_body_only(monkeypatch):
+    _fix_review_nonce(monkeypatch)
+    _mc_review_setup(monkeypatch, container=_inline_review(), review_files=_ANCHOR_FILES)
+    posts = []
+
+    def fake_run_gh(args, e, **k):
+        if "/files" in args[1]:
+            return 0, json.dumps([_ANCHOR_FILES]), ""
+        posts.append(json.loads(k["input"]))
+        if len(posts) == 1:
+            return 1, "", "gh: Unprocessable Entity (HTTP 422)"
+        return 0, json.dumps({"html_url": REVIEW_URL, "id": 9}), ""
+
+    monkeypatch.setattr(cli, "run_gh", fake_run_gh)
+    with CliRunner().isolated_filesystem():
+        res = CliRunner().invoke(cli.main, ["review-pr", PR_URL, "--json"])
+    assert res.exit_code == 0, res.output
+    assert len(posts) == 2 and posts[0]["comments"] and posts[1]["comments"] == []
+    assert "Guard null" in posts[1]["body"]
+    data = json.loads(res.stdout)
+    assert data["status"] == "review_published"
+    assert "inline anchors rejected, posted body-only" in data["reason"]
+
+
+def test_review_pr_422_retry_rechecks_head_first(monkeypatch):
+    _fix_review_nonce(monkeypatch)
+    _mc_review_setup(monkeypatch, container=_inline_review(), review_files=_ANCHOR_FILES)
+    shas = iter([LIVE_SHA, LIVE_SHA, LIVE_SHA, LIVE_SHA])
+    monkeypatch.setattr(cli, "fetch_pr_head_sha", lambda *a, **k: next(shas, "c" * 40))
+    posts = []
+
+    def fake_run_gh(args, e, **k):
+        if "/files" in args[1]:
+            return 0, json.dumps([_ANCHOR_FILES]), ""
+        posts.append(args)
+        return 1, "", "gh: Unprocessable Entity (HTTP 422)"
+
+    monkeypatch.setattr(cli, "run_gh", fake_run_gh)
+    with CliRunner().isolated_filesystem():
+        res = CliRunner().invoke(cli.main, ["review-pr", PR_URL, "--json"])
+    assert json.loads(res.stdout)["status"] == "publish_blocked_stale_head", res.output
+    assert len(posts) == 1  # the head moved, so no second write
+
+
+def test_review_pr_unreadable_files_posts_body_only_and_says_so(monkeypatch):
+    _fix_review_nonce(monkeypatch)
+    _mc_review_setup(monkeypatch, container=_inline_review(), review_files=_ANCHOR_FILES)
+    posts = []
+
+    def fake_run_gh(args, e, **k):
+        if "/files" in args[1]:
+            return 1, "", "HTTP 502"
+        posts.append(json.loads(k["input"]))
+        return 0, json.dumps({"html_url": REVIEW_URL, "id": 9}), ""
+
+    monkeypatch.setattr(cli, "run_gh", fake_run_gh)
+    with CliRunner().isolated_filesystem():
+        res = CliRunner().invoke(cli.main, ["review-pr", PR_URL, "--json"])
+    assert res.exit_code == 0, res.output
+    assert posts[0]["comments"] == [] and "Guard null" in posts[0]["body"]
+    assert "could not read the PR files" in json.loads(res.stdout)["reason"]
+
+
+def test_review_pr_refuses_malformed_head_sha(monkeypatch):
+    _fix_review_nonce(monkeypatch)
+    calls = _mc_review_setup(monkeypatch, live_sha="not-a-sha")
+    with CliRunner().isolated_filesystem():
+        res = CliRunner().invoke(cli.main, ["review-pr", PR_URL, "--json"])
+    assert res.exit_code != 0 and calls == []
+    assert "not a valid SHA" in res.stdout
+
+
+def test_review_pr_non_422_failure_does_not_retry(monkeypatch):
+    _fix_review_nonce(monkeypatch)
+    calls = _mc_review_setup(monkeypatch, container=_inline_review(), review_files=_ANCHOR_FILES)
+
+    def fake_run_gh(args, e, **k):
+        if "/files" in args[1]:
+            return 0, "[]", ""
+        calls.append(args)
+        return 1, "", "HTTP 500 boom"
+
+    monkeypatch.setattr(cli, "run_gh", fake_run_gh)
+    with CliRunner().isolated_filesystem():
+        res = CliRunner().invoke(cli.main, ["review-pr", PR_URL, "--json"])
+    assert res.exit_code == 8, res.output
+    assert json.loads(res.stdout)["status"] == "publish_failed"
+    assert len(calls) == 1
 
 
 def test_review_pr_off_allowlist_refuses(monkeypatch):
@@ -4540,8 +4711,8 @@ def test_review_pr_without_thread_forces_status_new(monkeypatch, tmp_path):
     with runner.isolated_filesystem():
         res = runner.invoke(cli.main, ["review-pr", "--json", PR_URL])
     assert res.exit_code == 0, res.output
-    args = " ".join(calls[0])
-    assert "event=REQUEST_CHANGES" in args and "[resolved]" not in args
+    body = json.loads(calls.inputs[0])
+    assert body["event"] == "REQUEST_CHANGES" and "[resolved]" not in body["body"]
 
 
 def test_review_pr_without_thread_is_unchanged(monkeypatch, tmp_path):

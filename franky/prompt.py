@@ -15,6 +15,7 @@ from . import profile as _profile
 from .task import GH_ISSUE_RE, TaskSpec
 
 _PERSONA_PATH = Path(__file__).parent / "persona.md"
+_REVIEW_METHOD_PATH = Path(__file__).parent / "review.md"
 
 # Mid-run steering (issue #72, `franky job attach`): a prompt-level, best-effort channel - the
 # hard guarantee is only that the host successfully writes the steer file; whether the agent
@@ -92,6 +93,10 @@ def build_setup_block(spec) -> str:
 
 def load_persona() -> str:
     return _PERSONA_PATH.read_text(encoding="utf-8").strip()
+
+
+def load_review_method() -> str:
+    return _REVIEW_METHOD_PATH.read_text(encoding="utf-8").strip()
 
 
 def task_slug(spec: TaskSpec) -> str:
@@ -321,6 +326,7 @@ def build_review_pr_prompt(
     nonce: str,
     handoff: dict | None = None,
     last_sha: str | None = None,
+    head_sha: str | None = None,
 ) -> str:
     """Prompt for the `review-pr` command: an INDEPENDENT, READ-ONLY review of an existing PR.
 
@@ -337,7 +343,8 @@ def build_review_pr_prompt(
     `handoff`/`last_sha` (`review-pr --thread`) add a "Prior review context" block after the task
     block: the prior findings, fenced by `FRANKY_PRIOR_<nonce>` markers as untrusted PR-derived
     data, plus the re-review scope rules, and a "status" key in the findings shape. Without a
-    handoff the prompt is byte-identical to before.
+    handoff the prompt carries no prior-review block. `head_sha` pins the review to the commit
+    Franky recorded, so inline anchors match the diff Franky posts against.
     """
     persona = load_persona()
 
@@ -347,7 +354,7 @@ def build_review_pr_prompt(
     task_block = (
         f"Repo: {repo}\n"
         f"Task: independently review this existing pull request - {pr_url}. Read its diff, "
-        "metadata, and any linked issue; run the repository's existing checks; report grounded "
+        "metadata, and any linked issue; check its CI results; report grounded "
         "findings. Do NOT change anything.\n"
         f"{instructions_line}"
     )
@@ -388,18 +395,22 @@ def build_review_pr_prompt(
         )
         status_shape = ', "status": "<new|open|resolved>"'
 
+    head_line = (
+        f"- After checkout, run `git checkout --detach {head_sha}` and review exactly that "
+        "commit; the review is posted against it.\n"
+        if head_sha
+        else ""
+    )
     conventions = (
         "REVIEW MODE - this is a READ-ONLY review pass, NOT execution:\n"
         f"- Check out the PR in an isolated, disposable workspace: `gh pr checkout {pr_url}` "
         "(or clone the repo and fetch the PR's ref). Do NOT create a branch of your own.\n"
+        f"{head_line}"
         f"- Inspect the PR metadata (`gh pr view {pr_url}`), the full diff (`gh pr diff "
         f"{pr_url}`), its commits, and any linked issue.\n"
-        "- Run the repository's existing fast/default checks (its normal test suite and any "
-        "lint/type-check it runs in CI) and record the outcome of each - do not skip this.\n"
-        "- Review for correctness, security, regressions, concurrency/error handling, "
-        "compatibility, maintainability, and test coverage. Every finding must be grounded in "
-        "the actual diff/checks you observed - never invent a file, line, or behavior you did "
-        "not verify.\n"
+        "- Every finding must be grounded in the actual diff/checks you observed - never invent "
+        "a file, line, or behavior you did not verify.\n"
+        f"\n{load_review_method()}\n\n"
         "- ABSOLUTE RULE: you are read-only for this entire pass. Do NOT edit, stage, or commit "
         "any file; do NOT `git push`; do NOT create, merge, or close any branch or PR; do NOT "
         "run `gh pr review`, `gh pr merge`, `gh pr close`, or resolve/dismiss anything on "
@@ -412,7 +423,8 @@ def build_review_pr_prompt(
         f"  {begin}" + "{<compact ONE-LINE JSON>}" + f"{end}\n"
         "  where the JSON is exactly this shape:\n"
         '  {"summary": "...", "findings": [{"title": "...", "body": "...", '
-        '"severity": "<blocking|normal|nit>", "file": "path/or/null", "line": <int-or-null>'
+        '"severity": "<blocking|normal|nit>", "file": "path/or/null", "line": <int-or-null>, '
+        '"start_line": <int-or-null>, "suggestion": "text-or-null"'
         f"{status_shape}}}], "
         '"checks": [{"name": "...", "outcome": "<pass|fail|skipped>", "detail": "..."}]}\n'
         '- Use "blocking" severity ONLY for a verified, must-fix defect; use "normal"/"nit" '

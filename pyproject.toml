@@ -44,6 +44,7 @@ packages = ["franky"]
 [tool.setuptools.package-data]
 franky = [
     "persona.md",
+    "review.md",
     "security-default.json",
     "security-task.json",
     "security-task.apparmor",

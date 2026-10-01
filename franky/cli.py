@@ -92,7 +92,14 @@ from .prompt import (
     build_setup_block,
     task_slug,
 )
-from .reviewpr import build_review_findings, parse_review_findings, render_review_body, review_event
+from .reviewpr import (
+    build_body_only_payload,
+    build_review_findings,
+    build_review_payload,
+    commentable_lines,
+    parse_review_findings,
+    render_review_body,
+)
 from .result import (
     EXIT_AGENT,
     EXIT_CONFIG,
@@ -980,6 +987,95 @@ def _read_review_instructions_file(path: Path) -> str:
         raise FrankyError(error, code=EXIT_USAGE, kind="usage_error") from exc
 
 
+def _publish_review(
+    repo: str,
+    pr_number: int,
+    pr_url: str,
+    pinned_sha: str,
+    shaped: dict,
+    secrets: list[str],
+) -> tuple[str, str, int, str | None, int | None]:
+    """Post the review as inline comments on the pinned commit; returns the result fields.
+
+    Fetches the PR files to learn which lines are commentable, re-checks the head, then POSTs.
+    If GitHub rejects the anchors (422), retries ONCE with every finding in the body.
+    """
+    timeout = _resolve_gh_timeout(os.environ)
+
+    def gh(args: list[str], **kw):
+        try:
+            return run_gh(args, os.environ, timeout=timeout, **kw)
+        except subprocess.TimeoutExpired as exc:
+            raise FrankyError(
+                f"publishing the review to {pr_url} exceeded {int(exc.timeout)}s",
+                code=EXIT_TIMEOUT,
+                kind="timeout",
+            ) from exc
+        except OSError as exc:
+            raise DockerError(
+                "the `gh` CLI is not installed or not executable on the host - "
+                "review-pr publishes via gh"
+            ) from exc
+
+    def stale() -> bool:
+        live = fetch_pr_head_sha(repo, pr_number, os.environ)
+        return live is None or live.lower() != pinned_sha.lower()
+
+    stale_result = (
+        "publish_blocked_stale_head",
+        f"{pr_url}'s head changed since the review started (reviewed {pinned_sha}) - "
+        "refusing to publish a stale review",
+        EXIT_AGENT,
+        None,
+        None,
+    )
+    if stale():
+        return stale_result
+    files: list | None = None
+    fcode, fout, _ferr = gh(
+        ["api", f"repos/{repo}/pulls/{pr_number}/files?per_page=100", "--paginate", "--slurp"]
+    )
+    if fcode == 0:
+        try:
+            pages = json.loads(fout)
+        except (ValueError, TypeError):
+            pages = None
+        if isinstance(pages, list):
+            files = []
+            for page in pages:
+                files.extend(page if isinstance(page, list) else [page])
+    if stale():
+        return stale_result
+
+    payload = build_review_payload(shaped, commentable_lines(files or []), pinned_sha, secrets)
+    post = ["api", "-X", "POST", f"repos/{repo}/pulls/{pr_number}/reviews", "--input", "-"]
+    gcode, gout, gerr = gh(post, input=json.dumps(payload))
+    reason = f"published a {payload['event']} review"
+    if files is None:
+        reason += " (could not read the PR files, posted body-only)"
+    if gcode != 0 and payload["comments"] and ("422" in gerr or "Unprocessable" in gerr):
+        # Re-check before the second write: the author may have pushed during the first POST.
+        if stale():
+            return stale_result
+        payload = build_body_only_payload(shaped, pinned_sha, secrets)
+        gcode, gout, gerr = gh(post, input=json.dumps(payload))
+        reason += " (inline anchors rejected, posted body-only)"
+    if gcode != 0:
+        return (
+            "publish_failed",
+            f"posting the GitHub review failed: {redact(gerr.strip(), secrets)[:500]}",
+            EXIT_NETWORK,
+            None,
+            None,
+        )
+    try:
+        resp = json.loads(gout)
+    except (ValueError, TypeError):
+        resp = {}
+    resp = resp if isinstance(resp, dict) else {}
+    return "review_published", reason, EXIT_SUCCESS, resp.get("html_url"), resp.get("id")
+
+
 @main.command("review-pr")
 @click.argument("pr_url")
 @click.argument("instructions", required=False, default="")
@@ -1172,6 +1268,8 @@ def review_pr(
                 f"{canonical_pr_url}'s current head {live_sha!r} - refusing (head changed)",
                 kind="head_changed",
             )
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", live_sha):
+            raise NetworkError(f"{canonical_pr_url}'s head commit is not a valid SHA - refusing")
         pinned_sha = live_sha
 
         franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
@@ -1213,7 +1311,13 @@ def review_pr(
                 now=now,
             )
         prompt = build_review_pr_prompt(
-            repo, canonical_pr_url, instructions, nonce, handoff=prior_handoff, last_sha=prior_sha
+            repo,
+            canonical_pr_url,
+            instructions,
+            nonce,
+            handoff=prior_handoff,
+            last_sha=prior_sha,
+            head_sha=pinned_sha,
         )
 
         diagnostics: dict = {}
@@ -1306,50 +1410,9 @@ def review_pr(
                         )
                         exit_code = EXIT_AGENT
                     else:
-                        event = review_event(shaped)  # COMMENT or REQUEST_CHANGES, never APPROVE
-                        body = render_review_body(shaped)
-                        try:
-                            gcode, gout, gerr = run_gh(
-                                [
-                                    "api",
-                                    f"repos/{repo}/pulls/{pr_number}/reviews",
-                                    "-f",
-                                    f"event={event}",
-                                    "-f",
-                                    f"body={body}",
-                                ],
-                                os.environ,
-                                timeout=_resolve_gh_timeout(os.environ),
-                            )
-                        except subprocess.TimeoutExpired as exc:
-                            raise FrankyError(
-                                f"publishing the review to {canonical_pr_url} exceeded "
-                                f"{int(exc.timeout)}s",
-                                code=EXIT_TIMEOUT,
-                                kind="timeout",
-                            ) from exc
-                        except OSError as exc:
-                            raise DockerError(
-                                "the `gh` CLI is not installed or not executable on the host - "
-                                "review-pr publishes via gh"
-                            ) from exc
-                        if gcode != 0:
-                            status = "publish_failed"
-                            reason = (
-                                "posting the GitHub review failed: "
-                                f"{redact(gerr.strip(), secrets)[:500]}"
-                            )
-                            exit_code = EXIT_NETWORK
-                        else:
-                            try:
-                                resp = json.loads(gout)
-                            except (ValueError, TypeError):
-                                resp = {}
-                            review_url = resp.get("html_url") if isinstance(resp, dict) else None
-                            review_id = resp.get("id") if isinstance(resp, dict) else None
-                            status = "review_published"
-                            reason = f"published a {event} review"
-                            exit_code = EXIT_SUCCESS
+                        status, reason, exit_code, review_url, review_id = _publish_review(
+                            repo, pr_number, canonical_pr_url, pinned_sha, shaped, secrets
+                        )
 
         thread_result = handoff = None
         if thread is not None:
