@@ -144,6 +144,9 @@ from .userconfig import (
 # the bridge's own `_SHA_RE` shape check, which Franky re-validates independently since
 # this CLI is also reachable directly, not only via the bridge).
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
+_RESULT_FINDING_KEYS = ("title", "body", "severity", "file", "line", "start_line")
+# `review-pr --at-sha/--diff-base`: a full lowercase 40-hex commit (never an abbreviation).
+_FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 FRANKY_VERBOSE_VAR = "FRANKY_VERBOSE"
 # `franky gh` subprocess watchdog. A default cap honors the never-hang guarantee for the
@@ -1076,6 +1079,42 @@ def _publish_review(
     return "review_published", reason, EXIT_SUCCESS, resp.get("html_url"), resp.get("id")
 
 
+def _require_commit_in_pr(repo: str, number: int, sha: str, pr_url: str) -> None:
+    """Refuse (fail closed) unless `sha` is one of the PR's commits. Read-only; never a POST."""
+
+    def refuse(why: str) -> FrankyError:
+        return FrankyError(
+            f"cannot confirm --at-sha {sha} is a commit of {pr_url}: {why}",
+            code=EXIT_USAGE,
+            kind="usage_error",
+        )
+
+    try:
+        code, out, _err = run_gh(
+            [
+                "api",
+                f"repos/{repo}/pulls/{number}/commits?per_page=100",
+                "--paginate",
+                "--slurp",
+            ],
+            os.environ,
+            timeout=_resolve_gh_timeout(os.environ),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise refuse(f"gh failed ({type(exc).__name__})") from exc
+    if code != 0:
+        raise refuse(f"gh exited {code}")
+    try:
+        pages = json.loads(out)
+    except ValueError as exc:
+        raise refuse("unparseable response") from exc
+    if not isinstance(pages, list):
+        raise refuse("unexpected response shape")
+    commits = [c for page in pages for c in (page if isinstance(page, list) else [page])]
+    if not any(isinstance(c, dict) and str(c.get("sha", "")).lower() == sha for c in commits):
+        raise refuse("commit not in the PR")
+
+
 @main.command("review-pr")
 @click.argument("pr_url")
 @click.argument("instructions", required=False, default="")
@@ -1090,6 +1129,20 @@ def _publish_review(
     "expected_head_sha",
     default=None,
     help="Refuse unless the PR's LIVE head SHA matches this (7-40 hex chars).",
+)
+@click.option(
+    "--at-sha",
+    "at_sha",
+    default=None,
+    help="Eval mode: review the PR frozen at this commit (40 hex; must be a commit of the PR). "
+    "Requires --diff-base and --no-publish.",
+)
+@click.option(
+    "--diff-base",
+    "diff_base",
+    default=None,
+    help="Eval mode: diff the reviewed commit against this base commit (40 hex). "
+    "Requires --at-sha.",
 )
 @click.option(
     "--no-publish",
@@ -1152,6 +1205,8 @@ def review_pr(
     instructions: str,
     instructions_file: Path | None,
     expected_head_sha: str | None,
+    at_sha: str | None,
+    diff_base: str | None,
     no_publish: bool,
     use_thread: bool,
     rubric_version: str,
@@ -1188,7 +1243,12 @@ def review_pr(
     review_complete on success, including reviewed_sha/findings_summary/checks and, once
     published, review_url/review_id). Exit codes follow the documented taxonomy (0 ok, 2 usage,
     3 config, 4 task, 5 auth, 6 docker, 7 agent, 8 net, 9 timeout).
-    A successful unpublished result also includes a bounded `review_body`.
+    A successful unpublished result also includes a bounded `review_body` and the shaped
+    `findings` (all of them, at most 10 by the private result limit) with `findings_total`.
+
+    --at-sha/--diff-base (eval mode) freeze the review at a historical commit of the PR and diff
+    it against a pinned base, blind to later PR state. They require --no-publish and refuse
+    --thread and --expected-head-sha, so this mode can never write to GitHub or a thread.
     """
     quiet = quiet or as_json
     secrets = cfg_secrets_safe()
@@ -1196,6 +1256,30 @@ def review_pr(
     try:
         if not quiet:
             maybe_auto_update()
+
+        frozen = at_sha is not None or diff_base is not None
+        if frozen:
+            if at_sha is None or diff_base is None:
+                raise FrankyError(
+                    "--at-sha and --diff-base must be given together",
+                    code=EXIT_USAGE,
+                    kind="usage_error",
+                )
+            at_sha, diff_base = at_sha.strip(), diff_base.strip()
+            for flag, value in (("--at-sha", at_sha), ("--diff-base", diff_base)):
+                if not _FULL_SHA_RE.match(value):
+                    raise FrankyError(
+                        f"{flag} {value!r} is not a full lowercase 40-hex commit SHA",
+                        code=EXIT_USAGE,
+                        kind="usage_error",
+                    )
+            if not no_publish or use_thread or expected_head_sha:
+                raise FrankyError(
+                    "--at-sha/--diff-base require --no-publish and cannot be combined with "
+                    "--thread or --expected-head-sha",
+                    code=EXIT_USAGE,
+                    kind="usage_error",
+                )
 
         expected_head_sha = (expected_head_sha or "").strip().lower()
         if expected_head_sha and not _SHA_RE.match(expected_head_sha):
@@ -1251,26 +1335,34 @@ def review_pr(
             thread = _open_thread(repo, pr_number, "reviewer")
             ctx.call_on_close(thread.close)
 
-        # Pin the LIVE head SHA before anything else runs - the review is grounded against
-        # exactly this commit. A caller-supplied --expected-head-sha must agree with it now, or
-        # we refuse rather than reviewing state the caller no longer expects (issue: review-pr
-        # MVP). Unlike find_open_pr's best-effort idempotency check, an unreachable/unparseable
-        # fetch here is fail-closed (NetworkError), not silently skipped.
-        live_sha = fetch_pr_head_sha(repo, pr_number, os.environ)
-        if live_sha is None:
-            raise NetworkError(
-                f"could not read {canonical_pr_url}'s live head commit via the GitHub API - "
-                "refusing"
-            )
-        if expected_head_sha and expected_head_sha != live_sha.lower():
-            raise TaskRejected(
-                f"expected head sha {expected_head_sha!r} does not match "
-                f"{canonical_pr_url}'s current head {live_sha!r} - refusing (head changed)",
-                kind="head_changed",
-            )
-        if not re.fullmatch(r"[0-9a-fA-F]{40}", live_sha):
-            raise NetworkError(f"{canonical_pr_url}'s head commit is not a valid SHA - refusing")
-        pinned_sha = live_sha
+        if frozen:
+            # Fail closed: the pinned commit must belong to THIS PR. One read-only GET (no POST),
+            # after every gate above. Nothing publishes in this mode, so no live-head pin.
+            _require_commit_in_pr(repo, pr_number, at_sha, canonical_pr_url)
+            pinned_sha = at_sha
+        else:
+            # Pin the LIVE head SHA before anything else runs - the review is grounded against
+            # exactly this commit. A caller-supplied --expected-head-sha must agree with it now, or
+            # we refuse rather than reviewing state the caller no longer expects (issue: review-pr
+            # MVP). Unlike find_open_pr's best-effort idempotency check, an unreachable/unparseable
+            # fetch here is fail-closed (NetworkError), not silently skipped.
+            live_sha = fetch_pr_head_sha(repo, pr_number, os.environ)
+            if live_sha is None:
+                raise NetworkError(
+                    f"could not read {canonical_pr_url}'s live head commit via the GitHub API - "
+                    "refusing"
+                )
+            if expected_head_sha and expected_head_sha != live_sha.lower():
+                raise TaskRejected(
+                    f"expected head sha {expected_head_sha!r} does not match "
+                    f"{canonical_pr_url}'s current head {live_sha!r} - refusing (head changed)",
+                    kind="head_changed",
+                )
+            if not re.fullmatch(r"[0-9a-fA-F]{40}", live_sha):
+                raise NetworkError(
+                    f"{canonical_pr_url}'s head commit is not a valid SHA - refusing"
+                )
+            pinned_sha = live_sha
 
         franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
         bundle, _setup_block = _load_profile_bundle(None, process_env, secrets, cfg)
@@ -1318,6 +1410,8 @@ def review_pr(
             handoff=prior_handoff,
             last_sha=prior_sha,
             head_sha=pinned_sha,
+            diff_base=diff_base,
+            frozen=frozen,
         )
 
         diagnostics: dict = {}
@@ -1359,6 +1453,8 @@ def review_pr(
         findings_summary: str | None = None
         review_body: str | None = None
         checks: list | None = None
+        findings_out: list | None = None
+        findings_total: int | None = None
         shaped: dict | None = None
 
         # Timeout first (124 is nonzero) -> dedicated timeout contract, before generic agent_error.
@@ -1376,6 +1472,15 @@ def review_pr(
                 reason = (
                     f"agent produced no parseable review findings - see the redacted log "
                     f"({log_path})"
+                )
+                exit_code = EXIT_AGENT
+            elif not isinstance(parsed.get("findings"), list):
+                # A review with no `findings` list is malformed, not a clean review: never report
+                # it as complete with zero findings.
+                status = "no_findings"
+                reason = (
+                    "agent review JSON has no `findings` list - treating as malformed, see the "
+                    f"redacted log ({log_path})"
                 )
                 exit_code = EXIT_AGENT
             else:
@@ -1397,6 +1502,10 @@ def review_pr(
                         status = "review_complete"
                         reason = "review pass complete (publish=False, nothing written to GitHub)"
                         exit_code = EXIT_SUCCESS
+                        findings_total = len(shaped["findings"])
+                        findings_out = [
+                            {k: f[k] for k in _RESULT_FINDING_KEYS} for f in shaped["findings"]
+                        ]
                 else:
                     # Re-check the LIVE head immediately before publishing - never post a review
                     # over a PR that moved on mid-run (same register as --expected-head-sha above).
@@ -1472,6 +1581,8 @@ def review_pr(
             reviewed_sha=pinned_sha,
             findings_summary=findings_summary,
             review_body=review_body,
+            findings=findings_out,
+            findings_total=findings_total,
             checks=checks,
             review_url=review_url,
             review_id=review_id,

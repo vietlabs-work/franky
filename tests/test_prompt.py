@@ -616,3 +616,27 @@ def test_review_prompt_handoff_without_findings():
         "me/repo", "u", "", "n0", handoff={**_HANDOFF, "findings": []}, last_sha=None
     )
     assert "(no open findings)" in prompt and f"Last reviewed commit: {'b' * 40}" in prompt
+
+
+def test_review_pr_prompt_frozen_pins_commit_and_forbids_later_state():
+    at, base = "a" * 40, "b" * 40
+    url = "https://github.com/me/repo/pull/1"
+    normal = build_review_pr_prompt("me/repo", url, "", "n0", head_sha=at)
+    frozen = build_review_pr_prompt(
+        "me/repo", url, "", "n0", head_sha=at, diff_base=base, frozen=True
+    )
+    assert "gh repo clone me/repo" in frozen
+    assert f"git fetch origin {at} {base}" in frozen
+    assert f"git checkout --detach {at}" in frozen
+    assert f"git diff {base} {at}" in frozen
+    assert f"gh pr view {url} --json title,body" in frozen
+    assert "Do NOT read PR comments, reviews, review threads, issue comments" in frozen
+    assert "Do NOT run `gh pr checkout` or `gh pr diff`" in frozen
+    assert "EVAL MODE overrides" in frozen
+    assert "Skip method step 6" in frozen and "empty list" in frozen
+    # The live-PR inspect bullets are gone; the read-only/sentinel rules stay.
+    assert f"(`gh pr diff {url}`)" not in frozen
+    assert "ABSOLUTE RULE" in frozen and "FRANKY_REVIEW_n0_BEGIN" in frozen
+    # A normal prompt carries none of it.
+    assert "EVAL MODE" not in normal and "gh repo clone" not in normal
+    assert f"`gh pr checkout {url}`" in normal

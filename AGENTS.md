@@ -36,6 +36,7 @@ make smoke-memory
 make smoke-memory ARGS="--jobs 4"
 
 make eval ARGS="-n 3 --engine pi --compare-engine codex"
+make review-eval ARGS="--cases ~/.franky/evals/review_cases.json -n 3"
 ```
 
 Unit tests must not use real Docker, networks, GitHub, or credentials. Inject runners, environments, and sleepers instead.

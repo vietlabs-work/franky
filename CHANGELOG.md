@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `franky review-pr --no-publish` accepts `--at-sha` and `--diff-base` (both 40-hex, together) to review a PR frozen at one of its historical commits against a pinned diff base, blind to later PR state. The mode refuses publishing, `--thread`, and `--expected-head-sha`, and refuses a SHA that is not a commit of the PR. A successful `--no-publish --json` result now also carries `findings` (at most 8, shaped) and `findings_total`; a review JSON without a `findings` list is reported as `no_findings`.
+
 ## [0.3.9] - 2026-10-01
 
 ### Changed

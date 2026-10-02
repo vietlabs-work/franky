@@ -1,0 +1,59 @@
+[
+  {
+    "id": "example-missing-null-check",
+    "pr_url": "https://github.com/example/app/pull/1",
+    "sha": "0123456789abcdef0123456789abcdef01234567",
+    "base_sha": "89abcdef0123456789abcdef0123456789abcdef",
+    "expect": [
+      {
+        "name": "null total crashes checkout",
+        "any_of": [
+          "(?i)null",
+          "(?i)NoneType"
+        ],
+        "all_of": [
+          "(?i)total"
+        ],
+        "min_severity": "normal",
+        "file": "checkout.py"
+      }
+    ],
+    "forbid": [
+      {
+        "name": "style nitpick on naming",
+        "any_of": [
+          "(?i)rename",
+          "(?i)naming"
+        ],
+        "severities": [
+          "normal",
+          "blocking"
+        ]
+      }
+    ],
+    "clean": false
+  },
+  {
+    "id": "example-fixed-null-check",
+    "control_of": "example-missing-null-check",
+    "pr_url": "https://github.com/example/app/pull/1",
+    "sha": "fedcba9876543210fedcba9876543210fedcba98",
+    "base_sha": "89abcdef0123456789abcdef0123456789abcdef",
+    "forbid": [
+      {
+        "name": "null total crashes checkout",
+        "any_of": [
+          "(?i)null",
+          "(?i)NoneType"
+        ],
+        "all_of": [
+          "(?i)total"
+        ],
+        "severities": [
+          "normal",
+          "blocking"
+        ]
+      }
+    ]
+  }
+]

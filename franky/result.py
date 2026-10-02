@@ -130,6 +130,8 @@ def build_result(
     reviewed_sha: str | None = None,
     findings_summary: str | None = None,
     review_body: str | None = None,
+    findings: list | None = None,
+    findings_total: int | None = None,
     checks: list | None = None,
     review_url: str | None = None,
     review_id: int | None = None,
@@ -167,7 +169,9 @@ def build_result(
     build/iterate emit the exact same keys as before. `reviewed_sha` is the PR head commit the
     review is grounded against (pinned before the pass, re-checked before publishing);
     `findings_summary`/`checks` summarize the agent's grounded findings and the repo checks it
-    ran. `review_body` is the bounded, complete rendered body of a successful unpublished review.
+    ran. `review_body` is the bounded, complete rendered body of a successful unpublished review;
+    `findings` (the shaped findings, capped at 8) and `findings_total` (count before the cap)
+    accompany it and are absent on any other status.
     `review_url`/`review_id` identify the GitHub review Franky posted, present only when
     `publish=True` actually posted one (never on a `--no-publish` run, which writes nothing to
     GitHub - see the `review-pr` command).
@@ -206,6 +210,10 @@ def build_result(
         result["findings_summary"] = findings_summary
     if review_body is not None:
         result["review_body"] = review_body
+    if findings is not None:
+        result["findings"] = findings
+    if findings_total is not None:
+        result["findings_total"] = findings_total
     if checks is not None:
         result["checks"] = checks
     if review_url is not None:

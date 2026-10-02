@@ -327,6 +327,8 @@ def build_review_pr_prompt(
     handoff: dict | None = None,
     last_sha: str | None = None,
     head_sha: str | None = None,
+    diff_base: str | None = None,
+    frozen: bool = False,
 ) -> str:
     """Prompt for the `review-pr` command: an INDEPENDENT, READ-ONLY review of an existing PR.
 
@@ -344,7 +346,9 @@ def build_review_pr_prompt(
     block: the prior findings, fenced by `FRANKY_PRIOR_<nonce>` markers as untrusted PR-derived
     data, plus the re-review scope rules, and a "status" key in the findings shape. Without a
     handoff the prompt carries no prior-review block. `head_sha` pins the review to the commit
-    Franky recorded, so inline anchors match the diff Franky posts against.
+    Franky recorded, so inline anchors match the diff Franky posts against. `frozen` (eval mode,
+    with `head_sha` = the pinned commit and `diff_base`) swaps the checkout/inspect bullets for a
+    clone pinned to that commit and forbids reading any PR state after it.
     """
     persona = load_persona()
 
@@ -401,16 +405,40 @@ def build_review_pr_prompt(
         if head_sha
         else ""
     )
+    if frozen:
+        checkout_block = (
+            f"- Clone the repo in an isolated, disposable workspace: `gh repo clone {repo} "
+            f"<dir>`, then `git fetch origin {head_sha} {diff_base}` and "
+            f"`git checkout --detach {head_sha}`. Do NOT create a branch of your own.\n"
+            f"- The diff under review is `git diff {diff_base} {head_sha}`. Read the PR's intent "
+            f"ONLY with `gh pr view {pr_url} --json title,body`.\n"
+            "- Do NOT read PR comments, reviews, review threads, issue comments, CI checks, "
+            f"linked issues, or any commit after {head_sha}. Do NOT run `gh pr checkout` or "
+            "`gh pr diff`.\n"
+        )
+        eval_block = (
+            "EVAL MODE overrides (these win over the review method above):\n"
+            f'- "The PR head" means commit {head_sha}. Review only that commit.\n'
+            "- Skip method step 6 (duplicates): read no existing review comments.\n"
+            '- Skip the "Checks:" CI instruction: read no CI results. Report checks as an empty '
+            "list.\n\n"
+        )
+    else:
+        checkout_block = (
+            f"- Check out the PR in an isolated, disposable workspace: `gh pr checkout {pr_url}` "
+            "(or clone the repo and fetch the PR's ref). Do NOT create a branch of your own.\n"
+            f"{head_line}"
+            f"- Inspect the PR metadata (`gh pr view {pr_url}`), the full diff (`gh pr diff "
+            f"{pr_url}`), its commits, and any linked issue.\n"
+        )
+        eval_block = ""
     conventions = (
         "REVIEW MODE - this is a READ-ONLY review pass, NOT execution:\n"
-        f"- Check out the PR in an isolated, disposable workspace: `gh pr checkout {pr_url}` "
-        "(or clone the repo and fetch the PR's ref). Do NOT create a branch of your own.\n"
-        f"{head_line}"
-        f"- Inspect the PR metadata (`gh pr view {pr_url}`), the full diff (`gh pr diff "
-        f"{pr_url}`), its commits, and any linked issue.\n"
+        f"{checkout_block}"
         "- Every finding must be grounded in the actual diff/checks you observed - never invent "
         "a file, line, or behavior you did not verify.\n"
         f"\n{load_review_method()}\n\n"
+        f"{eval_block}"
         "- ABSOLUTE RULE: you are read-only for this entire pass. Do NOT edit, stage, or commit "
         "any file; do NOT `git push`; do NOT create, merge, or close any branch or PR; do NOT "
         "run `gh pr review`, `gh pr merge`, `gh pr close`, or resolve/dismiss anything on "

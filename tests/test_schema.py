@@ -344,3 +344,9 @@ def test_schema_documents_thread_outputs():
 def test_error_schema_lists_image_pull_timeout():
     kind = build_schema(cli.main)["error_schema"]["error"]["kind"]
     assert "image_pull_timeout" in kind
+
+
+def test_result_schema_documents_review_findings():
+    schema = build_schema(cli.main)["result_schema"]
+    assert set(schema["findings"][0]) == {"title", "body", "severity", "file", "line", "start_line"}
+    assert "findings_total" in schema

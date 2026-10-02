@@ -50,6 +50,18 @@ _RESULT_SCHEMA: dict = {
     "reviewed_sha": "string; present ONLY for `review-pr`: the reviewed PR head commit",
     "findings_summary": "string; present ONLY for `review-pr`: the review findings summary",
     "review_body": "string; present ONLY for a successful unpublished `review-pr`: the complete rendered review",
+    # `findings`/`findings_total`: same condition as review_body (status review_complete).
+    "findings": [
+        {
+            "title": "string; finding title",
+            "body": "string; finding detail, possibly empty",
+            "severity": "string: blocking | normal | nit",
+            "file": "string or null",
+            "line": "integer or null",
+            "start_line": "integer or null",
+        }
+    ],
+    "findings_total": "integer; present ONLY with `findings`: the finding count before the cap of 8",
     "checks": [
         {
             "name": "string; check name",

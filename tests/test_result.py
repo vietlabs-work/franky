@@ -282,3 +282,21 @@ def test_build_result_includes_review_body_only_when_supplied():
         result_mod.build_result(**base, review_body="complete finding")["review_body"]
         == "complete finding"
     )
+
+
+def test_build_result_includes_findings_only_when_supplied():
+    base = dict(
+        status="review_complete",
+        pr_url="u",
+        reason="r",
+        exit_code=0,
+        usage=Usage(),
+        duration=1.0,
+        log_path="/l",
+        engine="claude",
+        repo="o/r",
+    )
+    plain = result_mod.build_result(**base)
+    assert "findings" not in plain and "findings_total" not in plain
+    out = result_mod.build_result(**base, findings=[], findings_total=0)
+    assert out["findings"] == [] and out["findings_total"] == 0

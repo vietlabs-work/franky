@@ -5,7 +5,7 @@
 # The `\#` is escaped: a bare `#` would start a Make comment and eat the `)`.
 VERSION ?= $(shell for kv in $(MAKEOVERRIDES); do n=$${kv%%=*}; l=$$(printf '%s' "$$n" | tr A-Z a-z); if [ "$$l" = version ] || [ "$$l" = v ]; then printf '%s' "$${kv\#*=}"; break; fi; done)
 
-.PHONY: footprint smoke-security smoke-dind smoke-resume smoke-profile smoke-thread smoke-memory eval release release-dry
+.PHONY: footprint smoke-security smoke-dind smoke-resume smoke-profile smoke-thread smoke-memory eval review-eval release release-dry
 
 # Credential-free host CPU and memory comparison against BASE. Real-Docker runtime checks stay
 # in smoke-memory; CI also builds and checks every release image variant.
@@ -54,6 +54,9 @@ smoke-memory:
 # flags via ARGS, e.g. `make eval ARGS="-n 3 --engine pi --compare-engine codex"`.
 eval:
 	python3 scripts/eval.py $(ARGS)
+
+review-eval:
+	python3 scripts/review_eval.py $(ARGS)
 
 release:
 	@test -n "$(VERSION)" || { echo "usage: make release VERSION=X.Y.Z"; exit 2; }

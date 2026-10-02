@@ -4905,3 +4905,161 @@ def test_review_pr_thread_copies_out_only_the_session_file_and_side_dir(monkeypa
     assert _review(["--thread", "--engine", "claude", "--no-publish"]).exit_code == 0
     assert seen[0]["tar_names"] == [f".claude/projects/-work/{sid}.jsonl"]
     assert not Path(seen[0]["kwargs"]["session_tar"]).exists()
+
+
+# --- review-pr --at-sha/--diff-base (frozen eval mode) ---------------------------------------
+
+AT_SHA = "c" * 40
+BASE_SHA = "d" * 40
+FROZEN = ["--no-publish", "--json", "--at-sha", AT_SHA, "--diff-base", BASE_SHA]
+
+
+def _frozen_setup(monkeypatch, *, commits=None, commits_rc=0, commits_out=None, container=None):
+    """Hermetic frozen run. Returns (gh_calls, container_calls); fails on any live-head fetch."""
+    _fix_review_nonce(monkeypatch)
+    monkeypatch.setattr(cli.os, "environ", _review_env())
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+
+    def no_live(*a, **k):
+        raise AssertionError("frozen mode must not read the live head")
+
+    monkeypatch.setattr(cli, "fetch_pr_head_sha", no_live)
+    gh_calls, container_calls = [], []
+    pages = [[{"sha": "e" * 40}], [{"sha": AT_SHA}]] if commits is None else commits
+    out = json.dumps(pages) if commits_out is None else commits_out
+
+    def fake_gh(args, e, **k):
+        gh_calls.append(list(args))
+        return commits_rc, out, ""
+
+    def fake_run(*a, **k):
+        container_calls.append(a)
+        return container or (
+            0,
+            _review_block({"summary": "s", "findings": [{"title": "t"}], "checks": []}),
+        )
+
+    monkeypatch.setattr(cli, "run_gh", fake_gh)
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+    return gh_calls, container_calls
+
+
+def _run_frozen(args):
+    return CliRunner().invoke(cli.main, ["review-pr", *args, "--", PR_URL])
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--no-publish", "--json", "--at-sha", AT_SHA],
+        ["--no-publish", "--json", "--diff-base", BASE_SHA],
+        ["--no-publish", "--json", "--at-sha", "abc123", "--diff-base", BASE_SHA],
+        ["--no-publish", "--json", "--at-sha", AT_SHA.upper(), "--diff-base", BASE_SHA],
+        ["--no-publish", "--json", "--at-sha", AT_SHA, "--diff-base", "z" * 40],
+        ["--json", "--at-sha", AT_SHA, "--diff-base", BASE_SHA],
+        [*FROZEN, "--thread"],
+        [*FROZEN, "--expected-head-sha", AT_SHA],
+    ],
+)
+def test_review_pr_frozen_flag_refusals(monkeypatch, args):
+    gh_calls, container_calls = _frozen_setup(monkeypatch)
+    res = _run_frozen(args)
+    assert res.exit_code == 2, res.output
+    assert json.loads(res.stdout)["error"]["kind"] == "usage_error"
+    assert gh_calls == [] and container_calls == []
+
+
+def test_review_pr_frozen_happy_path_pins_at_sha_and_never_posts(monkeypatch):
+    gh_calls, container_calls = _frozen_setup(monkeypatch)
+    res = _run_frozen(FROZEN)
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.stdout)
+    assert data["status"] == "review_complete"
+    assert data["reviewed_sha"] == AT_SHA
+    assert len(container_calls) == 1
+    assert gh_calls == [
+        [
+            "api",
+            f"repos/me/repo/pulls/{REVIEW_PR_NUMBER}/commits?per_page=100",
+            "--paginate",
+            "--slurp",
+        ]
+    ]
+    assert not any("POST" in a or "--method" in a or "-X" in a for c in gh_calls for a in c)
+
+
+def test_review_pr_frozen_prompt_is_frozen(monkeypatch):
+    _frozen_setup(monkeypatch)
+    seen = {}
+    original = cli.build_review_pr_prompt
+
+    def capture(*a, **k):
+        seen.update(k)
+        return original(*a, **k)
+
+    monkeypatch.setattr(cli, "build_review_pr_prompt", capture)
+    assert _run_frozen(FROZEN).exit_code == 0
+    assert seen["frozen"] is True and seen["diff_base"] == BASE_SHA and seen["head_sha"] == AT_SHA
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        {"commits": [[{"sha": "e" * 40}]]},  # absent
+        {"commits_rc": 1},  # gh failure
+        {"commits_out": "not json"},  # bad JSON
+        {"commits_out": '{"sha": "x"}'},  # wrong shape
+    ],
+)
+def test_review_pr_frozen_refuses_sha_not_in_pr(monkeypatch, kw):
+    gh_calls, container_calls = _frozen_setup(monkeypatch, **kw)
+    res = _run_frozen(FROZEN)
+    assert res.exit_code == 2, res.output
+    assert json.loads(res.stdout)["error"]["kind"] == "usage_error"
+    assert container_calls == []
+
+
+def test_review_pr_frozen_repo_gate_runs_before_any_api_call(monkeypatch):
+    gh_calls, container_calls = _frozen_setup(monkeypatch)
+    monkeypatch.setattr(cli.os, "environ", {**_review_env(), "FRANKY_ALLOWED_REPOS": "other/x"})
+    res = _run_frozen(FROZEN)
+    assert res.exit_code != 0
+    assert gh_calls == [] and container_calls == []
+
+
+def test_review_pr_no_publish_result_has_all_findings(monkeypatch):
+    _fix_review_nonce(monkeypatch)
+    items = [
+        {"title": f"t{i}", "body": "b", "severity": "blocking", "file": "a.py", "line": 3}
+        for i in range(10)
+    ]
+    _mc_review_setup(
+        monkeypatch, container=(0, _review_block({"summary": "s", "findings": items, "checks": []}))
+    )
+    res = CliRunner().invoke(cli.main, ["review-pr", "--no-publish", "--json", "--", PR_URL])
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.stdout)
+    assert data["findings_total"] == 10
+    assert len(data["findings"]) == 10  # all of them: findings_total must match
+    assert set(data["findings"][0]) == {"title", "body", "severity", "file", "line", "start_line"}
+
+
+@pytest.mark.parametrize("payload", [{"summary": "s", "checks": []}, {"findings": "x"}])
+def test_review_pr_missing_findings_list_is_not_a_clean_review(monkeypatch, payload):
+    _mc_review_setup(monkeypatch, container=(0, _review_block(payload)))
+    _fix_review_nonce(monkeypatch)
+    res = CliRunner().invoke(cli.main, ["review-pr", "--no-publish", "--json", "--", PR_URL])
+    assert res.exit_code == 7
+    data = json.loads(res.stdout)
+    assert data["status"] == "no_findings"
+    assert "findings" not in data and "no `findings` list" in data["reason"]
+
+
+def test_review_pr_findings_absent_on_non_complete_status(monkeypatch):
+    _fix_review_nonce(monkeypatch)
+    _mc_review_setup(monkeypatch, container=(1, "boom"))
+    res = CliRunner().invoke(cli.main, ["review-pr", "--no-publish", "--json", "--", PR_URL])
+    data = json.loads(res.stdout)
+    assert data["status"] == "agent_error"
+    assert "findings" not in data and "findings_total" not in data
