@@ -2,9 +2,16 @@ name: Footprint cache
 
 # Refresh what pull request footprint runs reuse: the BuildKit layer cache for every image
 # variant, and prebuilt pi and proxy images keyed by scripts/footprint-image-key.sh.
+# A release commit changes only these version files, which no image reads. Skip it so its six
+# jobs do not take runners from the release that starts at the same moment.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - pyproject.toml
+      - franky/__init__.py
+      - CHANGELOG.md
+      - README.md
 
 permissions:
   contents: read
