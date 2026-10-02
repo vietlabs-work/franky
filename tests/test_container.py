@@ -2334,3 +2334,27 @@ def test_run_in_container_session_and_workspace_restore_wait_in_order(monkeypatc
     assert order == [("profile", None, "s.tar.gz"), "work"]
     task_argv = argvs[0]
     assert f"{PROFILE_WAIT_VAR}=1" in task_argv and f"{snapshot.RESUME_WAIT_ENV}=1" in task_argv
+
+
+def test_run_in_container_extra_secrets_redacted_from_stream_and_output():
+    """Host-only secrets (the JIRA token) are redacted from the streamed and stored output."""
+    planted = "jira-tok-planted"
+    seen = []
+
+    def task(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    runner, calls = _orchestration_runner(task)
+    code, out = run_in_container(
+        _cfg(),
+        ["pi"],
+        runner=runner,
+        env={},
+        sleeper=NOOP_SLEEP,
+        progress=seen.append,
+        popen=_fake_popen_factory([f"leaked {planted}\n"]),
+        extra_secrets=[planted],
+    )
+    assert planted not in out and planted not in "".join(seen)
+    assert "***REDACTED***" in out
+    assert all(planted not in " ".join(map(str, c)) for c in calls)

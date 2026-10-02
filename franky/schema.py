@@ -71,6 +71,17 @@ _RESULT_SCHEMA: dict = {
     ],
     "review_url": "string; present ONLY when `review-pr` publishes a GitHub review",
     "review_id": "integer; present ONLY when `review-pr` publishes a GitHub review",
+    # Present on every `review-pr` result; [] when no JIRA key was found or in frozen
+    # (--at-sha/--diff-base) mode, which never fetches tickets. Never ticket text.
+    "context_sources": [
+        {
+            "kind": "string: jira",
+            "ref": "string; the ticket key",
+            "status": "string: included | partial | unavailable | unconfigured",
+            "reason": "string; present unless status is included or partial: unconfigured | "
+            "public_repo | auth | not_found | restricted | config | network",
+        }
+    ],
     "thread": {
         "id": "string or null; thread id `<owner>__<repo>__<pr>__<role>`, null until a `build "
         "--thread` session is bound (no PR yet, or bind left pending). The whole `thread` object "

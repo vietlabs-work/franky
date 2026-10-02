@@ -4744,6 +4744,7 @@ def test_review_pr_without_thread_is_unchanged(monkeypatch, tmp_path):
         "checks",
         "review_url",
         "review_id",
+        "context_sources",
     }
     argv, kwargs = seen[0]
     assert argv[:7] == [
@@ -4907,6 +4908,145 @@ def test_review_pr_thread_copies_out_only_the_session_file_and_side_dir(monkeypa
     assert not Path(seen[0]["kwargs"]["session_tar"]).exists()
 
 
+def _reasons(res):
+    return [
+        (s["ref"], s["status"], s.get("reason")) for s in json.loads(res.stdout)["context_sources"]
+    ]
+
+
+def test_review_pr_public_repo_never_fetches(monkeypatch, tmp_path):
+    prompts, fetched = _jira_review_setup(monkeypatch, tmp_path, meta={"private": False})
+    res = _review(["--engine", "claude", "--no-publish"])
+    assert res.exit_code == 0, res.output
+    assert fetched == []
+    assert _reasons(res) == [
+        ("ABC-123", "unavailable", "public_repo"),
+        ("OPS-9", "unavailable", "public_repo"),
+    ]
+    assert f"FRANKY_TICKET_{REVIEW_NONCE}_BEGIN\n" not in prompts[0]
+    assert "no ticket context was provided" in prompts[0]
+
+
+def test_review_pr_connection_failure_stops_further_fetches(monkeypatch, tmp_path):
+    def down(key, e, **k):
+        raise _jira_tag(NetworkError("could not reach JIRA"), "network", stop=True)
+
+    _, fetched = _jira_review_setup(
+        monkeypatch,
+        tmp_path,
+        fetcher=down,
+        meta={"title": "AA-1 BB-2 CC-3", "body": "", "head_ref": ""},
+    )
+    res = _review(["--engine", "claude", "--no-publish"])
+    assert res.exit_code == 0, res.output
+    assert [key for key, _ in fetched] == ["AA-1"]
+    assert {r for _, _, r in _reasons(res)} == {"network"}
+
+
+def test_review_pr_auth_failure_stops_further_fetches(monkeypatch, tmp_path):
+    def denied(key, e, **k):
+        raise _jira_tag(NetworkError("auth"), "auth", stop=True)
+
+    _, fetched = _jira_review_setup(monkeypatch, tmp_path, fetcher=denied)
+    res = _review(["--engine", "claude", "--no-publish"])
+    assert res.exit_code == 0, res.output
+    assert [key for key, _ in fetched] == ["ABC-123"]
+    assert [r for _, _, r in _reasons(res)] == ["auth", "auth"]
+
+
+def test_review_pr_http_base_url_is_unavailable_config_and_review_succeeds(monkeypatch, tmp_path):
+    from franky.jira import fetch_jira_issue as real_fetch
+
+    _jira_review_setup(
+        monkeypatch,
+        tmp_path,
+        fetcher=lambda key, e, **k: real_fetch(key, e, **k),
+        extra_env={"JIRA_BASE_URL": "http://example.atlassian.net"},
+    )
+    res = _review(["--engine", "claude", "--no-publish"])
+    assert res.exit_code == 0, res.output
+    assert json.loads(res.stdout)["status"] == "review_complete"
+    assert {(st, r) for _, st, r in _reasons(res)} == {("unavailable", "config")}
+
+
+def test_review_pr_partial_jira_config_is_unconfigured(monkeypatch, tmp_path):
+    _, fetched = _jira_review_setup(
+        monkeypatch,
+        tmp_path,
+        jira=False,
+        extra_env={"JIRA_BASE_URL": "https://example.atlassian.net"},
+    )
+    res = _review(["--engine", "claude", "--no-publish"])
+    assert res.exit_code == 0, res.output
+    assert fetched == []
+    assert {(st, r) for _, st, r in _reasons(res)} == {("unconfigured", "unconfigured")}
+
+
+def test_review_pr_redacts_jira_token_inside_ticket_text(monkeypatch, tmp_path):
+    prompts, _ = _jira_review_setup(
+        monkeypatch,
+        tmp_path,
+        fetcher=lambda key, e, **k: "[ABC-123] note jira-tok-s3cret end",
+        meta={"title": "ABC-123", "body": "", "head_ref": ""},
+    )
+    res = _review(["--engine", "claude", "--no-publish"])
+    assert res.exit_code == 0, res.output
+    assert "jira-tok-s3cret" not in prompts[0]
+    assert "[ABC-123] note ***REDACTED*** end" in prompts[0]
+
+
+def test_review_pr_passes_jira_secrets_for_stream_redaction_not_env(monkeypatch, tmp_path):
+    _jira_review_setup(monkeypatch, tmp_path)
+    kwargs = []
+
+    def fake_run(cfg, inner_argv, *a, **k):
+        kwargs.append((cfg, k))
+        return 0, _review_block({"summary": "ok", "findings": [], "checks": []})
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+    res = _review(["--engine", "claude", "--no-publish"])
+    assert res.exit_code == 0, res.output
+    cfg, k = kwargs[0]
+    assert set(k["extra_secrets"]) == {"jira-tok-s3cret", "dev@example.com"}
+    assert "JIRA_API_TOKEN" not in cfg.passthrough_env
+
+
+def test_review_pr_thread_seeded_retry_keeps_the_ticket_block(monkeypatch, tmp_path):
+    _fix_review_nonce(monkeypatch)
+    env = _thread_env(tmp_path)
+    env.update(_JIRA_ENV)
+    _mc_review_setup(monkeypatch, env=env)
+
+    def fake_fetch(repo, number, e, **k):
+        if k.get("meta_sink") is not None:
+            k["meta_sink"].update(title="ABC-123", body="", head_ref="", private=True)
+        return LIVE_SHA
+
+    monkeypatch.setattr(cli, "fetch_pr_head_sha", fake_fetch)
+    monkeypatch.setattr(cli, "fetch_jira_issue", lambda key, e, **k: _TICKET_TEXT)
+    _fake_thread_run(monkeypatch, tmp_path)
+    assert _review(["--thread", "--engine", "claude", "--no-publish"]).exit_code == 0
+    seen = _fake_thread_run(monkeypatch, tmp_path, results=[(1, RESUME_ERROR), (0, None)])
+    res = _review(["--thread", "--engine", "claude", "--no-publish"])
+    assert res.exit_code == 0, res.output
+    assert len(seen) == 2 and "--resume" in seen[0]["argv"] and "--resume" not in seen[1]["argv"]
+    fence = f"FRANKY_TICKET_{REVIEW_NONCE}_BEGIN\n{_TICKET_TEXT}\nFRANKY_TICKET_{REVIEW_NONCE}_END"
+    assert fence in seen[0]["argv"][2] and fence in seen[1]["argv"][2]
+
+
+def test_review_pr_frozen_mode_never_fetches_tickets(monkeypatch):
+    _frozen_setup(monkeypatch)
+    cli.os.environ.update(_JIRA_ENV)
+
+    def no_fetch(*a, **k):
+        raise AssertionError("frozen mode must not fetch tickets")
+
+    monkeypatch.setattr(cli, "fetch_jira_issue", no_fetch)
+    res = _run_frozen(FROZEN)
+    assert res.exit_code == 0, res.output
+    assert json.loads(res.stdout)["context_sources"] == []
+
+
 # --- review-pr --at-sha/--diff-base (frozen eval mode) ---------------------------------------
 
 AT_SHA = "c" * 40
@@ -5063,3 +5203,144 @@ def test_review_pr_findings_absent_on_non_complete_status(monkeypatch):
     data = json.loads(res.stdout)
     assert data["status"] == "agent_error"
     assert "findings" not in data and "findings_total" not in data
+
+
+# ---------------------------------------------------------------------------
+# `review-pr` JIRA ticket context (host-side fetch, fenced untrusted data)
+# ---------------------------------------------------------------------------
+
+from franky.jira import _tag as _jira_tag  # noqa: E402
+from franky.result import NetworkError  # noqa: E402
+
+_JIRA_ENV = {
+    "JIRA_BASE_URL": "https://example.atlassian.net",
+    "JIRA_EMAIL": "dev@example.com",
+    "JIRA_API_TOKEN": "jira-tok-s3cret",
+}
+_TICKET_TEXT = "[ABC-123] Cap the thing\n\nAcceptance: cap at 5."
+
+
+def _jira_review_setup(
+    monkeypatch, tmp_path, *, jira=True, fetcher=None, output=None, meta=None, extra_env=None
+):
+    """review-pr with PR metadata fed through meta_sink and a fake JIRA fetcher. Returns the
+    list of prompts seen by the container and the list of keys fetched."""
+    env = _review_env()
+    env["FRANKY_CONFIG_FILE"] = str(tmp_path / "no-config")
+    env["CLAUDE_CODE_OAUTH_TOKEN"] = "claude-fake"
+    if jira:
+        env.update(_JIRA_ENV)
+    env.update(extra_env or {})
+    _fix_review_nonce(monkeypatch)
+    _mc_review_setup(monkeypatch, env=env)
+    meta = {
+        "title": "ABC-123 fix",
+        "body": "also https://example.atlassian.net/browse/OPS-9",
+        "head_ref": "abc-123-fix",
+        "private": True,
+        **(meta or {}),
+    }
+
+    def fake_fetch(repo, number, e, **k):
+        if k.get("meta_sink") is not None:
+            k["meta_sink"].update(meta)
+        return LIVE_SHA
+
+    monkeypatch.setattr(cli, "fetch_pr_head_sha", fake_fetch)
+    fetched = []
+
+    def default_fetcher(key, e, **k):
+        fetched.append((key, k))
+        if key == "OPS-9":
+            raise _jira_tag(NetworkError("JIRA issue OPS-9 not found"), "not_found")
+        return _TICKET_TEXT
+
+    def fetcher_wrapper(key, e, **k):
+        fetched.append((key, k))
+        return fetcher(key, e, **k)
+
+    monkeypatch.setattr(cli, "fetch_jira_issue", fetcher_wrapper if fetcher else default_fetcher)
+    prompts = []
+
+    def fake_run(cfg, inner_argv, *a, **k):
+        prompts.append(" ".join(inner_argv))
+        return 0, output or _review_block({"summary": "ok", "findings": [], "checks": []})
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+    return prompts, fetched
+
+
+def test_review_pr_fences_jira_tickets_and_reports_context_sources(monkeypatch, tmp_path):
+    prompts, fetched = _jira_review_setup(monkeypatch, tmp_path)
+    res = _review(["--engine", "claude", "--no-publish"])
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.stdout)
+    assert data["context_sources"] == [
+        {"kind": "jira", "ref": "ABC-123", "status": "included"},
+        {"kind": "jira", "ref": "OPS-9", "status": "unavailable", "reason": "not_found"},
+    ]
+    assert all(k["refuse_restricted"] is True and k["timeout"] == 5.0 for _, k in fetched)
+    fence = f"FRANKY_TICKET_{REVIEW_NONCE}_BEGIN\n{_TICKET_TEXT}\nFRANKY_TICKET_{REVIEW_NONCE}_END"
+    assert fence in prompts[0]
+    assert "Acceptance: cap at 5." not in res.stdout
+    assert "jira-tok-s3cret" not in prompts[0]
+
+
+def test_review_pr_without_jira_env_reports_unconfigured_and_never_fetches(monkeypatch, tmp_path):
+    prompts, fetched = _jira_review_setup(monkeypatch, tmp_path, jira=False)
+    res = _review(["--engine", "claude", "--no-publish"])
+    assert res.exit_code == 0, res.output
+    assert fetched == []
+    sources = json.loads(res.stdout)["context_sources"]
+    assert [(s["status"], s["reason"]) for s in sources] == [("unconfigured", "unconfigured")] * 2
+    assert f"FRANKY_TICKET_{REVIEW_NONCE}_BEGIN\n" not in prompts[0]
+    assert "no ticket context was provided" in prompts[0]
+
+
+def test_review_pr_plain_stub_without_meta_gives_empty_context_sources(monkeypatch, tmp_path):
+    env = _thread_env(tmp_path)
+    _fix_review_nonce(monkeypatch)
+    _mc_review_setup(monkeypatch, env=env)
+    monkeypatch.setattr(cli, "fetch_pr_head_sha", lambda *a, **k: LIVE_SHA)
+    res = _review(["--engine", "claude", "--no-publish"])
+    assert res.exit_code == 0, res.output
+    assert json.loads(res.stdout)["context_sources"] == []
+
+
+def test_review_pr_long_ticket_is_truncated_and_partial(monkeypatch, tmp_path):
+    long_text = "[ABC-123] x\n\n" + "y" * 5000
+    prompts, _ = _jira_review_setup(
+        monkeypatch,
+        tmp_path,
+        fetcher=lambda key, e, **k: long_text,
+        meta={"title": "ABC-123", "body": "", "head_ref": ""},
+    )
+    res = _review(["--engine", "claude", "--no-publish"])
+    assert res.exit_code == 0, res.output
+    assert json.loads(res.stdout)["context_sources"] == [
+        {"kind": "jira", "ref": "ABC-123", "status": "partial"}
+    ]
+    assert "[truncated]" in prompts[0] and "y" * 5000 not in prompts[0]
+
+
+def test_review_pr_redacts_jira_token_from_agent_output_and_json(monkeypatch, tmp_path):
+    leak = _review_block({"summary": "token jira-tok-s3cret leaked", "findings": [], "checks": []})
+    _jira_review_setup(monkeypatch, tmp_path, output=leak)
+    res = _review(["--engine", "claude", "--no-publish"])
+    assert res.exit_code == 0, res.output
+    assert "jira-tok-s3cret" not in res.stdout
+    log_path = json.loads(res.stdout)["log_path"]
+    assert "jira-tok-s3cret" not in Path(log_path).read_text()
+
+
+def test_review_pr_jira_context_with_instructions_file(monkeypatch, tmp_path):
+    prompts, _ = _jira_review_setup(monkeypatch, tmp_path)
+    source = tmp_path / "instr.txt"
+    source.write_text("focus on caps")
+    source.chmod(0o600)
+    res = CliRunner().invoke(
+        cli.main,
+        ["review-pr", "--instructions-file", str(source), "--no-publish", "--json", "--", PR_URL],
+    )
+    assert res.exit_code == 0, res.output
+    assert json.loads(res.stdout)["context_sources"][0]["status"] == "included"

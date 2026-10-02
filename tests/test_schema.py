@@ -350,3 +350,23 @@ def test_result_schema_documents_review_findings():
     schema = build_schema(cli.main)["result_schema"]
     assert set(schema["findings"][0]) == {"title", "body", "severity", "file", "line", "start_line"}
     assert "findings_total" in schema
+
+
+def test_schema_advertises_review_context_sources():
+    entry = build_schema(cli.main)["result_schema"]["context_sources"][0]
+    assert set(entry) == {"kind", "ref", "status", "reason"}
+    assert "unconfigured" in entry["status"]
+
+
+def test_schema_context_sources_reason_lists_every_reason():
+    reason = build_schema(cli.main)["result_schema"]["context_sources"][0]["reason"]
+    for name in (
+        "unconfigured",
+        "public_repo",
+        "auth",
+        "not_found",
+        "restricted",
+        "config",
+        "network",
+    ):
+        assert name in reason

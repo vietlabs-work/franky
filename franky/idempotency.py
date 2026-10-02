@@ -77,6 +77,7 @@ def fetch_pr_head_sha(
     *,
     opener: Callable = urllib.request.urlopen,
     timeout: float = _FETCH_TIMEOUT,
+    meta_sink: dict | None = None,
 ) -> str | None:
     """Return the LIVE head commit SHA of PR `number` in `repo`, or None on any failure.
 
@@ -86,6 +87,10 @@ def fetch_pr_head_sha(
     publishing against an unconfirmed head, since this is the ground truth a review is pinned
     to (both before the pass starts and again immediately before publishing). The leniency is
     the caller's policy, not this function's - it always just degrades to None on any error.
+
+    `meta_sink` (review-pr) is filled from the SAME response with {"title", "body", "head_ref",
+    "private"} (non-string text becomes ""; `private` is True only for a literal `true`) - only on the valid-sha return path, so no extra GitHub call
+    shape exists and a failed pin leaves the sink untouched. The sha stays fail-closed.
     """
     url = f"https://api.github.com/repos/{repo}/pulls/{number}"
     headers = {
@@ -111,4 +116,19 @@ def fetch_pr_head_sha(
     if not isinstance(head, dict):
         return None
     sha = head.get("sha")
-    return sha if isinstance(sha, str) and sha else None
+    if not isinstance(sha, str) or not sha:
+        return None
+    if meta_sink is not None:
+        base = data.get("base")
+        base_repo = base.get("repo") if isinstance(base, dict) else None
+
+        def _text(value: object) -> str:
+            return value if isinstance(value, str) else ""
+
+        meta_sink.update(
+            title=_text(data.get("title")),
+            body=_text(data.get("body")),
+            head_ref=_text(head.get("ref")),
+            private=isinstance(base_repo, dict) and base_repo.get("private") is True,
+        )
+    return sha

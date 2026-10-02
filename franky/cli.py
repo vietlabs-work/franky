@@ -22,7 +22,7 @@ import tarfile
 import tempfile
 import time
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import replace as dc_replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -62,7 +62,13 @@ from .engine import (
 )
 from .github import run_gh
 from .idempotency import fetch_pr_head_sha, find_open_pr
-from .jira import JIRA_API_TOKEN_VAR, JIRA_EMAIL_VAR, fetch_jira_issue
+from .jira import (
+    JIRA_API_TOKEN_VAR,
+    JIRA_EMAIL_VAR,
+    extract_jira_keys,
+    fetch_jira_issue,
+    jira_configured,
+)
 from . import setups
 from .profile import (
     PROFILE_CATEGORIES,
@@ -1115,6 +1121,61 @@ def _require_commit_in_pr(repo: str, number: int, sha: str, pr_url: str) -> None
         raise refuse("commit not in the PR")
 
 
+# Seconds per JIRA request in `review-pr`: a slow JIRA must not stall a review.
+_REVIEW_JIRA_TIMEOUT = 5.0
+
+
+def _review_ticket_context(
+    pr_meta: dict, env: Mapping[str, str], secrets: list[str]
+) -> tuple[list[str], list[dict]]:
+    """Fetch the JIRA tickets a PR links, host-side, for the review prompt.
+
+    Returns (redacted ticket texts, `context_sources` entries). A JIRA problem never fails the
+    review: every error degrades to status "unavailable" with a machine `reason` (never ticket
+    text). Only private repos are fetched (a public PR must not pull internal ticket text into
+    its public review). Restricted (security-level) tickets are refused by `fetch_jira_issue`.
+    After a connection or auth failure the remaining keys are not fetched.
+    """
+    keys = extract_jira_keys(
+        pr_meta.get("title", ""), pr_meta.get("head_ref", ""), pr_meta.get("body", "")
+    )
+    configured = jira_configured(env)
+    private = pr_meta.get("private") is True
+    tickets: list[str] = []
+    sources: list[dict] = []
+    stopped = ""
+    for key in keys:
+        reason = ""
+        if not configured:
+            status, reason = "unconfigured", "unconfigured"
+        elif not private:
+            status, reason = "unavailable", "public_repo"
+        elif stopped:
+            status, reason = "unavailable", stopped
+        else:
+            try:
+                text = redact(
+                    fetch_jira_issue(
+                        key, env, refuse_restricted=True, timeout=_REVIEW_JIRA_TIMEOUT
+                    ),
+                    secrets,
+                ).strip()
+            except Exception as exc:
+                status = "unavailable"
+                reason = getattr(exc, "reason", "network")
+                if getattr(exc, "stop", False):
+                    stopped = reason
+            else:
+                status = "included"
+                if len(text) > PROSE_MAX_CHARS:
+                    text, status = text[:PROSE_MAX_CHARS] + "\n[truncated]", "partial"
+                tickets.append(text)
+        sources.append(
+            {"kind": "jira", "ref": key, "status": status, **({"reason": reason} if reason else {})}
+        )
+    return tickets, sources
+
+
 @main.command("review-pr")
 @click.argument("pr_url")
 @click.argument("instructions", required=False, default="")
@@ -1322,7 +1383,9 @@ def review_pr(
 
         try:
             cfg = load_config(engine, os.environ)
-            secrets = cfg.secret_values()
+            # The host-side JIRA token/email are not in cfg.secret_values(); the ticket text
+            # fetched below is the one place they could echo back, so redact them too.
+            secrets = cfg.secret_values() + cfg_secrets_safe()
             repo, canonical_pr_url, pr_number = parse_review_pr_task(pr_url, cfg.allowed_repos)
         except FrankyError:
             raise
@@ -1335,6 +1398,9 @@ def review_pr(
             thread = _open_thread(repo, pr_number, "reviewer")
             ctx.call_on_close(thread.close)
 
+        pr_meta: dict = {}
+        tickets: list[str] = []
+        context_sources: list[dict] = []
         if frozen:
             # Fail closed: the pinned commit must belong to THIS PR. One read-only GET (no POST),
             # after every gate above. Nothing publishes in this mode, so no live-head pin.
@@ -1346,7 +1412,7 @@ def review_pr(
             # we refuse rather than reviewing state the caller no longer expects (issue: review-pr
             # MVP). Unlike find_open_pr's best-effort idempotency check, an unreachable/unparseable
             # fetch here is fail-closed (NetworkError), not silently skipped.
-            live_sha = fetch_pr_head_sha(repo, pr_number, os.environ)
+            live_sha = fetch_pr_head_sha(repo, pr_number, os.environ, meta_sink=pr_meta)
             if live_sha is None:
                 raise NetworkError(
                     f"could not read {canonical_pr_url}'s live head commit via the GitHub API - "
@@ -1366,6 +1432,13 @@ def review_pr(
 
         franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
         bundle, _setup_block = _load_profile_bundle(None, process_env, secrets, cfg)
+        if not frozen:
+            # After the profile bundle: MCP env values are in `secrets` before ticket text is
+            # redacted. Frozen (eval) mode never fetches tickets.
+            tickets, context_sources = _review_ticket_context(pr_meta, os.environ, secrets)
+        tickets_missing = bool(context_sources) and not any(
+            src["status"] in ("included", "partial") for src in context_sources
+        )
         verbose = verbose or bool(os.environ.get(FRANKY_VERBOSE_VAR))
         progress = None if (quiet and not verbose) else _make_progress(cfg.engine, verbose)
 
@@ -1412,6 +1485,8 @@ def review_pr(
             head_sha=pinned_sha,
             diff_base=diff_base,
             frozen=frozen,
+            tickets=tickets,
+            tickets_missing=tickets_missing,
         )
 
         diagnostics: dict = {}
@@ -1440,6 +1515,7 @@ def review_pr(
             timeout=max_duration,
             diagnostics=diagnostics,
             private_prompt=instructions_file is not None,
+            extra_secrets=cfg_secrets_safe(),
         )
 
         usage = _parse_usage_safe(output)
@@ -1588,6 +1664,7 @@ def review_pr(
             review_id=review_id,
             thread=thread_result,
             handoff=handoff,
+            context_sources=context_sources,
         )
         _emit_result(
             result,
@@ -1959,6 +2036,7 @@ def _thread_pass(
     timeout,
     diagnostics,
     private_prompt=False,
+    extra_secrets=(),
 ):
     """Run a `review-pr` or `iterate` pass: one attempt, plus the one seeded retry
     `_thread_retry` allows on a thread. Without a thread it is exactly one plain `_run_pass`.
@@ -1995,6 +2073,7 @@ def _thread_pass(
                 run_id=job_id,
                 diagnostics_sink=diagnostics,
                 private_prompt=private_prompt,
+                extra_secrets=extra_secrets,
                 **run_kwargs,
             )
         finally:
@@ -2417,6 +2496,7 @@ def _run_pass(
     session_tar: str | None = None,
     session_sink: dict | None = None,
     private_prompt: bool = False,
+    extra_secrets: Sequence[str] = (),
 ) -> tuple[int, str, float]:
     """Run one container pass for `prompt` and return (exit_code, output, duration_secs).
 
@@ -2434,7 +2514,8 @@ def _run_pass(
     snapshot-on-timeout sink and a workspace-to-restore path respectively; both None by default.
     `session` = (session_id, resume) reaches the engine argv; `session_tar`/`session_sink` are
     forwarded to run_in_container (`review-pr --thread`). Each is passed on only when set, so a
-    run without them is unchanged.
+    run without them is unchanged. `extra_secrets` (host-only values such as the JIRA token) are
+    redacted from the streamed output and heartbeat; never added to the container env.
     """
     session_kwargs = {} if session is None else {"session_id": session[0], "resume": session[1]}
     inner_argv = cfg.engine.inner_argv(
@@ -2470,9 +2551,11 @@ def _run_pass(
         extra["session_tar"] = session_tar
     if session_sink is not None:
         extra["session_sink"] = session_sink
+    if extra_secrets:
+        extra["extra_secrets"] = list(extra_secrets)
     hb = _HEARTBEATS.get(run_id) if run_id else None
     if hb is not None:
-        progress = _liveness_progress(hb, progress, cfg.secret_values())
+        progress = _liveness_progress(hb, progress, [*cfg.secret_values(), *extra_secrets])
     t0 = time.monotonic()
     code, output = run_in_container(
         cfg,

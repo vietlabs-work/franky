@@ -26,6 +26,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections.abc import Iterable
 from pathlib import Path
 
 from . import egress, franky_version, snapshot
@@ -1172,6 +1173,7 @@ def run_in_container(
     session_tar: str | None = None,
     session_sink: dict | None = None,
     private_prompt_tar: bytes | None = None,
+    extra_secrets: Iterable[str] = (),
 ) -> tuple[int, str | Transcript]:
     """Run the inner engine in a hardened, egress-controlled container; return
     (returncode, redacted_output).
@@ -1199,6 +1201,9 @@ def run_in_container(
     `dest`. The first path is required, the rest optional; the sink gains `"status"`: ok,
     too_large (the combined stream passed `max_bytes`), or failed. `"on_timeout": True` also
     copies the session out of a timed-out run (`build --thread`, `job resume`).
+
+    `extra_secrets` are host-only values (the JIRA token and email) added to the redaction set
+    for the streamed and stored output. They are never passed into the container.
 
     Topology: an --internal network (no internet route) hosts a Squid proxy (default-deny
     allowlist) and the task container. The task's HTTP(S)_PROXY points at the proxy and its
@@ -1231,7 +1236,9 @@ def run_in_container(
     child_env = dict(os.environ if env is None else env)
     child_env.update(cfg.passthrough_env)
 
-    secrets = cfg.secret_values()
+    # extra_secrets: host-only values (the JIRA token/email) redacted from the output but never
+    # put in the container env.
+    secrets = [*cfg.secret_values(), *extra_secrets]
 
     net_created = False
     proxy_launched = False

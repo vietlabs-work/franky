@@ -137,6 +137,7 @@ def build_result(
     review_id: int | None = None,
     thread: dict | None = None,
     handoff: dict | None = None,
+    context_sources: list | None = None,
 ) -> dict:
     """Shape the success/agent-result object emitted on stdout under `--json`.
 
@@ -175,6 +176,10 @@ def build_result(
     `review_url`/`review_id` identify the GitHub review Franky posted, present only when
     `publish=True` actually posted one (never on a `--no-publish` run, which writes nothing to
     GitHub - see the `review-pr` command).
+
+    `context_sources` is `review-pr`-only (absent, not null, elsewhere): one
+    {kind, ref, status} entry per linked JIRA key Franky looked for, `[]` when none. It never
+    carries ticket text.
 
     `thread`/`handoff` are `--thread`-only (review-pr, build, iterate, and a `job resume` of a
     `--thread` build): both keys appear exactly when `thread` is
@@ -220,6 +225,8 @@ def build_result(
         result["review_url"] = review_url
     if review_id is not None:
         result["review_id"] = review_id
+    if context_sources is not None:
+        result["context_sources"] = context_sources
     if thread is not None:
         result["thread"] = thread
         result["handoff"] = handoff

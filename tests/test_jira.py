@@ -15,10 +15,14 @@ from franky.jira import (
     JIRA_BASE_URL_VAR,
     JIRA_EMAIL_VAR,
     _flatten_adf,
+    extract_jira_keys,
     fetch_jira_issue,
+    jira_configured,
 )
 
 import urllib.error
+
+from franky.result import NetworkError
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -42,7 +46,7 @@ def _make_opener(body: bytes, status: int = 200):
         def __init__(self):
             self._data = BytesIO(body)
 
-        def read(self):
+        def read(self, *_):
             return self._data.read()
 
         def __enter__(self):
@@ -249,7 +253,7 @@ def test_request_url_contains_key_and_fields():
     payload = {"fields": {"summary": "S", "description": None}}
 
     class _FakeResp:
-        def read(self):
+        def read(self, *_):
             return json.dumps(payload).encode()
 
         def __enter__(self):
@@ -323,3 +327,153 @@ def test_flatten_adf_unknown_node_recurses_into_content():
         ],
     }
     assert "still here" in _flatten_adf(doc)
+
+
+# ---------------------------------------------------------------------------
+# extract_jira_keys / jira_configured / refuse_restricted / size cap
+# ---------------------------------------------------------------------------
+
+
+def test_extract_keys_title_branch_body_order():
+    assert extract_jira_keys("ABC-1 fix", "ops-2-thing", "closes XY-3") == [
+        "ABC-1",
+        "OPS-2",
+        "XY-3",
+    ]
+
+
+def test_extract_keys_browse_url_and_dedup():
+    body = "see https://x.atlassian.net/browse/OPS-9 and OPS-9 again"
+    assert extract_jira_keys("OPS-9", "", body) == ["OPS-9"]
+    assert extract_jira_keys("", "", body) == ["OPS-9"]
+
+
+def test_extract_keys_caps_at_three_in_order():
+    assert extract_jira_keys("AA-1 BB-2 CC-3 DD-4", "", "") == ["AA-1", "BB-2", "CC-3"]
+
+
+def test_extract_keys_ignores_non_tickets():
+    assert extract_jira_keys("UTF-8 and SHA-256 foo_FBT-1", "", "") == []
+
+
+def test_jira_configured():
+    assert jira_configured(_GOOD_ENV)
+    assert not jira_configured({**_GOOD_ENV, JIRA_EMAIL_VAR: "  "})
+    assert not jira_configured({})
+
+
+def _issue(**extra):
+    return json.dumps({"fields": {"summary": "S", "description": None, **extra}}).encode()
+
+
+def test_refuse_restricted_accepts_explicit_null_security():
+    out = fetch_jira_issue(
+        "FOO-1", _GOOD_ENV, opener=_make_opener(_issue(security=None)), refuse_restricted=True
+    )
+    assert out == "[FOO-1] S"
+
+
+@pytest.mark.parametrize("extra", [{"security": {"name": "Secret"}}, {}])
+def test_refuse_restricted_rejects_level_or_missing_key(extra):
+    with pytest.raises(NetworkError) as exc:
+        fetch_jira_issue(
+            "FOO-1", _GOOD_ENV, opener=_make_opener(_issue(**extra)), refuse_restricted=True
+        )
+    assert "Secret" not in str(exc.value)
+
+
+def test_refuse_restricted_requests_security_field_default_does_not():
+    urls = []
+
+    def opener(req, *, timeout=None):
+        urls.append(req.full_url)
+        return _make_opener(_issue(security={"name": "x"}))(req, timeout=timeout)
+
+    fetch_jira_issue("FOO-1", _GOOD_ENV, opener=opener)  # default ignores security
+    with pytest.raises(NetworkError):
+        fetch_jira_issue("FOO-1", _GOOD_ENV, opener=opener, refuse_restricted=True)
+    assert "security" not in urls[0] and urls[1].endswith(",security")
+
+
+def test_response_over_256_kib_is_refused():
+    big = _issue(pad="x" * (256 * 1024))
+    with pytest.raises(NetworkError):
+        fetch_jira_issue("FOO-1", _GOOD_ENV, opener=_make_opener(big))
+
+
+@pytest.mark.parametrize(
+    ("head_ref", "expected"),
+    [
+        ("abc-123-fix", ["ABC-123"]),
+        ("feature/abc-123-x", ["ABC-123"]),
+        ("dependabot/pip/requests-2.32.0", []),
+        ("renovate/node-18.x", []),
+        ("release/v1-2", []),
+    ],
+)
+def test_extract_keys_branch_rules(head_ref, expected):
+    assert extract_jira_keys("", head_ref, "") == expected
+
+
+def test_extract_keys_browse_url_skips_denylist_but_bare_does_not():
+    assert extract_jira_keys("", "", "https://x.atlassian.net/browse/RFC-42") == ["RFC-42"]
+    assert extract_jira_keys("", "", "see RFC-42 for details") == []
+
+
+def _err(call, **kw):
+    with pytest.raises(NetworkError) as info:
+        call(**kw)
+    return info.value
+
+
+def _fetch(opener, **kw):
+    return fetch_jira_issue("FOO-1", _GOOD_ENV, opener=opener, refuse_restricted=True, **kw)
+
+
+@pytest.mark.parametrize(
+    ("status", "reason", "stop"),
+    [(404, "not_found", False), (500, "network", False), (401, "auth", True), (403, "auth", True)],
+)
+def test_http_errors_carry_reason(status, reason, stop):
+    with pytest.raises(Exception) as info:
+        _fetch(_make_opener(b"", status=status))
+    assert (info.value.reason, info.value.stop) == (reason, stop)
+
+
+def test_connection_failure_and_config_and_restricted_reasons():
+    def boom(req, *, timeout=None):
+        raise urllib.error.URLError("down")
+
+    with pytest.raises(NetworkError) as info:
+        _fetch(boom)
+    assert (info.value.reason, info.value.stop) == ("network", True)
+    with pytest.raises(NetworkError) as info:
+        fetch_jira_issue("FOO-1", {**_GOOD_ENV, JIRA_BASE_URL_VAR: "http://x.test"})
+    assert (info.value.reason, info.value.stop) == ("config", True)
+    with pytest.raises(NetworkError) as info:
+        _fetch(_make_opener(_issue(security={"name": "secret"})))
+    assert (info.value.reason, info.value.stop) == ("restricted", False)
+
+
+def test_no_redirect_handler_refuses_a_3xx():
+    import urllib.request
+
+    from franky.jira import _NoRedirect
+
+    req = urllib.request.Request("https://example.atlassian.net/x")
+    with pytest.raises(NetworkError, match="redirect"):
+        _NoRedirect().redirect_request(req, None, 302, "Found", {}, "https://evil.test/")
+
+
+def test_refuse_restricted_default_opener_does_not_follow_redirects(monkeypatch):
+    from franky import jira
+
+    calls = []
+
+    def fake(req, timeout=None):
+        calls.append(timeout)
+        return _make_opener(_issue(security=None))(req, timeout=timeout)
+
+    monkeypatch.setattr(jira, "_no_redirect_open", fake)
+    assert fetch_jira_issue("FOO-1", _GOOD_ENV, refuse_restricted=True, timeout=5) == "[FOO-1] S"
+    assert calls == [5]

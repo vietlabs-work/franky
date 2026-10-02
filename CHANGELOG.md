@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `review-pr` now gives the reviewer the linked JIRA tickets. On the host, Franky finds up to 3 JIRA keys in the PR title, head branch, and body, fetches them with the existing `JIRA_BASE_URL`, `JIRA_EMAIL`, and `JIRA_API_TOKEN`, and puts their text in the prompt as untrusted data. The credentials never enter the container. Only private repositories are fetched; tickets with a security level are skipped, redirects are refused, and a connection or auth failure stops further fetches. A JIRA failure never fails the review. The `--json` result adds `context_sources`, one `{kind, ref, status}` entry per key plus a `reason` when the ticket was not included (`unconfigured`, `public_repo`, `auth`, `not_found`, `restricted`, `config`, `network`), with no ticket text.
 - `franky review-pr --no-publish` accepts `--at-sha` and `--diff-base` (both 40-hex, together) to review a PR frozen at one of its historical commits against a pinned diff base, blind to later PR state. The mode refuses publishing, `--thread`, and `--expected-head-sha`, and refuses a SHA that is not a commit of the PR. A successful `--no-publish --json` result now also carries `findings` (at most 8, shaped) and `findings_total`; a review JSON without a `findings` list is reported as `no_findings`.
 
 ## [0.3.9] - 2026-10-01

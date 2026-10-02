@@ -196,6 +196,8 @@ Before each build attempt, Franky checks for an open PR on the predicted branch.
 
 The `review-pr` prompt tells the agent to inspect only. The host publishes comments or change requests after it rechecks the PR head.
 
+If `JIRA_BASE_URL`, `JIRA_EMAIL`, and `JIRA_API_TOKEN` are set on the host, `review-pr` also fetches up to 3 JIRA tickets linked in the PR title, branch, or body and gives their text to the reviewer as untrusted data. The credentials never enter the container, Only private repositories are fetched, and tickets with a security level are skipped. The `--json` result lists each ticket in `context_sources` (`ref`, `status`, and a `reason` when it was not included) without its text. The list is empty when no key was found, and in frozen `--at-sha` mode, which never fetches tickets.
+
 Scope `GH_TOKEN` permissions because they are the enforced GitHub boundary for the autonomous container.
 
 Use `--expected-head-sha` to reject a changed PR head. Use `--no-publish` for a read-only GitHub run.
