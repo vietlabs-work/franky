@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.10] - 2026-10-02
+
 ### Changed
 
 - `review-pr` traces new PII, secret, money, and auth values to every sink with `git grep`, adds a `question` severity for risks that depend on facts outside the repository (at most 2, never blocking), and self-checks its top three risks before it answers. On the review eval, recall rose from 4/15 to 6/15 with no new false positives. The review-eval frozen mode reads intent from the PR title and commit messages only, and fix-SHA controls score only their `forbid` findings.
