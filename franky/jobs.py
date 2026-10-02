@@ -85,6 +85,7 @@ _FAILURE_STATUSES = frozenset(
         "no_findings",
         "publish_blocked_stale_head",
         "publish_failed",
+        "publish_uncertain",
     }
 )
 

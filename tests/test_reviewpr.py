@@ -10,6 +10,7 @@ from franky.reviewpr import (
     build_review_findings,
     build_review_payload,
     commentable_lines,
+    match_resolved_threads,
     parse_review_findings,
     render_review_body,
     review_event,
@@ -162,7 +163,7 @@ def test_payload_splits_inline_and_body():
             "body": "**Blocking: Persist tax id**\n\nwhy\n\n```suggestion\ny = 2\n```",
         }
     ]
-    assert "- **Nit:** Off diff (a.py:99) - why" in p["body"]
+    assert "Off diff" not in p["body"]  # a nit is inline or nothing
     assert "- **Major:** No line - why" in p["body"]
     assert "Persist tax id" not in p["body"]
     assert p["body"].startswith("sum\n\n") and p["body"].endswith(
@@ -234,7 +235,7 @@ def test_body_only_payload_has_no_comments_and_lists_everything():
     shaped = _shape(_f("one"), _f("two", severity="nit"))
     p = build_body_only_payload(shaped, "sha", [])
     assert p["comments"] == [] and p["commit_id"] == "sha"
-    assert "- **Major:** one (a.py:11) - why" in p["body"] and "- **Nit:** two" in p["body"]
+    assert "- **Major:** one (a.py:11) - why" in p["body"] and "two" not in p["body"]
 
 
 def test_secrets_redacted_everywhere_including_unescaped_text():
@@ -270,10 +271,153 @@ def test_secrets_redacted_everywhere_including_unescaped_text():
         assert "[REDACTED" in json.dumps(p) or "REDACTED" in json.dumps(p)
 
 
-def test_event_is_never_approve():
+def test_event_is_never_approve_by_default():
     for sev in ("blocking", "normal", "nit", "bogus"):
-        p = build_review_payload(_shape(_f(severity=sev)), commentable_lines(FILES), "s", [])
+        shaped = _shape(_f(severity=sev))
+        p = build_review_payload(shaped, commentable_lines(FILES), "s", [])
         assert p["event"] in ("COMMENT", "REQUEST_CHANGES")
+        assert build_body_only_payload(shaped, "s", [])["event"] != "APPROVE"
+    assert review_event(_shape()) == "COMMENT"  # no findings, flag off
+
+
+def test_approve_needs_the_flag_and_no_open_major():
+    assert review_event(_shape(), allow_approve=True) == "APPROVE"
+    resolved = _shaped({"title": "fixed", "severity": "normal", "status": "resolved"})
+    assert review_event(resolved, allow_approve=True) == "APPROVE"
+    assert review_event(resolved) == "COMMENT"
+    nit = _shaped({"title": "n", "severity": "nit", "status": "open"})
+    assert review_event(nit, allow_approve=True) == "APPROVE"
+    major = _shaped({"title": "m", "severity": "normal", "status": "open"})
+    assert review_event(major, allow_approve=True) == "COMMENT"
+    new_major = _shaped({"title": "m", "severity": "normal"})
+    assert review_event(new_major, allow_approve=True) == "COMMENT"
+    block = _shaped({"title": "b", "severity": "blocking"})
+    assert review_event(block, allow_approve=True) == "REQUEST_CHANGES"
+
+
+def test_failed_check_blocks_approve():
+    shaped = build_review_findings(
+        {"summary": "s", "findings": [], "checks": [{"name": "t", "outcome": "fail"}]}
+    )
+    assert review_event(shaped, allow_approve=True) == "COMMENT"
+    ok = build_review_findings(
+        {"summary": "s", "findings": [], "checks": [{"name": "t", "outcome": "pass"}]}
+    )
+    assert review_event(ok, allow_approve=True) == "APPROVE"
+
+
+def test_prior_nits_never_listed_in_posted_bodies():
+    shaped = _shaped(
+        {"title": "open nit", "severity": "nit", "status": "open"},
+        {"title": "fixed nit", "severity": "nit", "status": "resolved"},
+        {"title": "fixed major", "severity": "normal", "status": "resolved"},
+    )
+    for p in (
+        build_review_payload(shaped, {}, "s", [], allow_approve=True),
+        build_body_only_payload(shaped, "s", [], allow_approve=True),
+    ):
+        assert "nit" not in p["body"] and "Resolved: fixed major" in p["body"]
+
+
+def test_dropped_malformed_finding_blocks_approve():
+    shaped = _shaped({"title": "n", "severity": "nit"}, {"body": "no title"})
+    assert shaped["dropped_malformed"] == 1
+    assert review_event(shaped, allow_approve=True) == "COMMENT"
+    p = build_review_payload(shaped, {}, "s", [], allow_approve=True)
+    assert p["event"] == "COMMENT"
+
+
+def test_nits_never_reach_the_body():
+    shaped = _shape(_f("big", severity="normal", line=99), _f("tiny", severity="nit", line=99))
+    for p in (
+        build_review_payload(shaped, commentable_lines(FILES), "s", []),
+        build_body_only_payload(shaped, "s", []),
+    ):
+        assert "big" in p["body"] and "tiny" not in p["body"]
+    only_nit = _shape(_f("tiny", severity="nit", line=99))
+    body = build_review_payload(only_nit, commentable_lines(FILES), "s", [])["body"]
+    assert body.startswith("sum") and "tiny" not in body
+
+
+def test_nit_never_displaces_a_major_from_inline():
+    nits = [_f(f"nit{i}", severity="nit", line=11) for i in range(MAX_INLINE)]
+    major = _f("major", severity="normal", line=12)
+    p = build_review_payload(_shape(*nits, major), commentable_lines(FILES), "s", [])
+    assert len(p["comments"]) == MAX_INLINE
+    assert p["comments"][0]["body"].startswith("**Major: major**")
+    assert "nit7" not in json.dumps(p)  # cut nit is dropped, not moved to the body
+
+
+def _node(id_, title="t", label="Major", path="a.py", resolved=False, typename="Bot"):
+    return {
+        "id": id_,
+        "isResolved": resolved,
+        "path": path,
+        "comments": {
+            "nodes": [
+                {
+                    "author": {"login": "franky-bot", "__typename": typename},
+                    "body": f"**{label}: {title}**\n\nwhy",
+                }
+            ]
+        },
+    }
+
+
+def _resolved(*findings):
+    return _shaped(*({"status": "resolved", "file": "a.py", "line": 3, **f} for f in findings))
+
+
+def test_match_resolved_threads_matches_only_unambiguous_own_threads():
+    shaped = _resolved({"title": "t", "severity": "normal"})
+    assert match_resolved_threads(shaped, [_node("T1")], "Franky-Bot") == ["T1"]
+    for bad in (
+        _node("T1", typename="User"),
+        _node("T1", resolved=True),
+        _node("T1", path="b.py"),
+        _node("T1", title="other"),
+    ):
+        assert match_resolved_threads(shaped, [bad], "franky-bot") == []
+    assert (
+        match_resolved_threads(shaped, [_node("T1"), _node("T2")], "franky-bot") == []
+    )  # ambiguous
+    assert match_resolved_threads(
+        shaped, [_node("T1"), _node("T2", resolved=True)], "franky-bot"
+    ) == ["T1"]
+
+
+def test_match_resolved_threads_needs_the_posting_login():
+    shaped = _resolved({"title": "t", "severity": "normal"})
+    assert match_resolved_threads(shaped, [_node("T1")], None) == []
+    assert match_resolved_threads(shaped, [_node("T1")], "other-bot") == []
+    assert match_resolved_threads(shaped, [_node("T1")], "FRANKY-BOT") == ["T1"]
+
+
+def test_match_resolved_threads_accepts_any_severity_label():
+    shaped = _resolved({"title": "t", "severity": "normal"})
+    assert match_resolved_threads(shaped, [_node("T1", label="Blocking")], "franky-bot") == ["T1"]
+    assert match_resolved_threads(shaped, [_node("T1", label="Bogus")], "franky-bot") == []
+
+
+def test_match_resolved_threads_open_twin_vetoes_the_title():
+    shaped = _shaped(
+        {"title": "t", "severity": "normal", "status": "resolved", "file": "a.py"},
+        {"title": "t", "severity": "nit", "status": "open", "file": "a.py"},
+    )
+    assert match_resolved_threads(shaped, [_node("T1")], "franky-bot") == []
+
+
+def test_match_resolved_threads_ignores_open_and_new_findings():
+    shaped = _shaped(
+        {"title": "t", "severity": "normal", "status": "open", "file": "a.py"},
+        {"title": "t", "severity": "normal", "status": "new", "file": "a.py"},
+    )
+    assert match_resolved_threads(shaped, [_node("T1")], "Franky-Bot") == []
+
+
+def test_match_resolved_threads_dedupes_ids():
+    shaped = _resolved({"title": "t", "severity": "normal"}, {"title": "t", "severity": "normal"})
+    assert match_resolved_threads(shaped, [_node("T1")], "Franky-Bot") == ["T1"]
 
 
 def test_empty_suggestion_renders_a_deletion_block():

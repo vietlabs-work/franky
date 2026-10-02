@@ -162,7 +162,7 @@ Any policy delta must pass pinned-policy tests, `make smoke-security`, and `make
 - Secret-scan every injected profile file. Resolve symlinks before deny checks.
 - Skip unscannable setup files. Never inject setup MCP configuration automatically.
 - Keep Codex `--ignore-user-config`. Pass validated MCP servers as explicit overrides.
-- Tell review agents to stay read-only. The host publisher only uses COMMENT or REQUEST_CHANGES.
+- Tell review agents to stay read-only. The host publisher uses COMMENT or REQUEST_CHANGES. It uses APPROVE only behind `--allow-approve`, when no finding above nit is open, nothing was dropped as malformed, and no check failed; the caller must enforce branch protection that dismisses stale approvals on push. An APPROVE with an uncertain outcome is reconciled, never blindly reposted (`publish_uncertain`). `--resolve-fixed` resolves only the publishing bot's own unambiguous matching threads.
 - Keep iterate commits additive. Tell autonomous agents never to merge or force-push.
 
 ## Add an engine

@@ -22,7 +22,7 @@ from . import result
 _RESULT_SCHEMA: dict = {
     "status": "result class: pr_opened | no_pr | agent_error | timeout | already_open | "
     "iterate_complete | replay_complete | review_published | review_complete | no_findings | "
-    "publish_blocked_stale_head | publish_failed",
+    "publish_blocked_stale_head | publish_failed | publish_uncertain",
     "pr_url": "the PR URL (string) or null when none was produced",
     "branch": "the PREDICTED branch name (`franky/<slug>`) computed host-side; MAY differ "
     "from the branch the agent actually created. null for iterate.",
@@ -71,6 +71,11 @@ _RESULT_SCHEMA: dict = {
     ],
     "review_url": "string; present ONLY when `review-pr` publishes a GitHub review",
     "review_id": "integer; present ONLY when `review-pr` publishes a GitHub review",
+    "review_event": "string: COMMENT | REQUEST_CHANGES | APPROVE; present ONLY when `review-pr` "
+    "publishes a GitHub review: the event actually posted (an APPROVE that was refused "
+    "is reported as COMMENT)",
+    "threads_resolved": "integer; present ONLY when `review-pr --resolve-fixed` ran: the number "
+    "of review threads it resolved",
     # Present on every `review-pr` result; [] when no JIRA key was found or in frozen
     # (--at-sha/--diff-base) mode, which never fetches tickets. Never ticket text.
     "context_sources": [
@@ -187,7 +192,7 @@ _JOB_RECORD_SCHEMA: dict = {
     "status": "running | pr_opened | no_pr | agent_error | timeout | already_open | "
     "iterate_complete | killed | diagnosed | diagnose_failed | replay_complete | "
     "review_published | review_complete | no_findings | publish_blocked_stale_head | "
-    "publish_failed",
+    "publish_failed | publish_uncertain",
     "started_at": "ISO-8601 UTC timestamp when the run was registered",
     "ended_at": "ISO-8601 UTC timestamp when the run finished, or null while running",
     "pr_url": "the PR URL (string) or null when none was produced",

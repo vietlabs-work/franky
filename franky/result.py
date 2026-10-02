@@ -135,6 +135,8 @@ def build_result(
     checks: list | None = None,
     review_url: str | None = None,
     review_id: int | None = None,
+    review_event: str | None = None,
+    threads_resolved: int | None = None,
     thread: dict | None = None,
     handoff: dict | None = None,
     context_sources: list | None = None,
@@ -148,7 +150,7 @@ def build_result(
     economics.Usage (input_tokens/output_tokens/cost_usd, each int|None / float|None). Status
     is one of: pr_opened | no_pr | agent_error | timeout | already_open | iterate_complete |
     replay_complete | review_published | review_complete | no_findings |
-    publish_blocked_stale_head | publish_failed.
+    publish_blocked_stale_head | publish_failed | publish_uncertain.
 
     For the `already_open` status (idempotency short-circuit, no container ran) the caller
     passes the sentinels `duration=0.0` and `log_path=""` - there is no run to time or log.
@@ -176,6 +178,10 @@ def build_result(
     `review_url`/`review_id` identify the GitHub review Franky posted, present only when
     `publish=True` actually posted one (never on a `--no-publish` run, which writes nothing to
     GitHub - see the `review-pr` command).
+
+    `review_event` (COMMENT | REQUEST_CHANGES | APPROVE) is the event the posted review really
+    has, and `threads_resolved` the number of threads `--resolve-fixed` resolved; both are
+    `review-pr`-only and absent otherwise.
 
     `context_sources` is `review-pr`-only (absent, not null, elsewhere): one
     {kind, ref, status} entry per linked JIRA key Franky looked for, `[]` when none. It never
@@ -225,6 +231,10 @@ def build_result(
         result["review_url"] = review_url
     if review_id is not None:
         result["review_id"] = review_id
+    if review_event is not None:
+        result["review_event"] = review_event
+    if threads_resolved is not None:
+        result["threads_resolved"] = threads_resolved
     if context_sources is not None:
         result["context_sources"] = context_sources
     if thread is not None:

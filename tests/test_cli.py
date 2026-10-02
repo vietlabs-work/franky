@@ -13,6 +13,7 @@ import franky.jobs as jobs
 from click.testing import CliRunner
 
 from franky import __version__
+from franky.reviewpr import RESOLVE_MUTATION, THREADS_QUERY, build_review_findings
 from franky.schema import build_schema
 from franky._install import Install
 
@@ -3970,7 +3971,7 @@ def test_review_pr_published_echoes_review_url_and_never_approves(monkeypatch):
     assert args[0] == "api"
     assert args[3] == f"repos/me/repo/pulls/{REVIEW_PR_NUMBER}/reviews"
     assert json.loads(calls.inputs[0])["event"] == "COMMENT"
-    assert "APPROVE" not in " ".join(args) + calls.inputs[0]
+    assert "APPROVE" not in " ".join(args) + calls.inputs[0]  # flags off: never an APPROVE
 
 
 def test_review_pr_json_success_reports_reviewed_sha_and_review_url(monkeypatch):
@@ -4762,6 +4763,7 @@ def test_review_pr_without_thread_is_unchanged(monkeypatch, tmp_path):
         "checks",
         "review_url",
         "review_id",
+        "review_event",
         "context_sources",
     }
     argv, kwargs = seen[0]
@@ -5362,3 +5364,410 @@ def test_review_pr_jira_context_with_instructions_file(monkeypatch, tmp_path):
     )
     assert res.exit_code == 0, res.output
     assert json.loads(res.stdout)["context_sources"][0]["status"] == "included"
+
+
+# ---------------------------------------------------------------------------
+# review-pr --allow-approve / --resolve-fixed (host-side event choice, fallback, thread resolve)
+# ---------------------------------------------------------------------------
+
+REFUSED = "GitHub wrapper refused: approve is not allowed"
+THREADS_PAGE = lambda nodes, nxt=None: json.dumps(  # noqa: E731
+    {
+        "data": {
+            "repository": {
+                "pullRequest": {
+                    "reviewThreads": {
+                        "pageInfo": {"hasNextPage": nxt is not None, "endCursor": nxt},
+                        "nodes": nodes,
+                    }
+                }
+            }
+        }
+    }
+)
+THREAD_NODE = {
+    "id": "PRRT_1",
+    "isResolved": False,
+    "path": "a.py",
+    "comments": {
+        "nodes": [
+            {"author": {"login": "franky-bot", "__typename": "Bot"}, "body": "**Major: race**\n\nb"}
+        ]
+    },
+}
+CLEAN = {"summary": "ok", "findings": [], "checks": []}
+
+
+class _Gh:
+    """Scripted `gh` for _publish_review: `posts` and `reviews`/`graphql` replies are queues."""
+
+    def __init__(self, monkeypatch, *, heads=None, posts=(), reviews=None, graphql=()):
+        self.calls, self.inputs = [], []
+        self.posts, self.graphql = list(posts), list(graphql)
+        self.reviews = reviews if reviews is not None else (0, "[]", "")
+        self.heads = list(heads) if heads is not None else []
+        self.sleeps = []
+        monkeypatch.setattr(cli, "_sleep", self.sleeps.append)
+        monkeypatch.setattr(cli.os, "environ", _review_env())
+        monkeypatch.setattr(cli, "fetch_pr_head_sha", self._head)
+        monkeypatch.setattr(cli, "run_gh", self._run)
+
+    def _head(self, *a, **k):
+        return self.heads.pop(0) if self.heads else LIVE_SHA
+
+    def _run(self, args, env, **k):
+        self.calls.append(list(args))
+        self.inputs.append(k.get("input"))
+        if args[1].endswith("/files?per_page=100"):
+            return 0, "[[]]", ""
+        if args[1].endswith("/reviews?per_page=100"):
+            return self.reviews() if callable(self.reviews) else self.reviews
+        if args[1] == "graphql":
+            reply = self.graphql.pop(0)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+        reply = self.posts.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    def post_events(self):
+        return [json.loads(i)["event"] for c, i in zip(self.calls, self.inputs) if i]
+
+
+OK_POST = (
+    0,
+    json.dumps({"html_url": REVIEW_URL, "id": 555, "user": {"login": "franky-bot[bot]"}}),
+    "",
+)
+
+
+def _pub(shaped, **kw):
+    return cli._publish_review("me/repo", 11, PR_URL, LIVE_SHA, shaped, [], **kw)
+
+
+def _clean():
+    return build_review_findings(CLEAN)
+
+
+def test_publish_approves_when_allowed_and_clean(monkeypatch):
+    gh = _Gh(monkeypatch, posts=[OK_POST])
+    out = _pub(_clean(), allow_approve=True)
+    assert out[0] == "review_published" and out[5] == "APPROVE" and out[6] is None
+    assert gh.post_events() == ["APPROVE"]
+    assert "<!-- franky-review:" in json.loads(gh.inputs[-1])["body"]
+
+
+def test_publish_default_never_approves(monkeypatch):
+    gh = _Gh(monkeypatch, posts=[OK_POST])
+    out = _pub(_clean())
+    assert out[5] == "COMMENT" and gh.post_events() == ["COMMENT"]
+    assert "franky-review:" not in json.loads(gh.inputs[-1])["body"]
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [(1, "", REFUSED), (1, "", "gh: Unprocessable Entity (HTTP 422)")],
+)
+def test_publish_confirmed_refusal_downgrades_to_comment(monkeypatch, refusal):
+    gh = _Gh(monkeypatch, posts=[refusal, OK_POST])
+    out = _pub(_clean(), allow_approve=True)
+    assert out[0] == "review_published" and out[5] == "COMMENT"
+    assert gh.post_events() == ["APPROVE", "COMMENT"]
+    assert not any(c[1].endswith("/reviews?per_page=100") for c in gh.calls)  # no reconcile
+
+
+def test_publish_refusal_then_head_moved_publishes_nothing(monkeypatch):
+    gh = _Gh(monkeypatch, heads=[LIVE_SHA, LIVE_SHA, "b" * 40], posts=[(1, "", REFUSED)])
+    out = _pub(_clean(), allow_approve=True)
+    assert out[0] == "publish_blocked_stale_head" and gh.post_events() == ["APPROVE"]
+
+
+@pytest.mark.parametrize(
+    "uncertain",
+    [(1, "", "boom"), (0, "not json", ""), subprocess.TimeoutExpired(["gh"], 5)],
+)
+def test_publish_uncertain_approve_reconciles_before_any_retry(monkeypatch, uncertain):
+    gh = _Gh(monkeypatch, posts=[uncertain])
+
+    def reviews():
+        marker = (
+            json.loads([i for i in gh.inputs if i][-1])["body"].split("<!-- ")[1].split(" -->")[0]
+        )
+        found = {"id": 9, "commit_id": LIVE_SHA, "state": "APPROVED", "html_url": "u"}
+        return 0, json.dumps([[{**found, "body": f"x <!-- {marker} -->"}]]), ""
+
+    gh.reviews = reviews
+    out = _pub(_clean(), allow_approve=True)
+    assert out[0] == "review_published" and out[5] == "APPROVE" and out[4] == 9
+    assert gh.post_events() == ["APPROVE"]  # no second POST
+
+
+def test_publish_uncertain_approve_not_found_posts_comment_once(monkeypatch):
+    gh = _Gh(monkeypatch, posts=[(1, "", "boom"), OK_POST], reviews=(0, "[[]]", ""))
+    out = _pub(_clean(), allow_approve=True)
+    assert out[5] == "COMMENT" and gh.post_events() == ["APPROVE", "COMMENT"]
+    reads = [c for c in gh.calls if c[1].endswith("/reviews?per_page=100")]
+    assert len(reads) == 2 and len(gh.sleeps) == 1  # absent needs two reads
+
+
+def test_publish_reconcile_ignores_other_commit_and_marker(monkeypatch):
+    other = [
+        [{"id": 1, "commit_id": "c" * 40, "state": "APPROVED", "body": "<!-- franky-review:zz -->"}]
+    ]
+    gh = _Gh(monkeypatch, posts=[(1, "", "boom"), OK_POST], reviews=(0, json.dumps(other), ""))
+    assert _pub(_clean(), allow_approve=True)[5] == "COMMENT"
+    assert gh.post_events() == ["APPROVE", "COMMENT"]
+
+
+def test_publish_422_after_downgrade_keeps_comment(monkeypatch):
+    shaped = build_review_findings(
+        {"summary": "s", "findings": [{"title": "n", "severity": "nit", "file": "a.py", "line": 1}]}
+    )
+    gh = _Gh(
+        monkeypatch,
+        posts=[(1, "", REFUSED), (1, "", "gh: Unprocessable Entity (HTTP 422)"), OK_POST],
+    )
+    # an anchored nit makes the COMMENT carry an inline comment, so the 422 retry applies
+    monkeypatch.setattr(cli, "commentable_lines", lambda files: {"a.py": [(1, 5)]})
+    out = _pub(shaped, allow_approve=True)
+    assert out[0] == "review_published" and out[5] == "COMMENT"
+    assert gh.post_events() == ["APPROVE", "COMMENT", "COMMENT"]
+    assert json.loads(gh.inputs[-1])["comments"] == []
+
+
+def test_publish_failure_without_approve_is_unchanged(monkeypatch):
+    gh = _Gh(monkeypatch, posts=[(1, "", "boom")])
+    out = _pub(_clean())
+    assert out[0] == "publish_failed" and out[5] is None and gh.post_events() == ["COMMENT"]
+
+
+RESOLVED_SHAPED = lambda **kw: build_review_findings(  # noqa: E731
+    {
+        "summary": "s",
+        "findings": [
+            {
+                "title": "race",
+                "severity": "normal",
+                "file": "a.py",
+                "line": 3,
+                "status": "resolved",
+                **kw,
+            }
+        ],
+    },
+    threaded=True,
+)
+GQL_BASE = ["api", "graphql", "-f", f"query={THREADS_QUERY}", "-F", "owner=me",
+            "-F", "name=repo", "-F", "number=11"]  # fmt: skip
+RESOLVE_ARGV = ["api", "graphql", "-f", f"query={RESOLVE_MUTATION}", "-F", "id=PRRT_1"]
+MUTATION_OK = (
+    0,
+    json.dumps({"data": {"resolveReviewThread": {"thread": {"isResolved": True}}}}),
+    "",
+)
+
+
+def test_resolve_fixed_exact_argv_and_count(monkeypatch):
+    gh = _Gh(
+        monkeypatch, posts=[OK_POST], graphql=[(0, THREADS_PAGE([THREAD_NODE]), ""), MUTATION_OK]
+    )
+    out = _pub(RESOLVED_SHAPED(), resolve_fixed=True)
+    assert out[0] == "review_published" and out[6] == 1
+    graphql = [c for c in gh.calls if c[1] == "graphql"]
+    assert graphql == [GQL_BASE, RESOLVE_ARGV]
+
+
+def test_resolve_fixed_pages_with_cursor(monkeypatch):
+    other = {**THREAD_NODE, "id": "PRRT_2", "path": "z.py"}
+    gh = _Gh(
+        monkeypatch,
+        posts=[OK_POST],
+        graphql=[
+            (0, THREADS_PAGE([other], "CUR1"), ""),
+            (0, THREADS_PAGE([THREAD_NODE]), ""),
+            MUTATION_OK,
+        ],
+    )
+    out = _pub(RESOLVED_SHAPED(), resolve_fixed=True)
+    assert out[6] == 1
+    graphql = [c for c in gh.calls if c[1] == "graphql"]
+    assert graphql == [GQL_BASE, [*GQL_BASE, "-F", "after=CUR1"], RESOLVE_ARGV]
+
+
+def test_resolve_fixed_skipped_when_off_open_or_head_moved(monkeypatch):
+    _Gh(monkeypatch, posts=[OK_POST])
+    assert _pub(RESOLVED_SHAPED())[6] is None  # flag off
+    _Gh(monkeypatch, posts=[OK_POST])
+    assert _pub(RESOLVED_SHAPED(status="open"), resolve_fixed=True)[6] is None
+    gh = _Gh(monkeypatch, heads=[LIVE_SHA, LIVE_SHA, "b" * 40], posts=[OK_POST])
+    out = _pub(RESOLVED_SHAPED(), resolve_fixed=True)
+    assert out[0] == "review_published" and out[6] is None
+    assert not [c for c in gh.calls if c[1] == "graphql"]
+
+
+def test_resolve_fixed_failures_never_fail_the_run(monkeypatch):
+    _Gh(
+        monkeypatch,
+        posts=[OK_POST],
+        graphql=[(0, THREADS_PAGE([THREAD_NODE]), ""), (1, "", REFUSED)],
+    )
+    out = _pub(RESOLVED_SHAPED(), resolve_fixed=True)
+    assert out[0] == "review_published" and out[6] == 0
+    _Gh(monkeypatch, posts=[OK_POST], graphql=[(0, "not json", "")])
+    out = _pub(RESOLVED_SHAPED(), resolve_fixed=True)
+    assert out[0] == "review_published" and out[6] == 0
+
+
+def test_resolve_fixed_not_run_when_post_fails(monkeypatch):
+    gh = _Gh(monkeypatch, posts=[(1, "", "boom")])
+    out = _pub(RESOLVED_SHAPED(), resolve_fixed=True)
+    assert out[0] == "publish_failed" and out[6] is None
+    assert not [c for c in gh.calls if c[1] == "graphql"]
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--allow-approve", "--no-publish"],
+        ["--resolve-fixed", "--no-publish", "--thread"],
+        ["--resolve-fixed"],
+    ],
+)
+def test_review_pr_flag_validation_refusals(monkeypatch, flags):
+    _mc_review_setup(monkeypatch)
+    res = _review(flags)
+    assert res.exit_code == 2, res.output
+
+
+def test_review_pr_allow_approve_reports_event(monkeypatch):
+    _fix_review_nonce(monkeypatch)
+    calls = _mc_review_setup(monkeypatch)
+    res = _review(["--allow-approve"])
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.stdout)
+    assert data["review_event"] == "APPROVE" and "threads_resolved" not in data
+    assert json.loads(calls.inputs[0])["event"] == "APPROVE"
+
+
+def test_review_pr_default_reports_comment_event(monkeypatch):
+    _fix_review_nonce(monkeypatch)
+    _mc_review_setup(monkeypatch)
+    data = json.loads(_review([]).stdout)
+    assert data["review_event"] == "COMMENT"
+
+
+def test_review_pr_flags_visible_in_help():
+    out = CliRunner().invoke(cli.main, ["review-pr", "--help"]).output
+    assert "--allow-approve" in out and "--resolve-fixed" in out
+
+
+def test_graphql_read_never_passes_dash_x(monkeypatch):
+    gh = _Gh(
+        monkeypatch, posts=[OK_POST], graphql=[(0, THREADS_PAGE([THREAD_NODE]), ""), MUTATION_OK]
+    )
+    _pub(RESOLVED_SHAPED(), resolve_fixed=True)
+    reads = [c for c in gh.calls if c[1] == "graphql" and f"query={THREADS_QUERY}" in c]
+    assert reads and all("-X" not in c for c in reads)
+
+
+def _comment_shaped():
+    return build_review_findings(
+        {
+            "summary": "s",
+            "findings": [{"title": "n", "severity": "nit", "file": "a.py", "line": 1}],
+        }
+    )
+
+
+def test_publish_approve_422_retries_body_only_approve_first(monkeypatch):
+    monkeypatch.setattr(cli, "commentable_lines", lambda files: {"a.py": [(1, 5)]})
+    gh = _Gh(monkeypatch, posts=[(1, "", "gh: Unprocessable Entity (HTTP 422)"), OK_POST])
+    out = _pub(_comment_shaped(), allow_approve=True)
+    assert out[0] == "review_published" and out[5] == "APPROVE"
+    assert gh.post_events() == ["APPROVE", "APPROVE"]
+    assert json.loads(gh.inputs[-1])["comments"] == []
+
+
+def test_publish_body_only_approve_refused_falls_back_to_comment(monkeypatch):
+    monkeypatch.setattr(cli, "commentable_lines", lambda files: {"a.py": [(1, 5)]})
+    gh = _Gh(
+        monkeypatch,
+        posts=[(1, "", "gh: Unprocessable Entity (HTTP 422)"), (1, "", REFUSED), OK_POST],
+    )
+    out = _pub(_comment_shaped(), allow_approve=True)
+    assert out[5] == "COMMENT" and gh.post_events() == ["APPROVE", "APPROVE", "COMMENT"]
+
+
+def test_publish_reconcile_unknown_reposts_nothing(monkeypatch):
+    for reviews in ((1, "", "boom"), (0, "not json", ""), (0, "{}", "")):
+        gh = _Gh(monkeypatch, posts=[(1, "", "boom")], reviews=reviews)
+        out = _pub(_clean(), allow_approve=True)
+        assert out[0] == "publish_uncertain" and out[2] != 0 and out[5] is None
+        assert gh.post_events() == ["APPROVE"]
+
+
+def test_publish_reconcile_read_timeout_is_unknown(monkeypatch):
+    gh = _Gh(
+        monkeypatch,
+        posts=[(1, "", "boom")],
+        reviews=lambda: (_ for _ in ()).throw(subprocess.TimeoutExpired(["gh"], 5)),
+    )
+    assert _pub(_clean(), allow_approve=True)[0] == "publish_uncertain"
+    assert gh.post_events() == ["APPROVE"]
+
+
+def test_publish_head_moved_after_uncertain_approve_is_uncertain(monkeypatch):
+    gh = _Gh(
+        monkeypatch,
+        heads=[LIVE_SHA, LIVE_SHA, "b" * 40],
+        posts=[(1, "", "boom")],
+        reviews=(0, "[[]]", ""),
+    )
+    out = _pub(_clean(), allow_approve=True)
+    assert out[0] == "publish_uncertain" and gh.post_events() == ["APPROVE"]
+
+
+def test_bare_422_substring_is_not_a_confirmed_refusal():
+    assert cli._review_confirmed_unwritten(1, "gh: Unprocessable Entity (HTTP 422)")
+    assert cli._review_confirmed_unwritten(1, REFUSED)
+    assert not cli._review_confirmed_unwritten(1, "request id 4221 failed")
+    assert not cli._review_confirmed_unwritten(1, "timed out")
+
+
+def test_failed_check_blocks_approve_in_publish(monkeypatch):
+    shaped = build_review_findings(
+        {"summary": "s", "findings": [], "checks": [{"name": "t", "outcome": "fail"}]}
+    )
+    gh = _Gh(monkeypatch, posts=[OK_POST])
+    assert _pub(shaped, allow_approve=True)[5] == "COMMENT" and gh.post_events() == ["COMMENT"]
+
+
+def test_resolve_uses_poster_login_from_post_response(monkeypatch):
+    no_user = (0, json.dumps({"html_url": REVIEW_URL, "id": 555}), "")
+    gh = _Gh(monkeypatch, posts=[no_user])
+    assert _pub(RESOLVED_SHAPED(), resolve_fixed=True)[6] == 0
+    assert not [c for c in gh.calls if c[1] == "graphql"]  # unknown login: nothing read or resolved
+    other = {
+        **THREAD_NODE,
+        "comments": {
+            "nodes": [
+                {
+                    "author": {"login": "someone-else", "__typename": "Bot"},
+                    "body": "**Major: race**\n\nb",
+                }
+            ]
+        },
+    }
+    _Gh(monkeypatch, posts=[OK_POST], graphql=[(0, THREADS_PAGE([other]), "")])
+    assert _pub(RESOLVED_SHAPED(), resolve_fixed=True)[6] == 0
+
+
+def test_resolve_stops_when_thread_list_exceeds_page_limit(monkeypatch):
+    pages = [(0, THREADS_PAGE([THREAD_NODE], f"C{i}"), "") for i in range(5)]
+    gh = _Gh(monkeypatch, posts=[OK_POST], graphql=pages)
+    out = _pub(RESOLVED_SHAPED(), resolve_fixed=True)
+    assert out[0] == "review_published" and out[6] == 0
+    graphql = [c for c in gh.calls if c[1] == "graphql"]
+    assert len(graphql) == 5 and all(f"query={RESOLVE_MUTATION}" not in c for c in graphql)

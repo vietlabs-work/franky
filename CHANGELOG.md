@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `review-pr --allow-approve` lets the host post an `APPROVE` when no blocking or Major finding is left open, no finding was dropped as malformed, and no check failed. The caller must also require branch protection that dismisses stale approvals on push. Without the flag the review is never an `APPROVE`. An `APPROVE` with HTTP 422 is retried once body-only; a refused one falls back to one `COMMENT`. An uncertain one is first reconciled against the PR's reviews using a `<!-- franky-review:ID -->` marker in the `APPROVE` body, so it is never posted twice; if that cannot be settled, the run ends with the new status `publish_uncertain` (non-zero exit) and posts nothing more.
+- `review-pr --resolve-fixed` (with `--thread`) resolves the publishing bot's own unambiguous review threads for findings a re-review marked `resolved`, using two fixed GraphQL calls (the read has no `-X GET`, which GitHub would ignore). Both new flags are refused with `--no-publish`.
+- The `--json` result of a published `review-pr` adds `review_event` (the event actually posted) and, with `--resolve-fixed`, `threads_resolved`.
+
+### Changed
+
+- `review-pr` posts a nit inline or not at all: nits no longer appear in the review body, and anchored findings are cut to the inline cap by severity so a nit never displaces a Major. The "Since the last review" lines no longer list nits.
+- The threaded `review-pr` prompt asks the agent to report each prior finding under its exact prior title.
+
 ## [0.3.10] - 2026-10-02
 
 ### Changed

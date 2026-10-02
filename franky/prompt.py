@@ -340,9 +340,11 @@ def build_review_pr_prompt(
     anti-injection register: a hostile PR body/diff cannot plant a fixed sentinel to hijack the
     findings Franky reports).
 
-    Franky's own host process is the ONLY thing that ever posts a GitHub review (COMMENT or
-    REQUEST_CHANGES, NEVER APPROVE - see reviewpr.review_event) - the agent itself must never
-    write to the repo or to GitHub, so every mutating action is spelled out as forbidden here.
+    Franky's own host process is the ONLY thing that ever posts a GitHub review or resolves a
+    thread (the event is decided by the host - see reviewpr.review_event; APPROVE only behind
+    `--allow-approve`) - the agent itself must never write to the repo or to GitHub, approve,
+    request changes or resolve anything, so every mutating action is spelled out as forbidden
+    here.
 
     `handoff`/`last_sha` (`review-pr --thread`) add a "Prior review context" block after the task
     block: the prior findings, fenced by `FRANKY_PRIOR_<nonce>` markers as untrusted PR-derived
@@ -413,6 +415,7 @@ def build_review_pr_prompt(
             "severity, unless the ticket context shows the code misses a stated requirement.\n"
             f"4. If {since} is not reachable (force-push or rebase), review the full diff, but "
             "still verify the prior findings by their content.\n"
+            "5. Report each prior finding under its exact prior title.\n"
         )
         status_shape = ', "status": "<new|open|resolved>"'
 
@@ -485,7 +488,7 @@ def build_review_pr_prompt(
         f"{status_shape}}}], "
         '"checks": [{"name": "...", "outcome": "<pass|fail|skipped>", "detail": "..."}]}\n'
         '- Use "blocking" severity ONLY for a verified, must-fix defect; use "normal"/"nit" '
-        "otherwise. Franky decides whether to request changes from this - you never approve or "
+        "otherwise. Franky's host decides the review event from this - you never approve or "
         "request changes yourself.\n"
         f"- Output ONLY the sentinel block as the FINAL content of your response; add no text "
         f"after `{end}`.\n"

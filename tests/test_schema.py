@@ -214,6 +214,7 @@ def test_result_schemas_document_review_outputs():
         "no_findings",
         "publish_blocked_stale_head",
         "publish_failed",
+        "publish_uncertain",
     ):
         assert status in schema["result_schema"]["status"]
         assert status in schema["job_record_schema"]["status"]

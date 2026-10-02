@@ -196,6 +196,14 @@ Before each build attempt, Franky checks for an open PR on the predicted branch.
 
 The `review-pr` prompt tells the agent to inspect only. The host publishes comments or change requests after it rechecks the PR head.
 
+Two flags let the host do more, and both are off by default. Both need publishing, so `--no-publish` refuses them.
+
+- `--allow-approve` lets the review be an `APPROVE`. The host picks it from the full finding list: no blocking or Major finding is left open (resolved ones do not count), no finding was dropped as malformed, and no check failed. Open nits and questions do not block it, and the body never lists a prior nit. Otherwise the review is `COMMENT` or `REQUEST_CHANGES`. The caller must enforce branch protection, and that protection must dismiss stale approvals on push: a push can land between Franky's last head check and the POST.
+- If an `APPROVE` gets HTTP 422 with inline comments, the host retries once as a body-only `APPROVE`. If an `APPROVE` is refused (a wrapper line starting `GitHub wrapper refused:` or `(HTTP 422)`), it posts a `COMMENT` instead. If the outcome is uncertain (timeout, other failure, unreadable reply), it first lists the PR's reviews (`gh api repos/OWNER/REPO/pulls/N/reviews?per_page=100 --paginate --slurp`, read twice a short time apart) for a review on the same commit with the body marker `<!-- franky-review:ID -->`, which only an `APPROVE` body carries. Found: it reports that review. Absent on both reads: it posts one `COMMENT`. If a read failed, or the head moved while an `APPROVE` may be on the PR, it posts nothing and ends with status `publish_uncertain` (non-zero exit, no `review_event`), so the caller must look at the PR before acting. The result `review_event` is the event actually posted.
+- `--resolve-fixed` (needs `--thread`) resolves the review threads of findings the re-review marked `resolved`, after the review posts and only if the PR head did not move. A thread matches only if it is open, its first comment is by the publishing bot (the login in the POST response, without `[bot]`) on the finding's file, and it starts with a `**Label: title**` heading Franky wrote (any severity label). Zero or several matches skip the finding, and so does a new or open finding with the same file and title. If the publishing login is unknown, or more than 5 pages of threads exist, nothing is resolved. A failure is logged and never fails the run. The result `threads_resolved` counts the threads resolved.
+
+A nit is posted inline or not at all: it never goes in the review body, and it never takes an inline slot from a Major or Blocking finding. Findings outside the diff or without a line still go to the body.
+
 If `JIRA_BASE_URL`, `JIRA_EMAIL`, and `JIRA_API_TOKEN` are set on the host, `review-pr` also fetches up to 3 JIRA tickets linked in the PR title, branch, or body and gives their text to the reviewer as untrusted data. The credentials never enter the container, Only private repositories are fetched, and tickets with a security level are skipped. The `--json` result lists each ticket in `context_sources` (`ref`, `status`, and a `reason` when it was not included) without its text. The list is empty when no key was found, and in frozen `--at-sha` mode, which never fetches tickets.
 
 Scope `GH_TOKEN` permissions because they are the enforced GitHub boundary for the autonomous container.
@@ -223,6 +231,7 @@ Do not combine the file with inline instructions.
 - A second run for the same PR while one is active exits 4 (`thread_busy`).
 - Thread ids are lowercase, so `Me/Repo` and `me/repo` share one thread.
 - Without `--thread`, Franky ignores any finding `status` the agent reports.
+- Re-reviews should report each prior finding under its exact prior title; `--resolve-fixed` matches threads by it.
 - `--rubric-version` pins a rubric label. Changing it, the engine, or the model starts a new session.
 
 Sessions move by stream-in (tar over `docker exec`) and copy-out (a `docker cp ... -` tar stream, capped at 64 MiB) only. No volume or mount is added. Only the session file and its side directory move. Claude's project memory never moves between runs. Stored sessions contain regular files only, are scrubbed of known secret values and token patterns, and are refused on any finding. They stay host-only (0700/0600) and are never exported. The stored findings are redacted the same way. `threads prune` and `threads purge` delete them.

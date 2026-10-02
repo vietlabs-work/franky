@@ -99,10 +99,15 @@ from .prompt import (
     task_slug,
 )
 from .reviewpr import (
+    APPROVE_MARKER,
+    MAX_THREAD_PAGES,
+    RESOLVE_MUTATION,
+    THREADS_QUERY,
     build_body_only_payload,
     build_review_findings,
     build_review_payload,
     commentable_lines,
+    match_resolved_threads,
     parse_review_findings,
     render_review_body,
 )
@@ -996,6 +1001,131 @@ def _read_review_instructions_file(path: Path) -> str:
         raise FrankyError(error, code=EXIT_USAGE, kind="usage_error") from exc
 
 
+_WRAPPER_REFUSED = "GitHub wrapper refused:"
+_HTTP_422 = re.compile(r"\(HTTP 422\)")
+RECONCILE_DELAY_S = 2.0  # wait before the second reconcile read (eventual consistency)
+
+
+def _sleep(seconds: float) -> None:  # injectable: tests replace it
+    time.sleep(seconds)
+
+
+def _is_422(err: str) -> bool:
+    return bool(_HTTP_422.search(err))
+
+
+def _review_confirmed_unwritten(code: int, err: str) -> bool:
+    """True when a failed APPROVE POST certainly wrote nothing: a wrapper refusal or HTTP 422."""
+    return code > 0 and (_WRAPPER_REFUSED in err or _is_422(err))
+
+
+def _paged_list(out: str) -> list | None:
+    """Flatten `gh api --paginate --slurp` output; None when it is not a list of pages."""
+    try:
+        pages = json.loads(out)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(pages, list):
+        return None
+    items: list = []
+    for page in pages:
+        items.extend(page if isinstance(page, list) else [page])
+    return items
+
+
+def _find_marked_review(gh, repo: str, pr_number: int, sha: str, marker: str):
+    """Reconcile an uncertain APPROVE POST. Returns ("found", review), ("absent", None) or
+    ("unknown", None). Absent needs two clean reads, a short sleep apart; any failed, refused,
+    timed-out or unparsable read is unknown, never absent."""
+    for attempt in range(2):
+        try:
+            code, out, _err = gh(
+                [
+                    "api",
+                    f"repos/{repo}/pulls/{pr_number}/reviews?per_page=100",
+                    "--paginate",
+                    "--slurp",
+                ]
+            )
+        except (FrankyError, DockerError):
+            return "unknown", None
+        reviews = _paged_list(out) if code == 0 else None
+        if reviews is None:
+            return "unknown", None
+        for r in reviews:
+            if (
+                isinstance(r, dict)
+                and str(r.get("commit_id", "")).lower() == sha.lower()
+                and marker in str(r.get("body") or "")
+            ):
+                return "found", r
+        if attempt == 0:
+            _sleep(RECONCILE_DELAY_S)
+    return "absent", None
+
+
+def _resolve_fixed_threads(
+    gh, repo: str, pr_number: int, shaped: dict, login: str | None, secrets: list[str]
+) -> int:
+    """Resolve the publishing bot's matching threads for resolved findings; returns the count.
+
+    Best effort: any read, parse or mutation failure is logged (redacted) and skipped. Nothing is
+    resolved when the poster login is unknown or the thread list could not be read in full.
+    """
+    if not login:
+        return 0
+    owner, name = repo.split("/", 1)
+    base = [
+        "api", "graphql", "-f", f"query={THREADS_QUERY}",
+        "-F", f"owner={owner}", "-F", f"name={name}", "-F", f"number={pr_number}",
+    ]  # fmt: skip
+    nodes: list = []
+    cursor = None
+    try:
+        for page in range(MAX_THREAD_PAGES):
+            code, out, err = gh(base + ([] if cursor is None else ["-F", f"after={cursor}"]))
+            if code != 0:
+                raise ValueError(err)
+            threads = json.loads(out)["data"]["repository"]["pullRequest"]["reviewThreads"]
+            nodes.extend(threads["nodes"])
+            if not threads["pageInfo"]["hasNextPage"]:
+                break
+            cursor = threads["pageInfo"]["endCursor"]
+        else:
+            raise ValueError("more review threads than the page limit; uniqueness unknown")
+    except (FrankyError, DockerError, ValueError, TypeError, KeyError) as exc:
+        click.echo(
+            f"franky: could not read review threads: {redact(str(exc), secrets)[:200]}", err=True
+        )
+        return 0
+    done = 0
+    for thread_id in match_resolved_threads(shaped, nodes, login):
+        try:
+            code, _out, err = gh(
+                ["api", "graphql", "-f", f"query={RESOLVE_MUTATION}", "-F", f"id={thread_id}"]
+            )
+        except (FrankyError, DockerError) as exc:
+            code, err = 1, str(exc)
+        if code == 0:
+            done += 1
+        else:
+            click.echo(
+                f"franky: could not resolve a thread: {redact(err.strip(), secrets)[:200]}",
+                err=True,
+            )
+    return done
+
+
+def _poster_login(resp: dict) -> str | None:
+    """The publishing account's login from a review response, without a trailing `[bot]`."""
+    user = resp.get("user")
+    login = user.get("login") if isinstance(user, dict) else None
+    if not isinstance(login, str) or not login.strip():
+        return None
+    login = login.strip()
+    return login[: -len("[bot]")] if login.lower().endswith("[bot]") else login
+
+
 def _publish_review(
     repo: str,
     pr_number: int,
@@ -1003,11 +1133,27 @@ def _publish_review(
     pinned_sha: str,
     shaped: dict,
     secrets: list[str],
-) -> tuple[str, str, int, str | None, int | None]:
-    """Post the review as inline comments on the pinned commit; returns the result fields.
+    allow_approve: bool = False,
+    resolve_fixed: bool = False,
+) -> tuple[str, str, int, str | None, int | None, str | None, int | None]:
+    """Post the review as inline comments on the pinned commit; returns the result fields
+    (status, reason, exit code, review url, review id, event posted, threads resolved).
 
     Fetches the PR files to learn which lines are commentable, re-checks the head, then POSTs.
     If GitHub rejects the anchors (422), retries ONCE with every finding in the body.
+
+    With `allow_approve` the event may be APPROVE; the payload then ends with a unique
+    `<!-- franky-review:<nonce> -->` marker. If that POST does not succeed:
+    - HTTP 422 with inline comments: retry once as a body-only APPROVE after a head check;
+    - a confirmed refusal (wrapper refusal line, or HTTP 422) wrote nothing: re-check the head and
+      post COMMENT instead;
+    - anything else (timeout, other failure, unparsable reply) is reconciled first: list the PR's
+      reviews (two reads) for one on this commit that carries the marker. Found: report it as
+      published with its own state. Absent: nothing was written, post COMMENT. Unknown (a read
+      failed), or the head moved while an APPROVE may be on the PR: never repost, end with status
+      `publish_uncertain` so the caller looks at the PR before acting.
+    With `resolve_fixed`, after a successful post and an unmoved head, resolve the publishing
+    bot's matching threads for findings marked resolved (login from the POST response).
     """
     timeout = _resolve_gh_timeout(os.environ)
 
@@ -1030,13 +1176,20 @@ def _publish_review(
         live = fetch_pr_head_sha(repo, pr_number, os.environ)
         return live is None or live.lower() != pinned_sha.lower()
 
-    stale_result = (
+    def fail(status: str, reason: str, code: int):
+        return (status, reason, code, None, None, None, None)
+
+    stale_result = fail(
         "publish_blocked_stale_head",
         f"{pr_url}'s head changed since the review started (reviewed {pinned_sha}) - "
         "refusing to publish a stale review",
         EXIT_AGENT,
-        None,
-        None,
+    )
+    uncertain_result = fail(
+        "publish_uncertain",
+        f"an APPROVE review on {pr_url} may or may not have been posted - check the PR "
+        "before acting; nothing was reposted",
+        EXIT_NETWORK,
     )
     if stale():
         return stale_result
@@ -1045,44 +1198,112 @@ def _publish_review(
         ["api", f"repos/{repo}/pulls/{pr_number}/files?per_page=100", "--paginate", "--slurp"]
     )
     if fcode == 0:
-        try:
-            pages = json.loads(fout)
-        except (ValueError, TypeError):
-            pages = None
-        if isinstance(pages, list):
-            files = []
-            for page in pages:
-                files.extend(page if isinstance(page, list) else [page])
+        files = _paged_list(fout)
     if stale():
         return stale_result
 
-    payload = build_review_payload(shaped, commentable_lines(files or []), pinned_sha, secrets)
+    commentable = commentable_lines(files or [])
     post = ["api", "-X", "POST", f"repos/{repo}/pulls/{pr_number}/reviews", "--input", "-"]
-    gcode, gout, gerr = gh(post, input=json.dumps(payload))
-    reason = f"published a {payload['event']} review"
+    marker = f"<!-- {APPROVE_MARKER}:{uuid.uuid4().hex} -->"
+
+    def build(allow: bool, body_only: bool = False) -> dict:
+        if body_only:
+            p = build_body_only_payload(shaped, pinned_sha, secrets, allow)
+        else:
+            p = build_review_payload(shaped, commentable, pinned_sha, secrets, allow)
+        if p["event"] == "APPROVE":
+            p["body"] += f"\n\n{marker}"
+        return p
+
+    def send(p: dict):
+        try:
+            return gh(post, input=json.dumps(p))
+        except FrankyError as exc:
+            # An APPROVE that timed out may or may not have landed: report it as uncertain.
+            if p["event"] != "APPROVE" or exc.kind != "timeout":
+                raise
+            return -1, "", "timed out"
+
+    def parsed(out: str) -> dict:
+        try:
+            resp = json.loads(out)
+        except (ValueError, TypeError):
+            return {}
+        return resp if isinstance(resp, dict) else {}
+
+    maybe_written = False
+
+    def approve(p: dict):
+        """POST an APPROVE payload: ("ok", gout, event), ("unwritten", err, None) or
+        ("unknown", err, None)."""
+        nonlocal maybe_written
+        gcode, gout, gerr = send(p)
+        if gcode == 0 and parsed(gout).get("id") is not None:
+            return "ok", gout, "APPROVE"
+        if _review_confirmed_unwritten(gcode, gerr):
+            return "unwritten", gerr, None
+        maybe_written = True
+        kind, review = _find_marked_review(gh, repo, pr_number, pinned_sha, marker)
+        if kind == "found":
+            event = {"APPROVED": "APPROVE", "CHANGES_REQUESTED": "REQUEST_CHANGES"}.get(
+                str(review.get("state")), "COMMENT"
+            )
+            return "ok", json.dumps(review), event
+        return ("unwritten" if kind == "absent" else "unknown"), gerr, None
+
+    notes: list[str] = []
+    payload = build(allow_approve)
+    if payload["event"] == "APPROVE":
+        kind, gout, event = approve(payload)
+        if kind == "unwritten" and payload["comments"] and _is_422(gout):
+            if stale():
+                return uncertain_result if maybe_written else stale_result
+            payload = build(True, body_only=True)
+            notes.append(" (inline anchors rejected, posted body-only)")
+            kind, gout, event = approve(payload)
+        if kind == "unknown":
+            return uncertain_result
+        if kind == "unwritten":
+            if stale():
+                return uncertain_result if maybe_written else stale_result
+            allow_approve = False
+            notes = [" (APPROVE not accepted, posted COMMENT)"]
+            payload = build(False)
+            gcode, gout, gerr = send(payload)
+        else:
+            gcode, gerr = 0, ""
+            payload["event"] = event
+    else:
+        gcode, gout, gerr = send(payload)
     if files is None:
-        reason += " (could not read the PR files, posted body-only)"
-    if gcode != 0 and payload["comments"] and ("422" in gerr or "Unprocessable" in gerr):
+        notes.insert(0, " (could not read the PR files, posted body-only)")
+    if gcode != 0 and payload["comments"] and _is_422(gerr):
         # Re-check before the second write: the author may have pushed during the first POST.
         if stale():
             return stale_result
-        payload = build_body_only_payload(shaped, pinned_sha, secrets)
-        gcode, gout, gerr = gh(post, input=json.dumps(payload))
-        reason += " (inline anchors rejected, posted body-only)"
+        payload = build(allow_approve, body_only=True)
+        gcode, gout, gerr = send(payload)
+        notes.append(" (inline anchors rejected, posted body-only)")
     if gcode != 0:
-        return (
+        return fail(
             "publish_failed",
             f"posting the GitHub review failed: {redact(gerr.strip(), secrets)[:500]}",
             EXIT_NETWORK,
-            None,
-            None,
         )
-    try:
-        resp = json.loads(gout)
-    except (ValueError, TypeError):
-        resp = {}
-    resp = resp if isinstance(resp, dict) else {}
-    return "review_published", reason, EXIT_SUCCESS, resp.get("html_url"), resp.get("id")
+    resp = parsed(gout)
+    event = payload["event"]
+    resolved = None
+    if resolve_fixed and any(f["status"] == "resolved" for f in shaped["findings"]) and not stale():
+        resolved = _resolve_fixed_threads(gh, repo, pr_number, shaped, _poster_login(resp), secrets)
+    return (
+        "review_published",
+        f"published a {event} review" + "".join(notes),
+        EXIT_SUCCESS,
+        resp.get("html_url"),
+        resp.get("id"),
+        event,
+        resolved,
+    )
 
 
 def _require_commit_in_pr(repo: str, number: int, sha: str, pr_url: str) -> None:
@@ -1213,6 +1434,23 @@ def _review_ticket_context(
     help="Review but write nothing to GitHub; report findings only (default: publish a review).",
 )
 @click.option(
+    "--allow-approve",
+    "allow_approve",
+    is_flag=True,
+    default=False,
+    help="Let the review be an APPROVE when no blocking or Major finding is left open and "
+    "nothing was dropped as malformed. The caller must gate this (e.g. branch protection). "
+    "Refused with --no-publish.",
+)
+@click.option(
+    "--resolve-fixed",
+    "resolve_fixed",
+    is_flag=True,
+    default=False,
+    help="After publishing, resolve this bot's own review threads for findings the re-review "
+    "marked resolved (unambiguous matches only). Requires --thread; refused with --no-publish.",
+)
+@click.option(
     "--thread",
     "use_thread",
     is_flag=True,
@@ -1269,6 +1507,8 @@ def review_pr(
     at_sha: str | None,
     diff_base: str | None,
     no_publish: bool,
+    allow_approve: bool,
+    resolve_fixed: bool,
     use_thread: bool,
     rubric_version: str,
     engine: str | None,
@@ -1277,7 +1517,7 @@ def review_pr(
     quiet: bool,
     max_duration: int | None,
 ) -> None:
-    """Independently REVIEW an existing pull request - read-only, never merges or approves.
+    """Independently REVIEW an existing pull request - read-only, never merges.
 
     Example:
       franky review-pr https://github.com/you/repo/pull/42
@@ -1286,8 +1526,12 @@ def review_pr(
 
     Runs the SAME hardened, egress-controlled container as `build`/`iterate`. The prompt directs
     the agent to inspect the PR and run existing checks without changing GitHub or the checkout.
-    The host publishes the result as COMMENT or REQUEST_CHANGES, never APPROVE. Token permissions
-    remain the enforced GitHub boundary for the autonomous container.
+    The host publishes the result as COMMENT or REQUEST_CHANGES. Only --allow-approve can make it
+    an APPROVE (no blocking or Major finding left open, nothing dropped as malformed); if GitHub or
+    a wrapper refuses it, the host posts a COMMENT instead and reports `review_event`.
+    --resolve-fixed (needs --thread) then resolves the bot's own threads for fixed findings and
+    reports `threads_resolved`. Nits are posted inline or not at all. Token permissions remain
+    the enforced GitHub boundary for the autonomous container.
 
     --expected-head-sha pins the PR head you last observed; a live head that disagrees (checked
     BEFORE the pass starts, and again immediately BEFORE publishing) refuses rather than
@@ -1341,6 +1585,20 @@ def review_pr(
                     code=EXIT_USAGE,
                     kind="usage_error",
                 )
+
+        if (allow_approve or resolve_fixed) and no_publish:
+            raise FrankyError(
+                "--allow-approve/--resolve-fixed publish to GitHub and cannot be combined "
+                "with --no-publish",
+                code=EXIT_USAGE,
+                kind="usage_error",
+            )
+        if resolve_fixed and not use_thread:
+            raise FrankyError(
+                "--resolve-fixed requires --thread (it needs the prior findings)",
+                code=EXIT_USAGE,
+                kind="usage_error",
+            )
 
         expected_head_sha = (expected_head_sha or "").strip().lower()
         if expected_head_sha and not _SHA_RE.match(expected_head_sha):
@@ -1526,6 +1784,8 @@ def review_pr(
 
         review_url: str | None = None
         review_id: int | None = None
+        review_event_out: str | None = None
+        threads_resolved: int | None = None
         findings_summary: str | None = None
         review_body: str | None = None
         checks: list | None = None
@@ -1595,8 +1855,23 @@ def review_pr(
                         )
                         exit_code = EXIT_AGENT
                     else:
-                        status, reason, exit_code, review_url, review_id = _publish_review(
-                            repo, pr_number, canonical_pr_url, pinned_sha, shaped, secrets
+                        (
+                            status,
+                            reason,
+                            exit_code,
+                            review_url,
+                            review_id,
+                            review_event_out,
+                            threads_resolved,
+                        ) = _publish_review(
+                            repo,
+                            pr_number,
+                            canonical_pr_url,
+                            pinned_sha,
+                            shaped,
+                            secrets,
+                            allow_approve=allow_approve,
+                            resolve_fixed=resolve_fixed,
                         )
 
         thread_result = handoff = None
@@ -1662,6 +1937,8 @@ def review_pr(
             checks=checks,
             review_url=review_url,
             review_id=review_id,
+            review_event=review_event_out,
+            threads_resolved=threads_resolved,
             thread=thread_result,
             handoff=handoff,
             context_sources=context_sources,
