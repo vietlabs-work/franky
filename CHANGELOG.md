@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.11] - 2026-10-02
+
 ### Added
 
 - `review-pr --allow-approve` lets the host post an `APPROVE` when no blocking or Major finding is left open, no finding was dropped as malformed, and no check failed. The caller must also require branch protection that dismisses stale approvals on push. Without the flag the review is never an `APPROVE`. An `APPROVE` with HTTP 422 is retried once body-only; a refused one falls back to one `COMMENT`. An uncertain one is first reconciled against the PR's reviews using a `<!-- franky-review:ID -->` marker in the `APPROVE` body, so it is never posted twice; if that cannot be settled, the run ends with the new status `publish_uncertain` (non-zero exit) and posts nothing more.

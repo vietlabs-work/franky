@@ -391,4 +391,4 @@ See [`evals/README.md`](evals/README.md) for task formats. See [`docs/releasing.
 
 ## Status
 
-v0.3.10. Live end-to-end runs require operator-supplied credentials.
+v0.3.11. Live end-to-end runs require operator-supplied credentials.
