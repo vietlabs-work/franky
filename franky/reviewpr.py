@@ -23,15 +23,16 @@ from collections.abc import Iterable
 from .config import redact
 from .sentinel import scan_sentinel_json
 
-_VALID_SEVERITIES = frozenset({"blocking", "normal", "nit"})
+_VALID_SEVERITIES = frozenset({"blocking", "normal", "question", "nit"})
 _VALID_OUTCOMES = frozenset({"pass", "fail", "skipped"})
 # Per-finding status on a `--thread` re-review: new, still open, or fixed since the last review.
 _VALID_STATUSES = frozenset({"new", "open", "resolved"})
 
 MAX_INLINE = 8  # inline comments per review
 MAX_BODY_FINDINGS = 5  # lines per list in the review body
+MAX_QUESTIONS = 2  # question findings kept per review
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
-_LABELS = {"blocking": "Blocking", "normal": "Major", "nit": "Nit"}
+_LABELS = {"blocking": "Blocking", "normal": "Major", "question": "Question", "nit": "Nit"}
 _FOOTER = "<sub>Automated review by Franky</sub>"
 # Host-side length caps: the prompt asks for short text, these guarantee it.
 MAX_TITLE_CHARS = 200
@@ -114,10 +115,16 @@ def build_review_findings(parsed: dict, threaded: bool = False) -> dict:
     raw_findings = parsed.get("findings")
     findings: list[dict] = []
     if isinstance(raw_findings, list):
+        questions = 0
         for raw in raw_findings:
             shaped = _shape_finding(raw, threaded)
-            if shaped is not None:
-                findings.append(shaped)
+            if shaped is None:
+                continue
+            if shaped["severity"] == "question":
+                questions += 1
+                if questions > MAX_QUESTIONS:  # the method allows at most 2
+                    continue
+            findings.append(shaped)
 
     raw_checks = parsed.get("checks")
     checks: list[dict] = []

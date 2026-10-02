@@ -2272,6 +2272,24 @@ def test_run_pass_loads_only_reserved_claude_mcp_config(tmp_path, monkeypatch):
     ]
 
 
+def test_run_pass_passes_configured_effort_to_claude(monkeypatch):
+    from franky.config import Config
+    from franky.engine import ClaudeEngine
+
+    seen = {}
+
+    def fake_run(_cfg, inner_argv, **_kwargs):
+        seen["argv"] = inner_argv
+        return 0, "ok"
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+    cfg = Config(engine=ClaudeEngine(), allowed_repos=["me/repo"], effort="xhigh")
+    cli._run_pass(cfg, "do it", "franky", "franky-proxy")
+    assert seen["argv"][-2:] == ["--effort", "xhigh"]
+    cli._run_pass(Config(engine=ClaudeEngine(), allowed_repos=["me/repo"]), "x", "f", "p")
+    assert "--effort" not in seen["argv"]
+
+
 def test_run_pass_threads_configured_model_to_engine(monkeypatch):
     from franky.config import Config
     from franky.engine import OpenCodeEngine

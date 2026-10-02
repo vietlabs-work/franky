@@ -7,10 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `review-pr` traces new PII, secret, money, and auth values to every sink with `git grep`, adds a `question` severity for risks that depend on facts outside the repository (at most 2, never blocking), and self-checks its top three risks before it answers. On the review eval, recall rose from 4/15 to 6/15 with no new false positives. The review-eval frozen mode reads intent from the PR title and commit messages only, and fix-SHA controls score only their `forbid` findings.
+- `FRANKY_EFFORT` sets the Claude engine's `--effort` (`low` to `max`). It is unset by default.
+
 ### Added
 
 - `review-pr` now gives the reviewer the linked JIRA tickets. On the host, Franky finds up to 3 JIRA keys in the PR title, head branch, and body, fetches them with the existing `JIRA_BASE_URL`, `JIRA_EMAIL`, and `JIRA_API_TOKEN`, and puts their text in the prompt as untrusted data. The credentials never enter the container. Only private repositories are fetched; tickets with a security level are skipped, redirects are refused, and a connection or auth failure stops further fetches. A JIRA failure never fails the review. The `--json` result adds `context_sources`, one `{kind, ref, status}` entry per key plus a `reason` when the ticket was not included (`unconfigured`, `public_repo`, `auth`, `not_found`, `restricted`, `config`, `network`), with no ticket text.
-- `franky review-pr --no-publish` accepts `--at-sha` and `--diff-base` (both 40-hex, together) to review a PR frozen at one of its historical commits against a pinned diff base, blind to later PR state. The mode refuses publishing, `--thread`, and `--expected-head-sha`, and refuses a SHA that is not a commit of the PR. A successful `--no-publish --json` result now also carries `findings` (at most 8, shaped) and `findings_total`; a review JSON without a `findings` list is reported as `no_findings`.
+- `franky review-pr --no-publish` accepts `--at-sha` and `--diff-base` (both 40-hex, together) to review a PR frozen at one of its historical commits against a pinned diff base, blind to later PR state. The mode refuses publishing, `--thread`, and `--expected-head-sha`, and refuses a SHA that is not a commit of the PR. A successful `--no-publish --json` result now also carries `findings` (all of them, at most 10, shaped) and `findings_total`; a review JSON without a `findings` list is reported as `no_findings`.
 
 ## [0.3.9] - 2026-10-01
 

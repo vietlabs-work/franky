@@ -55,7 +55,7 @@ _RESULT_SCHEMA: dict = {
         {
             "title": "string; finding title",
             "body": "string; finding detail, possibly empty",
-            "severity": "string: blocking | normal | nit",
+            "severity": "string: blocking | normal | question | nit",
             "file": "string or null",
             "line": "integer or null",
             "start_line": "integer or null",
@@ -124,7 +124,7 @@ _RESULT_SCHEMA: dict = {
                 "title": "string; at most 200 chars",
                 "file": "string or null; at most 200 chars",
                 "line": "integer or null",
-                "severity": "string: blocking | normal | nit",
+                "severity": "string: blocking | normal | question | nit",
                 "status": "string: new | open (resolved findings are dropped; at most 40)",
             }
         ],

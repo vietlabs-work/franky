@@ -29,6 +29,8 @@ GH_TOKEN_VAR = "GH_TOKEN"
 ALLOWED_REPOS_VAR = "FRANKY_ALLOWED_REPOS"
 EXTRA_ALLOWED_DOMAINS_VAR = "FRANKY_EXTRA_ALLOWED_DOMAINS"
 MODEL_VAR = "FRANKY_MODEL"
+EFFORT_VAR = "FRANKY_EFFORT"
+_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 MEMORY_MB_VAR = "FRANKY_MEMORY_MB"
 DISK_MB_VAR = "FRANKY_DISK_MB"
 DEFAULT_MEMORY_MB = 2048
@@ -77,6 +79,7 @@ class Config:
     codex_mcp_overrides: list[str] = field(default_factory=list)
     claude_mcp_config_path: str | None = None
     model: str | None = None
+    effort: str | None = None
     memory_mb: int = DEFAULT_MEMORY_MB
     disk_mb: int = DEFAULT_DISK_MB
 
@@ -152,6 +155,11 @@ def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
         )
 
     model = env.get(MODEL_VAR) or None
+    effort = env.get(EFFORT_VAR) or None
+    if effort is not None and effort not in _EFFORTS:
+        raise ConfigError(f"{EFFORT_VAR} must be one of {', '.join(_EFFORTS)}")
+    if effort is not None and engine.name != "claude":
+        raise ConfigError(f"{EFFORT_VAR} is supported only by the claude engine")
     model_error = model_name_error(engine.name, model)
     if model_error:
         raise ConfigError(f"{MODEL_VAR}: {model_error}")
@@ -214,6 +222,7 @@ def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
         extra_allowed_domains=extra_domains,
         auth_volume=auth_volume,
         model=model,
+        effort=effort,
         memory_mb=_resource_budget(env, MEMORY_MB_VAR, DEFAULT_MEMORY_MB, 256, 8192),
         disk_mb=_resource_budget(env, DISK_MB_VAR, DEFAULT_DISK_MB, 1024, 32768),
     )

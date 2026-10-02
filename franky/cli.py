@@ -2527,6 +2527,8 @@ def _run_pass(
         inner_argv += ["-c", override]
     if cfg.claude_mcp_config_path:
         inner_argv += ["--mcp-config", cfg.claude_mcp_config_path, "--strict-mcp-config"]
+    if cfg.effort:
+        inner_argv += ["--effort", cfg.effort]
     extra = {} if timeout is None else {"timeout": timeout}
     if private_prompt:
         prompt_bytes = prompt.encode("utf-8")

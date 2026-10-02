@@ -309,3 +309,12 @@ def test_body_only_fallback_keeps_up_to_eight_findings():
         if r.startswith("- ")
     ]
     assert len(rows) == MAX_INLINE and not any("more" in r for r in rows)
+
+
+def test_question_severity_is_kept_capped_and_never_blocks():
+    shaped = _shape(*[_f(f"q{i}", severity="question") for i in range(4)])
+    assert [f["title"] for f in shaped["findings"]] == ["q0", "q1"]
+    assert shaped["has_blocking"] is False
+    p = build_review_payload(shaped, commentable_lines(FILES), "s", [])
+    assert p["comments"][0]["body"].startswith("**Question: q0**")
+    assert p["event"] == "COMMENT"

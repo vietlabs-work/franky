@@ -5,8 +5,8 @@ Runs `franky review-pr --no-publish --json --at-sha S --diff-base B` on fixed hi
 times each and scores the findings against expectations, so a review-method change is judged by
 score. The case file lives outside the repo (it names real PRs); see evals/review_cases.example.json.
 
-Isolation is best-effort: the agent reads the PR title and body live (they can change after the
-case SHA), and the "no later PR state" rule is a prompt rule, not a token limit. `franky` refuses a
+Isolation is best-effort: the agent reads the PR title live (it can change after the case SHA),
+and intent otherwise comes from the commit messages up to the case SHA, and the "no later PR state" rule is a prompt rule, not a token limit. `franky` refuses a
 case SHA that is not in the PR's commit list (GitHub lists at most 250, and a force-pushed commit
 is gone). The diff base is not checked as an ancestor of the case SHA.
 
@@ -241,7 +241,10 @@ def _mean(values: list) -> float | None:
 
 
 def is_negative_case(case: dict) -> bool:
-    return bool(case.get("clean") or case.get("control_of"))
+    """A clean case: any blocking or normal finding is a false positive. A fix-SHA control
+    (`control_of`) is scored only by its `forbid` list, because real unrelated findings are
+    usually present in both the buggy and the fixed commit."""
+    return bool(case.get("clean"))
 
 
 def score_case(case: dict, runs: list[dict]) -> dict:

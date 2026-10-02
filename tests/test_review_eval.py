@@ -212,10 +212,11 @@ def test_score_expect_forbid_and_clean():
     assert tot["recall"]["rate"] == 0.5 and tot["error_runs"] == 1
 
 
-def test_control_case_scores_false_positives_but_plain_case_does_not():
+def test_only_clean_cases_score_false_positives():
     runs = [re_.classify_run(case(), 0, json.dumps(result([f()])))]
     assert "false_positive" not in re_.score_case(case(), runs)
-    assert re_.score_case(case(control_of="c0"), runs)["false_positive"] == {"runs": 1, "of": 1}
+    assert "false_positive" not in re_.score_case(case(control_of="c0"), runs)
+    assert re_.score_case(case(clean=True), runs)["false_positive"] == {"runs": 1, "of": 1}
 
 
 def test_cost_unknown_stays_null_never_zero():
@@ -329,5 +330,5 @@ def test_subprocess_timeout_becomes_an_error_run(monkeypatch):
 def test_example_file_marks_only_the_fixed_case_as_control():
     path = Path(__file__).resolve().parents[1] / "evals" / "review_cases.example.json"
     cases = re_.load_cases(path)
-    controls = [c["id"] for c in cases if re_.is_negative_case(c)]
+    controls = [c["id"] for c in cases if c.get("control_of")]
     assert controls == ["example-fixed-null-check"]

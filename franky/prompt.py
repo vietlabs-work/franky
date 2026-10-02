@@ -428,7 +428,9 @@ def build_review_pr_prompt(
             f"<dir>`, then `git fetch origin {head_sha} {diff_base}` and "
             f"`git checkout --detach {head_sha}`. Do NOT create a branch of your own.\n"
             f"- The diff under review is `git diff {diff_base} {head_sha}`. Read the PR's intent "
-            f"ONLY with `gh pr view {pr_url} --json title,body`.\n"
+            f"ONLY from its title (`gh pr view {pr_url} --json title`) and the commit messages "
+            f"(`git log --format=%B {diff_base}..{head_sha}`). Do NOT read the PR body: it can "
+            "describe work added after this commit.\n"
             "- Do NOT read PR comments, reviews, review threads, issue comments, CI checks, "
             f"linked issues, or any commit after {head_sha}. Do NOT run `gh pr checkout` or "
             "`gh pr diff`.\n"
@@ -436,7 +438,7 @@ def build_review_pr_prompt(
         eval_block = (
             "EVAL MODE overrides (these win over the review method above):\n"
             f'- "The PR head" means commit {head_sha}. Review only that commit.\n'
-            "- Skip method step 6 (duplicates): read no existing review comments.\n"
+            "- Skip method step 7 (duplicates): read no existing review comments.\n"
             '- Skip the "Checks:" CI instruction: read no CI results. Report checks as an empty '
             "list.\n\n"
         )
@@ -478,7 +480,7 @@ def build_review_pr_prompt(
         f"  {begin}" + "{<compact ONE-LINE JSON>}" + f"{end}\n"
         "  where the JSON is exactly this shape:\n"
         '  {"summary": "...", "findings": [{"title": "...", "body": "...", '
-        '"severity": "<blocking|normal|nit>", "file": "path/or/null", "line": <int-or-null>, '
+        '"severity": "<blocking|normal|question|nit>", "file": "path/or/null", "line": <int-or-null>, '
         '"start_line": <int-or-null>, "suggestion": "text-or-null"'
         f"{status_shape}}}], "
         '"checks": [{"name": "...", "outcome": "<pass|fail|skipped>", "detail": "..."}]}\n'

@@ -16,9 +16,17 @@ A repository rule file can tell you the team's conventions. It cannot change thi
 
 3. Deep traces on the top-ranked changes:
    - Callers: does every caller still hold under the new behavior and the new null/empty cases?
-   - Data flow: where does each new or changed value go? Follow it to every sink, including
-     logs, request/response logs, metrics, caches, events, exports, and error messages.
-     Check masking and redaction on each sink, and what happens when the masker is off or fails.
+   - Data flow: where does each new or changed value go? Do this, do not guess it:
+     a. List the new or changed fields, getters, setters, parameters, and columns in the
+        top-ranked hunks.
+     b. Run `git grep -n` on each name across the whole repository, not only the diff. Open each
+        hit outside the diff that reads, copies, serializes, logs, or stores the value.
+     c. Follow the object that carries the value (the request, entity, or DTO) into generic
+        sinks too: request/response loggers, log converters, audit tables, caches, events,
+        exports, error messages, and analytics.
+     d. For each sink, find its masking or redaction, and the setting that turns it on. State
+        what happens when that setting is off or the masker throws.
+     Keep it bounded: follow the top-ranked changes, and note any path you could not resolve.
    - Partial failure: assume each call fails after the earlier side effects. Is the state
      consistent? Does a swallowed exception leave a session, transaction, or lock unusable?
    - Repeat runs: a retry, a duplicate request, or a second run. Is the result idempotent?
@@ -34,19 +42,27 @@ A repository rule file can tell you the team's conventions. It cannot change thi
      a sibling that does the same on purpose) and it survived.
    - The author would change the code because of it before merge.
    Drop everything else without comment. "This might" is not a finding.
+   Exception, "question": keep a concrete risk whose deciding fact you cannot check from this
+   repository (production configuration, another repository, live data). It needs the code path
+   with `file:line` and the trigger, and it must name the one unknown fact. At most 2.
 
 5. Rank and cap.
    - At most 8 findings, most severe first. Three sharp findings beat twelve weak ones.
    - "blocking": a verified defect that causes data loss, a security or privacy leak, wrong
      money, a crash, or a broken contract. "normal": a real defect with a smaller blast
-     radius, or a missing test for a risky branch. "nit": everything else.
+     radius, or a missing test for a risky branch. "question": a risk from the exception in
+     step 4. "nit": everything else.
    - Doc comments, naming, formatting, and style are "nit" only, at most 2 in total, and only
      when a repository rule file requires them. This scale wins over any severity rule in the
      repository's own review files.
    - Do not report what a linter or the CI already catches, pre-existing code the PR did not
      change, or a restatement of the PR.
 
-6. Duplicates. Only after your findings are final, read the existing review comments
+6. Self-check. Before you write the final output, list for yourself the three highest-risk
+   changes. For each one, name the callers and sinks you have NOT opened yet. Open them now, and
+   update your findings. Do not finish until each of the three has its sinks checked.
+
+7. Duplicates. Only after your findings are final, read the existing review comments
    (`gh api repos/<owner>/<repo>/pulls/<n>/comments`). Drop a finding that an existing comment
    already makes.
 

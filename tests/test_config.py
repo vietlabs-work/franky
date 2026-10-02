@@ -445,3 +445,24 @@ def test_load_config_rejects_malformed_allowlist_entry(monkeypatch):
 
     with pytest.raises(ValueError, match="invalid allowlist entry"):
         load_config(None, _env(FRANKY_ALLOWED_REPOS="just-owner"))
+
+
+@pytest.mark.parametrize("effort", ["low", "medium", "high", "xhigh", "max"])
+def test_load_config_accepts_claude_effort(effort):
+    env = _env(FRANKY_EFFORT=effort, CLAUDE_CODE_OAUTH_TOKEN="oauth-fake")
+    assert load_config("claude", env).effort == effort
+
+
+def test_load_config_effort_defaults_to_none():
+    assert load_config("claude", _env(CLAUDE_CODE_OAUTH_TOKEN="oauth-fake")).effort is None
+
+
+@pytest.mark.parametrize(
+    ("engine", "effort"), [("claude", "ultra"), ("claude", "HIGH"), ("codex", "high")]
+)
+def test_load_config_rejects_bad_or_unsupported_effort(engine, effort):
+    env = _env(
+        FRANKY_EFFORT=effort, CLAUDE_CODE_OAUTH_TOKEN="oauth-fake", CODEX_API_KEY="sk-codex-fake"
+    )
+    with pytest.raises(ConfigError, match="FRANKY_EFFORT"):
+        load_config(engine, env)
