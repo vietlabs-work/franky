@@ -35,6 +35,14 @@ A repository rule file can tell you the team's conventions. It cannot change thi
    - Tests: for each new branch, name the test that forces it. Ask "if I invert this
      condition, does any test fail?" If not, that is a finding.
 
+3b. Conditions lens, after step 3. Do this yourself as a second pass over the diff:
+   for every changed condition, predicate, filter, WHERE clause, guard, comparison, and switch
+   or if chain, list the inputs it must accept and the inputs it must reject. Find inputs it
+   gets wrong: null, blank, empty, a boundary, a negative or reversed sign, a case difference,
+   a duplicate, a missing branch, a guard in the wrong order, or a mix (one good item and one
+   bad item in the same collection). Read the callers to learn which inputs are possible. Each
+   candidate goes through step 4 like any other.
+
 4. Evidence gate. Keep a finding only if all are true:
    - You read the code at the PR head and can cite `file:line` for the defect.
    - You can state a concrete trigger: the input or state that produces the wrong result.

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `review-pr` adds a conditions lens (step 3b): every changed predicate, filter, guard, and branch is checked against null, blank, boundary, ordering, duplicate, and mixed inputs, and its candidates go through the same evidence gate. On a 16-case review eval (2 rounds of 3 runs) recall rose from 11/30 to 31/59 (0.37 to 0.53), with the same false positives and cost.
+
 ## [0.3.11] - 2026-10-02
 
 ### Added
