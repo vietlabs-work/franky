@@ -482,11 +482,18 @@ def build_review_pr_prompt(
         # `+` concatenation around it is intentional (not a typo).
         f"  {begin}" + "{<compact ONE-LINE JSON>}" + f"{end}\n"
         "  where the JSON is exactly this shape:\n"
-        '  {"summary": "...", "findings": [{"title": "...", "body": "...", '
+        '  {"summary": "...", "findings": [{"title": "...", "evidence": "...", "impact": "...", '
+        '"fix": "...", '
         '"severity": "<blocking|normal|question|nit>", "file": "path/or/null", "line": <int-or-null>, '
         '"start_line": <int-or-null>, "suggestion": "text-or-null"'
         f"{status_shape}}}], "
-        '"checks": [{"name": "...", "outcome": "<pass|fail|skipped>", "detail": "..."}]}\n'
+        '"checks": [{"name": "...", "outcome": "<pass|fail|skipped>", "detail": "..."}], '
+        '"verified": [{"claim": "...", "evidence": "...", "status": "<confirmed|contradicted>"}]}\n'
+        '- "evidence" (max 60 words) cites file:line and a concrete trigger -> wrong result; '
+        '"impact" (max 40 words) says who or what breaks and when; "fix" (max 40 words) is the '
+        'concrete change. "verified" is optional, at most 8 items: each concrete claim in the PR '
+        "description you checked, with file:line evidence. A contradicted claim must ALSO be "
+        "reported as a finding.\n"
         '- Use "blocking" severity ONLY for a verified, must-fix defect; use "normal"/"nit" '
         "otherwise. Franky's host decides the review event from this - you never approve or "
         "request changes yourself.\n"

@@ -3,7 +3,7 @@
 import json
 
 from franky.reviewpr import (
-    MAX_BODY_FINDINGS,
+    MAX_BODY_CHARS,
     MAX_INLINE,
     anchor_ok,
     build_body_only_payload,
@@ -18,8 +18,12 @@ from franky.reviewpr import (
 
 
 def _shaped(*findings, threaded=True):
+    # A finding needs a content field to be well formed; default the legacy body.
+    findings = [
+        {"body": "why", **f} if isinstance(f, dict) and "title" in f else f for f in findings
+    ]
     return build_review_findings(
-        {"summary": "s", "findings": list(findings), "checks": []}, threaded=threaded
+        {"summary": "s", "findings": findings, "checks": []}, threaded=threaded
     )
 
 
@@ -48,7 +52,7 @@ def test_review_body_tags_status_except_new():
         )
     )
     assert "- Still open: race" in body
-    assert "- **Nit:** typo" in body and "[new]" not in body
+    assert "**Nit: typo**" in body and "[new]" not in body
 
 
 def test_non_thread_review_ignores_agent_status():
@@ -63,9 +67,9 @@ def test_non_thread_review_ignores_agent_status():
     body = render_review_body(shaped)
     assert "[resolved]" not in body and "[open]" not in body
     assert (
-        build_review_findings({"findings": [{"title": "x", "status": "open"}]})["findings"][0][
-            "status"
-        ]
+        build_review_findings({"findings": [{"title": "x", "body": "b", "status": "open"}]})[
+            "findings"
+        ][0]["status"]
         == "new"
     )  # the default is non-threaded
 
@@ -164,11 +168,11 @@ def test_payload_splits_inline_and_body():
         }
     ]
     assert "Off diff" not in p["body"]  # a nit is inline or nothing
-    assert "- **Major:** No line - why" in p["body"]
+    assert "**Major: No line**\n\nwhy" in p["body"]
     assert "Persist tax id" not in p["body"]
-    assert p["body"].startswith("sum\n\n") and p["body"].endswith(
-        "<sub>Automated review by Franky</sub>"
-    )
+    assert p["body"].startswith("Review of sha1: 2 findings (1 blocking). sum\n\n") and p[
+        "body"
+    ].endswith("<sub>Automated review by Franky</sub>")
 
 
 def test_single_line_comment_has_no_start_fields():
@@ -180,7 +184,7 @@ def test_single_line_comment_has_no_start_fields():
 def test_empty_summary_default_and_no_findings():
     p = build_review_payload(build_review_findings({}), {}, "s", [])
     assert (
-        p["body"] == "Franky reviewed this pull request.\n\n<sub>Automated review by Franky</sub>"
+        p["body"] == "Review of s: no findings above nit.\n\n<sub>Automated review by Franky</sub>"
     )
     assert p["comments"] == [] and p["event"] == "COMMENT"
 
@@ -190,9 +194,8 @@ def test_inline_cap_and_body_overflow():
     shaped = _shape(*[_f(f"t{i}", line=i + 1) for i in range(MAX_INLINE + 9)])
     p = build_review_payload(shaped, c, "s", [])
     assert len(p["comments"]) == MAX_INLINE
-    rows = [r for r in p["body"].split("\n") if r.startswith("- ")]
-    assert len(rows) == MAX_BODY_FINDINGS + 1
-    assert rows[-1] == "- +4 more"  # 9 overflow - 5 shown
+    assert "Findings with no line (9)" in p["body"]  # all 9 overflow, none dropped silently
+    assert all(f"**Major: t{i}**" in p["body"] for i in range(MAX_INLINE, MAX_INLINE + 9))
 
 
 def test_suggestion_with_backticks_gets_longer_fence():
@@ -211,7 +214,10 @@ def test_threaded_statuses_go_to_body_only():
     )
     p = build_review_payload(shaped, commentable_lines(FILES), "s", [])
     assert [c["body"].split("\n")[0] for c in p["comments"]] == ["**Major: fresh**"]
-    assert "Since the last review:\n- Still open: still\n- Resolved: done" in p["body"]
+    assert (
+        "<summary>Since the last review (2)</summary>\n\n- Still open: still (a.py:11)\n- Fixed: done (a.py:11)\n\n</details>"
+        in p["body"]
+    )
     assert p["event"] == "COMMENT"
 
 
@@ -235,7 +241,7 @@ def test_body_only_payload_has_no_comments_and_lists_everything():
     shaped = _shape(_f("one"), _f("two", severity="nit"))
     p = build_body_only_payload(shaped, "sha", [])
     assert p["comments"] == [] and p["commit_id"] == "sha"
-    assert "- **Major:** one (a.py:11) - why" in p["body"] and "two" not in p["body"]
+    assert "**Major: one** (a.py:11)\n\nwhy" in p["body"] and "two" not in p["body"]
 
 
 def test_secrets_redacted_everywhere_including_unescaped_text():
@@ -316,7 +322,8 @@ def test_prior_nits_never_listed_in_posted_bodies():
         build_review_payload(shaped, {}, "s", [], allow_approve=True),
         build_body_only_payload(shaped, "s", [], allow_approve=True),
     ):
-        assert "nit" not in p["body"] and "Resolved: fixed major" in p["body"]
+        assert "open nit" not in p["body"] and "fixed nit" not in p["body"]
+        assert "- Fixed: fixed major" in p["body"]
 
 
 def test_dropped_malformed_finding_blocks_approve():
@@ -336,7 +343,7 @@ def test_nits_never_reach_the_body():
         assert "big" in p["body"] and "tiny" not in p["body"]
     only_nit = _shape(_f("tiny", severity="nit", line=99))
     body = build_review_payload(only_nit, commentable_lines(FILES), "s", [])["body"]
-    assert body.startswith("sum") and "tiny" not in body
+    assert body.startswith("Review of s: no findings above nit. sum") and "tiny" not in body
 
 
 def test_nit_never_displaces_a_major_from_inline():
@@ -426,7 +433,7 @@ def test_empty_suggestion_renders_a_deletion_block():
 
 
 def test_host_caps_text_length():
-    from franky.reviewpr import MAX_BODY_CHARS, MAX_SUMMARY_CHARS, MAX_TITLE_CHARS
+    from franky.reviewpr import MAX_SUMMARY_CHARS, MAX_TITLE_CHARS
 
     shaped = build_review_findings(
         {
@@ -447,12 +454,8 @@ def test_body_only_fallback_keeps_up_to_eight_findings():
     from franky.reviewpr import build_body_only_payload
 
     shaped = _shape(*[_f(f"t{i}", line=i + 1) for i in range(MAX_INLINE)])
-    rows = [
-        r
-        for r in build_body_only_payload(shaped, "s", [])["body"].split("\n")
-        if r.startswith("- ")
-    ]
-    assert len(rows) == MAX_INLINE and not any("more" in r for r in rows)
+    body = build_body_only_payload(shaped, "s", [])["body"]
+    assert all(f"**Major: t{i}**" in body for i in range(MAX_INLINE)) and "more" not in body
 
 
 def test_question_severity_is_kept_capped_and_never_blocks():
@@ -462,3 +465,238 @@ def test_question_severity_is_kept_capped_and_never_blocks():
     p = build_review_payload(shaped, commentable_lines(FILES), "s", [])
     assert p["comments"][0]["body"].startswith("**Question: q0**")
     assert p["event"] == "COMMENT"
+
+
+# --- evidence / impact / fix, verified, collapsed body, round link ---------------------------
+
+REVIEW_URL = "https://github.com/me/repo/pull/7#pullrequestreview-123"
+
+
+def _ev(title="t", **kw):
+    f = {
+        "title": title,
+        "evidence": "a.py:11 x=None -> NPE",
+        "impact": "checkout 500s",
+        "fix": "guard x",
+        "file": "a.py",
+        "line": 11,
+    }
+    f.update(kw)
+    return f
+
+
+def _inline(f):
+    return build_review_payload(_shaped(f), commentable_lines(FILES), "s", [])["comments"][0][
+        "body"
+    ]
+
+
+def test_inline_comment_renders_three_fields_after_the_byte_identical_heading():
+    body = _inline(_ev("Guard x", severity="blocking", suggestion="y = 1"))
+    assert body == (
+        "**Blocking: Guard x**\n\n**Evidence:** a.py:11 x=None -&gt; NPE\n\n"
+        "**Why it matters:** checkout 500s\n\n**Suggestion:** guard x\n\n"
+        "```suggestion\ny = 1\n```"
+    )
+
+
+def test_inline_comment_omits_a_missing_field():
+    body = _inline(_ev(impact=""))
+    assert "Why it matters" not in body and body.count("\n\n") == 2
+    assert body.startswith("**Major: t**\n\n**Evidence:**") and body.endswith(
+        "**Suggestion:** guard x"
+    )
+
+
+def test_legacy_body_renders_as_before_and_new_fields_win():
+    assert (
+        _inline({"title": "t", "body": "why", "file": "a.py", "line": 11}) == "**Major: t**\n\nwhy"
+    )
+    assert "why" not in _inline(_ev(body="why"))
+
+
+def test_finding_without_any_content_field_is_malformed_and_blocks_approve():
+    shaped = build_review_findings(
+        {"summary": "s", "findings": [{"title": "bare"}, {"title": "x", "fix": "  "}]}
+    )
+    assert shaped["findings"] == [] and shaped["dropped_malformed"] == 2
+    assert review_event(shaped, allow_approve=True) == "COMMENT"
+    assert build_review_findings({"findings": [{"title": "t", "fix": "do it"}]})["findings"]
+
+
+def test_field_caps():
+    from franky.reviewpr import MAX_FIELD_CHARS
+
+    f = build_review_findings({"findings": [_ev(evidence="e" * 5000, fix="f" * 5000)]})["findings"][
+        0
+    ]
+    assert len(f["evidence"]) == MAX_FIELD_CHARS == len(f["fix"])
+
+
+def test_heading_still_matches_resolve_threads():
+    shaped = _shaped(_ev("Guard x", status="resolved"))
+    comment = _inline(_ev("Guard x"))
+    node = {
+        "id": "T1",
+        "isResolved": False,
+        "path": "a.py",
+        "comments": {"nodes": [{"author": {"login": "bot", "__typename": "Bot"}, "body": comment}]},
+    }
+    assert match_resolved_threads(shaped, [node], "bot") == ["T1"]
+
+
+def test_body_headline_counts_and_collapsed_blocks_only_when_non_empty():
+    quiet = build_review_payload(_shaped(_ev(severity="nit")), {}, "abcdef1234", [])["body"]
+    assert quiet == (
+        "Review of abcdef1: no findings above nit. s\n\n<sub>Automated review by Franky</sub>"
+    )
+    shaped = _shaped(_ev("a", severity="blocking", file=None, line=None), _ev("b", line=11))
+    body = build_review_payload(shaped, commentable_lines(FILES), "abcdef1234", [])["body"]
+    assert body.startswith("Review of abcdef1: 2 findings (1 blocking). s\n\n")
+    assert body.count("<details>") == 1 and "Since the last" not in body
+    assert (
+        "<details><summary>Findings with no line (1)</summary>\n\n**Blocking: a**\n\n"
+        "**Evidence:** a.py:11 x=None -&gt; NPE\n\n**Why it matters:** checkout 500s\n\n"
+        "**Suggestion:** guard x\n\n</details>"
+    ) in body
+    assert body.endswith("</details>\n\n<sub>Automated review by Franky</sub>")
+
+
+def test_since_last_review_uses_fixed_and_shows_plus_n_more():
+    shaped = _shaped(*[_ev(f"p{i}", status="open") for i in range(23)])
+    body = render_review_body(shaped, "abcdef1")
+    assert "Since the last review (23)" in body and body.count("- Still open:") == 20
+    assert "- +3 more" in body
+    assert "- Fixed: gone (a.py:11)" in render_review_body(_shaped(_ev("gone", status="resolved")))
+
+
+def test_verified_normalised_capped_and_rendered():
+    parsed = {
+        "summary": "s",
+        "findings": [],
+        "verified": [
+            {"claim": "c" * 400, "evidence": "a.py:3 " + "e" * 400, "status": "confirmed"},
+            {"claim": "no cite", "evidence": "trust me", "status": "confirmed"},
+            {"claim": "bad status", "evidence": "a.py:1", "status": "maybe"},
+            "junk",
+            {
+                "claim": "flag off is identical",
+                "evidence": "b.py:9 branch differs",
+                "status": "contradicted",
+            },
+            *[{"claim": f"k{i}", "evidence": "x.py:1", "status": "confirmed"} for i in range(10)],
+        ],
+    }
+    shaped = build_review_findings(parsed)
+    assert len(shaped["verified"]) == 8 and shaped["dropped_malformed"] == 0
+    assert (
+        len(shaped["verified"][0]["claim"]) == 150 and len(shaped["verified"][0]["evidence"]) == 200
+    )
+    body = render_review_body(shaped)
+    assert "<summary>What I verified (8)</summary>\n\n- **cccc" in body
+    assert "- **flag off is identical** -> b.py:9 branch differs (contradicted)" in body
+    assert review_event(shaped, allow_approve=True) == "APPROVE"  # verified never blocks
+    assert build_review_findings({"findings": [], "verified": "x"})["verified"] == []
+
+
+def test_follows_line_only_for_a_github_review_url():
+    shaped = _shaped(_ev())
+    body = build_review_payload(
+        shaped, commentable_lines(FILES), "abcdef1", [], prior_url=REVIEW_URL
+    )["body"]
+    assert body.split("\n\n")[1] == f"Follows [the previous review]({REVIEW_URL})."
+    for bad in (None, "", "https://evil.example/x", "javascript:alert(1)"):
+        assert "Follows" not in render_review_body(shaped, "abcdef1", bad)
+
+
+def test_approve_marker_is_appended_after_the_footer():
+    from franky import cli
+
+    # cli appends the marker to the built body; the body must therefore end with the footer.
+    p = build_review_payload(_shaped(), {}, "s", [], allow_approve=True)
+    assert p["event"] == "APPROVE" and p["body"].endswith("<sub>Automated review by Franky</sub>")
+    assert cli.APPROVE_MARKER
+
+
+# --- hardening: non-str types, size budget, HTML escaping ------------------------------------
+
+
+def test_non_str_enum_fields_never_raise():
+    for bad in ([], {}, 1, None, ["confirmed"]):
+        shaped = build_review_findings(
+            {
+                "findings": [
+                    {"title": "t", "body": "b", "severity": bad, "status": bad},
+                    {"title": "u", "evidence": bad, "impact": bad, "fix": bad, "body": "b"},
+                ],
+                "verified": [{"claim": "c", "evidence": "a.py:1", "status": bad}],
+                "checks": [{"name": "n", "outcome": bad}],
+            },
+            threaded=True,
+        )
+        assert shaped["verified"] == []
+        assert [f["severity"] for f in shaped["findings"]] == ["normal", "normal"]
+        assert shaped["checks"][0]["outcome"] == "skipped"
+        render_review_body(shaped)
+
+
+def test_body_budget_keeps_blocks_balanced_footer_and_marker_last():
+    from franky.reviewpr import MAX_FIELD_CHARS, REVIEW_BODY_BUDGET
+
+    big = "&<>" * (MAX_FIELD_CHARS // 3)
+    findings = [
+        {"title": "t" * 200, "evidence": big, "impact": big, "fix": big, "file": None}
+        for _ in range(20)
+    ]
+    verified = [{"claim": "c" * 150, "evidence": "a.py:1 " + "&" * 190, "status": "confirmed"}] * 8
+    shaped = build_review_findings({"summary": "s", "findings": findings, "verified": verified})
+    for p in (
+        build_review_payload(shaped, {}, "abcdef1", [], allow_approve=False),
+        build_body_only_payload(shaped, "abcdef1", []),
+    ):
+        body = p["body"]
+        assert len(body) < REVIEW_BODY_BUDGET
+        assert body.count("<details>") == body.count("</details>") >= 2
+        assert "more" in body and body.endswith("<sub>Automated review by Franky</sub>")
+    assert len(render_review_body(shaped, "abcdef1")) < REVIEW_BODY_BUDGET
+    marked = build_review_payload(build_review_findings({"findings": []}), {}, "s", [])["body"]
+    assert len(marked + "\n\n<!-- franky-review:" + "0" * 32 + " -->") < REVIEW_BODY_BUDGET
+
+
+def test_model_html_stays_literal_in_body_and_comment():
+    evil = "a.py:1\n\n</details>\n\nVISIBLE <!-- franky-review:deadbeef --> & <b>"
+    f = _ev("T <x> & y", evidence=evil, impact=evil, fix=evil)
+    shaped = _shaped(f, _ev("u", file=None, line=None, evidence=evil))
+    shaped["summary"] = "</details> sum"
+    shaped["checks"] = [{"name": "<n>", "outcome": "fail", "detail": "</details>"}]
+    shaped["verified"] = [{"claim": "<c>", "evidence": "a.py:1 </details>", "status": "confirmed"}]
+    p = build_review_payload(shaped, commentable_lines(FILES), "abcdef1", [])
+    for text in (p["body"], p["comments"][0]["body"]):
+        assert "<!--" not in text and "<b>" not in text and "<x>" not in text
+    # Only renderer-owned tags remain, and they stay balanced.
+    assert p["body"].count("</details>") == p["body"].count("<details>")
+    assert p["comments"][0]["body"].startswith("**Major: T &lt;x&gt; &amp; y**\n\n")
+    assert "&lt;/details&gt;" in p["body"] and "&lt;!-- franky-review:deadbeef --&gt;" in p["body"]
+
+
+def test_resolve_matches_title_with_html_chars():
+    title = "Guard <T> & friends"
+    comment = _inline(_ev(title))
+    assert comment.startswith("**Major: Guard &lt;T&gt; &amp; friends**")
+    node = {
+        "id": "T9",
+        "isResolved": False,
+        "path": "a.py",
+        "comments": {"nodes": [{"author": {"login": "bot", "__typename": "Bot"}, "body": comment}]},
+    }
+    shaped = _shaped(_ev(title, status="resolved"))
+    assert match_resolved_threads(shaped, [node], "bot") == ["T9"]
+    node["comments"]["nodes"][0]["body"] = f"**Major: {title}**\n\nold raw comment"
+    assert match_resolved_threads(shaped, [node], "bot") == ["T9"]  # pre-escaping comments
+
+
+def test_suggestion_cannot_close_its_fence_and_is_not_escaped():
+    sug = "a = '<T>'\n```\nrm -rf /\n```"
+    body = _inline(_ev(suggestion=sug))
+    fence = "````"
+    assert body.endswith(f"{fence}suggestion\n{sug}\n{fence}") and "<T>" in body

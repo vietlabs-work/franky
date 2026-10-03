@@ -59,6 +59,7 @@ from pathlib import Path
 from . import jobs, snapshot
 from .config import redact
 from .engine import ENGINES
+from .reviewpr import REVIEW_URL_RE
 from .github import run_gh
 from .profile import _SECRET_PATTERNS
 from .result import TaskRejected
@@ -479,12 +480,13 @@ def _clean_text(value, limit: int, secrets) -> str | None:
     return " ".join(text.split())[:limit]
 
 
-def build_handoff(shaped: dict, sha: str, secrets) -> dict:
+def build_handoff(shaped: dict, sha: str, secrets, review_url: str | None = None) -> dict:
     """The bounded, redacted summary a later run is seeded with: no finding bodies, resolved
-    findings dropped, blocking first, at most HANDOFF_MAX_FINDINGS entries, text on one line."""
+    findings dropped, blocking first, at most HANDOFF_MAX_FINDINGS entries, text on one line.
+    `review_url` (a GitHub PR review permalink, else ignored) lets the next run link back."""
     kept = [f for f in shaped.get("findings", []) if f.get("status") != "resolved"]
     kept.sort(key=lambda f: _SEVERITY_ORDER.get(f.get("severity"), 2))  # stable
-    return {
+    handoff = {
         "schema": SCHEMA,
         "sha": sha,
         "summary": _clean_text(shaped.get("summary") or "", 500, secrets),
@@ -499,6 +501,9 @@ def build_handoff(shaped: dict, sha: str, secrets) -> dict:
             for f in kept[:HANDOFF_MAX_FINDINGS]
         ],
     }
+    if isinstance(review_url, str) and REVIEW_URL_RE.match(review_url):
+        handoff["review_url"] = review_url
+    return handoff
 
 
 def _error_lines(tail: str) -> str:
@@ -550,6 +555,7 @@ def finish_run(
     now: datetime,
     timeout_code: int = 124,
     runner=subprocess.run,
+    review_url: str | None = None,
 ) -> tuple[dict, str]:
     """Settle a run and write the record. Returns (record, session_reason label or "").
 
@@ -581,7 +587,7 @@ def finish_run(
                 )
                 if why in ("too_large", "verify_failed"):
                     _drop_session(thread, record)
-        record["handoff"] = build_handoff(shaped, sha, secrets)
+        record["handoff"] = build_handoff(shaped, sha, secrets, review_url)
         record["last_sha"] = sha
         record["updated_at"] = now.isoformat(timespec="seconds")
     if incoming is not None:

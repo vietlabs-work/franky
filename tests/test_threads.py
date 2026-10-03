@@ -463,6 +463,20 @@ def test_finish_run_success_commits_session_and_handoff(env):
     thread.close()
 
 
+def test_handoff_review_url_round_trip_and_validation(env):
+    url = "https://github.com/me/repo/pull/7#pullrequestreview-123"
+    shaped = {"summary": "s", "findings": []}
+    assert "review_url" not in threads.build_handoff(shaped, "sha", [])
+    assert threads.build_handoff(shaped, "sha", [], url)["review_url"] == url
+    for bad in ("https://evil.example/x", "http://github.com/a/b/pull/1#pullrequestreview-1", ""):
+        assert "review_url" not in threads.build_handoff(shaped, "sha", [], bad)
+    thread = _open(env)
+    record = _begin(thread, None, "fresh")
+    record, _ = _finish(thread, record, mode="fresh", review_url=url)
+    assert threads.read_record(thread.path)["handoff"]["review_url"] == url
+    thread.close()
+
+
 def test_finish_run_failed_fresh_run_keeps_previous_handoff(env):
     thread = _open(env)
     prior = _record(session_ok=False)

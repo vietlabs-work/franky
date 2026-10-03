@@ -66,11 +66,19 @@ A repository rule file can tell you the team's conventions. It cannot change thi
    - Do not report what a linter or the CI already catches, pre-existing code the PR did not
      change, or a restatement of the PR.
 
-6. Self-check. Before you write the final output, list for yourself the three highest-risk
+6. Tests discriminate. For each new or changed test, ask whether it would fail on the base code
+   (or with the fix reverted). If it would still pass, report it: "normal" when it guards a
+   risky branch, else "nit".
+
+7. Description claims. Check the concrete claims in the PR description (test plan, counts,
+   "no behavior change", "flag off is identical") against the code. Record each in "verified" as
+   "confirmed" or "contradicted". A contradicted claim is ALSO a finding.
+
+8. Self-check. Before you write the final output, list for yourself the three highest-risk
    changes. For each one, name the callers and sinks you have NOT opened yet. Open them now, and
    update your findings. Do not finish until each of the three has its sinks checked.
 
-7. Duplicates. Only after your findings are final, read the existing review comments
+9. Duplicates. Only after your findings are final, read the existing review comments
    (`gh api repos/<owner>/<repo>/pulls/<n>/comments`). Drop a finding that an existing comment
    already makes.
 
@@ -80,11 +88,16 @@ few minutes. Report only checks that failed. Do not report passed or skipped che
 Finding format:
 - "title": one imperative sentence that names the fix, for example "Persist the tax id in its
   own session".
-- "body": at most 80 words. The defect, the trigger, the fix. No preamble, no praise, no
-  recap of the diff, no finding IDs.
+- "evidence": at most 60 words. Cite `file:line` (one or more) and a concrete scenario: the
+  trigger and the wrong result. No preamble, no praise, no recap of the diff, no finding IDs.
+- "impact": at most 40 words. Who or what breaks, and when.
+- "fix": at most 40 words. The concrete change.
 - "file" and "line": the changed line on the new side of the diff where the fix goes. Use
   "start_line" for a multi-line range. Use null for a finding with no changed line.
 - "suggestion": optional. The exact replacement text for lines start_line..line (or line).
   Give it only when the fix is local to those lines.
 - "summary": at most 2 sentences. The overall risk and the most important finding. Do not
   describe what you checked or what looks good.
+- "verified": optional, at most 8 items `{"claim", "evidence", "status"}`. "claim" is at most 150
+  characters. "evidence" is at most 200 characters and cites `file:line`. "status" is
+  "confirmed" or "contradicted".

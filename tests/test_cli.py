@@ -4072,7 +4072,9 @@ def test_review_pr_no_publish_makes_zero_github_writes(monkeypatch):
     assert "review_url" not in data
     assert "review_id" not in data
     assert data["review_body"] == (
-        "private summary\n\n- **Blocking:** wrong total (fare.py:7) - recalculate tax\n\n"
+        "Review of aaaaaaa: 1 finding (1 blocking). private summary\n\n"
+        "<details><summary>Findings with no line (1)</summary>\n\n"
+        "**Blocking: wrong total** (fare.py:7)\n\nrecalculate tax\n\n</details>\n\n"
         "<sub>Automated review by Franky</sub>"
     )
     assert calls == []  # zero GitHub writes
@@ -4517,6 +4519,20 @@ def _review(args):
     runner = CliRunner()
     with runner.isolated_filesystem():
         return runner.invoke(cli.main, ["review-pr", *args, "--json", PR_URL])
+
+
+def test_review_pr_thread_publish_stores_review_url_and_next_body_links_it(monkeypatch, tmp_path):
+    _fix_review_nonce(monkeypatch)
+    calls = _mc_review_setup(monkeypatch, env=_thread_env(tmp_path))
+    _fake_thread_run(monkeypatch, tmp_path)
+    first = _review(["--thread", "--engine", "claude"])
+    assert first.exit_code == 0, first.output
+    assert "Follows" not in json.loads(calls.inputs[-1])["body"]
+    handoff = threads_mod.read_record(_thread_dir(tmp_path))["handoff"]
+    assert handoff["review_url"] == REVIEW_URL
+    second = _review(["--thread", "--engine", "claude"])
+    assert second.exit_code == 0, second.output
+    assert f"Follows [the previous review]({REVIEW_URL})." in json.loads(calls.inputs[-1])["body"]
 
 
 def test_review_pr_thread_first_run_pins_session_before_launch(monkeypatch, tmp_path):
@@ -5097,7 +5113,9 @@ def _frozen_setup(monkeypatch, *, commits=None, commits_rc=0, commits_out=None, 
         container_calls.append(a)
         return container or (
             0,
-            _review_block({"summary": "s", "findings": [{"title": "t"}], "checks": []}),
+            _review_block(
+                {"summary": "s", "findings": [{"title": "t", "body": "b"}], "checks": []}
+            ),
         )
 
     monkeypatch.setattr(cli, "run_gh", fake_gh)
@@ -5202,7 +5220,17 @@ def test_review_pr_no_publish_result_has_all_findings(monkeypatch):
     data = json.loads(res.stdout)
     assert data["findings_total"] == 10
     assert len(data["findings"]) == 10  # all of them: findings_total must match
-    assert set(data["findings"][0]) == {"title", "body", "severity", "file", "line", "start_line"}
+    assert set(data["findings"][0]) == {
+        "title",
+        "body",
+        "evidence",
+        "impact",
+        "fix",
+        "severity",
+        "file",
+        "line",
+        "start_line",
+    }
 
 
 @pytest.mark.parametrize("payload", [{"summary": "s", "checks": []}, {"findings": "x"}])
@@ -5459,6 +5487,17 @@ def test_publish_approves_when_allowed_and_clean(monkeypatch):
     assert "<!-- franky-review:" in json.loads(gh.inputs[-1])["body"]
 
 
+def test_publish_approve_marker_is_last_and_follows_line_comes_from_prior_url(monkeypatch):
+    gh = _Gh(monkeypatch, posts=[OK_POST])
+    prior = "https://github.com/me/repo/pull/11#pullrequestreview-9"
+    _pub(_clean(), allow_approve=True, prior_url=prior)
+    body = json.loads(gh.inputs[-1])["body"]
+    assert f"Follows [the previous review]({prior})." in body
+    footer = "<sub>Automated review by Franky</sub>"
+    assert body.index(footer) < body.index("<!-- franky-review:")
+    assert body.rstrip().endswith("-->")
+
+
 def test_publish_default_never_approves(monkeypatch):
     gh = _Gh(monkeypatch, posts=[OK_POST])
     out = _pub(_clean())
@@ -5523,7 +5562,10 @@ def test_publish_reconcile_ignores_other_commit_and_marker(monkeypatch):
 
 def test_publish_422_after_downgrade_keeps_comment(monkeypatch):
     shaped = build_review_findings(
-        {"summary": "s", "findings": [{"title": "n", "severity": "nit", "file": "a.py", "line": 1}]}
+        {
+            "summary": "s",
+            "findings": [{"title": "n", "body": "b", "severity": "nit", "file": "a.py", "line": 1}],
+        }
     )
     gh = _Gh(
         monkeypatch,
@@ -5549,6 +5591,7 @@ RESOLVED_SHAPED = lambda **kw: build_review_findings(  # noqa: E731
         "findings": [
             {
                 "title": "race",
+                "body": "b",
                 "severity": "normal",
                 "file": "a.py",
                 "line": 3,
@@ -5676,7 +5719,7 @@ def _comment_shaped():
     return build_review_findings(
         {
             "summary": "s",
-            "findings": [{"title": "n", "severity": "nit", "file": "a.py", "line": 1}],
+            "findings": [{"title": "n", "body": "b", "severity": "nit", "file": "a.py", "line": 1}],
         }
     )
 

@@ -7,8 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `review-pr` findings carry `evidence` (file:line plus a concrete trigger, max 60 words), `impact` (max 40) and `fix` (max 40) instead of one `body`. A legacy finding with only `body` renders as before; a finding with a title but no content field is dropped as malformed (and blocks `APPROVE`). The `--json` finding list adds the three fields.
+- New optional `verified` list (max 8 `{claim, evidence, status}`, evidence must cite file:line) records the PR-description claims the reviewer checked. It shows in the review body under "What I verified"; a malformed item is dropped silently.
+- A threaded re-review links the previous review: the handoff stores the published review URL (only a github.com PR review permalink) and the next body starts with `Follows [the previous review](URL).`
+- Two review method steps: check that each new or changed test would fail on the base code, and check the PR description's concrete claims against the code.
+
 ### Changed
 
+- Inline comments render `**Label: title**` (unchanged, thread-resolve depends on it) then `**Evidence:**`, `**Why it matters:**` and `**Suggestion:**`.
+- The review body shows only a headline (`Review of SHA7: N findings (B blocking). summary`); findings with no line, "Since the last review" (now "Fixed" instead of "Resolved"), "What I verified" and failed checks sit in collapsed `<details>` blocks. A list longer than 20 items ends with `- +N more` instead of cutting silently.
 - `review-pr` adds a conditions lens (step 3b): every changed predicate, filter, guard, and branch is checked against null, blank, boundary, ordering, duplicate, and mixed inputs, and its candidates go through the same evidence gate. On a 16-case review eval (2 rounds of 3 runs) recall rose from 11/30 to 31/59 (0.37 to 0.53), with the same false positives and cost.
 
 ## [0.3.11] - 2026-10-02

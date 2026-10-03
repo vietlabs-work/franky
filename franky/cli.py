@@ -155,7 +155,17 @@ from .userconfig import (
 # the bridge's own `_SHA_RE` shape check, which Franky re-validates independently since
 # this CLI is also reachable directly, not only via the bridge).
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
-_RESULT_FINDING_KEYS = ("title", "body", "severity", "file", "line", "start_line")
+_RESULT_FINDING_KEYS = (
+    "title",
+    "body",
+    "evidence",
+    "impact",
+    "fix",
+    "severity",
+    "file",
+    "line",
+    "start_line",
+)
 # `review-pr --at-sha/--diff-base`: a full lowercase 40-hex commit (never an abbreviation).
 _FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
@@ -1135,6 +1145,7 @@ def _publish_review(
     secrets: list[str],
     allow_approve: bool = False,
     resolve_fixed: bool = False,
+    prior_url: str | None = None,
 ) -> tuple[str, str, int, str | None, int | None, str | None, int | None]:
     """Post the review as inline comments on the pinned commit; returns the result fields
     (status, reason, exit code, review url, review id, event posted, threads resolved).
@@ -1208,9 +1219,9 @@ def _publish_review(
 
     def build(allow: bool, body_only: bool = False) -> dict:
         if body_only:
-            p = build_body_only_payload(shaped, pinned_sha, secrets, allow)
+            p = build_body_only_payload(shaped, pinned_sha, secrets, allow, prior_url)
         else:
-            p = build_review_payload(shaped, commentable, pinned_sha, secrets, allow)
+            p = build_review_payload(shaped, commentable, pinned_sha, secrets, allow, prior_url)
         if p["event"] == "APPROVE":
             p["body"] += f"\n\n{marker}"
         return p
@@ -1824,7 +1835,9 @@ def review_pr(
                 findings_summary = shaped["summary"]
                 checks = shaped["checks"]
                 if no_publish:
-                    review_body = render_review_body(shaped)
+                    review_body = render_review_body(
+                        shaped, pinned_sha, (prior_handoff or {}).get("review_url")
+                    )
                     if (
                         len(review_body) > 8000
                         or len(shaped["findings"]) > 10
@@ -1872,6 +1885,7 @@ def review_pr(
                             secrets,
                             allow_approve=allow_approve,
                             resolve_fixed=resolve_fixed,
+                            prior_url=(prior_handoff or {}).get("review_url"),
                         )
 
         thread_result = handoff = None
@@ -1889,6 +1903,7 @@ def review_pr(
                 copy_status=sink.get("status"),
                 secrets=secrets,
                 now=datetime.now(timezone.utc),
+                review_url=review_url,
             )
             handoff = record.get("handoff")
             thread_result = {

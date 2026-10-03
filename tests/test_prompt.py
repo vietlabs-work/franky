@@ -562,8 +562,9 @@ def test_review_prompt_without_handoff_is_unchanged():
     assert plain == build_review_pr_prompt(
         "me/repo", "https://github.com/me/repo/pull/1", "", "n0", handoff=None, last_sha=None
     )
-    assert "Prior review context" not in plain and '"status"' not in plain
+    assert "Prior review context" not in plain and '"status": "<new|open|resolved>"' not in plain
     assert '"start_line": <int-or-null>, "suggestion": "text-or-null"}], "checks"' in plain
+    assert '"evidence": "...", "impact": "...", "fix": "..."' in plain and '"verified"' in plain
 
 
 def test_review_prompt_handoff_block_is_fenced_and_scoped():

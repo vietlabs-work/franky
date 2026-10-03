@@ -54,7 +54,10 @@ _RESULT_SCHEMA: dict = {
     "findings": [
         {
             "title": "string; finding title",
-            "body": "string; finding detail, possibly empty",
+            "body": "string; legacy finding detail, possibly empty (empty when evidence/impact/fix are set)",
+            "evidence": "string; file:line and the concrete trigger, possibly empty",
+            "impact": "string; who or what breaks and when, possibly empty",
+            "fix": "string; the concrete change, possibly empty",
             "severity": "string: blocking | normal | question | nit",
             "file": "string or null",
             "line": "integer or null",
