@@ -441,7 +441,7 @@ def build_review_pr_prompt(
         eval_block = (
             "EVAL MODE overrides (these win over the review method above):\n"
             f'- "The PR head" means commit {head_sha}. Review only that commit.\n'
-            "- Skip method step 7 (duplicates): read no existing review comments.\n"
+            "- Skip the method's Duplicates step: read no existing review comments.\n"
             '- Skip the "Checks:" CI instruction: read no CI results. Report checks as an empty '
             "list.\n\n"
         )

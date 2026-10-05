@@ -161,6 +161,9 @@ def test_expect_matching():
     assert hit([f("race in cache")], spec())
     assert not hit([f("Unrelated")], spec())
     assert hit([f("x", "a race here")], spec())  # body counts
+    assert hit([{**f("x", ""), "evidence": "a race here"}], spec())  # structured fields count
+    assert hit([{**f("x", ""), "fix": "take the lock"}], spec(any_of=["lock"]))
+    assert not hit([f("Add a test for the race")], spec(all_of=[r"\A(?!Add\b)"]))  # title-anchored
     # all_of: every one must match
     assert hit([f("race and lock")], spec(all_of=["lock", "race"]))
     assert not hit([f("race only")], spec(all_of=["lock"]))

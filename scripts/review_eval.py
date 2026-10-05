@@ -208,7 +208,9 @@ def run_once(case: dict, runner: Runner, franky_bin: str, max_duration: int) -> 
 
 
 def finding_matches(finding: dict, spec: dict, *, severity_ok: Callable[[object], bool]) -> bool:
-    text = f"{finding.get('title') or ''}\n{finding.get('body') or ''}"
+    # The title comes first, so a case regex can anchor on it with \A.
+    fields = ("title", "body", "evidence", "impact", "fix")
+    text = "\n".join(str(finding.get(k) or "") for k in fields)
     if not all(re.search(r, text) for r in spec.get("all_of") or []):
         return False
     if not any(re.search(r, text) for r in spec["any_of"]):

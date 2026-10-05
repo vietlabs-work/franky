@@ -18,7 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Inline comments render `**Label: title**` (unchanged, thread-resolve depends on it) then `**Evidence:**`, `**Why it matters:**` and `**Suggestion:**`.
 - The review body shows only a headline (`Review of SHA7: N findings (B blocking). summary`); findings with no line, "Since the last review" (now "Fixed" instead of "Resolved"), "What I verified" and failed checks sit in collapsed `<details>` blocks. A list longer than 20 items ends with `- +N more` instead of cutting silently.
-- `review-pr` adds a conditions lens (step 3b): every changed predicate, filter, guard, and branch is checked against null, blank, boundary, ordering, duplicate, and mixed inputs, and its candidates go through the same evidence gate. On a 16-case review eval (2 rounds of 3 runs) recall rose from 11/30 to 31/59 (0.37 to 0.53), with the same false positives and cost.
+- `review-pr` adds a second lens (step 3b). The agent writes a candidate list for every changed condition (null, blank, boundary, ordering, duplicate, and mixed inputs) and for every new call that can fail (is it inside the try or fallback the caller relies on, and does a swallowed failure break a session or transaction). Each candidate goes through the same evidence gate. On a 16-case review eval with strict matching, recall rose from 0.27 to 0.43, false positives fell from 1/6 to 0/6, and the cost stayed at about $0.22 per review.
+
+### Fixed
+
+- `review-pr --at-sha` (eval mode) skipped the wrong method step after the step renumbering: it told the agent to skip step 7, which is now the description-claims check, not the duplicates step. It now names the Duplicates step.
 
 ## [0.3.11] - 2026-10-02
 

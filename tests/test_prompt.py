@@ -635,7 +635,7 @@ def test_review_pr_prompt_frozen_pins_commit_and_forbids_later_state():
     assert "Do NOT read PR comments, reviews, review threads, issue comments" in frozen
     assert "Do NOT run `gh pr checkout` or `gh pr diff`" in frozen
     assert "EVAL MODE overrides" in frozen
-    assert "Skip method step 7" in frozen and "empty list" in frozen
+    assert "Skip the method's Duplicates step" in frozen and "empty list" in frozen
     # The live-PR inspect bullets are gone; the read-only/sentinel rules stay.
     assert f"(`gh pr diff {url}`)" not in frozen
     assert "ABSOLUTE RULE" in frozen and "FRANKY_REVIEW_n0_BEGIN" in frozen
