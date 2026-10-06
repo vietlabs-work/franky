@@ -622,3 +622,30 @@ def test_changelog_check_ignores_bullets_in_released_sections(repo):
 def test_changelog_check_accepts_any_bullet_marker(repo, bullet):
     head = _BASE_CHANGELOG.replace("## [Unreleased]\n", f"## [Unreleased]\n\n{bullet}\n")
     _check(repo, ["franky/cli.py"], head)
+
+
+def test_changelog_check_fails_when_bullet_lands_in_released_section(repo, capsys):
+    # Release cut after the branch forked: the PR bullet merges under the new version header.
+    base = "# Changelog\n\n## [Unreleased]\n\n## [0.0.2] - 2026-02-01\n\n- Released.\n"
+    head = base.replace("- Released.", "- Released.\n- Stale PR bullet.")
+    with pytest.raises(SystemExit) as exc:
+        _check(repo, ["franky/cli.py"], head, base_changelog=base)
+    assert exc.value.code == 1
+    assert "released version section" in capsys.readouterr().err
+
+
+def test_changelog_check_fails_on_bullet_duplicated_into_released_section(repo):
+    # The same text is valid in Unreleased but a second copy inside a released section is stale.
+    base = "# Changelog\n\n## [Unreleased]\n\n## [0.0.2] - 2026-02-01\n\n- Same.\n"
+    head = (
+        "# Changelog\n\n## [Unreleased]\n\n- Same.\n\n## [0.0.2] - 2026-02-01\n\n- Same.\n- Same.\n"
+    )
+    with pytest.raises(SystemExit):
+        _check(repo, ["franky/cli.py"], head, base_changelog=base)
+
+
+def test_changelog_check_ignores_removed_unreleased_duplicate(repo):
+    # Dropping an Unreleased bullet that repeats an old release is not a released-section edit.
+    base = "# Changelog\n\n## [Unreleased]\n\n- Same.\n\n## [0.0.1] - 2026-01-01\n\n- Same.\n"
+    head = "# Changelog\n\n## [Unreleased]\n\n- New.\n\n## [0.0.1] - 2026-01-01\n\n- Same.\n"
+    _check(repo, ["franky/cli.py"], head, base_changelog=base)

@@ -15,6 +15,7 @@ import re
 import subprocess
 import sys
 import time
+from collections import Counter
 from datetime import date
 from pathlib import Path
 
@@ -170,16 +171,41 @@ def _unreleased_bullets(text: str) -> set[str]:
     return {m.group(1).strip() for m in _BULLET_RE.finditer(body)}
 
 
+def _released_bullets(text: str) -> Counter:
+    """Bullet counts of every versioned section (the text with ## [Unreleased] cut out).
+
+    A Counter, so a duplicate of a bullet already in an old release still counts as added.
+    """
+    idx = text.find("## [Unreleased]")
+    if idx != -1:
+        nxt = re.search(r"^## ", text[idx + 1 :], re.MULTILINE)
+        text = text[:idx] + (text[idx + 1 + nxt.start() :] if nxt else "")
+    return Counter(m.group(1).strip() for m in _BULLET_RE.finditer(text))
+
+
 def cmd_changelog_check(args, run, root: Path) -> None:
     files = _git(run, ["diff", "--name-only", f"{args.base}...HEAD"]).stdout.split()
     shipped = [f for f in files if f.startswith(_SHIPPED)]
+    # A missing base CHANGELOG.md (first commit) counts as no prior bullets.
+    base = _git(run, ["show", f"{args.base}:CHANGELOG.md"], check=False)
+    base_text = base.stdout if base.returncode == 0 else ""
+    head_text = (root / "CHANGELOG.md").read_text(encoding="utf-8")
+    # A release cut after the branch forked leaves a stale bullet inside the released section
+    # (git merges it there silently), and `make release` then finds an empty Unreleased.
+    added = list((_released_bullets(head_text) - _released_bullets(base_text)).elements())
+    if added:
+        print(
+            "release.py: CHANGELOG.md gains a bullet inside a released version section "
+            f"({added[0][:60]!r}). Released sections are frozen: rebase on the base "
+            "branch and move the bullet under ## [Unreleased].",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
     if not shipped:
         print("release.py: no shipped files changed; no changelog entry needed")
         return
-    # A missing base CHANGELOG.md (first commit) counts as no prior bullets.
-    base = _git(run, ["show", f"{args.base}:CHANGELOG.md"], check=False)
-    before = _unreleased_bullets(base.stdout if base.returncode == 0 else "")
-    after = _unreleased_bullets((root / "CHANGELOG.md").read_text(encoding="utf-8"))
+    before = _unreleased_bullets(base_text)
+    after = _unreleased_bullets(head_text)
     if after - before:
         print("release.py: changelog entry found under ## [Unreleased]")
         return
