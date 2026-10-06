@@ -509,9 +509,9 @@ def build_review_pr_prompt(
         'concrete change. "verified" is optional, at most 8 items: each concrete claim in the PR '
         "description you checked, with file:line evidence. A contradicted claim must ALSO be "
         "reported as a finding.\n"
-        '- Use "blocking" severity ONLY for a verified, must-fix defect; use "normal"/"nit" '
-        "otherwise. Franky's host decides the review event from this - you never approve or "
-        "request changes yourself.\n"
+        '- Set "severity" by the scale in method step 5, after you write "impact". A defect with '
+        'a concrete trigger is never "nit". Franky\'s host decides the review event from this - '
+        "you never approve or request changes yourself.\n"
         f"- Output ONLY the sentinel block as the FINAL content of your response; add no text "
         f"after `{end}`.\n"
     )

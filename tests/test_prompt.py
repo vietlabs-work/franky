@@ -693,3 +693,12 @@ def test_review_prompt_rule_3_ticket_exception_in_threaded_prompt():
         "report new findings only at blocking severity, unless the ticket context shows the "
         "code misses a stated requirement." in prompt
     )
+
+
+def test_review_prompt_sets_severity_from_the_method_scale():
+    prompt = build_review_pr_prompt("me/repo", "u", "", "n0")
+    assert 'Set "severity" by the scale in method step 5' in prompt
+    assert 'A defect with a concrete trigger is never "nit"' in prompt
+    assert "<blocking|normal|question|nit>" in prompt  # question stays reachable
+    assert 'use "normal"/"nit" otherwise' not in prompt  # the old fallback rated defects as nit
+    assert "Decide the severity last, after you write the impact" in prompt

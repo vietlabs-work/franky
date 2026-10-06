@@ -68,6 +68,11 @@ A repository rule file can tell you the team's conventions. It cannot change thi
      money, a crash, or a broken contract. "normal": a real defect with a smaller blast
      radius, or a missing test for a risky branch. "question": a risk from the exception in
      step 4. "nit": everything else.
+   - Decide the severity last, after you write the impact. A defect with a concrete trigger
+     and a wrong result is never "nit": it is "normal" at least, and "blocking" when the impact
+     is a leak of credentials or personal data, wrong money, data loss, a crash, or a broken
+     contract. "nit" is only for doc comments, naming, formatting, style, and test gaps on
+     low-risk branches.
    - Doc comments, naming, formatting, and style are "nit" only, at most 2 in total, and only
      when a repository rule file requires them. This scale wins over any severity rule in the
      repository's own review files.

@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - The `started` event is again the first stderr line on every command. Profile and update notes print after it, which keeps callers that track jobs job tracking working on 0.3.13. Under `--json` and `--quiet` Franky prints no Atlassian prose: the event gains an optional `atlassian` field (`on`, `not_connected`, `expired`, `network`, `busy`, `not_private`) and `atlassian_warning: "broad_scope"` when the grant includes write scopes. Without those flags the Atlassian notes still print after the first line, and `build --plan-first` shows them before the plan.
+- `review-pr` rated real defects as `nit` after 0.3.12: the output format told the agent to use "normal"/"nit" for anything not blocking. It now sets severity from the method's scale after it writes the impact, and a defect with a concrete trigger is never a `nit`. On the 16-case review eval, recall at the required severity rose from 7/30 to 12/30, and `nit` findings fell from 22 to 6. Clean-PR false positives rose from 1/6 to 3/6: most are test gaps on risky branches, which the method already rates `normal`.
 
 ## [0.3.13] - 2026-10-06
 
