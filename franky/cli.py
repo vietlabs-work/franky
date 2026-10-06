@@ -281,6 +281,7 @@ def _emit_error(exc: FrankyError, as_json: bool, secrets: list[str]) -> None:
     host-side JIRA token/email never reach `cfg.secret_values()`, so union in
     cfg_secrets_safe() too - defense-in-depth for the typed JIRA error path.
     """
+    _flush_notes()
     all_secrets = secrets + cfg_secrets_safe()
     if as_json:
         payload = build_error(exc.code, exc.kind, str(exc), exc.hint)
@@ -304,6 +305,7 @@ def _emit_result(
     Non-json: keep stdout pure - the bare PR URL on stdout for a build pr_opened, the
     "no PR URL"/iterate-completion lines to stderr, never a secret value.
     """
+    _flush_notes()  # a run that never announced (already_open) still shows its notes first
     if as_json:
         click.echo(redact(json.dumps(result), secrets))
         return
@@ -501,7 +503,7 @@ def build(
         # Best-effort, hint-only update check (never blocks/raises; ~1s budget, cached). Skip
         # under --quiet/--json so stderr stays clean. Silenced too by FRANKY_NO_UPDATE_CHECK=1.
         if not quiet:
-            maybe_auto_update()
+            maybe_auto_update(out=_note)
 
         # Shared config + task-parse + JIRA-fetch preamble (also computes the host-predicted
         # branch before the JIRA fetch mutates spec.text - see _resolve_task_spec).
@@ -532,7 +534,7 @@ def build(
                 ctx.exit(EXIT_SUCCESS)
 
         # After the idempotency short-circuit: an already-open run makes no GitHub or token call.
-        _enable_atlassian(cfg, spec.repo, secrets)
+        _enable_atlassian(cfg, spec.repo, secrets, prose=not (quiet or as_json))
         franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
 
         # Build the profile bundle (optional). Auto-discovers ~/.franky/profile.toml unless
@@ -554,6 +556,8 @@ def build(
                     kind="interactive_input_required",
                     hint="pass --yes to auto-approve",
                 )
+            # The operator must see the Atlassian write-scope notes before approving a plan.
+            _flush_notes()
             # PHASE 1: planning pass. Show the plan (to stderr - stdout stays pure), then gate.
             # A plan that errored is not a plan to approve. No economics on this pass.
             code, output, _plan_dur = _run_pass(
@@ -805,7 +809,7 @@ def iterate(
     process_env = dict(os.environ)
     try:
         if not quiet:
-            maybe_auto_update()
+            maybe_auto_update(out=_note)
 
         # Same config-file injection as `build` (see that command's WHY comment).
         try:
@@ -819,7 +823,7 @@ def iterate(
             cfg = load_config(engine, os.environ)
             secrets = cfg.secret_values()
             spec = parse_pr_task(pr_url, cfg.allowed_repos)
-            _enable_atlassian(cfg, spec.repo, secrets)
+            _enable_atlassian(cfg, spec.repo, secrets, prose=not (quiet or as_json))
         except FrankyError:
             raise
         except ValueError as exc:
@@ -1575,7 +1579,7 @@ def review_pr(
     process_env = dict(os.environ)
     try:
         if not quiet:
-            maybe_auto_update()
+            maybe_auto_update(out=_note)
 
         frozen = at_sha is not None or diff_base is not None
         if frozen:
@@ -1705,7 +1709,13 @@ def review_pr(
 
         # Frozen (eval) runs stay hermetic: no tools. Otherwise reuse the PR fetch's `private`.
         if not frozen:
-            _enable_atlassian(cfg, repo, secrets, private=pr_meta.get("private") is True)
+            _enable_atlassian(
+                cfg,
+                repo,
+                secrets,
+                private=pr_meta.get("private") is True,
+                prose=not (quiet or as_json),
+            )
         franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
         bundle, _setup_block = _load_profile_bundle(None, process_env, secrets, cfg)
         if not frozen:
@@ -2051,15 +2061,16 @@ def plan(
         task_input_str = _read_task_input(task_input)
 
         if not quiet:
-            maybe_auto_update()
+            maybe_auto_update(out=_note)
 
         # Shared config + task-parse + JIRA-fetch preamble (branch is unused - plan builds
         # nothing).
         cfg, spec, _branch, secrets = _resolve_task_spec(task_input_str, repo, engine, os.environ)
-        _enable_atlassian(cfg, spec.repo, secrets)
+        _enable_atlassian(cfg, spec.repo, secrets, prose=not (quiet or as_json))
 
         franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
         bundle, _setup_block = _load_profile_bundle(profile_path_opt, process_env, secrets, cfg)
+        _flush_notes()  # plan announces no job, so its notes may print now
         progress = None if quiet else _make_progress(cfg.engine, False)
 
         # Per-run nonce fenced into the prompt + parser: a hostile issue body / repo file
@@ -2942,10 +2953,9 @@ def _load_profile_bundle(
     # container, and silently injecting nothing is the one failure they would not notice.
     for kind, scan in spec.setup_scans.items():
         if not scan.files:
-            click.echo(
+            _note(
                 f"franky: WARNING setup {kind!r} at {scan.root} matched no files - nothing from "
-                "it will be injected. Run `franky profile check` to see what it expanded to.",
-                err=True,
+                "it will be injected. Run `franky profile check` to see what it expanded to."
             )
 
     setup_block = build_setup_block(spec)
@@ -3003,7 +3013,57 @@ def _economics_line(usage: Usage, duration: float, secrets: list[str]) -> str:
         return redact(format_economics(Usage(), duration), secrets)
 
 
-def _enable_atlassian(cfg: Config, repo: str | None, secrets: list[str], *, private=None) -> None:
+class _PreStart:
+    """Stderr notes that would print before the `started` event, held for one command invocation.
+
+    callers that track jobs read the job id from the first stderr line, so `started` must come first.
+    Lives in the click context meta (never a module global), so invocations cannot leak into
+    each other. `flush` opens it: later notes print at once."""
+
+    def __init__(self) -> None:
+        self.lines: list[str] = []
+        self.atlassian: str | None = None
+        self.atlassian_warning: str | None = None
+        self.open = False
+
+    def flush(self) -> None:
+        self.open = True
+        lines, self.lines = self.lines, []
+        for line in lines:
+            click.echo(line, err=True)
+
+
+def _pre_start() -> _PreStart | None:
+    ctx = click.get_current_context(silent=True)
+    if ctx is None:
+        return None
+    pre = ctx.meta.get("franky.pre_start")
+    if pre is None:
+        pre = ctx.meta["franky.pre_start"] = _PreStart()
+        # Safety net for every exit that never announces (plan, already_open, errors, early
+        # returns): the notes still print, once.
+        ctx.find_root().call_on_close(pre.flush)
+    return pre
+
+
+def _note(msg: str) -> None:
+    """A stderr line that must not precede the `started` event."""
+    pre = _pre_start()
+    if pre is None or pre.open:
+        click.echo(msg, err=True)
+    else:
+        pre.lines.append(msg)
+
+
+def _flush_notes() -> None:
+    pre = _pre_start()
+    if pre is not None:
+        pre.flush()
+
+
+def _enable_atlassian(
+    cfg: Config, repo: str | None, secrets: list[str], *, private=None, prose: bool = True
+) -> None:
     """Turn on the in-container Atlassian tools when a `franky connect jira` connection exists AND
     `repo` is private AND the engine is claude or codex.
 
@@ -3011,29 +3071,50 @@ def _enable_atlassian(cfg: Config, repo: str | None, secrets: list[str], *, priv
     engine without Atlassian wiring, no connection, a non-private repo, or a failed privacy or
     token lookup leaves the tools off (one stderr note) and the task continues. The engine is
     checked first so pi/opencode never trigger a GitHub lookup or a token refresh. `private` lets
-    review-pr reuse the answer it already has from the PR fetch.
+    review-pr reuse the answer it already has from the PR fetch. `prose=False` (--json, --quiet)
+    prints no note at all: the `started` event carries the verdict and the broad-scope warning.
     """
     if not repo or cfg.engine.name not in ("claude", "codex"):
         return
+    pre = _pre_start()
+
+    def verdict(v: str) -> None:
+        if pre is not None:
+            pre.atlassian = v
+
+    def say(msg: str) -> None:
+        if prose:
+            _note(msg)
+
     if not atlassian.stored_secrets(os.environ):
+        verdict("not_connected")
         if jira_configured(os.environ):
-            click.echo("franky: Atlassian tools off - run `franky connect jira`", err=True)
+            say("franky: Atlassian tools off - run `franky connect jira`")
         return
     if private is None:
         private = repo_is_private(repo, os.environ)
     if not private:
-        click.echo("franky: Atlassian tools off (repo is not confirmed private)", err=True)
+        verdict("not_private")
+        say("franky: Atlassian tools off (repo is not confirmed private)")
         return
-    got = atlassian.access_token(os.environ)
+    got = atlassian.access_token(os.environ, echo=say)
     if got.warning:
-        click.echo(got.warning, err=True)
+        say(got.warning)
+    if got.broad and pre is not None:
+        pre.atlassian_warning = "broad_scope"
     if got.token is None:
-        click.echo(f"franky: {got.hint or atlassian.HINT_REJECTED}", err=True)
+        verdict(
+            {"missing": "not_connected", "expired": "expired", "busy": "busy"}.get(
+                got.reason or "", "network"
+            )
+        )
+        say(f"franky: {got.hint or atlassian.HINT_REJECTED}")
         return
     cfg.enable_atlassian(got.token)
+    verdict("on")
     if got.expires_at is not None:
         until = time.strftime("%H:%M", time.gmtime(got.expires_at))
-        click.echo(f"franky: Atlassian tools on (token valid until {until} UTC)", err=True)
+        say(f"franky: Atlassian tools on (token valid until {until} UTC)")
     secrets.extend(v for v in cfg.secret_values() if v not in secrets)
 
 
@@ -3062,6 +3143,7 @@ def _announce_start(job_id, command, as_json, quiet, suffix="") -> None:
     --json: ALWAYS one machine-readable line on stderr (stdout stays exactly one result object),
     even with --quiet, so a bot learns the handle to poll. Otherwise the prose line, unless quiet.
     """
+    pre = _pre_start()
     if as_json:
         event = {
             "event": "started",
@@ -3069,9 +3151,15 @@ def _announce_start(job_id, command, as_json, quiet, suffix="") -> None:
             "command": command,
             "status_command": f"franky job status {job_id} --json",
         }
+        if pre is not None and pre.atlassian:
+            event["atlassian"] = pre.atlassian
+        if pre is not None and pre.atlassian_warning:
+            event["atlassian_warning"] = pre.atlassian_warning
         click.echo(json.dumps(event), err=True)
     elif not quiet:
         click.echo(f"franky: job {job_id} started{suffix}", err=True)
+    if pre is not None:
+        pre.flush()
 
 
 def _liveness(job_id, **fields) -> None:
@@ -3393,6 +3481,7 @@ def _diagnose(
         _announce_start(job_id, "diagnose", as_json, quiet)
     elif not quiet:
         click.echo(f"franky: diagnosing job {diagnosed_job_id} (job {job_id})", err=True)
+        _flush_notes()
 
     nonce = _make_nonce()
     code, output, duration = _run_pass(
@@ -4227,7 +4316,7 @@ def job_diagnose(
         secrets = cfg.secret_values()
         diag_repo = record.get("repo")
         if diag_repo and repo_allowed(diag_repo, cfg.allowed_repos):
-            _enable_atlassian(cfg, diag_repo, secrets)
+            _enable_atlassian(cfg, diag_repo, secrets, prose=not (quiet or as_json))
 
         franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
         verbose = verbose or bool(os.environ.get(FRANKY_VERBOSE_VAR))
@@ -4383,7 +4472,6 @@ def job_replay(
         # run - a saved record must never bypass the fail-closed gate a fresh build goes through.
         if not repo_allowed(repo, cfg.allowed_repos):
             raise TaskRejected(f"repo {repo!r} is no longer in the allowlist - refusing to replay")
-        _enable_atlassian(cfg, repo, secrets)
 
         base_sha = record.get("base_sha")
         if not base_sha:
@@ -4448,6 +4536,9 @@ def job_replay(
                     result, as_json, secrets, pr_url=existing, status="already_open", quiet=quiet
                 )
                 ctx.exit(EXIT_SUCCESS)
+
+        # After the idempotency short-circuit: an already-open run makes no GitHub or token call.
+        _enable_atlassian(cfg, repo, secrets, prose=not (quiet or as_json))
 
         new_id = jobs.new_job_id()
         _record_run_start(
@@ -4695,7 +4786,6 @@ def job_resume(
         # saved record must never bypass the fail-closed gate a fresh build goes through.
         if not repo_allowed(repo, cfg.allowed_repos):
             raise TaskRejected(f"repo {repo!r} is no longer in the allowlist - refusing to resume")
-        _enable_atlassian(cfg, repo, secrets)
 
         spec = TaskSpec(repo=repo, text=text, source=source)
         # Prefer the original run's actual branch so the continued work lands on the same head the
@@ -4728,6 +4818,9 @@ def job_resume(
                 )
                 ctx.exit(EXIT_SUCCESS)
 
+        # After the idempotency short-circuit: an already-open run makes no GitHub or token call.
+        _enable_atlassian(cfg, repo, secrets, prose=not (quiet or as_json))
+
         # V2 gate: a `--thread` run's record carries its session id. Without one this is V1,
         # byte-identical to before. A native engine gets a session either way (resumed in V2, a
         # new id in V1) so a PR this run opens can still be bound.
@@ -4741,10 +4834,9 @@ def job_resume(
             elif cfg.engine.session_dir:
                 session_id = str(uuid.uuid4())
             if fallback and not quiet:
-                click.echo(
+                _note(
                     f"franky: resuming {job_id} without its engine session "
-                    f"(reason={fallback}) - workspace-only (V1) resume",
-                    err=True,
+                    f"(reason={fallback}) - workspace-only (V1) resume"
                 )
 
         new_id = jobs.new_job_id()

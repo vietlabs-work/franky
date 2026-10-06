@@ -252,6 +252,10 @@ _STARTED_EVENT_SCHEMA: dict = {
     "job_id": "string; the 12-hex handle to poll",
     "command": "string; build | iterate | review-pr | replay | resume",
     "status_command": "string; the exact command to poll this run",
+    "atlassian": "optional; on | not_connected | expired | network | busy | not_private - "
+    "absent when the Atlassian gate did not run",
+    "atlassian_warning": "optional; broad_scope - the Atlassian grant includes write scopes or "
+    "its scopes are unknown; present only when it fired",
     "where": "ONE JSON line on stderr at job start with --json (even with --quiet); stdout "
     "stays exactly one result object",
 }

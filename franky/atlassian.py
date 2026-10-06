@@ -253,17 +253,18 @@ def _discover(opener) -> dict:
     return meta
 
 
-def _warn_if_broad(scope: str) -> None:
+def _is_broad(scope: str) -> bool:
+    return scope == "unknown" or any(s.startswith(_BROAD_SCOPE_PREFIXES) for s in scope.split())
+
+
+def _warn_if_broad(scope: str, echo: Callable = lambda m: click.echo(m, err=True)) -> None:
     if scope == "unknown":
-        click.echo(
-            "franky: WARNING granted scopes unknown; Franky still denies write tools", err=True
-        )
+        echo("franky: WARNING granted scopes unknown; Franky still denies write tools")
     elif any(s.startswith(_BROAD_SCOPE_PREFIXES) for s in scope.split()):
-        click.echo(
+        echo(
             "franky: WARNING the Atlassian grant includes write scopes; Atlassian does not enforce "
             "read-only here, Franky only denies the write tools. Re-run `franky connect jira` and "
-            "grant read access.",
-            err=True,
+            "grant read access."
         )
 
 
@@ -448,6 +449,8 @@ class Token(NamedTuple):
     hint: str | None = None
     warning: str | None = None
     expires_at: float | None = None
+    reason: str | None = None  # expired | network | busy | missing (token is None)
+    broad: bool = False  # the grant includes write scopes, or its scopes are unknown
 
 
 def access_token(
@@ -456,6 +459,7 @@ def access_token(
     now: Callable = time.time,
     opener: Callable = urllib.request.urlopen,
     min_ttl: float = 2100,
+    echo: Callable = lambda m: click.echo(m, err=True),
 ) -> Token:
     """An access token with at least `min_ttl` seconds left, refreshing if needed. When the refresh
     fails the file is left untouched and the Token carries the reason."""
@@ -463,7 +467,7 @@ def access_token(
         with _locked(env):
             rec = _load(env)
             if rec is None:
-                return Token()
+                return Token(reason="missing")
             if rec["expires_at"] - now() >= min_ttl:
                 return Token(rec["access_token"], expires_at=rec["expires_at"])
             fields = {
@@ -478,10 +482,13 @@ def access_token(
                 tok = _form(opener, rec["token_endpoint"], fields, "token refresh")
             except NetworkError as exc:
                 rejected = getattr(exc, "status", None) in (400, 401)
-                return Token(hint=HINT_REJECTED if rejected else HINT_NETWORK)
+                return Token(
+                    hint=HINT_REJECTED if rejected else HINT_NETWORK,
+                    reason="expired" if rejected else "network",
+                )
             new = tok.get("access_token")
             if not isinstance(new, str) or not new:
-                return Token(hint=HINT_NETWORK)
+                return Token(hint=HINT_NETWORK, reason="network")
             old = rec["access_token"]
             rotated = tok.get("refresh_token")
             scope = tok.get("scope") if isinstance(tok.get("scope"), str) else rec["scope"]
@@ -501,12 +508,12 @@ def access_token(
                 _save(env, rec)
             except Exception:
                 warning = WARN_SAVE  # this run still gets the new token
-            _warn_if_broad(scope)
-            return Token(new, warning=warning, expires_at=expires_at)
+            _warn_if_broad(scope, echo)
+            return Token(new, warning=warning, expires_at=expires_at, broad=_is_broad(scope))
     except _Busy:
-        return Token(hint=HINT_BUSY)
+        return Token(hint=HINT_BUSY, reason="busy")
     except Exception:
-        return Token(hint=HINT_NETWORK)
+        return Token(hint=HINT_NETWORK, reason="network")
 
 
 def status(env: Mapping[str, str], *, now: Callable = time.time) -> str:

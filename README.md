@@ -148,7 +148,7 @@ Run `franky COMMAND --help` for flags and examples. Run `franky schema` for the 
 
 ### Track a run
 
-With `--json`, every run prints one `{"event":"started","job_id":...,"status_command":...}` line on stderr when it starts, even with `--quiet`. Stdout stays one result object. Poll with `franky job status JOB_ID --json`.
+With `--json`, every run prints one `{"event":"started","job_id":...,"status_command":...}` line on stderr when it starts, even with `--quiet`. It is always the first stderr line; profile notes follow it. It adds `"atlassian"` (`on`, `not_connected`, `expired`, `network`, `busy`, `not_private`) when the Atlassian gate ran, and `"atlassian_warning": "broad_scope"` when the grant includes write scopes. Under `--json` or `--quiet` Franky prints no Atlassian prose; without them the notes follow the first line. Stdout stays one result object. Poll with `franky job status JOB_ID --json`.
 
 `state` is `active` (output in the last 120 s), `quiet` (alive, silent), `orphaned` (the owning process is gone), `unknown` (liveness cannot be confirmed), or `finished`. `next` gives one `action` (`wait`, `check`, `kill`, `resume`, `rerun`, `inspect`, `done`), its `command`, `retry_safe`, and `check_after`. Do not rerun unless `retry_safe` is true. `unknown` is never proof of death.
 

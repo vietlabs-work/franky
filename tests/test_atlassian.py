@@ -448,11 +448,34 @@ def test_missing_or_malformed_connection_is_not_connected(connect_atlassian, mut
 
 
 def test_garbage_and_missing_file_are_not_connected():
-    assert atlassian.access_token({}, opener=_no_network).token is None
+    assert atlassian.access_token({}, opener=_no_network).reason == "missing"
     path = atlassian.store_path({})
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("{not json")
-    assert atlassian.access_token({}, opener=_no_network).token is None
+    got = atlassian.access_token({}, opener=_no_network)
+    assert got.token is None and got.reason == "missing"
+
+
+@pytest.mark.parametrize(
+    "outcome, reason",
+    [
+        (_http_error(TOKEN, 400), "expired"),
+        (_http_error(TOKEN, 401), "expired"),
+        (OSError("down"), "network"),
+        ({}, "network"),
+    ],
+)
+def test_refresh_failure_carries_a_reason_code(connect_atlassian, outcome, reason):
+    connect_atlassian(expires_at=T0)
+    got = atlassian.access_token({}, now=lambda: T0, opener=Net(**{TOKEN: outcome}))
+    assert got.token is None and got.reason == reason
+
+
+def test_a_broad_grant_is_flagged_on_the_token(connect_atlassian):
+    connect_atlassian(expires_at=T0)
+    net = Net(**{TOKEN: {"access_token": "a", "scope": "read:x write:jira:x", "expires_in": 3600}})
+    got = atlassian.access_token({}, now=lambda: T0, opener=net, echo=lambda m: None)
+    assert got.token == "a" and got.broad
 
 
 def test_two_threads_with_an_expired_token_cause_exactly_one_refresh(connect_atlassian):
@@ -729,7 +752,9 @@ def test_enable_off_when_the_connection_is_expired_or_revoked(
     connect_atlassian()
     monkeypatch.setattr(cli, "repo_is_private", lambda *a, **k: True)
     monkeypatch.setattr(
-        cli.atlassian, "access_token", lambda env: atlassian.Token(hint=atlassian.HINT_REJECTED)
+        cli.atlassian,
+        "access_token",
+        lambda env, **k: atlassian.Token(hint=atlassian.HINT_REJECTED),
     )
     cfg = load_config("claude", _env())
     cli._enable_atlassian(cfg, "me/repo", [])
@@ -742,7 +767,7 @@ def test_enable_success_adds_only_the_header_and_the_mcp_host(monkeypatch, conne
     connect_atlassian()
     monkeypatch.setattr(cli, "repo_is_private", lambda *a, **k: True)
     monkeypatch.setattr(
-        cli.atlassian, "access_token", lambda env: atlassian.Token("tok", expires_at=T0 + 3600)
+        cli.atlassian, "access_token", lambda env, **k: atlassian.Token("tok", expires_at=T0 + 3600)
     )
     cfg = load_config("claude", _env())
     before = set(cfg.passthrough_env)
@@ -759,7 +784,7 @@ def test_enable_reuses_a_known_privacy_answer(monkeypatch, connect_atlassian):
     connect_atlassian()
     monkeypatch.setattr(cli, "repo_is_private", _no_lookup)
     monkeypatch.setattr(
-        cli.atlassian, "access_token", lambda env: atlassian.Token("tok", expires_at=T0 + 3600)
+        cli.atlassian, "access_token", lambda env, **k: atlassian.Token("tok", expires_at=T0 + 3600)
     )
     cfg = load_config("claude", _env())
     cli._enable_atlassian(cfg, "me/repo", [], private=True)
@@ -1107,12 +1132,12 @@ def test_enable_prints_the_rejected_busy_and_save_lines(monkeypatch, capsys, con
         (atlassian.Token(hint=atlassian.HINT_NETWORK), "token refresh failed: network"),
         (atlassian.Token(hint=atlassian.HINT_BUSY), "connection busy"),
     ]:
-        monkeypatch.setattr(cli.atlassian, "access_token", lambda env, t=tok: t)
+        monkeypatch.setattr(cli.atlassian, "access_token", lambda env, t=tok, **k: t)
         cfg = load_config("claude", _env())
         cli._enable_atlassian(cfg, "me/repo", [])
         assert not cfg.atlassian_tools and text in capsys.readouterr().err
     tok = atlassian.Token("tok", warning=atlassian.WARN_SAVE, expires_at=3 * 3600 + 5 * 60)
-    monkeypatch.setattr(cli.atlassian, "access_token", lambda env: tok)
+    monkeypatch.setattr(cli.atlassian, "access_token", lambda env, **k: tok)
     cfg = load_config("claude", _env())
     cli._enable_atlassian(cfg, "me/repo", [])
     err = capsys.readouterr().err

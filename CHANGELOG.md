@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The `started` event is again the first stderr line on every command. Profile and update notes print after it, which keeps callers that track jobs job tracking working on 0.3.13. Under `--json` and `--quiet` Franky prints no Atlassian prose: the event gains an optional `atlassian` field (`on`, `not_connected`, `expired`, `network`, `busy`, `not_private`) and `atlassian_warning: "broad_scope"` when the grant includes write scopes. Without those flags the Atlassian notes still print after the first line, and `build --plan-first` shows them before the plan.
+
 ## [0.3.13] - 2026-10-06
 
 ### Added
