@@ -47,6 +47,21 @@ def test_config_file_path_default() -> None:
     assert path == Path.home() / ".franky" / "config"
 
 
+def test_swapped_environ_never_reaches_the_real_home(monkeypatch) -> None:
+    # Many tests replace os.environ with a dict that has no HOME; the conftest home pin must
+    # still keep the config and default profile out of the developer's real home.
+    import os
+    import pwd
+
+    from franky.profile import profile_path
+
+    real_home = Path(pwd.getpwuid(os.getuid()).pw_dir)  # what Path.home() used to fall back to
+    monkeypatch.setattr(os, "environ", {})
+    for path in (config_file_path({}), Path.home() / ".franky" / "profile.toml"):
+        assert real_home not in path.parents and path.is_relative_to(Path.home())
+    assert profile_path({}) is None  # the tmp home has no profile
+
+
 # ---------------------------------------------------------------------------
 # read_config_file
 # ---------------------------------------------------------------------------

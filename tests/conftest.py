@@ -69,6 +69,27 @@ def _hermetic_config_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
 
 
 @pytest.fixture(autouse=True)
+def _hermetic_home(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Never let Path.home() resolve to the developer's real home directory.
+
+    Many tests replace os.environ with a plain dict that has no HOME. Path.home() then falls
+    back to the password database and returns the real home, so ~/.franky/config and
+    ~/.franky/profile.toml leaked into those tests (a developer's engine choice made tests pass
+    locally that failed in CI). Pin Path.home() to a tmp dir; a HOME a test sets on purpose wins.
+    """
+    default = tmp_path_factory.mktemp("home")  # outside tmp_path: tests assert it stays empty
+    monkeypatch.setenv("HOME", str(default))
+
+    def _safe_home(cls=Path):
+        home = os.environ.get("HOME")
+        return Path(home) if home else default
+
+    monkeypatch.setattr(Path, "home", classmethod(_safe_home))
+
+
+@pytest.fixture(autouse=True)
 def _no_idempotency_network(monkeypatch: pytest.MonkeyPatch) -> None:
     """Stub the host-side GitHub GETs to "nothing found" for every test (no real network).
 
