@@ -371,3 +371,17 @@ def test_every_manifest_kind_has_a_default_root_and_instruction_file():
         assert manifest.default_root.startswith("~/"), kind
         assert manifest.files, kind
         assert manifest.dirs, kind
+
+
+def test_expand_setup_denies_the_atlassian_login_by_name_and_through_a_symlink(tmp_path):
+    root = _claude_setup(tmp_path / ".claude")
+    cook = root / "skills" / "cook"
+    login = tmp_path / "atlassian-jira.json"
+    login.write_text('{"refresh_token": "rt"}\n', encoding="utf-8")
+    (cook / "atlassian-jira.json").write_text("{}\n", encoding="utf-8")
+    (cook / "atlassian-jira.lock").write_text("", encoding="utf-8")
+    (cook / "notes.md").symlink_to(login)
+
+    scan = setups.expand_setup("claude", root)
+
+    assert {p.name for p in scan.files} == {"CLAUDE.md", "SKILL.md", "pr.md"}

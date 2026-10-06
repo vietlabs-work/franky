@@ -83,3 +83,42 @@ def _no_idempotency_network(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(cli, "find_open_pr", lambda *a, **k: None)
     monkeypatch.setattr(cli.baseref, "resolve_base_sha", lambda *a, **k: None)
+    # The Atlassian privacy gate is one more GitHub GET; default it to "not private" (tools off).
+    monkeypatch.setattr(cli, "repo_is_private", lambda *a, **k: False)
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_atlassian_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point the Atlassian connection file at tmp for every test: a real ~/.franky/atlassian-jira.json
+    must never leak in, even when a test replaces os.environ with a dict lacking
+    FRANKY_CONFIG_FILE."""
+    import franky.atlassian as atlassian
+
+    path = tmp_path / "test-franky-atlassian" / "atlassian-jira.json"
+    monkeypatch.setattr(atlassian, "store_path", lambda env=None: path)
+
+
+@pytest.fixture
+def connect_atlassian():
+    """Write a stored Atlassian connection; returns the record (override fields by keyword)."""
+    import franky.atlassian as atlassian
+
+    def make(**over) -> dict:
+        rec = {
+            "version": 1,
+            "client_id": "cid",
+            "client_secret": None,
+            "token_endpoint": "https://auth.atlassian.com/oauth/token",
+            "revocation_endpoint": "https://auth.atlassian.com/oauth/revoke",
+            "refresh_token": "rt-0",
+            "access_token": "at-0",
+            "expires_at": 10_000.0,
+            "scope": atlassian.READ_SCOPES,
+            "connected_at": 1_000.0,
+            "previous_access_tokens": [],
+        }
+        rec.update(over)
+        atlassian._save({}, rec)
+        return rec
+
+    return make

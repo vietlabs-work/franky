@@ -132,3 +132,27 @@ def fetch_pr_head_sha(
             private=isinstance(base_repo, dict) and base_repo.get("private") is True,
         )
     return sha
+
+
+def repo_is_private(
+    repo: str,
+    env: Mapping[str, str],
+    *,
+    opener: Callable = urllib.request.urlopen,
+    timeout: float = _FETCH_TIMEOUT,
+) -> bool:
+    """True only when GitHub says `repo` is private. Any failure is False (fail closed): this
+    gates credentials entering the task container, so uncertainty must mean "no"."""
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "franky-idempotency"}
+    token = env.get("GH_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(f"https://api.github.com/repos/{repo}", headers=headers)
+    try:
+        with opener(req, timeout=timeout) as resp:
+            if getattr(resp, "status", None) != 200:
+                return False
+            data = json.load(resp)
+    except Exception:
+        return False
+    return isinstance(data, dict) and data.get("private") is True

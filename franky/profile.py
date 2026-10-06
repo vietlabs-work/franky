@@ -120,6 +120,10 @@ _SECRET_PATTERNS: list[tuple[str, re.Pattern]] = [
         re.compile(r"\bsk-[A-Za-z0-9_-]{48,}\b"),
     ),
     (
+        "OAuth credential JSON (refresh_token/access_token)",
+        re.compile(r'"(?:refresh|access)_token"\s*:\s*"[^"\s]{20,}"'),
+    ),
+    (
         "env-var assignment of a known secret variable",
         re.compile(
             r"(?m)^[ \t]*"
@@ -384,6 +388,13 @@ def load_profile(path: Path) -> ProfileSpec:
                 raise ValueError(f"could not inspect profile file {entry!r}: {exc}") from exc
             if not paths and not is_glob:
                 raise ValueError(f"profile file not found: {entry!r} (listed in {path})")
+            for found in paths:
+                # By the symlink-resolved name too: a link must not smuggle the Atlassian login in.
+                if found.resolve().name.lower() in setups.ATLASSIAN_STORE_NAMES:
+                    raise ValueError(
+                        f"profile file {found} is the Atlassian login (franky connect jira); "
+                        "it never ships"
+                    )
             resolved.extend(paths)
         setattr(spec, category, resolved)
 

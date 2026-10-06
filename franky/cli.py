@@ -60,14 +60,14 @@ from .engine import (
     resolve_engine,
     tool_name,
 )
+from . import atlassian
 from .github import run_gh
-from .idempotency import fetch_pr_head_sha, find_open_pr
+from .idempotency import fetch_pr_head_sha, find_open_pr, repo_is_private
 from .jira import (
-    JIRA_API_TOKEN_VAR,
-    JIRA_EMAIL_VAR,
     extract_jira_keys,
     fetch_jira_issue,
     jira_configured,
+    jira_secret_strings,
 )
 from . import setups
 from .profile import (
@@ -87,6 +87,7 @@ from .profile import (
     write_profile,
 )
 from .prompt import (
+    ATLASSIAN_TOOLS_BLOCK,
     build_decompose_prompt,
     build_diagnose_prompt,
     build_iterate_prompt,
@@ -530,6 +531,8 @@ def build(
                 )
                 ctx.exit(EXIT_SUCCESS)
 
+        # After the idempotency short-circuit: an already-open run makes no GitHub or token call.
+        _enable_atlassian(cfg, spec.repo, secrets)
         franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
 
         # Build the profile bundle (optional). Auto-discovers ~/.franky/profile.toml unless
@@ -816,6 +819,7 @@ def iterate(
             cfg = load_config(engine, os.environ)
             secrets = cfg.secret_values()
             spec = parse_pr_task(pr_url, cfg.allowed_repos)
+            _enable_atlassian(cfg, spec.repo, secrets)
         except FrankyError:
             raise
         except ValueError as exc:
@@ -1699,6 +1703,9 @@ def review_pr(
                 )
             pinned_sha = live_sha
 
+        # Frozen (eval) runs stay hermetic: no tools. Otherwise reuse the PR fetch's `private`.
+        if not frozen:
+            _enable_atlassian(cfg, repo, secrets, private=pr_meta.get("private") is True)
         franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
         bundle, _setup_block = _load_profile_bundle(None, process_env, secrets, cfg)
         if not frozen:
@@ -1756,6 +1763,7 @@ def review_pr(
             frozen=frozen,
             tickets=tickets,
             tickets_missing=tickets_missing,
+            jira_tools=cfg.atlassian_tools,
         )
 
         diagnostics: dict = {}
@@ -2048,6 +2056,7 @@ def plan(
         # Shared config + task-parse + JIRA-fetch preamble (branch is unused - plan builds
         # nothing).
         cfg, spec, _branch, secrets = _resolve_task_spec(task_input_str, repo, engine, os.environ)
+        _enable_atlassian(cfg, spec.repo, secrets)
 
         franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
         bundle, _setup_block = _load_profile_bundle(profile_path_opt, process_env, secrets, cfg)
@@ -2769,7 +2778,9 @@ def _kill_secrets(engine):
         ok = False
     extra = _profile_secrets(os.environ)
     values = [os.environ[k] for k in SECRET_KEYS if os.environ.get(k)]
-    return list(dict.fromkeys([*values, *loaded, *(extra or [])])), ok and extra is not None
+    # The JIRA forms and the stored Atlassian connection are scrubbed whether or not tools are on.
+    held = [*jira_secret_strings(os.environ), *atlassian.stored_secrets(os.environ)]
+    return list(dict.fromkeys([*values, *loaded, *held, *(extra or [])])), ok and extra is not None
 
 
 def _run_pass(
@@ -2810,6 +2821,8 @@ def _run_pass(
     redacted from the streamed output and heartbeat; never added to the container env.
     """
     session_kwargs = {} if session is None else {"session_id": session[0], "resume": session[1]}
+    if cfg.atlassian_tools:
+        prompt += ATLASSIAN_TOOLS_BLOCK
     inner_argv = cfg.engine.inner_argv(
         "__FRANKY_PRIVATE_PROMPT__" if private_prompt else prompt,
         model=cfg.model,
@@ -2817,8 +2830,15 @@ def _run_pass(
     )
     for override in cfg.codex_mcp_overrides:
         inner_argv += ["-c", override]
-    if cfg.claude_mcp_config_path:
-        inner_argv += ["--mcp-config", cfg.claude_mcp_config_path, "--strict-mcp-config"]
+    claude_configs = [cfg.claude_mcp_config_path] if cfg.claude_mcp_config_path else []
+    if cfg.atlassian_tools and cfg.engine.name == "codex":
+        inner_argv += ["-c", atlassian.codex_override()]
+    elif cfg.atlassian_tools and cfg.engine.name == "claude":
+        claude_configs.append(atlassian.claude_mcp_json())
+    if claude_configs:
+        inner_argv += ["--mcp-config", *claude_configs, "--strict-mcp-config"]
+    if cfg.atlassian_tools and cfg.engine.name == "claude":
+        inner_argv += ["--disallowedTools", atlassian.claude_disallowed()]
     if cfg.effort:
         inner_argv += ["--effort", cfg.effort]
     extra = {} if timeout is None else {"timeout": timeout}
@@ -2983,6 +3003,40 @@ def _economics_line(usage: Usage, duration: float, secrets: list[str]) -> str:
         return redact(format_economics(Usage(), duration), secrets)
 
 
+def _enable_atlassian(cfg: Config, repo: str | None, secrets: list[str], *, private=None) -> None:
+    """Turn on the in-container Atlassian tools when a `franky connect jira` connection exists AND
+    `repo` is private AND the engine is claude or codex.
+
+    Every container-running command calls this once the repo is known. Fail closed: no repo, an
+    engine without Atlassian wiring, no connection, a non-private repo, or a failed privacy or
+    token lookup leaves the tools off (one stderr note) and the task continues. The engine is
+    checked first so pi/opencode never trigger a GitHub lookup or a token refresh. `private` lets
+    review-pr reuse the answer it already has from the PR fetch.
+    """
+    if not repo or cfg.engine.name not in ("claude", "codex"):
+        return
+    if not atlassian.stored_secrets(os.environ):
+        if jira_configured(os.environ):
+            click.echo("franky: Atlassian tools off - run `franky connect jira`", err=True)
+        return
+    if private is None:
+        private = repo_is_private(repo, os.environ)
+    if not private:
+        click.echo("franky: Atlassian tools off (repo is not confirmed private)", err=True)
+        return
+    got = atlassian.access_token(os.environ)
+    if got.warning:
+        click.echo(got.warning, err=True)
+    if got.token is None:
+        click.echo(f"franky: {got.hint or atlassian.HINT_REJECTED}", err=True)
+        return
+    cfg.enable_atlassian(got.token)
+    if got.expires_at is not None:
+        until = time.strftime("%H:%M", time.gmtime(got.expires_at))
+        click.echo(f"franky: Atlassian tools on (token valid until {until} UTC)", err=True)
+    secrets.extend(v for v in cfg.secret_values() if v not in secrets)
+
+
 def cfg_secrets_safe() -> list[str]:
     """Best-effort secret list for redacting an error raised before cfg fully exists.
 
@@ -2994,7 +3048,7 @@ def cfg_secrets_safe() -> list[str]:
     names the invalid FRANKY_CODEX_AUTH_VOLUME value verbatim - that value is a volume NAME
     (policy, like an allowlist entry), never a credential, so it is deliberately not redacted.
     """
-    return [v for v in (os.environ.get(JIRA_API_TOKEN_VAR), os.environ.get(JIRA_EMAIL_VAR)) if v]
+    return [*jira_secret_strings(os.environ), *atlassian.stored_secrets(os.environ)]
 
 
 # Heartbeats of the runs this process owns, keyed by job id (see jobs.Heartbeat). Populated by
@@ -4171,6 +4225,9 @@ def job_diagnose(
             raise ConfigError(f"config file error: {exc}") from exc
         cfg = load_config(engine, os.environ)
         secrets = cfg.secret_values()
+        diag_repo = record.get("repo")
+        if diag_repo and repo_allowed(diag_repo, cfg.allowed_repos):
+            _enable_atlassian(cfg, diag_repo, secrets)
 
         franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
         verbose = verbose or bool(os.environ.get(FRANKY_VERBOSE_VAR))
@@ -4326,6 +4383,7 @@ def job_replay(
         # run - a saved record must never bypass the fail-closed gate a fresh build goes through.
         if not repo_allowed(repo, cfg.allowed_repos):
             raise TaskRejected(f"repo {repo!r} is no longer in the allowlist - refusing to replay")
+        _enable_atlassian(cfg, repo, secrets)
 
         base_sha = record.get("base_sha")
         if not base_sha:
@@ -4637,6 +4695,7 @@ def job_resume(
         # saved record must never bypass the fail-closed gate a fresh build goes through.
         if not repo_allowed(repo, cfg.allowed_repos):
             raise TaskRejected(f"repo {repo!r} is no longer in the allowlist - refusing to resume")
+        _enable_atlassian(cfg, repo, secrets)
 
         spec = TaskSpec(repo=repo, text=text, source=source)
         # Prefer the original run's actual branch so the continued work lands on the same head the
@@ -5239,6 +5298,42 @@ def threads_purge(
         ctx.exit(exc.code)
 
 
+@main.group("connect")
+def connect_group() -> None:
+    """Connect Franky to external services."""
+
+
+@connect_group.command("jira")
+@click.option(
+    "--no-browser",
+    is_flag=True,
+    help="Print the login URL and take the pasted redirect URL (headless host).",
+)
+@click.option("--status", "show_status", is_flag=True, help="Show the connection, no network.")
+@click.option("--disconnect", "do_disconnect", is_flag=True, help="Revoke and delete the login.")
+@click.pass_context
+def connect_jira(ctx: click.Context, no_browser: bool, show_status: bool, do_disconnect: bool):
+    """Give tasks on private repos read-only JIRA and Confluence tools (browser login).
+
+    No Atlassian admin step: a PKCE OAuth login that requests read scopes only (write tools are denied
+    in the engine config; `--status` shows what Atlassian granted). The login stays in
+    ~/.franky/atlassian-jira.json (0600) on this host; only a short-lived access token ever
+    enters a task container.
+    """
+    try:
+        if show_status:
+            click.echo(atlassian.status(os.environ))
+        elif do_disconnect:
+            gone = atlassian.disconnect(os.environ)
+            click.echo("Atlassian disconnected." if gone else "Atlassian was not connected.")
+        else:
+            atlassian.connect(os.environ, no_browser=no_browser)
+            click.echo("Atlassian connected. " + atlassian.status(os.environ))
+    except FrankyError as exc:
+        _emit_error(exc, False, [])
+        ctx.exit(exc.code)
+
+
 @main.group("auth")
 def auth_group() -> None:
     """Manage persistent engine subscription authentication."""
@@ -5521,6 +5616,7 @@ def config_init() -> None:
     # Optional JIRA
     click.echo()
     if click.confirm("Configure JIRA (for `franky build jira <KEY>`)?", default=False):
+        click.echo("  For read-only JIRA/Confluence tools inside tasks, run: franky connect jira")
         base = click.prompt("JIRA_BASE_URL (e.g. https://your-org.atlassian.net)").strip()
         if base:
             data["JIRA_BASE_URL"] = base

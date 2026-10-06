@@ -56,7 +56,9 @@ Every build needs:
 - `GH_TOKEN`: A narrow token with content and pull-request access for the allowed repositories.
 - Credentials for the selected engine.
 
-JIRA inputs also need `JIRA_BASE_URL`, `JIRA_EMAIL`, and `JIRA_API_TOKEN`.
+JIRA inputs also need `JIRA_BASE_URL`, `JIRA_EMAIL`, and `JIRA_API_TOKEN`; these stay on the host for the ticket fetch.
+
+To give every task on a private repository read-only JIRA and Confluence tools inside the container, run `franky connect jira`. It opens a browser login (OAuth with PKCE and a loopback redirect; no Atlassian admin step). On a headless host run `franky connect jira --no-browser`, open the printed URL elsewhere, and paste the redirect URL back. `--status` shows the connection and `--disconnect` revokes it. The login stays in `~/.franky/atlassian-jira.json` (0600) on the host. For the Claude and Codex engines Franky then adds the Atlassian MCP server (`https://mcp.atlassian.com/v2/mcp`): the host refreshes a short-lived access token and only that token enters the container, as `FRANKY_ATLASSIAN_MCP_HEADER`. Franky requests read and search scopes only, and the write tools are denied in the engine config (Claude deny patterns, a Codex read-tool allowlist). If Atlassian grants broader scopes, read-only is not enforced by Atlassian; `--status` shows the granted scopes. A missing, expired or revoked connection turns the tools off with one hint line, and each run with the tools on prints when its token expires. A very long run can outlive that token; the agent then falls back to the ticket text. The egress allowlist gains `mcp.atlassian.com` only when the tools are on. Pi and OpenCode get no Atlassian tools.
 
 ```bash
 franky config set FRANKY_ALLOWED_REPOS
@@ -206,7 +208,7 @@ Review layout. Each finding has `evidence` (file:line and a concrete trigger), `
 
 A nit is posted inline or not at all: it never goes in the review body, and it never takes an inline slot from a Major or Blocking finding. Findings outside the diff or without a line still go to the body.
 
-If `JIRA_BASE_URL`, `JIRA_EMAIL`, and `JIRA_API_TOKEN` are set on the host, `review-pr` also fetches up to 3 JIRA tickets linked in the PR title, branch, or body and gives their text to the reviewer as untrusted data. The credentials never enter the container, Only private repositories are fetched, and tickets with a security level are skipped. The `--json` result lists each ticket in `context_sources` (`ref`, `status`, and a `reason` when it was not included) without its text. The list is empty when no key was found, and in frozen `--at-sha` mode, which never fetches tickets.
+If `JIRA_BASE_URL`, `JIRA_EMAIL`, and `JIRA_API_TOKEN` are set on the host, `review-pr` also fetches up to 3 JIRA tickets linked in the PR title, branch, or body and gives their text to the reviewer as untrusted data. The credentials never enter the container. Only private repositories are fetched, and tickets with a security level are skipped. The `--json` result lists each ticket in `context_sources` (`ref`, `status`, and a `reason` when it was not included) without its text. The list is empty when no key was found, and in frozen `--at-sha` mode, which never fetches tickets.
 
 Scope `GH_TOKEN` permissions because they are the enforced GitHub boundary for the autonomous container.
 

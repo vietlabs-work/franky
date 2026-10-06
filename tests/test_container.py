@@ -1661,6 +1661,29 @@ def test_build_docker_argv_no_resume_wait_by_default():
     assert "FRANKY_RESUME_WAIT=1" not in e_values
 
 
+def test_run_in_container_redacts_the_stored_atlassian_login_with_tools_off(connect_atlassian):
+    """The refresh token and a previous access token are redacted although no tool is enabled."""
+    connect_atlassian(refresh_token="rt-planted", previous_access_tokens=["prev-planted"])
+    seen = []
+
+    def task(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+
+    runner, _ = _orchestration_runner(task)
+    _code, out = run_in_container(
+        _cfg(),
+        ["pi"],
+        runner=runner,
+        env={},
+        sleeper=NOOP_SLEEP,
+        progress=seen.append,
+        popen=_fake_popen_factory(["leak rt-planted and Bearer prev-planted\n"]),
+    )
+    both = out + "".join(seen)
+    assert "rt-planted" not in both and "prev-planted" not in both
+    assert {"rt-planted", "prev-planted"} <= set(_cfg().secret_values())
+
+
 def test_run_in_container_snapshots_on_timeout():
     """A timed-out run populates snapshot_sink: extract fires BEFORE the task reap, finalize
     after."""

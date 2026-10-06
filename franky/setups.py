@@ -189,6 +189,10 @@ DENY_DIRS = frozenset(
     }
 )
 
+# The Atlassian connection (`franky connect jira`) holds a refresh token: its file and lock never
+# ship, whether swept, globbed or listed explicitly (profile.py checks the resolved name too).
+ATLASSIAN_STORE_NAMES = ("atlassian-jira.json", "atlassian-jira.lock")
+
 # Basename patterns (fnmatch, case-insensitive) never injected. The include allowlist already
 # excludes most of these by construction; this is the second gate, so widening a manifest later
 # cannot accidentally start shipping credentials or local state.
@@ -219,6 +223,7 @@ DENY_NAMES = (
     "settings.json",
     "settings.local.json",
     "token.json",
+    *ATLASSIAN_STORE_NAMES,
 )
 
 # Where a PR-description spec lives by convention across these tools: a `pr` command / prompt

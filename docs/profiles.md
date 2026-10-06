@@ -119,6 +119,8 @@ Every HTTP or HTTPS URL in an MCP config must use a declared host. The runtime p
 | Pi | Inject an MCP extension and its JSON or TOML config. Pi has no built-in MCP config loader. |
 | OpenCode | Use an explicit validated native JSON or TOML config. |
 
+After `franky connect jira`, and when the task repository is private, Franky also adds a built-in MCP server named `atlassian` (the Atlassian MCP server) for Claude and Codex, beside your profile servers. A profile server named `atlassian` is overridden by it. Pi and OpenCode get none. Franky requests read and search scopes only and denies write tools in the engine config; if Atlassian grants broader scopes, read-only is not enforced by Atlassian (`franky connect jira --status` shows the granted scopes).
+
 MCP paths must be explicit files under HOME. Globs and other formats are not supported.
 
 Franky does not install MCP servers. Use binaries in the image or a package runner such as `npx`.

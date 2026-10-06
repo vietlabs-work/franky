@@ -2634,7 +2634,7 @@ def test_build_already_open_json_carries_url(monkeypatch):
     with runner.isolated_filesystem():
         res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo", "--json"])
     assert res.exit_code == 0, res.output
-    data = json.loads(res.output)
+    data = json.loads(res.stdout)
     assert data["status"] == "already_open"
     assert data["pr_url"] == existing
     assert data["branch"]  # the predicted branch is populated
@@ -2734,7 +2734,7 @@ def test_plan_json_emits_one_decomposition_object(monkeypatch):
         res = runner.invoke(cli.main, ["plan", "add a big feature", "--repo", "me/repo", "--json"])
     assert res.exit_code == 0, res.output
     # Exactly one JSON object on stdout, nothing else.
-    data = json.loads(res.output)
+    data = json.loads(res.stdout)
     assert data["fits_one_pr"] is False
     assert [s["title"] for s in data["subtasks"]] == ["part one", "part two"]
     assert data["rationale"] == "two concerns"
@@ -2791,7 +2791,7 @@ def test_plan_json_fits_one_pr_true_happy_path(monkeypatch):
     with runner.isolated_filesystem():
         res = runner.invoke(cli.main, ["plan", "tiny fix", "--repo", "me/repo", "--json"])
     assert res.exit_code == 0, res.output
-    data = json.loads(res.output)
+    data = json.loads(res.stdout)
     assert data["fits_one_pr"] is True
     assert [s["title"] for s in data["subtasks"]] == ["the whole thing"]
     assert data["exit_code"] == 0
@@ -2826,7 +2826,7 @@ def test_plan_no_parseable_plan_exits_7_with_error_object(monkeypatch):
     with runner.isolated_filesystem():
         res = runner.invoke(cli.main, ["plan", "do it", "--repo", "me/repo", "--json"])
     assert res.exit_code == 7, res.output
-    data = json.loads(res.output)
+    data = json.loads(res.stdout)
     # The shared error envelope, NOT a partial decomposition.
     assert "error" in data
     assert "fits_one_pr" not in data
@@ -2845,7 +2845,7 @@ def test_plan_agent_error_exits_7(monkeypatch):
     with runner.isolated_filesystem():
         res = runner.invoke(cli.main, ["plan", "do it", "--repo", "me/repo", "--json"])
     assert res.exit_code == 7, res.output
-    data = json.loads(res.output)
+    data = json.loads(res.stdout)
     assert "error" in data
     assert data["error"]["kind"] == "agent_error"
 
@@ -5043,7 +5043,7 @@ def test_review_pr_passes_jira_secrets_for_stream_redaction_not_env(monkeypatch,
     res = _review(["--engine", "claude", "--no-publish"])
     assert res.exit_code == 0, res.output
     cfg, k = kwargs[0]
-    assert set(k["extra_secrets"]) == {"jira-tok-s3cret", "dev@example.com"}
+    assert {"jira-tok-s3cret", "dev@example.com"} <= set(k["extra_secrets"])
     assert "JIRA_API_TOKEN" not in cfg.passthrough_env
 
 
@@ -5814,3 +5814,120 @@ def test_resolve_stops_when_thread_list_exceeds_page_limit(monkeypatch):
     assert out[0] == "review_published" and out[6] == 0
     graphql = [c for c in gh.calls if c[1] == "graphql"]
     assert len(graphql) == 5 and all(f"query={RESOLVE_MUTATION}" not in c for c in graphql)
+
+
+# --- Atlassian tools: every container-running command applies the same private-repo gate -------
+
+_ATLASSIAN_ENV = dict(_JIRA_ENV)
+_CONNECTION = {
+    "version": 1,
+    "client_id": "cid",
+    "client_secret": None,
+    "token_endpoint": "https://auth.atlassian.com/oauth/token",
+    "revocation_endpoint": None,
+    "refresh_token": "rt-0",
+    "access_token": "at-0",
+    "expires_at": 1.0,
+    "scope": "offline_access read:jira:agent-interface",
+    "connected_at": 1.0,
+    "previous_access_tokens": [],
+}
+
+
+def _atlassian_scenario(command, monkeypatch, tmp_path, private):
+    """Wire `command` hermetically, run it, return the Config run_in_container saw."""
+    seen = []
+    # A stored connection exists; refreshing is stubbed so no network is touched.
+    cli.atlassian._save({}, _CONNECTION)
+    monkeypatch.setattr(
+        cli.atlassian,
+        "access_token",
+        lambda env, **k: cli.atlassian.Token("tok", expires_at=3601.0),
+    )
+
+    def fake_run(cfg, *a, **k):
+        seen.append(cfg)
+        return 0, f"opened {PR_URL}"
+
+    monkeypatch.setattr(cli, "repo_is_private", lambda *a, **k: private)
+    runner = CliRunner()
+    if command == "review-pr":
+        _jira_review_setup(
+            monkeypatch,
+            tmp_path,
+            meta={"private": private},
+            extra_env={},
+        )
+        monkeypatch.setattr(
+            cli,
+            "run_in_container",
+            lambda cfg, *a, **k: (
+                seen.append(cfg),
+                (0, _review_block({"summary": "ok", "findings": [], "checks": []})),
+            )[1],
+        )
+        runner.invoke(cli.main, ["review-pr", "--engine", "claude", "--no-publish", "--", PR_URL])
+        return seen[0]
+    if command in ("job replay", "job resume"):
+        maker = _replay_env if command == "job replay" else _resume_env
+        env = maker(monkeypatch, tmp_path, (0, "x"))
+        env.update(_ATLASSIAN_ENV, CLAUDE_CODE_OAUTH_TOKEN="claude-fake")
+        monkeypatch.setattr(cli, "run_in_container", fake_run)
+        if command == "job replay":
+            monkeypatch.setattr(cli.baseref, "commit_exists", lambda *a, **k: True)
+            job_id = _write_replayable_run(env, tmp_path)
+        else:
+            job_id = _write_resumable_run(env, tmp_path, job_id="beef09")
+        runner.invoke(cli.main, [*command.split(), job_id, "--engine", "claude", "--json"])
+        return seen[0]
+    if command == "job diagnose":
+        env = _diag_setup(monkeypatch, tmp_path, (0, "x"), "n", {})
+        env.update(_ATLASSIAN_ENV, CLAUDE_CODE_OAUTH_TOKEN="claude-fake")
+        monkeypatch.setattr(cli, "run_in_container", fake_run)
+        runner.invoke(
+            cli.main,
+            ["job", "diagnose", _write_failed_run(env, tmp_path), "--engine", "claude", "--json"],
+        )
+        return seen[0]
+    env = {**_iterate_env(), **_ATLASSIAN_ENV, "CLAUDE_CODE_OAUTH_TOKEN": "claude-fake"}
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+    args = {
+        "build": ["build", "do it", "--repo", "me/repo", "--engine", "claude"],
+        "plan": ["plan", "do it", "--repo", "me/repo", "--engine", "claude"],
+        "iterate": ["iterate", PR_URL, "--engine", "claude"],
+    }[command]
+    with runner.isolated_filesystem():
+        runner.invoke(cli.main, args)
+    return seen[0]
+
+
+@pytest.mark.parametrize("private", [True, False])
+@pytest.mark.parametrize(
+    "command",
+    ["build", "plan", "iterate", "review-pr", "job replay", "job resume", "job diagnose"],
+)
+def test_atlassian_header_enters_only_for_private_repos(command, private, monkeypatch, tmp_path):
+    cfg = _atlassian_scenario(command, monkeypatch, tmp_path, private)
+    env = cfg.passthrough_env
+    assert not any(k.startswith("JIRA_") for k in env)  # no JIRA credential enters the container
+    if private:
+        assert env["FRANKY_ATLASSIAN_MCP_HEADER"] == "Bearer tok" and cfg.atlassian_tools
+        assert cfg.extra_allowed_domains == ["mcp.atlassian.com"]
+    else:
+        assert "FRANKY_ATLASSIAN_MCP_HEADER" not in env and not cfg.atlassian_tools
+
+
+def test_job_diagnose_skips_the_privacy_lookup_for_a_repo_off_the_allowlist(monkeypatch, tmp_path):
+    env = _diag_setup(monkeypatch, tmp_path, (0, "x"), "n", {})
+    env.update(_ATLASSIAN_ENV)
+    job_id = _write_failed_run(env, tmp_path)
+    env["FRANKY_ALLOWED_REPOS"] = "other/repo"
+
+    def no_lookup(*a, **k):
+        raise AssertionError("no privacy lookup for a repo outside the allowlist")
+
+    monkeypatch.setattr(cli, "repo_is_private", no_lookup)
+    CliRunner().invoke(cli.main, ["job", "diagnose", job_id, "--json"])

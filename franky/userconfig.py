@@ -184,14 +184,17 @@ def write_config_file(path: Path, data: dict[str, str]) -> None:
                 "refusing to write (would corrupt the file)"
             )
 
-    # Create ~/.franky at 0700 so the containing dir is not world-readable.
-    parent = path.parent
-    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-
     lines = [f"[{_TABLE}]"]
     for key, value in sorted(data.items()):
         lines.append(f'{key} = "{_toml_escape(value)}"')
-    content = "\n".join(lines) + "\n"
+    _atomic_write_0600(path, "\n".join(lines) + "\n")
+
+
+def _atomic_write_0600(path: Path, text: str) -> None:
+    """Write `text` to `path` atomically at mode 0600, creating the parent at 0700."""
+    # Create ~/.franky at 0700 so the containing dir is not world-readable.
+    parent = path.parent
+    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
 
     # Write atomically: temp file in same dir -> os.replace so the file is never
     # half-written (safe for concurrent readers that open -> read -> close).
@@ -200,7 +203,7 @@ def write_config_file(path: Path, data: dict[str, str]) -> None:
     try:
         os.chmod(fd, stat.S_IRUSR | stat.S_IWUSR)  # 0600 before writing
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(content)
+            fh.write(text)
         os.replace(tmp_path, path)
     except Exception:
         # Clean up the temp file if replace failed; ignore secondary errors.

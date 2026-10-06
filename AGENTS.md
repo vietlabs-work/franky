@@ -58,6 +58,7 @@ CLI -> config and task policy -> prompt -> engine command -> container runtime -
 | CLI contract | `cli.py`, `result.py`, `schema.py` | Commands, exit codes, JSON results, machine discovery |
 | Configuration | `config.py`, `userconfig.py`, `engine.py` | Fail-closed settings, credentials, engine selection |
 | Task resolution | `task.py`, `jira.py`, `idempotency.py`, `baseref.py` | Input parsing, repo gates, base commits, duplicate-PR checks |
+| Atlassian | `atlassian.py` | Host-side Atlassian OAuth connection and MCP wiring |
 | Agent instructions | `prompt.py`, `persona.md`, `decompose.py`, `diagnosis.py`, `reviewpr.py`, `sentinel.py` | Prompts and bounded structured output |
 | Runtime | `container.py`, `security.py`, `egress.py`, `franky-dind-entrypoint.sh`, `proxy/` | Docker lifecycle, isolation, policies, proxy |
 | Transfer | `profile.py`, `setups.py`, `snapshot.py` | Bounded, secret-scanned profile and workspace bundles |
@@ -105,6 +106,7 @@ Do not weaken these rules.
 ### Secrets and output
 
 - Pass credentials to task containers as `-e NAME`, never as values on the command line.
+- Only `FRANKY_ATLASSIAN_MCP_HEADER` (`Bearer` plus a short-lived access token) enters a task container for JIRA and Confluence, as `-e NAME`, and only with a stored `franky connect jira` connection and a repo GitHub confirms private. The connection file `~/.franky/atlassian-jira.json` is 0600, host-only, never mounted, and its refresh token never enters a container. Profile and setup scans deny it. The classic `JIRA_API_TOKEN` is host-only (ticket fetch). Every JIRA credential form (token, email, base64 forms, refresh and access tokens, previous access tokens) is redacted and scrubbed whether or not the tools are on.
 - MCP credentials must come from named process environment variables.
 - Send only policy data, such as `FRANKY_ALLOWED_DOMAINS`, by value to the proxy.
 - Redact autonomous output, stored transcripts, diagnostics, and JSON errors before release.
@@ -116,6 +118,7 @@ Do not weaken these rules.
 
 - Refuse an empty repository allowlist, missing `GH_TOKEN`, missing engine credentials, or unsupported OpenCode provider.
 - Gate every task and PR repository with `FRANKY_ALLOWED_REPOS`.
+- Enable the Atlassian tools only for a repo GitHub confirms private.
 - Scope parsed PR URLs to the task repository.
 - Refuse malformed security data, proxy policy, profile data, snapshots, or structured output.
 - Start the task only after the proxy passes its bounded health check.
@@ -146,6 +149,7 @@ Any policy delta must pass pinned-policy tests, `make smoke-security`, and `make
 - Route all task and nested-Docker traffic through the HTTPS-only Squid proxy.
 - Build the provider allowlist from the selected engine and model only.
 - Keep package and container registries explicit in `DOCKER_REGISTRY_DOMAINS`.
+- Add `mcp.atlassian.com` only when the Atlassian tools are on. The host calls `auth.atlassian.com` itself; no other Atlassian host enters the allowlist.
 - Treat allowlisted hosts as trusted destinations. The agent can move its credentials into nested containers.
 - In Squid, `.example.com` matches the apex and subdomains. Do not also add the bare apex.
 
@@ -162,6 +166,7 @@ Any policy delta must pass pinned-policy tests, `make smoke-security`, and `make
 - Secret-scan every injected profile file. Resolve symlinks before deny checks.
 - Skip unscannable setup files. Never inject setup MCP configuration automatically.
 - Keep Codex `--ignore-user-config`. Pass validated MCP servers as explicit overrides.
+- Franky requests read and search scopes only and denies the Atlassian write tools in the engine config (Claude deny patterns, a Codex read-tool allowlist), plus the prompt. If Atlassian grants broader scopes, read-only is not enforced by Atlassian; `--status` shows the granted scopes. Only claude and codex get the tools. A missing, expired or revoked connection turns the tools off with one stderr line and never fails a task.
 - Tell review agents to stay read-only. The host publisher uses COMMENT or REQUEST_CHANGES. It uses APPROVE only behind `--allow-approve`, when no finding above nit is open, nothing was dropped as malformed, and no check failed; the caller must enforce branch protection that dismisses stale approvals on push. An APPROVE with an uncertain outcome is reconciled, never blindly reposted (`publish_uncertain`). `--resolve-fixed` resolves only the publishing bot's own unambiguous matching threads.
 - Keep iterate commits additive. Tell autonomous agents never to merge or force-push.
 

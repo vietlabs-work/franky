@@ -9,6 +9,7 @@ printed. A secret value must never survive into a log file or the terminal.
 from __future__ import annotations
 
 import fnmatch
+import os
 import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
@@ -82,6 +83,22 @@ class Config:
     effort: str | None = None
     memory_mb: int = DEFAULT_MEMORY_MB
     disk_mb: int = DEFAULT_DISK_MB
+    # Every classic JIRA secret string the host holds (and, once enabled, the Atlassian access
+    # token), whether or not the tools are on.
+    jira_secrets: list[str] = field(default_factory=list)
+    atlassian_tools: bool = False
+
+    def enable_atlassian(self, token: str) -> None:
+        """Turn the Atlassian tools on: the short-lived access token (as a header value), the MCP
+        host and the wiring flag. Called only after the caller confirmed a private repo."""
+        from .atlassian import ATLASSIAN_MCP_HEADER_VAR, ATLASSIAN_MCP_HOST
+
+        header = f"Bearer {token}"
+        self.passthrough_env[ATLASSIAN_MCP_HEADER_VAR] = header
+        if ATLASSIAN_MCP_HOST not in self.extra_allowed_domains:
+            self.extra_allowed_domains.append(ATLASSIAN_MCP_HOST)
+        self.jira_secrets.extend(v for v in (token, header) if v not in self.jira_secrets)
+        self.atlassian_tools = True
 
     def secret_values(self) -> list[str]:
         """Secret strings known to the host and therefore available for output redaction.
@@ -89,7 +106,13 @@ class Config:
         Subscription auth.json never crosses the Docker volume boundary, so its contents are
         intentionally neither read nor returned here.
         """
-        return [v for v in self.passthrough_env.values() if v]
+        from .atlassian import stored_secrets
+
+        values = [v for v in self.passthrough_env.values() if v]
+        # The stored Atlassian login (refresh token, current and previous access tokens, client
+        # secret) is redacted from every run whether or not the tools are on.
+        held = stored_secrets(os.environ)
+        return list(dict.fromkeys([*values, *self.jira_secrets, *held]))
 
 
 def validate_allowlist_entry(entry: str) -> None:
@@ -208,6 +231,9 @@ def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
     raw_extra = env.get(EXTRA_ALLOWED_DOMAINS_VAR, "") or ""
     extra_domains = [d.strip() for d in raw_extra.split(",") if d.strip()]
 
+    # Imported here: jira pulls in urllib.request, which every `redact` caller would pay for.
+    from .jira import jira_secret_strings
+
     auth_volume: str | None = None
     if subscription_auth:
         try:
@@ -225,6 +251,7 @@ def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
         effort=effort,
         memory_mb=_resource_budget(env, MEMORY_MB_VAR, DEFAULT_MEMORY_MB, 256, 8192),
         disk_mb=_resource_budget(env, DISK_MB_VAR, DEFAULT_DISK_MB, 1024, 32768),
+        jira_secrets=jira_secret_strings(env),
     )
 
 

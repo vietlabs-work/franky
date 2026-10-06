@@ -126,6 +126,18 @@ def extract_jira_keys(title: str, head_ref: str, body: str, *, limit: int = 3) -
     return keys
 
 
+def jira_secret_strings(env: Mapping[str, str]) -> list[str]:
+    """Every classic-JIRA secret string the host can hold: the email, the token, the bare base64
+    of email:token and its "Basic " header form. Redacted and scrubbed whether or not tools are on."""
+    email = (env.get(JIRA_EMAIL_VAR) or "").strip()
+    token = (env.get(JIRA_API_TOKEN_VAR) or "").strip()
+    out = [email, token]
+    if email and token:
+        b64 = base64.b64encode(f"{email}:{token}".encode()).decode()
+        out += [b64, f"Basic {b64}"]
+    return [v for v in out if v]
+
+
 def jira_configured(env: Mapping[str, str]) -> bool:
     """True when all three JIRA vars are set and non-blank."""
     return all(

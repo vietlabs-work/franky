@@ -1206,3 +1206,53 @@ def test_write_profile_round_trips_the_setups_table(tmp_path):
 
 def test_read_setups_raw_absent_file_is_empty(tmp_path):
     assert read_setups_raw(tmp_path / "nope.toml") == {}
+
+
+# ---------------------------------------------------------------------------
+# The Atlassian login (`franky connect jira`) never ships
+# ---------------------------------------------------------------------------
+
+_LOGIN_JSON = (
+    '{"refresh_token": "rt-0123456789abcdefghij", "access_token": "at-0123456789abcdefghij"}\n'
+)
+
+
+@pytest.mark.parametrize("name", ["atlassian-jira.json", "atlassian-jira.lock"])
+def test_load_profile_refuses_the_atlassian_login_listed_explicitly(tmp_path, name):
+    login = tmp_path / name
+    login.write_text(_LOGIN_JSON, encoding="utf-8")
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text(f'[profile]\nknowledge = ["{login}"]\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="Atlassian login"):
+        load_profile(cfg)
+
+
+def test_load_profile_refuses_the_atlassian_login_matched_by_a_glob(tmp_path):
+    (tmp_path / "atlassian-jira.json").write_text(_LOGIN_JSON, encoding="utf-8")
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text(f'[profile]\nknowledge = ["{tmp_path}/atlassian-*.json"]\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="Atlassian login"):
+        load_profile(cfg)
+
+
+def test_load_profile_refuses_a_symlink_to_the_atlassian_login(tmp_path):
+    login = tmp_path / "atlassian-jira.json"
+    login.write_text(_LOGIN_JSON, encoding="utf-8")
+    link = tmp_path / "notes.md"
+    link.symlink_to(login)
+    cfg = tmp_path / "profile.toml"
+    cfg.write_text(f'[profile]\nknowledge = ["{link}"]\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="Atlassian login"):
+        load_profile(cfg)
+
+
+def test_scanner_refuses_oauth_credential_json_under_any_name():
+    assert scan_for_secrets(_LOGIN_JSON) == ["OAuth credential JSON (refresh_token/access_token)"]
+    assert scan_for_secrets('{"access_token": "short"}') == []
+    assert scan_for_secrets("the refresh_token field rotates") == []
+
+
+def test_scanner_oauth_json_value_may_contain_any_non_space_character():
+    colon = '{"refresh_token": "rt:0123456789:abcdefghij!@#$"}'
+    assert scan_for_secrets(colon) == ["OAuth credential JSON (refresh_token/access_token)"]
+    assert scan_for_secrets('{"access_token": "has a space 0123456789abcdefghij"}') == []
