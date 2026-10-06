@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.13] - 2026-10-06
+
 ### Added
 
 - `franky connect jira` connects Franky to Atlassian with a browser OAuth flow (PKCE, dynamic client registration, loopback redirect; `--no-browser` prints the URL and takes the pasted redirect on a headless host; `--status`, `--disconnect`). No Atlassian admin step. The connection stays in `~/.franky/atlassian-jira.json` (0600) on the host. Every task on a private repo then gets read-only JIRA and Confluence tools from the Atlassian MCP server (`https://mcp.atlassian.com/v2/mcp`) for the Claude and Codex engines: the host refreshes a short-lived access token and passes only `FRANKY_ATLASSIAN_MCP_HEADER` into the container, Franky requests read and search scopes only and denies write tools in the engine config (if Atlassian grants broader scopes, read-only is not enforced by Atlassian; `--status` shows the granted scopes). A missing, expired or revoked connection turns the tools off with one hint line, and a run with the tools on prints when its token expires (a very long run can outlive it). The egress allowlist gains `mcp.atlassian.com` only in that case. `JIRA_API_TOKEN` stays host-side for the ticket fetch.
