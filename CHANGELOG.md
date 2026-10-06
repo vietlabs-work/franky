@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.12] - 2026-10-06
+
 ### Added
 
 - `review-pr` findings carry `evidence` (file:line plus a concrete trigger, max 60 words), `impact` (max 40) and `fix` (max 40) instead of one `body`. A legacy finding with only `body` renders as before; a finding with a title but no content field is dropped as malformed (and blocks `APPROVE`). The `--json` finding list adds the three fields.
