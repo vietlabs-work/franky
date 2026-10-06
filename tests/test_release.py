@@ -649,3 +649,27 @@ def test_changelog_check_ignores_removed_unreleased_duplicate(repo):
     base = "# Changelog\n\n## [Unreleased]\n\n- Same.\n\n## [0.0.1] - 2026-01-01\n\n- Same.\n"
     head = "# Changelog\n\n## [Unreleased]\n\n- New.\n\n## [0.0.1] - 2026-01-01\n\n- Same.\n"
     _check(repo, ["franky/cli.py"], head, base_changelog=base)
+
+
+def test_changelog_check_frozen_only_skips_unreleased_requirement(repo):
+    runner, _ = make_fake_run(
+        [
+            (["git", "diff", "--name-only"], 0, "franky/cli.py\n", ""),
+            (["git", "show"], 0, _BASE_CHANGELOG, ""),
+        ]
+    )
+    (repo / "CHANGELOG.md").write_text(_BASE_CHANGELOG)
+    main(["changelog-check", "--frozen-only", "--base", "abc"], run=runner, root=repo)
+
+
+def test_changelog_check_frozen_only_still_fails_on_released_edit(repo):
+    head = _BASE_CHANGELOG.replace("- Old stuff.", "- Old stuff.\n- Edited history.")
+    runner, _ = make_fake_run(
+        [
+            (["git", "diff", "--name-only"], 0, "README.md\n", ""),
+            (["git", "show"], 0, _BASE_CHANGELOG, ""),
+        ]
+    )
+    (repo / "CHANGELOG.md").write_text(head)
+    with pytest.raises(SystemExit):
+        main(["changelog-check", "--frozen-only", "--base", "abc"], run=runner, root=repo)

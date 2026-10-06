@@ -6,7 +6,8 @@ Subcommands:
   tag X.Y.Z [--dry-run]  - recovery: tag + push only (when commit exists but tag/push failed)
   guard <tag>        - assert pyproject==__init__==tag (CI gate, exits nonzero on skew)
   notes X.Y.Z        - print the changelog section body for X.Y.Z (used as release notes)
-  changelog-check --base SHA - PR gate: shipped code changed => a new ## [Unreleased] bullet
+  changelog-check --base SHA [--frozen-only] - PR gate: shipped code changed => a new
+                               ## [Unreleased] bullet; never a new bullet in a released section
 """
 
 import argparse
@@ -201,6 +202,9 @@ def cmd_changelog_check(args, run, root: Path) -> None:
             file=sys.stderr,
         )
         raise SystemExit(1)
+    if args.frozen_only:
+        print("release.py: released sections unchanged")
+        return
     if not shipped:
         print("release.py: no shipped files changed; no changelog entry needed")
         return
@@ -555,6 +559,11 @@ def main(argv=None, run=None, root=None, sleep=None) -> None:
         "changelog-check", help="PR gate: shipped changes need a new ## [Unreleased] bullet."
     )
     check_parser.add_argument("--base", required=True, metavar="SHA")
+    check_parser.add_argument(
+        "--frozen-only",
+        action="store_true",
+        help="Only fail on a bullet added to a released section (post-merge check).",
+    )
 
     args = parser.parse_args(argv)
 

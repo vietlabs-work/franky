@@ -1,0 +1,28 @@
+name: Changelog frozen
+
+# Post-merge guard for `main`: a PR that was green before a release can still merge a bullet
+# into the new release's section (git places it there). Fail right after the merge, not at
+# `make release`. Release commits move Unreleased bullets on purpose, so they are skipped.
+# The head commit is checked against its parent (squash merges: one commit per PR), so a
+# first push or a force push, where `github.event.before` is unusable, still works.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  frozen:
+    name: frozen
+    if: ${{ !startsWith(github.event.head_commit.message, 'release:') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Released sections are frozen
+        run: python3 scripts/release.py changelog-check --frozen-only --base "HEAD^"
