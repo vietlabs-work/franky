@@ -15,6 +15,7 @@ import io
 import os
 import re
 import secrets
+import shutil
 import stat
 import subprocess
 import sys
@@ -52,6 +53,7 @@ from .container import (
 from . import jobs, snapshot, threads
 from .container import container_running, container_state, deliver_steer, reap_run, run_names
 from .engine import (
+    CLAUDE_TOKEN_VAR,
     CODEX_SUBSCRIPTION_VAR,
     ENGINES,
     PI_PROVIDER_VARS,
@@ -5444,10 +5446,44 @@ def _resolve_codex_auth_volume() -> str:
         raise click.ClickException(str(exc)) from exc
 
 
+def _claude_auth_login() -> None:
+    # A hidden prompt would block forever with no TTY - fail fast instead (never-hang).
+    if not _stdin_is_interactive():
+        raise click.UsageError(
+            "`franky auth login claude` needs a terminal for the token prompt. "
+            f"Pipe the token in with `franky config set {CLAUDE_TOKEN_VAR} --stdin` instead."
+        )
+    if shutil.which("claude"):
+        subprocess.run(["claude", "setup-token"], check=False)
+    else:
+        click.echo("Run `claude setup-token` where Claude Code is installed, then paste the token.")
+    token = click.prompt(CLAUDE_TOKEN_VAR, hide_input=True).strip()
+    if not token:
+        raise click.ClickException(f"no {CLAUDE_TOKEN_VAR} entered")
+    try:
+        set_value(config_file_path(dict(os.environ)), CLAUDE_TOKEN_VAR, token)
+    except ValueError as exc:
+        raise click.ClickException(f"could not update config: {exc}") from exc
+    click.echo("Claude subscription token saved.")
+
+
+def _claude_token_set() -> bool:
+    """The token from the same env a run uses: process env first, then the config file."""
+    env = dict(os.environ)
+    try:
+        load_config_file(env)
+    except ValueError as exc:
+        raise click.ClickException(f"config file error: {exc}") from exc
+    return bool(env.get(CLAUDE_TOKEN_VAR, "").strip())
+
+
 @auth_group.command("login")
-@click.argument("engine", type=click.Choice(["codex"]))
+@click.argument("engine", type=click.Choice(["claude", "codex"]))
 def auth_login(engine: str) -> None:
-    """Log in once from a browserless container using a code opened elsewhere."""
+    """Log in once: codex from a browserless container, claude by saving a setup token."""
+    if engine == "claude":
+        _claude_auth_login()
+        return
     image = _codex_auth_image()
     auth_volume = _resolve_codex_auth_volume()
     _clear_codex_auth_marker()
@@ -5462,9 +5498,16 @@ def auth_login(engine: str) -> None:
 
 
 @auth_group.command("status")
-@click.argument("engine", type=click.Choice(["codex"]))
+@click.argument("engine", type=click.Choice(["claude", "codex"]))
 def auth_status(engine: str) -> None:
-    """Check that the persistent Codex credential is present and validly shaped."""
+    """Check that the engine's subscription credential is present."""
+    if engine == "claude":
+        if not _claude_token_set():
+            raise click.ClickException(
+                f"{CLAUDE_TOKEN_VAR} is not set - run `franky auth login claude`"
+            )
+        click.echo("Claude subscription token is set.")
+        return
     if not _codex_auth_marker_enabled():
         raise click.ClickException("Codex subscription login is not enabled")
     auth_volume = _resolve_codex_auth_volume()
@@ -5474,9 +5517,18 @@ def auth_status(engine: str) -> None:
 
 
 @auth_group.command("logout")
-@click.argument("engine", type=click.Choice(["codex"]))
+@click.argument("engine", type=click.Choice(["claude", "codex"]))
 def auth_logout(engine: str) -> None:
-    """Delete the persistent Codex credential volume and disable subscription auth."""
+    """Remove the engine's stored subscription credential."""
+    if engine == "claude":
+        try:
+            unset_value(config_file_path(dict(os.environ)), CLAUDE_TOKEN_VAR)
+        except ValueError as exc:
+            raise click.ClickException(f"could not update config: {exc}") from exc
+        click.echo("Claude subscription token removed from the config file.")
+        if os.environ.get(CLAUDE_TOKEN_VAR):
+            click.echo(f"{CLAUDE_TOKEN_VAR} is still exported in this shell.", err=True)
+        return
     auth_volume = _resolve_codex_auth_volume()
     _clear_codex_auth_marker()
     if not codex_auth_logout(auth_volume=auth_volume):

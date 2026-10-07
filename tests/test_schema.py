@@ -87,7 +87,7 @@ def test_schema_documents_positional_arguments():
     ]
 
     login_arg = commands["auth"]["commands"]["login"]["arguments"][0]
-    assert login_arg["type"]["choices"] == ["codex"]
+    assert login_arg["type"]["choices"] == ["claude", "codex"]
 
 
 def test_schema_documents_option_types_and_defaults():

@@ -76,7 +76,7 @@ Select an engine with `--engine`, then `FRANKY_ENGINE`, or use the default `pi`.
 | Engine | Authentication | Notes |
 |--------|----------------|-------|
 | `pi` | One supported provider variable | Vendor-neutral BYOK client |
-| `claude` | `CLAUDE_CODE_OAUTH_TOKEN` | Claude Code subscription token |
+| `claude` | `franky auth login claude` or `CLAUDE_CODE_OAUTH_TOKEN` | Claude Code subscription token |
 | `codex` | `franky auth login codex` or `CODEX_API_KEY` | ChatGPT subscription or API key |
 | `opencode` | `FRANKY_MODEL` plus its matching key | Moonshot or OpenRouter |
 
@@ -99,6 +99,8 @@ franky auth login codex
 franky auth status codex
 franky auth logout codex
 ```
+
+`franky auth login claude` runs `claude setup-token` when Claude Code is on the PATH, then saves the token you paste as `CLAUDE_CODE_OAUTH_TOKEN` in the config file. `auth status claude` and `auth logout claude` check and remove it.
 
 Set `FRANKY_CODEX_AUTH_VOLUME` to isolate logins between Franky instances. `CODEX_API_KEY` takes precedence when both methods exist.
 
@@ -171,6 +173,9 @@ A run also keeps `<job_id>.progress.json` beside its record: phase, attempt, las
 | `franky auth login codex` | Create persistent Codex subscription authentication. |
 | `franky auth status codex` | Check the stored Codex authentication. |
 | `franky auth logout codex` | Delete the Codex authentication volume. |
+| `franky auth login claude` | Save a Claude Code subscription token to the config file. |
+| `franky auth status claude` | Check that a Claude token is set. |
+| `franky auth logout claude` | Remove the Claude token from the config file. |
 | `franky config init` | Create or update the user configuration. |
 | `franky config set KEY [VALUE]` | Set one configuration value. Secret values use a hidden prompt, or `--stdin` to read one piped line. |
 | `franky config list` | List configuration values with secrets masked. |

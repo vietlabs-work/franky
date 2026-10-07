@@ -5931,3 +5931,38 @@ def test_job_diagnose_skips_the_privacy_lookup_for_a_repo_off_the_allowlist(monk
 
     monkeypatch.setattr(cli, "repo_is_private", no_lookup)
     CliRunner().invoke(cli.main, ["job", "diagnose", job_id, "--json"])
+
+
+def test_auth_login_claude_runs_setup_token_and_saves_token(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "config"
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)
+    monkeypatch.setattr(cli.shutil, "which", lambda name: "/usr/bin/claude")
+    calls = []
+    monkeypatch.setattr(cli.subprocess, "run", lambda argv, **_kw: calls.append(argv))
+    res = CliRunner().invoke(cli.main, ["auth", "login", "claude"], input="tok-123\n")
+    assert res.exit_code == 0, res.output
+    assert calls == [["claude", "setup-token"]]
+    assert cli.read_config_file(cfg_path)["CLAUDE_CODE_OAUTH_TOKEN"] == "tok-123"
+    assert "tok-123" not in res.output
+
+
+def test_auth_login_claude_without_tty_fails_fast(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "config"
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: False)
+    res = CliRunner().invoke(cli.main, ["auth", "login", "claude"])
+    assert res.exit_code == 2
+    assert not cfg_path.exists()
+
+
+def test_auth_status_and_logout_claude(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "config"
+    monkeypatch.setenv("FRANKY_CONFIG_FILE", str(cfg_path))
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    assert CliRunner().invoke(cli.main, ["auth", "status", "claude"]).exit_code != 0
+    cli.write_config_file(cfg_path, {"CLAUDE_CODE_OAUTH_TOKEN": "tok-123"})
+    res = CliRunner().invoke(cli.main, ["auth", "status", "claude"])
+    assert res.exit_code == 0 and "tok-123" not in res.output
+    assert CliRunner().invoke(cli.main, ["auth", "logout", "claude"]).exit_code == 0
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in cli.read_config_file(cfg_path)

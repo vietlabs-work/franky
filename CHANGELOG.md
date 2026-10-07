@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `franky auth login|status|logout claude`. Before, the `auth` commands accepted only `codex`. `auth login claude` runs `claude setup-token` when Claude Code is on the PATH. It then asks for the token with a hidden prompt and saves it as `CLAUDE_CODE_OAUTH_TOKEN` in the config file. `auth status claude` checks the environment and the config file. `auth logout claude` removes the token from the config file.
+
 ## [0.3.14] - 2026-10-07
 
 ### Changed
