@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- An engine login that is expired, revoked, or refused now ends `build`, `iterate`, `review-pr`, `plan`, and `job replay` with the existing `auth_error` envelope (exit 5) and the message `engine '<engine>' login was refused (expired, revoked or invalid) before any tool call - safe to rerun`, instead of `agent_error` (exit 7). Franky emits it only when no attempt of the run made an engine tool call, so a caller can rerun the same request with another engine. This proves no engine tool call, not that operator hooks or profile MCP servers did nothing. `job resume` keeps `agent_error`, and so does the build pass of `build --plan-first`. The OpenCode missing-credential message now starts with `engine 'opencode' requires <VAR> but it is unset`.
+
 ### Added
 
 - `franky auth login|status|logout claude`. Before, the `auth` commands accepted only `codex`. `auth login claude` runs `claude setup-token` when Claude Code is on the PATH. It then asks for the token with a hidden prompt and saves it as `CLAUDE_CODE_OAUTH_TOKEN` in the config file. `auth status claude` checks the environment and the config file. `auth logout claude` removes the token from the config file.

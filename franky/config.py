@@ -203,7 +203,7 @@ def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
     if not cred_vars and not subscription_auth:
         if opencode_credential:
             raise AuthError(
-                f"{opencode_credential} is unset or empty - refusing "
+                f"engine 'opencode' requires {opencode_credential} but it is unset - refusing "
                 f"(required by {MODEL_VAR}={model})"
             )
         # The hint comes from the engine itself so the refusal names THIS engine's vars -

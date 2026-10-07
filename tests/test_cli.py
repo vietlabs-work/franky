@@ -5990,3 +5990,202 @@ def test_auth_status_and_logout_claude(tmp_path, monkeypatch):
     assert res.exit_code == 0 and "tok-123" not in res.output
     assert CliRunner().invoke(cli.main, ["auth", "logout", "claude"]).exit_code == 0
     assert "CLAUDE_CODE_OAUTH_TOKEN" not in cli.read_config_file(cfg_path)
+
+
+# --- engine login refused before any work -> auth_error envelope (exit 5) ---
+
+# Wording source: the Claude Code CLI's stream-json final `result` event on a bad login.
+CLAUDE_REFUSED = (
+    json.dumps({"type": "result", "is_error": True, "result": "OAuth token has expired"}) + "\n"
+)
+CLAUDE_TOOL = json.dumps(
+    {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash"}]}}
+)
+
+
+def _claude_env(**extra):
+    return {
+        "FRANKY_ALLOWED_REPOS": "me/repo",
+        "GH_TOKEN": "ghp_fake",
+        "CLAUDE_CODE_OAUTH_TOKEN": "tok-fake",
+        "FRANKY_ENGINE": "claude",
+        **extra,
+    }
+
+
+def _assert_auth_envelope(res):
+    assert res.exit_code == 5, res.output
+    lines = res.stdout.strip().splitlines()
+    assert len(lines) == 1
+    err = json.loads(lines[0])
+    assert set(err) == {"error"}
+    assert set(err["error"]) == {"code", "kind", "message", "hint"}
+    assert err["error"]["kind"] == "auth_error"
+    assert err["error"]["message"].startswith("engine 'claude' login was refused")
+
+
+def _only_record():
+    recs = jobs.list_records(None)
+    assert len(recs) == 1
+    return recs[0]
+
+
+def test_build_engine_login_refused_is_auth_error(monkeypatch):
+    _mc_setup(monkeypatch, env=_claude_env(), container=(1, CLAUDE_REFUSED))
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo", "--json"])
+    _assert_auth_envelope(res)
+    assert _only_record()["status"] == "agent_error"
+
+
+def test_build_retry_login_refused_makes_one_attempt_no_diagnose(monkeypatch):
+    _mc_setup(monkeypatch, env=_claude_env(), container=(1, CLAUDE_REFUSED))
+    calls = []
+    monkeypatch.setattr(
+        cli, "run_in_container", lambda *a, **k: calls.append(1) or (1, CLAUDE_REFUSED)
+    )
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(
+            cli.main, ["build", "do it", "--repo", "me/repo", "--json", "--retry", "2"]
+        )
+    _assert_auth_envelope(res)
+    assert len(calls) == 1
+
+
+def test_build_retry_refusal_on_later_attempt_stays_agent_error(monkeypatch):
+    _mc_setup(monkeypatch, env=_claude_env())
+    outs = iter([(1, "tests failed, pushed a branch"), (1, CLAUDE_REFUSED), (1, "diag")])
+    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: next(outs))
+    monkeypatch.setattr(
+        cli, "_diagnose", lambda *a, **k: ({"retryable": True, "retry_hint": "again"}, 0)
+    )
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(
+            cli.main, ["build", "do it", "--repo", "me/repo", "--json", "--retry", "1"]
+        )
+    assert res.exit_code == 7, res.output
+    assert json.loads(res.stdout)["status"] == "agent_error"
+
+
+@pytest.mark.parametrize(
+    "output",
+    [CLAUDE_TOOL + "\n" + CLAUDE_REFUSED, "x" * 70000 + "\n" + CLAUDE_REFUSED],
+    ids=["after-tool-use", "output-over-tail"],
+)
+def test_build_login_refused_after_work_stays_agent_error(monkeypatch, output):
+    _mc_setup(monkeypatch, env=_claude_env(), container=(1, output))
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo", "--json"])
+    assert res.exit_code == 7, res.output
+    assert json.loads(res.stdout)["status"] == "agent_error"
+
+
+def test_iterate_engine_login_refused_is_auth_error(monkeypatch):
+    _mc_setup(monkeypatch, env=_claude_env(), container=(1, CLAUDE_REFUSED))
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["iterate", PR_URL, "--json"])
+    _assert_auth_envelope(res)
+    assert _only_record()["status"] == "agent_error"
+
+
+def test_review_pr_engine_login_refused_is_auth_error_and_never_publishes(monkeypatch):
+    calls = _mc_review_setup(monkeypatch, env=_claude_env(), container=(1, CLAUDE_REFUSED))
+    published = []
+    monkeypatch.setattr(cli, "_publish_review", lambda *a, **k: published.append(1))
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["review-pr", PR_URL, "--json"])
+    _assert_auth_envelope(res)
+    assert not published and len(calls) == 0
+    assert _only_record()["status"] == "agent_error"
+
+
+def test_plan_engine_login_refused_is_auth_error(monkeypatch):
+    _mc_setup(monkeypatch, env=_claude_env(), container=(1, CLAUDE_REFUSED))
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["plan", "do it", "--repo", "me/repo", "--json"])
+    _assert_auth_envelope(res)
+
+
+def test_build_plan_first_engine_login_refused_is_auth_error(monkeypatch):
+    _mc_setup(monkeypatch, env=_claude_env(), container=(1, CLAUDE_REFUSED))
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(
+            cli.main, ["build", "do it", "--repo", "me/repo", "--plan-first", "--json"], input="y\n"
+        )
+    _assert_auth_envelope(res)
+
+
+def test_job_resume_engine_login_refused_stays_agent_error(monkeypatch, tmp_path):
+    # The resumed build may already have pushed commits, so resume never claims "safe to rerun".
+    env = _resume_env(monkeypatch, tmp_path, (1, CLAUDE_REFUSED))
+    env.pop("OPENROUTER_API_KEY")
+    env.update(_claude_env())
+    job_id = _write_resumable_run(env, tmp_path, job_id="beef0a")
+    res = CliRunner().invoke(cli.main, ["job", "resume", job_id, "--json"])
+    assert res.exit_code == 7, res.output
+    assert json.loads(res.stdout)["status"] == "agent_error"
+
+
+def test_job_replay_engine_login_refused_is_auth_error(monkeypatch, tmp_path):
+    env = _resume_env(monkeypatch, tmp_path, (1, CLAUDE_REFUSED))
+    env.pop("OPENROUTER_API_KEY")
+    env.update(_claude_env())
+    job_id = _write_resumable_run(env, tmp_path, job_id="beef0b", with_snapshot=False)
+    res = CliRunner().invoke(cli.main, ["job", "replay", job_id, "--json"])
+    _assert_auth_envelope(res)
+
+
+@pytest.mark.parametrize("command", ["iterate", "review-pr"])
+def test_thread_retry_after_work_then_login_refused_stays_agent_error(
+    monkeypatch, tmp_path, command
+):
+    # Attempt 1 made a tool call then failed; the seeded retry is a clean 401. Work happened in
+    # an earlier attempt, so the refusal must not claim "safe to rerun".
+    _mc_setup(monkeypatch, env=_claude_env(), container=(1, CLAUDE_REFUSED))
+    outs = iter([(1, CLAUDE_TOOL + "\nboom"), (1, CLAUDE_REFUSED)])
+    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: next(outs))
+    if command == "review-pr":
+        _mc_review_setup(monkeypatch, env=_claude_env(), container=(1, CLAUDE_REFUSED))
+        monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: next(outs))
+    monkeypatch.setattr(cli, "_thread_retry", _retry_once_stub())
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, [command, PR_URL, "--json"])
+    assert res.exit_code == 7, res.output
+    assert json.loads(res.stdout)["status"] == "agent_error"
+
+
+def _retry_once_stub():
+    """Force exactly one retry after a failed first attempt (a thread would do this itself)."""
+    seen = []
+
+    def stub(thread, record, **k):
+        if seen:
+            return None
+        seen.append(1)
+        return record, "seeded", "resume_failed"
+
+    return stub
+
+
+def test_build_plan_first_refusal_in_build_pass_stays_agent_error(monkeypatch):
+    _mc_setup(monkeypatch, env=_claude_env())
+    outs = iter([(0, "the plan"), (1, CLAUDE_REFUSED)])
+    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: next(outs))
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(
+            cli.main, ["build", "do it", "--repo", "me/repo", "--plan-first", "--json"], input="y\n"
+        )
+    assert res.exit_code == 7, res.output
+    assert json.loads(res.stdout)["status"] == "agent_error"

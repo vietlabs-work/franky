@@ -586,7 +586,7 @@ def build(
                     kind="timeout",
                 )
             if code != 0:
-                raise FrankyError(
+                raise _engine_auth_error(cfg, code, output) or FrankyError(
                     f"planning pass exited non-zero ({code}) - see the redacted log "
                     f"({plan_log_path})",
                     code=EXIT_AGENT,
@@ -658,6 +658,8 @@ def build(
                 task_full=task_full,
                 base_sha=base_sha,
                 thread=use_thread,
+                # A --plan-first plan pass already ran in this invocation: not the first pass.
+                first_attempt=attempt_no == 1 and not plan_first,
             )
             attempts.append(
                 {"job_id": final["job_id"], "status": final["status"], "retry_hint": ""}
@@ -894,6 +896,7 @@ def iterate(
             nonce = _make_nonce()
         # Populated (best-effort) by run_in_container just before container teardown (issue #69).
         diagnostics: dict = {}
+        work_sink: dict = {"clean": True}
         code, output, duration, record, mode, plan_reason, run_kwargs, incoming = _thread_pass(
             cfg,
             build_iterate_prompt(spec, operator_setup=setup_block, prior=prior, nonce=nonce),
@@ -916,6 +919,7 @@ def iterate(
             progress=progress,
             timeout=max_duration,
             diagnostics=diagnostics,
+            work_sink=work_sink,
         )
 
         usage = _parse_usage_safe(output)
@@ -975,6 +979,8 @@ def iterate(
             log_path=log_path,
             diagnostics=diagnostics,
         )
+        if auth_error := _engine_auth_error(cfg, code, output, clean=work_sink["clean"]):
+            raise auth_error
         result = build_result(
             status=status,
             pr_url=spec.text,
@@ -1782,6 +1788,7 @@ def review_pr(
         diagnostics: dict = {}
         # A failed resumed attempt never blocks the review: _thread_pass drops that session and
         # retries once in this run as a seeded session (new id, prior findings in the prompt).
+        work_sink: dict = {"clean": True}
         code, output, duration, record, mode, plan_reason, run_kwargs, incoming = _thread_pass(
             cfg,
             prompt,
@@ -1804,6 +1811,7 @@ def review_pr(
             progress=progress,
             timeout=max_duration,
             diagnostics=diagnostics,
+            work_sink=work_sink,
             private_prompt=instructions_file is not None,
             extra_secrets=cfg_secrets_safe(),
         )
@@ -1957,6 +1965,9 @@ def review_pr(
                 "no_publish": True if no_publish else None,
             },
         )
+        # Reached only when the agent failed (code != 0), so _publish_review never ran.
+        if auth_error := _engine_auth_error(cfg, code, output, clean=work_sink["clean"]):
+            raise auth_error
         result = build_result(
             status=status,
             pr_url=canonical_pr_url,
@@ -2108,7 +2119,7 @@ def plan(
                 kind="timeout",
             )
         if code != 0:
-            raise FrankyError(
+            raise _engine_auth_error(cfg, code, output) or FrankyError(
                 f"plan pass exited {code} - see the redacted log ({decompose_log_path})",
                 code=EXIT_AGENT,
                 kind="agent_error",
@@ -2234,6 +2245,35 @@ def _startup_rejected(output) -> bool:
     return threads.startup_rejected(tail, truncated=len(tail) >= _TAIL_CHARS)
 
 
+def _engine_auth_error(cfg, code, output, *, clean=True) -> AuthError | None:
+    """An AuthError when the engine's own login was refused before any tool call, else None.
+
+    Safe-to-rerun contract (C1): only a short output (the whole run fits the tail window) whose
+    engine-specific reading shows an auth refusal and no tool call, and only when `clean` (no
+    earlier attempt of this invocation did work). Callers raise it AFTER the run record is
+    written, so the job stays agent_error. Proves no engine tool call, not that operator hooks
+    or profile MCP servers did nothing."""
+    if not clean or code in (0, CONTAINER_TIMEOUT_CODE):
+        return None
+    tail = _output_tail(output)
+    if len(tail) >= _TAIL_CHARS or not cfg.engine.auth_refused(tail):
+        return None
+    return AuthError(
+        f"engine '{cfg.engine.name}' login was refused (expired, revoked or invalid) "
+        "before any tool call - safe to rerun",
+        hint=f"renew the engine login: {cfg.engine.cred_hint()}",
+    )
+
+
+def _attempt_clean(cfg, code, output) -> bool:
+    """True when one finished attempt provably did no work: the engine refused the session at
+    startup, or refused its login before any tool call."""
+    if _startup_rejected(output):
+        return True
+    tail = _output_tail(output)
+    return len(tail) < _TAIL_CHARS and cfg.engine.auth_refused(tail)
+
+
 def _open_thread(repo: str, pr: int, role: str):
     """Open and lock one thread, mapping store errors onto the CLI contract (exit 4 when busy
     or invalid, exit 3 when the store is not writable)."""
@@ -2355,9 +2395,12 @@ def _thread_pass(
     diagnostics,
     private_prompt=False,
     extra_secrets=(),
+    work_sink=None,
 ):
     """Run a `review-pr` or `iterate` pass: one attempt, plus the one seeded retry
     `_thread_retry` allows on a thread. Without a thread it is exactly one plain `_run_pass`.
+
+    `work_sink["clean"]` is set False when an attempt that was then retried may have done work.
 
     Returns (code, output, duration, record, mode, reason, run_kwargs, copy-out dir or None)."""
     duration = 0.0
@@ -2414,6 +2457,8 @@ def _thread_pass(
         )
         if retry is None:
             return code, output, duration, record, mode, reason, run_kwargs, incoming
+        if work_sink is not None and not _attempt_clean(cfg, code, output):
+            work_sink["clean"] = False
         record, mode, reason = retry
         retried = True
         _liveness(job_id, phase="setup", attempt=2, retry_reason=reason)
@@ -3330,6 +3375,7 @@ def _build_once(
     base_sha=None,
     setup_block="",
     thread=False,
+    first_attempt=False,
 ) -> dict:
     """Run ONE build attempt end to end and return its outcome (issue #64 #5).
 
@@ -3445,6 +3491,9 @@ def _build_once(
             secrets=secrets,
             env=env,
         )
+    # Only the FIRST attempt: an earlier attempt of a --retry loop may already have pushed.
+    if first_attempt and (auth_error := _engine_auth_error(cfg, code, output)):
+        raise auth_error
     return outcome
 
 
@@ -4620,6 +4669,8 @@ def job_replay(
             env=os.environ,
         )
 
+        if auth_error := _engine_auth_error(cfg, code, output):
+            raise auth_error
         result = build_result(
             status=status,
             pr_url=pr_url,

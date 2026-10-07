@@ -466,3 +466,11 @@ def test_load_config_rejects_bad_or_unsupported_effort(engine, effort):
     )
     with pytest.raises(ConfigError, match="FRANKY_EFFORT"):
         load_config(engine, env)
+
+
+def test_load_config_opencode_missing_credential_uses_engine_requires_wording():
+    env = _env(FRANKY_MODEL="openrouter/anthropic/claude-x")
+    del env["OPENROUTER_API_KEY"]
+    with pytest.raises(ValueError) as exc:
+        load_config("opencode", env)
+    assert str(exc.value).startswith("engine 'opencode' requires OPENROUTER_API_KEY ")

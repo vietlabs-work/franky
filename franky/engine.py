@@ -258,6 +258,31 @@ def tool_name(line: str) -> str | None:
     return None
 
 
+def _events(tail: str):
+    """Parsed JSON object per JSONL line of an output tail (non-JSON lines skipped).
+
+    Raises ValueError on a line that looks like JSON but does not parse, so a caller that
+    must fail closed can treat a damaged stream as unknown."""
+    for line in tail.splitlines():
+        line = line.strip()
+        if line.startswith("{"):
+            event = json.loads(line)
+            if isinstance(event, dict):
+                yield line, event
+
+
+_CLAUDE_AUTH_RE = re.compile(
+    r"(?i)API Error: 401|authentication_error|invalid api key"
+    r"|oauth token (?:has expired|revoked)|please run /login"
+)
+_CODEX_AUTH_RE = re.compile(
+    r"(?i)unexpected status 401 Unauthorized"
+    r"|refresh token (?:was already used|has expired|is invalid|was revoked)"
+    r"|invalid_grant|invalid api key|incorrect api key|sign in again|log ?out and sign in"
+)
+_CODEX_ABORT = "franky: Codex subscription login is missing or invalid"
+
+
 class Engine:
     """Base engine. Subclasses set `name` and implement the required behaviours."""
 
@@ -308,6 +333,14 @@ class Engine:
         `required_env` returns [] (no creds at all), so it answers "what should the operator
         set" rather than "which creds are usable now"."""
         raise NotImplementedError
+
+    def auth_refused(self, tail: str) -> bool:
+        """True when the output tail shows the engine's own login was refused before any work.
+
+        Base: False (the engine keeps today's agent_error handling). Conservative by design:
+        a refusal only counts when the stream shows no tool call, so a rerun is side-effect free.
+        """
+        return False
 
     def distill_line(self, line: str) -> str | None:
         """Return a compact progress summary for one redacted output line, or None to skip.
@@ -442,6 +475,23 @@ class ClaudeEngine(Engine):
     def cred_hint(self) -> str:
         return f"set {CLAUDE_TOKEN_VAR}"
 
+    def auth_refused(self, tail: str) -> bool:
+        # Only the result event's own text counts, never assistant text; any tool call = work.
+        refused = False
+        try:
+            for line, event in _events(tail):
+                if tool_name(line):
+                    return False
+                if (
+                    event.get("type") == "result"
+                    and event.get("is_error") is True
+                    and _CLAUDE_AUTH_RE.search(str(event.get("result") or ""))
+                ):
+                    refused = True
+        except ValueError:
+            return False
+        return refused
+
     def distill_line(self, line: str) -> str | None:
         line = line.strip()
         if not line.startswith("{"):
@@ -468,6 +518,26 @@ class ClaudeEngine(Engine):
 class CodexEngine(Engine):
     name = "codex"
     supports_steering = True
+
+    def auth_refused(self, tail: str) -> bool:
+        try:
+            events = list(_events(tail))
+        except ValueError:
+            return False
+        if not events:
+            # Franky's own pre-run abort: the whole output is that one line.
+            return tail.lstrip().startswith(_CODEX_ABORT)
+        refused = False
+        for line, event in events:
+            etype = str(event.get("type") or "")
+            if tool_name(line) or etype.startswith("item."):
+                return False
+            err = event.get("error")
+            msg = err.get("message") if isinstance(err, dict) else None
+            msg = str(event.get("message") or msg or "")
+            if etype in ("error", "turn.failed") and "mcp" not in msg.lower():
+                refused = refused or bool(_CODEX_AUTH_RE.search(msg))
+        return refused
 
     def inner_argv(
         self, prompt: str, model: str | None, *, session_id: str | None = None, resume: bool = False

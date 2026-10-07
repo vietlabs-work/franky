@@ -759,3 +759,121 @@ def test_engines_without_native_resume_ignore_session_kwargs(cls):
         assert engine.inner_argv("go", model, session_id=SESSION, resume=True) == engine.inner_argv(
             "go", model
         )
+
+
+# --- auth_refused (shared-brain contract: engine login refused before any work) ---
+
+
+def _claude_result(text, *, is_error=True):
+    return json.dumps({"type": "result", "is_error": is_error, "result": text}) + "\n"
+
+
+# Wording source: the Claude Code CLI prints these in the final stream-json `result` event.
+@pytest.mark.parametrize(
+    "text",
+    [
+        "OAuth token has expired. Please run /login",
+        "OAuth token revoked",
+        "Invalid API key - Please run /login",
+        'API Error: 401 {"type":"authentication_error"}',
+    ],
+)
+def test_claude_auth_refused_on_result_error(text):
+    assert ClaudeEngine().auth_refused(_claude_result(text)) is True
+
+
+def test_claude_auth_refused_false_after_tool_use():
+    work = json.dumps(
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {}}]},
+        }
+    )
+    assert ClaudeEngine().auth_refused(work + "\n" + _claude_result("Invalid API key")) is False
+
+
+def test_claude_auth_refused_false_for_non_auth_error_or_non_error():
+    assert ClaudeEngine().auth_refused(_claude_result("max turns reached")) is False
+    assert ClaudeEngine().auth_refused(_claude_result("Invalid API key", is_error=False)) is False
+
+
+def test_claude_auth_refused_ignores_assistant_text():
+    text = json.dumps(
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "401 Invalid API key"}]},
+        }
+    )
+    assert ClaudeEngine().auth_refused(text + "\n" + _claude_result("boom")) is False
+
+
+# Wording source: the Codex CLI `exec --json` stream (`error` / `turn.failed` events).
+@pytest.mark.parametrize(
+    "line",
+    [
+        {"type": "turn.failed", "error": {"message": "unexpected status 401 Unauthorized: x"}},
+        {"type": "error", "message": "Your refresh token was already used"},
+    ],
+)
+def test_codex_auth_refused_on_error_events(line):
+    assert CodexEngine().auth_refused(json.dumps(line) + "\n") is True
+
+
+def test_codex_auth_refused_on_franky_abort_line():
+    out = "franky: Codex subscription login is missing or invalid - run `franky auth login codex`"
+    assert CodexEngine().auth_refused(out) is True
+
+
+@pytest.mark.parametrize(
+    "work", [{"type": "item.started", "item": {"type": "file_change"}}, {"type": "item.completed"}]
+)
+def test_codex_auth_refused_false_after_work(work):
+    fail = {"type": "turn.failed", "error": {"message": "401 Unauthorized"}}
+    out = json.dumps(work) + "\n" + json.dumps(fail) + "\n"
+    assert CodexEngine().auth_refused(out) is False
+
+
+def test_codex_auth_refused_false_for_non_auth_error():
+    out = json.dumps({"type": "turn.failed", "error": {"message": "rate limited"}})
+    assert CodexEngine().auth_refused(out) is False
+
+
+def test_pi_and_opencode_never_report_auth_refused():
+    out = _claude_result("Invalid API key")
+    assert PiEngine().auth_refused(out) is False
+    assert OpenCodeEngine().auth_refused(out) is False
+
+
+def test_auth_refused_fails_closed_on_a_damaged_json_line():
+    damaged = '{"type": "result", "is_error": tru\n' + _claude_result("Invalid API key")
+    assert ClaudeEngine().auth_refused(damaged) is False
+    fail = json.dumps({"type": "turn.failed", "error": {"message": "401 Unauthorized"}})
+    assert CodexEngine().auth_refused('{"broken\n' + fail) is False
+
+
+def test_codex_abort_line_must_start_the_output_with_no_events():
+    abort = "franky: Codex subscription login is missing or invalid - run it"
+    assert CodexEngine().auth_refused("  " + abort) is True
+    assert CodexEngine().auth_refused("note: " + abort) is False
+    assert CodexEngine().auth_refused("some log\n" + abort) is False
+    event = json.dumps({"type": "thread.started"})
+    assert CodexEngine().auth_refused(abort + "\n" + event) is False
+
+
+@pytest.mark.parametrize(
+    "msg",
+    [
+        "failed to refresh token: connection timed out",
+        "dns error: failed to lookup address",
+        "unexpected status 500 Internal Server Error",
+        "MCP client for linear failed: unexpected status 401 Unauthorized",
+        "retrying after 401 ms",
+    ],
+)
+def test_codex_auth_refused_ignores_non_auth_errors(msg):
+    assert CodexEngine().auth_refused(json.dumps({"type": "error", "message": msg})) is False
+
+
+@pytest.mark.parametrize("text", ["took 401 ms", "port 401 closed", "HTTP 500 error"])
+def test_claude_auth_refused_ignores_bare_401(text):
+    assert ClaudeEngine().auth_refused(_claude_result(text)) is False
