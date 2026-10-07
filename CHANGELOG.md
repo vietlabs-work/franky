@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `franky auth login|status|logout claude`. Before, the `auth` commands accepted only `codex`. `auth login claude` runs `claude setup-token` when Claude Code is on the PATH. It then asks for the token with a hidden prompt and saves it as `CLAUDE_CODE_OAUTH_TOKEN` in the config file. `auth status claude` checks the environment and the config file. `auth logout claude` removes the token from the config file.
 
+### Fixed
+
+- A threaded `review-pr` re-review that leaves out an earlier finding above `nit` no longer lets it disappear. The finding stays open: it blocks `--allow-approve` for that run, and it is carried into the thread's next handoff, so the next re-review must report it again. The review body lists it as "Not re-reported, still open", and an omitted blocking finding gives `REQUEST_CHANGES`. Each reported finding accounts for one earlier finding (same file and title first, then the same title, ignoring case and end punctuation), so a repeated title cannot clear two. Before, an omitted finding left the gate and the handoff, and the following run could post an `APPROVE`.
+- The thread handoff keeps questions ahead of nits under its 40-finding cap. If the cap ever cuts a finding above `nit`, the handoff records `overflow`, and that thread never auto-approves again (`franky threads purge` resets it).
+
 ## [0.3.14] - 2026-10-07
 
 ### Changed

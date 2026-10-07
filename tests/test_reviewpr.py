@@ -462,6 +462,21 @@ def test_body_only_fallback_keeps_up_to_eight_findings():
     assert all(f"**Major: t{i}**" in body for i in range(MAX_INLINE)) and "more" not in body
 
 
+def test_prior_finding_left_out_of_a_re_review_blocks_approve():
+    shaped = _shape(threaded=True)
+    assert review_event(shaped, allow_approve=True) == "APPROVE"
+    shaped["omitted_prior"] = [{"title": "Guard the null list", "severity": "normal"}]
+    assert review_event(shaped, allow_approve=True) == "COMMENT"
+    body = render_review_body(shaped, "a" * 40)
+    assert "Not re-reported, still open: Guard the null list" in body
+    assert "1 finding (0 blocking)" in body
+    shaped["omitted_prior"] = [{"title": "Race", "severity": "blocking", "file": "a.py"}]
+    assert review_event(shaped) == "REQUEST_CHANGES"
+    over = _shape(threaded=True)
+    over["prior_overflow"] = True
+    assert review_event(over, allow_approve=True) == "COMMENT"
+
+
 def test_open_question_over_the_cap_still_blocks_approve():
     def q(t, status):
         return {"title": t, "body": "why", "severity": "question", "status": status}

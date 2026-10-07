@@ -424,11 +424,72 @@ def test_build_handoff_keeps_blocking_findings_first_under_the_cap():
     findings = [{"title": f"nit{i}", "severity": "nit"} for i in range(45)]
     findings += [{"title": "odd", "severity": "weird"}, {"title": "norm", "severity": "normal"}]
     findings += [{"title": f"block{i}", "severity": "blocking"} for i in range(2)]
-    titles = [
-        f["title"] for f in threads.build_handoff({"findings": findings}, "s", [])["findings"]
-    ]
+    handoff = threads.build_handoff({"findings": findings}, "s", [])
+    titles = [f["title"] for f in handoff["findings"]]
     assert titles[:3] == ["block0", "block1", "norm"]
-    assert titles[3:5] == ["nit0", "nit1"] and len(titles) == 40
+    assert titles[3:6] == ["odd", "nit0", "nit1"] and len(titles) == 40
+    assert "overflow" not in handoff  # only nits were cut
+
+
+def test_build_handoff_overflow_when_the_cap_cuts_a_finding_above_nit_and_it_sticks():
+    findings = [{"title": f"m{i}", "severity": "normal"} for i in range(41)]
+    assert threads.build_handoff({"findings": findings}, "s", [])["overflow"] is True
+    questions_first = [{"title": f"n{i}", "severity": "nit"} for i in range(40)]
+    questions_first.append({"title": "q", "severity": "question"})
+    kept = threads.build_handoff({"findings": questions_first}, "s", [])
+    assert kept["findings"][0]["title"] == "q" and "overflow" not in kept  # nits go first
+    sticky = threads.build_handoff({"findings": [], "prior_overflow": True}, "s", [])
+    assert sticky["overflow"] is True
+
+
+def test_omitted_prior_findings_stay_open_and_carry_into_the_next_handoff():
+    prior = threads.build_handoff(
+        {
+            "findings": [
+                {"title": f"Fix   {SECRET} leak", "severity": "blocking", "file": "a.py"},
+                {"title": "Guard the null list", "severity": "normal"},
+                {"title": "Confirm the prod flag", "severity": "question"},
+                {"title": "Rename x", "severity": "nit"},
+            ]
+        },
+        "a" * 40,
+        [SECRET],
+    )
+    # The re-review reports the first finding (same title, after the same cleaning) and
+    # leaves out the normal and the question; the left-out nit does not count.
+    shaped = {"findings": [{"title": f"Fix {SECRET} leak", "severity": "blocking"}]}
+    omitted = threads.omitted_prior(shaped, prior, [SECRET])
+    assert [f["title"] for f in omitted] == ["Guard the null list", "Confirm the prod flag"]
+    assert all(f["status"] == "open" for f in omitted)
+    shaped["omitted_prior"] = omitted
+    titles = [f["title"] for f in threads.build_handoff(shaped, "b" * 40, [SECRET])["findings"]]
+    assert "Guard the null list" in titles and "Confirm the prod flag" in titles
+    assert threads.omitted_prior({"findings": []}, None, []) == []  # first run: no prior
+
+
+def test_omitted_prior_matches_one_to_one_and_ignores_case_and_end_punctuation():
+    def h(*fs):
+        return {"findings": [{"severity": "normal", "status": "open", **f} for f in fs]}
+
+    prior = h({"title": "Guard null", "file": "a.py"}, {"title": "Guard null", "file": "b.py"})
+    # One report under a repeated title clears only one prior finding: the same file first.
+    one = {"findings": [{"title": "Guard null", "file": "b.py", "status": "resolved"}]}
+    assert [f["file"] for f in threads.omitted_prior(one, prior, [])] == ["a.py"]
+    # A report on another file still accounts for one prior finding, by title.
+    moved = {"findings": [{"title": "Guard null", "file": "c.py"}]}
+    assert len(threads.omitted_prior(moved, prior, [])) == 1
+    both = {"findings": [{"title": "guard NULL.", "file": "a.py"}, {"title": "Guard null"}]}
+    assert threads.omitted_prior(both, prior, []) == []
+
+
+def test_carried_finding_drops_out_once_a_re_review_resolves_it():
+    carried = {"title": "Guard null", "file": "a.py", "severity": "normal", "status": "open"}
+    handoff = threads.build_handoff({"findings": [], "omitted_prior": [carried]}, "s", [])
+    assert [f["title"] for f in handoff["findings"]] == ["Guard null"]
+    fixed = {"findings": [{"title": "Guard null", "file": "a.py", "status": "resolved"}]}
+    assert threads.omitted_prior(fixed, handoff, []) == []
+    assert threads.build_handoff(fixed, "s", [])["findings"] == []
+    assert threads.omitted_prior({"findings": []}, {"findings": "bad"}, []) == []
 
 
 def _finish(thread, record, **overrides):

@@ -1853,6 +1853,9 @@ def review_pr(
                 exit_code = EXIT_AGENT
             else:
                 shaped = build_review_findings(parsed, threaded=thread is not None)
+                if thread is not None:
+                    shaped["omitted_prior"] = threads.omitted_prior(shaped, prior_handoff, secrets)
+                    shaped["prior_overflow"] = bool((prior_handoff or {}).get("overflow"))
                 findings_summary = shaped["summary"]
                 checks = shaped["checks"]
                 if no_publish:

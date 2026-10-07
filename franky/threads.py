@@ -80,7 +80,7 @@ _ID_RE = re.compile(r"[A-Za-z0-9_.-]+__[1-9][0-9]*__(?:reviewer|author)")
 _SESSION_DIRS = ("session", "session.new", "session.old")
 # Every temp file or dir the store creates inside a thread dir; swept by open_thread and purge.
 _TMP_PREFIX = ".tmp-"
-_SEVERITY_ORDER = {"blocking": 0, "normal": 1}
+_SEVERITY_ORDER = {"blocking": 0, "normal": 1, "question": 2, "nit": 3}
 
 # Engine error lines meaning the stored session is unusable. Matched only on a failed run and
 # only on non-JSON lines, so PR content that a tool echoed into the event stream cannot match.
@@ -480,11 +480,52 @@ def _clean_text(value, limit: int, secrets) -> str | None:
     return " ".join(text.split())[:limit]
 
 
+def _title_key(title, secrets) -> str:
+    """A title as the handoff stores it, without case or trailing punctuation."""
+    return (_clean_text(title, 200, secrets) or "").casefold().rstrip(".:;!? ")
+
+
+def omitted_prior(shaped: dict, handoff: dict | None, secrets) -> list[dict]:
+    """The prior handoff's findings above nit that a threaded re-review left out.
+
+    The re-review must report every prior finding under its exact title. One it leaves out is
+    neither shown nor resolved, so it stays open: it blocks APPROVE and it is carried into the
+    next handoff. Each reported finding accounts for one prior finding only: the same file and
+    title first, then the same title, so a repeated title cannot clear two prior findings."""
+    pool = [
+        (_title_key(f.get("title"), secrets), _clean_text(f.get("file"), 200, secrets))
+        for f in shaped.get("findings", [])
+    ]
+    prior = (handoff or {}).get("findings")
+    prior = [
+        (f, _title_key(f.get("title"), secrets), f.get("file"))
+        for f in (prior if isinstance(prior, list) else [])
+        if isinstance(f, dict) and f.get("severity") != "nit"
+    ]
+    unmatched = []
+    for f, title, file_ in prior:  # pass 1: same file and title
+        if (title, file_) in pool:
+            pool.remove((title, file_))
+        else:
+            unmatched.append((f, title))
+    omitted = []
+    for f, title in unmatched:  # pass 2: same title, another or no file
+        hit = next((p for p in pool if p[0] == title), None)
+        if hit is None:
+            omitted.append({**f, "status": "open"})
+        else:
+            pool.remove(hit)
+    return omitted
+
+
 def build_handoff(shaped: dict, sha: str, secrets, review_url: str | None = None) -> dict:
     """The bounded, redacted summary a later run is seeded with: no finding bodies, resolved
     findings dropped, blocking first, at most HANDOFF_MAX_FINDINGS entries, text on one line.
-    `review_url` (a GitHub PR review permalink, else ignored) lets the next run link back."""
+    `review_url` (a GitHub PR review permalink, else ignored) lets the next run link back.
+    `overflow` is set when the cap cut a finding above nit, and it stays set for the thread:
+    a cut finding can no longer be tracked, so the thread never auto-approves again."""
     kept = [f for f in shaped.get("findings", []) if f.get("status") != "resolved"]
+    kept += shaped.get("omitted_prior") or []  # still open: the re-review never reported them
     kept.sort(key=lambda f: _SEVERITY_ORDER.get(f.get("severity"), 2))  # stable
     handoff = {
         "schema": SCHEMA,
@@ -501,6 +542,9 @@ def build_handoff(shaped: dict, sha: str, secrets, review_url: str | None = None
             for f in kept[:HANDOFF_MAX_FINDINGS]
         ],
     }
+    cut = kept[HANDOFF_MAX_FINDINGS:]
+    if shaped.get("prior_overflow") or any(f.get("severity") != "nit" for f in cut):
+        handoff["overflow"] = True
     if isinstance(review_url, str) and REVIEW_URL_RE.match(review_url):
         handoff["review_url"] = review_url
     return handoff

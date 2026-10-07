@@ -4535,6 +4535,30 @@ def test_review_pr_thread_publish_stores_review_url_and_next_body_links_it(monke
     assert f"Follows [the previous review]({REVIEW_URL})." in json.loads(calls.inputs[-1])["body"]
 
 
+def test_review_pr_thread_re_review_that_omits_a_prior_finding_never_approves(
+    monkeypatch, tmp_path
+):
+    _fix_review_nonce(monkeypatch)
+    calls = _mc_review_setup(monkeypatch, env=_thread_env(tmp_path))
+    major = {
+        "summary": "one bug",
+        "findings": [
+            {"title": "race", "body": "b", "severity": "normal", "file": "a.py", "line": 3}
+        ],
+        "checks": [],
+    }
+    silent = {"summary": "looks fine", "findings": [], "checks": []}
+    _fake_thread_run(
+        monkeypatch, tmp_path, results=[(0, _review_block(major)), (0, _review_block(silent))]
+    )
+    assert _review(["--thread", "--engine", "claude"]).exit_code == 0
+    second = _review(["--thread", "--allow-approve", "--engine", "claude"])
+    assert second.exit_code == 0, second.output
+    assert json.loads(calls.inputs[-1])["event"] == "COMMENT"  # "race" was never reported
+    handoff = threads_mod.read_record(_thread_dir(tmp_path))["handoff"]
+    assert [(f["title"], f["status"]) for f in handoff["findings"]] == [("race", "open")]
+
+
 def test_review_pr_thread_first_run_pins_session_before_launch(monkeypatch, tmp_path):
     _fix_review_nonce(monkeypatch)
     _mc_review_setup(monkeypatch, env=_thread_env(tmp_path))

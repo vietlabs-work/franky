@@ -345,6 +345,7 @@ def _block(title: str, items: list[str], sep: str, room: int) -> str:
 
 def _headline(shaped: dict, sha: str) -> str:
     live = [f for f in shaped["findings"] if f["status"] != "resolved" and f["severity"] != "nit"]
+    live += shaped.get("omitted_prior") or []
     blocking = sum(f["severity"] == "blocking" for f in live)
     what = (
         f"{len(live)} finding{'' if len(live) == 1 else 's'} ({blocking} blocking)."
@@ -373,6 +374,10 @@ def _body(
         for f in unanchored
     ]
     prior = [
+        f"- Not re-reported, still open: {_esc(f.get('title') or '')}"
+        + (f" ({_esc(f['file'])})" if f.get("file") else "")
+        for f in shaped.get("omitted_prior") or []
+    ] + [
         f"- {'Still open' if f['status'] == 'open' else 'Fixed'}: {_esc(f['title'])}{_loc(f)}"
         for f in shaped["findings"]
         if f["status"] in ("open", "resolved") and (prior_nits or f["severity"] != "nit")
@@ -478,14 +483,19 @@ def review_event(shaped: dict, allow_approve: bool = False) -> str:
 
     The default can never return APPROVE. With `allow_approve`, APPROVE needs every finding above
     nit (blocking, Major, or an open question, whose deciding fact is still unknown) to be resolved,
-    no finding dropped as malformed, and no failed check. The decision reads the full structured
+    no finding dropped as malformed, no prior finding left out of a threaded re-review
+    (`omitted_prior`; an omitted blocking one gives REQUEST_CHANGES), no thread handoff that
+    overflowed (`prior_overflow`), and no failed check. The decision reads the full structured
     list, never the rendered or truncated text.
     """
-    if shaped["has_blocking"]:
+    omitted = shaped.get("omitted_prior") or []
+    if shaped["has_blocking"] or any(f.get("severity") == "blocking" for f in omitted):
         return "REQUEST_CHANGES"
     if (
         allow_approve
         and not shaped.get("dropped_malformed")
+        and not omitted
+        and not shaped.get("prior_overflow")
         and not any(c["outcome"] == "fail" for c in shaped["checks"])
         and not any(
             f["severity"] != "nit" and f["status"] != "resolved" for f in shaped["findings"]
