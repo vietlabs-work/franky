@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.14] - 2026-10-07
+
 ### Changed
 
 - `review-pr --allow-approve` no longer posts an `APPROVE` while a `question` finding is open. A question names a deciding fact the reviewer could not check, so the review stays a `COMMENT` until a re-review finds the answer in the code or the PR and marks it resolved. Open nits still do not block it. This matches the rule in AGENTS.md. The cap of 2 questions now counts only open ones: before, two resolved questions could hide a third open one.
