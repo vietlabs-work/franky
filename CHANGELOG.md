@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.15] - 2026-10-07
+
 ### Changed
 
 - An engine login that is expired, revoked, or refused now ends `build`, `iterate`, `review-pr`, `plan`, and `job replay` with the existing `auth_error` envelope (exit 5) and the message `engine '<engine>' login was refused (expired, revoked or invalid) before any tool call - safe to rerun`, instead of `agent_error` (exit 7). Franky emits it only when no attempt of the run made an engine tool call, so a caller can rerun the same request with another engine. This proves no engine tool call, not that operator hooks or profile MCP servers did nothing. `job resume` keeps `agent_error`, and so does the build pass of `build --plan-first`. The OpenCode missing-credential message now starts with `engine 'opencode' requires <VAR> but it is unset`.
