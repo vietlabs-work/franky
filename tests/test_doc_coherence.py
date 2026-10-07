@@ -257,6 +257,10 @@ def test_readme_sections_allowed():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     sections = set(re.findall(r"^## (.+)$", _FENCED_BLOCK.sub("", readme), re.MULTILINE))
     assert sections <= README_SECTIONS, f"README sections not allowed: {sections - README_SECTIONS}"
+    # scripts/release.py bumps this exact line; losing it aborts a release.
+    assert re.search(r"^## Status\n\nv\d+\.\d+\.\d+\.", readme, re.MULTILINE), (
+        "README needs the `## Status` version line that scripts/release.py bumps"
+    )
 
 
 def test_every_doc_linked_from_readme():

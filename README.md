@@ -13,7 +13,7 @@ franky review-pr https://github.com/you/repo/pull/42
 ## Install
 
 ```bash
-uv tool install franky-agent   # or: pipx install franky-agent
+uv tool install franky-agent   # or: pipx install / pip install franky-agent
 ```
 
 Docker must be available. Franky pulls version-pinned images from GHCR on the first run. Native AppArmor hosts also need the [task profile](docs/configuration.md#apparmor).
@@ -32,7 +32,7 @@ Every build needs:
 
 ## Engines
 
-Select an engine with `--engine` or `FRANKY_ENGINE`. The default is `pi`.
+Select an engine with `--engine`, then `FRANKY_ENGINE`. The default is `pi`.
 
 | Engine | Authentication | Notes |
 |--------|----------------|-------|
