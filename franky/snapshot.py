@@ -408,17 +408,18 @@ def session_path_for(job_id: str, env=None) -> Path:
 
 # `build --no-publish` bundle header: the one part of a container-made bundle the host reads.
 _BUNDLE_HEADER_MAX = 64 * 1024
-_BUNDLE_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_BUNDLE_SHA_RE = re.compile(rb"^[0-9a-f]{40}$")
 
 
 def parse_bundle_header(path, branch: str) -> str:
     """Return the head SHA of the one ref in a git bundle, or raise ValueError. Pure, bounded.
 
-    The host never runs git on a container-made file; it only reads this text header (at most
-    64 KiB, up to the first blank line) and refuses anything unexpected: a version other than
-    v2/v3, a capability other than `@object-format=sha1`, a malformed or non-40-hex SHA, no ref,
-    more than one ref, or a ref other than `refs/heads/<branch>`. Prerequisite lines (`-<sha>`)
-    are allowed and checked for shape only."""
+    The host never runs git on a container-made file; it only reads this header as BYTES (at
+    most 64 KiB, up to the first blank line) and refuses anything unexpected: a version other
+    than v2/v3, a capability other than `@object-format=sha1`, a malformed or non-40-hex SHA, no
+    ref, more than one ref, or a ref other than `refs/heads/<branch>`. SHAs and the ref are
+    checked as ASCII. A prerequisite line (`-<sha> <description>`) checks the SHA only: the
+    description is opaque bytes (a commit subject can be any encoding)."""
     try:
         with open(path, "rb") as stream:
             head = stream.read(_BUNDLE_HEADER_MAX + 1)
@@ -427,28 +428,29 @@ def parse_bundle_header(path, branch: str) -> str:
     end = head.find(b"\n\n")
     if end < 0 or end > _BUNDLE_HEADER_MAX:
         raise ValueError("bundle header not terminated within bound")
-    try:
-        lines = head[:end].decode("ascii").split("\n")
-    except UnicodeDecodeError as exc:
-        raise ValueError("bundle header is not ASCII") from exc
-    if lines[0] not in ("# v2 git bundle", "# v3 git bundle"):
+    lines = head[:end].split(b"\n")
+    if lines[0] not in (b"# v2 git bundle", b"# v3 git bundle"):
         raise ValueError("unsupported bundle version")
+    try:
+        want_ref = f"refs/heads/{branch}".encode("ascii")
+    except UnicodeEncodeError as exc:
+        raise ValueError("branch is not ASCII") from exc
     refs = []
     for line in lines[1:]:
-        if line.startswith("@"):
-            if lines[0] != "# v3 git bundle" or line != "@object-format=sha1":
+        if line.startswith(b"@"):
+            if lines[0] != b"# v3 git bundle" or line != b"@object-format=sha1":
                 raise ValueError("unsupported bundle capability")
-        elif line.startswith("-"):
-            if not _BUNDLE_SHA_RE.match(line[1:41]) or line[41:42] not in ("", " "):
+        elif line.startswith(b"-"):
+            if not _BUNDLE_SHA_RE.match(line[1:41]) or line[41:42] not in (b"", b" "):
                 raise ValueError("malformed bundle prerequisite")
         else:
-            sha, space, ref = line.partition(" ")
+            sha, space, ref = line.partition(b" ")
             if not space or not _BUNDLE_SHA_RE.match(sha):
                 raise ValueError("malformed bundle ref line")
             refs.append((sha, ref))
-    if len(refs) != 1 or refs[0][1] != f"refs/heads/{branch}":
+    if len(refs) != 1 or refs[0][1] != want_ref:
         raise ValueError("bundle must hold exactly the expected branch")
-    return refs[0][0]
+    return refs[0][0].decode("ascii")
 
 
 # ---------------------------------------------------------------------------

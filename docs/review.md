@@ -18,14 +18,16 @@ Before each build attempt, Franky checks for an open PR on the predicted branch.
 franky build "fix the flaky retry test" --repo you/repo --no-publish --json
 ```
 
-`build --no-publish` writes nothing to GitHub. The agent cuts `franky/<slug>` from the default-branch tip that Franky pins at start (`base_sha`), commits its work there, and does not push or open a PR. A host caller that holds the write credential takes the commits from the result. Franky never pushes them.
+`build --no-publish` writes nothing to GitHub. The agent clones the repository into `/work/<repo-name>`, cuts `franky/<slug>` from the default-branch tip that Franky pins at start (`base_sha`), commits its work there, and does not push or open a PR. A host caller that holds the write credential takes the commits from the result. Franky never pushes them.
 
 - Supply a read-only `GH_TOKEN`. Franky cannot enforce this: the token is the only thing that stops the agent from pushing.
 - A start that cannot resolve the default-branch tip exits `8` before any container runs. `--thread` is refused with exit `2`. The open-PR check is skipped, and a retry never looks for a PR.
-- After a clean exit, two networkless, read-only helpers read the stopped task's volumes during the entrypoint's session hold. The first reads the new commits as patch text, and the host scans them for the run's secret values. The second writes `base_sha..branch` as one git bundle to `<FRANKY_RUNS_DIR>/<job_id>.bundle` (0600). The host reads only the bundle header, and never runs git on the container's checkout.
-- Status `branch_ready` (exit `0`) returns `branch`, `base_sha`, `head_sha`, and `bundle_path`. The bundle holds exactly `refs/heads/<branch>`. `no_changes`, `export_failed`, `timeout`, and `agent_error` exit `7` or `9`. `export_refused` exits `4`. [Automation](automation.md#build---no-publish) lists every field and status.
+- After a clean exit, two networkless, read-only helpers read the task's `/work` volume during the entrypoint's session hold. They mount only that volume, read-only, never HOME, `/tmp`, or the Codex login volume. Git runs with replace refs and every global or system config off. The first helper prints the branch tip and then the raw objects that the bundle will carry (commits with all their headers, trees, blobs). The host scans them for the run's credential values: tokens, keys, and the Basic and Atlassian forms, not the JIRA email. The second helper writes `base_sha..branch` as one git bundle to `<FRANKY_RUNS_DIR>/<job_id>.bundle` (0600), and refuses if the branch moved since the scan. The host reads only the bundle header, which must name that same tip. It never runs git on the container's checkout.
+- The scan guards against accidental leaks of exact values only. An encoded or split value passes, so the caller that pushes the bundle must scan for credential patterns.
+- Both helpers, their start-up, and their removal share 30 s of the 60 s hold. The bundle step is skipped, and the result is `export_failed`, when less than 10 s remain.
+- Status `branch_ready` (exit `0`) returns `branch`, `base_sha`, `head_sha`, and `bundle_path`. The bundle holds exactly `refs/heads/<branch>`. `no_changes`, `export_failed`, `timeout`, and `agent_error` exit `7` or `9`. Helper output never reaches the result; it goes to the run log only. `export_refused` exits `4`. [Automation](automation.md#build---no-publish) lists every field and status.
 - Franky deletes the bundle on every outcome except `branch_ready`. Run-record pruning deletes it with its record, so a caller should take it promptly.
-- `job resume` refuses these runs, and `job status` never offers a resume.
+- `job resume` and `job replay` refuse these runs, and `job status` never offers a resume.
 
 `iterate` only targets an allowlisted PR from a same-repository `franky/*` branch. Its prompt forbids force pushes, new PRs, and merges.
 

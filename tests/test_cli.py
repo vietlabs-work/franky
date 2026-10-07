@@ -6214,6 +6214,7 @@ def _np_setup(
     export="ok",
     base=_NP_BASE,
     header=None,
+    tip=None,
     output="did the work",
 ):
     """Hermetic `build --no-publish`. Returns (env, seen) where `seen` records the container call."""
@@ -6247,6 +6248,7 @@ def _np_setup(
         sink = kwargs.get("workspace_sink")
         if sink is not None and code == 0 and export:
             sink["status"] = export
+            sink["tip"] = tip if tip is not None else _NP_HEAD
             if export == "ok":
                 path = Path(sink["dest"])
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -6283,8 +6285,9 @@ def test_build_no_publish_branch_ready_contract(monkeypatch, tmp_path):
     # The container got the export sink pinned to the base, and a prompt that never publishes.
     sink = seen["kwargs"]["workspace_sink"]
     assert sink["branch"] == "franky/add-a-flag" and sink["base"] == _NP_BASE
+    assert sink["clone_dir"] == "/work/repo"
     prompt = " ".join(seen["inner"])
-    assert f"git checkout -b franky/add-a-flag {_NP_BASE}" in prompt
+    assert f"git -C /work/repo checkout -b franky/add-a-flag {_NP_BASE}" in prompt
     assert "Open the PR with" not in prompt
     # The run record says so, and carries the export facts.
     rec = jobs.read_record(data["job_id"], env)
@@ -6422,3 +6425,56 @@ def test_job_resume_refuses_a_no_publish_run(monkeypatch, tmp_path):
 def test_schema_build_lists_no_publish():
     data = json.loads(CliRunner().invoke(cli.main, ["schema"]).output)
     assert any(f["name"] == "no_publish" for f in data["commands"]["build"]["flags"])
+
+
+def test_build_no_publish_requires_the_bundle_to_be_the_tip_that_was_scanned(monkeypatch, tmp_path):
+    # The scan resolved one tip; a bundle whose ref is another commit (the branch moved) is refused.
+    _np_setup(monkeypatch, tmp_path, tip="e" * 40)
+    res = _np_build()
+    assert res.exit_code == 7, res.output
+    data = json.loads(res.stdout)
+    assert data["status"] == "export_failed" and "scanned" in data["reason"]
+    assert "bundle_path" not in data and not list((tmp_path / "runs").glob("*.bundle"))
+
+
+def test_build_no_publish_deletes_the_bundle_when_anything_fails_after_the_export(
+    monkeypatch, tmp_path
+):
+    _np_setup(monkeypatch, tmp_path)
+
+    def boom(*a, **k):
+        raise cli.ConfigError("could not write the run transcript")
+
+    monkeypatch.setattr(cli, "_write_log", boom)
+    res = _np_build()
+    assert res.exit_code == 3, res.output
+    assert not list((tmp_path / "runs").glob("*.bundle"))
+
+
+def test_build_no_publish_deletes_the_bundle_after_a_late_auth_refusal(monkeypatch, tmp_path):
+    _np_setup(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        cli, "_engine_auth_error", lambda *a, **k: cli.AuthError("engine login was refused")
+    )
+    res = _np_build()
+    assert res.exit_code == 5, res.output
+    assert not list((tmp_path / "runs").glob("*.bundle"))
+
+
+def test_build_no_publish_refuses_a_repo_name_that_is_not_a_directory_name(monkeypatch, tmp_path):
+    env, seen = _np_setup(monkeypatch, tmp_path)
+    env["FRANKY_ALLOWED_REPOS"] = "*"
+    res = CliRunner().invoke(
+        cli.main, ["build", "do it", "--repo", "me/a;b", "--no-publish", "--json"]
+    )
+    assert res.exit_code in (3, 4), res.output
+    assert seen["container"] == 0
+
+
+def test_job_replay_refuses_a_no_publish_run(monkeypatch, tmp_path):
+    env = _resume_env(monkeypatch, tmp_path, (0, "x"))
+    job_id = _write_resumable_run(env, tmp_path, job_id="beef0b", with_snapshot=False)
+    jobs.update_record(job_id, {"no_publish": True}, env)
+    res = CliRunner().invoke(cli.main, ["job", "replay", job_id, "--json"])
+    assert res.exit_code == 4, res.output
+    assert json.loads(res.stdout)["error"]["kind"] == "task_rejected"

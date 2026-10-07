@@ -196,6 +196,20 @@ def _prior_failures_block(prior_failures: tuple[str, ...] | list[str]) -> str:
     )
 
 
+_CLONE_NAME_RE = re.compile(r"^(?!\.\.?$)[A-Za-z0-9._-]+$")
+
+
+def workspace_clone_dir(repo: str) -> str:
+    """The one place a `--no-publish` build is told to clone: `/work/<repo-name>`.
+
+    The host export reads exactly this directory, so the prompt and the helper must agree on it.
+    Raises ValueError for a repository whose name is not a plain directory name."""
+    name = repo.split("/", 1)[1] if "/" in repo else ""
+    if not _CLONE_NAME_RE.match(name):
+        raise ValueError(f"cannot derive a clone directory from {repo!r}")
+    return f"/work/{name}"
+
+
 def build_prompt(
     spec: TaskSpec,
     *,
@@ -230,10 +244,12 @@ def build_prompt(
     if not publish:
         if not (isinstance(base_sha, str) and re.fullmatch(r"[0-9a-f]{40}", base_sha)):
             raise ValueError("a --no-publish prompt needs a full 40-hex base_sha")
+        clone_dir = workspace_clone_dir(spec.repo)
         conventions = (
             "Conventions (follow exactly):\n"
-            f"- Clone {spec.repo} with its full history (no --depth), then run "
-            f"`git checkout -b {branch} {base_sha}`. Work only on that branch.\n"
+            f"- Clone {spec.repo} with its full history (no --depth) into exactly "
+            f"`{clone_dir}`, then run `git -C {clone_dir} checkout -b {branch} {base_sha}`. "
+            "Work only in that clone, on that branch.\n"
             "- Run the repo's tests and make them pass BEFORE your final commit.\n"
             "- Commit all your work on that branch with conventional-commit messages: "
             "`<type>: <summary>` (e.g. `feat:`, `fix:`, `chore:`). Leave nothing uncommitted.\n"

@@ -851,3 +851,29 @@ def test_values_in_a_stream_are_found_across_chunk_edges():
     assert snapshot.stream_contains_values(io.BytesIO(data), [secret]) is True
     assert snapshot.stream_contains_values(io.BytesIO(b"clean " * 50), [secret]) is False
     assert snapshot.stream_contains_values(io.BytesIO(data), []) is False
+
+
+def test_parse_bundle_header_treats_a_prerequisite_description_as_opaque_bytes(tmp_path):
+    # A base commit subject can be any encoding; only SHAs and the ref are checked, as ASCII.
+    header = (
+        b"# v2 git bundle\n"
+        + b"-"
+        + _SHA_A.encode()
+        + b" \xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e \xff\xfe subject\n"
+        + _SHA_B.encode()
+        + b" refs/heads/franky/fix-a\n\nPACK"
+    )
+    path = tmp_path / "x.bundle"
+    path.write_bytes(header)
+    assert snapshot.parse_bundle_header(path, "franky/fix-a") == _SHA_B
+
+
+def test_parse_bundle_header_refuses_a_non_ascii_ref_or_sha(tmp_path):
+    for line in (
+        _SHA_B.encode() + " refs/heads/franky/fix-\u00e4".encode(),
+        _SHA_B.encode()[:-1] + b"\xff refs/heads/franky/fix-a",
+    ):
+        path = tmp_path / "y.bundle"
+        path.write_bytes(b"# v2 git bundle\n" + line + b"\n\nPACK")
+        with pytest.raises(ValueError):
+            snapshot.parse_bundle_header(path, "franky/fix-a")

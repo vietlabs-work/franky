@@ -242,7 +242,7 @@ _JOB_RECORD_SCHEMA: dict = {
     "`build --thread` / resumed run once its session is bound: the thread it belongs to (see "
     "thread_record_schema). Absent on every other run.",
     "no_publish": "present ONLY on a `build --no-publish` or `review-pr --no-publish` run: "
-    "true. `job resume` refuses a `build --no-publish` record.",
+    "true. `job resume` and `job replay` refuse a `build --no-publish` record.",
     "head_sha": "present ONLY on a `build --no-publish` run that reached branch_ready: the "
     "exported branch tip (see result_schema.head_sha)",
     "bundle_path": "present ONLY on a `build --no-publish` run that reached branch_ready: the "

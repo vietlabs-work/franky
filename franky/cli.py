@@ -100,6 +100,7 @@ from .prompt import (
     build_review_pr_prompt,
     build_setup_block,
     task_slug,
+    workspace_clone_dir,
 )
 from .reviewpr import (
     APPROVE_MARKER,
@@ -564,8 +565,12 @@ def build(
 
         # --no-publish pins the branch to the default-branch tip, so an unresolved tip stops the
         # run here, before any image pull or container. Other builds resolve it later (below).
-        base_sha = None
+        base_sha = clone_dir = None
         if no_publish:
+            try:
+                clone_dir = workspace_clone_dir(spec.repo)
+            except ValueError as exc:
+                raise TaskRejected(str(exc)) from exc
             base_sha = baseref.resolve_base_sha(spec.repo, os.environ)
             if not (base_sha and _FULL_SHA_RE.match(base_sha)):
                 raise NetworkError(
@@ -699,6 +704,7 @@ def build(
                 base_sha=base_sha,
                 thread=use_thread,
                 no_publish=no_publish,
+                clone_dir=clone_dir,
                 # A --plan-first plan pass already ran in this invocation: not the first pass.
                 first_attempt=attempt_no == 1 and not plan_first,
             )
@@ -3408,8 +3414,9 @@ def _record_run_end(
 def _classify_export(sink: dict, branch: str, bundle: Path) -> tuple[str, str, int, str | None]:
     """Turn a `--no-publish` export sink into (status, reason, exit_code, head_sha).
 
-    Only `ok` with a bundle whose header names exactly `refs/heads/<branch>` is `branch_ready`.
-    A missing status means the hold line never came (nothing was exported) and is a failure."""
+    Only `ok` with a bundle whose header names exactly `refs/heads/<branch>` at the very tip the
+    scan resolved is `branch_ready`. A missing status means the hold line never came (nothing was
+    exported) and is a failure. Reasons are fixed phrases; helper output never reaches them."""
     export = sink.get("status")
     if export == "no_changes":
         return "no_changes", "the agent made no commits beyond the base", EXIT_AGENT, None
@@ -3422,14 +3429,17 @@ def _classify_export(sink: dict, branch: str, bundle: Path) -> tuple[str, str, i
         )
     if export == "ok":
         try:
-            return (
-                "branch_ready",
-                "branch exported",
-                EXIT_SUCCESS,
-                snapshot.parse_bundle_header(bundle, branch),
-            )
+            head = snapshot.parse_bundle_header(bundle, branch)
         except ValueError:
             return "export_failed", "the exported bundle failed verification", EXIT_AGENT, None
+        if head != sink.get("tip"):
+            return (
+                "export_failed",
+                "the exported branch is not the tip that was scanned",
+                EXIT_AGENT,
+                None,
+            )
+        return "branch_ready", "branch exported", EXIT_SUCCESS, head
     reason = sink.get("detail") or "the workspace was not exported"
     return "export_failed", f"export failed: {reason}"[:300], EXIT_AGENT, None
 
@@ -3455,6 +3465,7 @@ def _build_once(
     setup_block="",
     thread=False,
     no_publish=False,
+    clone_dir=None,
     first_attempt=False,
 ) -> dict:
     """Run ONE build attempt end to end and return its outcome (issue #64 #5).
@@ -3512,108 +3523,113 @@ def _build_once(
             "dest": str(bundle_dest),
             "branch": branch,
             "base": base_sha,
+            "clone_dir": clone_dir,
         }
-    code, output, duration = _run_pass(
-        cfg,
-        build_prompt(
-            spec,
-            branch=branch,
-            prior_failures=prior_failures,
-            operator_setup=setup_block,
-            publish=not no_publish,
-            base_sha=base_sha,
-        ),
-        franky_img,
-        proxy_img,
-        bundle,
-        progress=progress,
-        timeout=timeout,
-        run_id=job_id,
-        diagnostics_sink=diagnostics,
-        snapshot_sink=None if no_publish else snapshot_sink,
-        **run_kwargs,
-    )
-
-    # Parse usage ONCE; both the prose econ line and the JSON economics block come from it.
-    usage = _parse_usage_safe(output)
-    econ = _economics_line(usage, duration, secrets)
-    if not as_json:
-        click.echo(econ, err=True)
-    log_path = _write_log(output, secrets, footer=econ, run_id=job_id, env=env)
-
-    # Scope PR-URL detection to the task's own repo so a hostile issue body cannot make Franky
-    # report a PR URL for some other (attacker) repo. Timeout is checked FIRST: a timed-out run
-    # returns the CONTAINER_TIMEOUT_CODE sentinel (124, nonzero), so it must be distinguished
-    # before the generic agent_error branch and mapped to the dedicated timeout status.
-    pr_url = None if no_publish else cfg.engine.parse_pr_url(output, repo=spec.repo)
-    head_sha = bundle_path = None
-    if code == CONTAINER_TIMEOUT_CODE:
-        status, reason, exit_code = "timeout", "exceeded max-duration", EXIT_TIMEOUT
-    elif code != 0:
-        status, reason, exit_code = "agent_error", f"agent exited {code}", EXIT_AGENT
-    elif no_publish:
-        sink = run_kwargs["workspace_sink"]
-        status, reason, exit_code, head_sha = _classify_export(sink, branch, bundle_dest)
-        if status == "branch_ready":
-            bundle_path = str(bundle_dest)
-    elif pr_url:
-        status, reason, exit_code = "pr_opened", "PR opened", EXIT_SUCCESS
-    else:
-        status, reason, exit_code = "no_pr", "agent produced no PR URL", EXIT_AGENT
-    if no_publish and status != "branch_ready":
-        # Container-made bytes stay on the host only when they are the deliverable.
-        try:
-            bundle_dest.unlink(missing_ok=True)
-        except OSError:
-            pass
-
-    _record_run_end(
-        job_id,
-        status=status,
-        pr_url=pr_url,
-        usage=usage,
-        duration=duration,
-        exit_code=exit_code,
-        log_path=log_path,
-        diagnostics=diagnostics,
-        snapshot_path=snapshot_sink.get("snapshot_path"),
-        extra={"head_sha": head_sha, "bundle_path": bundle_path},
-        env=env,
-    )
-    outcome = {
-        "job_id": job_id,
-        "status": status,
-        "reason": reason,
-        "exit_code": exit_code,
-        "pr_url": pr_url,
-        "output": output,
-        "log_path": log_path,
-        "usage": usage,
-        "duration": duration,
-        "diagnostics": diagnostics,
-    }
-    if no_publish:
-        outcome["base_sha"] = base_sha
-        if head_sha:
-            outcome["head_sha"], outcome["bundle_path"] = head_sha, bundle_path
-    if thread:
-        outcome["thread"], outcome["handoff"] = _settle_author_session(
+    # Container-made bytes stay on the host only when they are the deliverable: every other
+    # outcome, and any error from here on, deletes the bundle.
+    keep_bundle = False
+    try:
+        code, output, duration = _run_pass(
             cfg,
-            job_id=job_id,
-            repo=spec.repo,
-            branch=branch,
-            session_id=session_id,
-            sink=run_kwargs.get("session_sink"),
-            code=code,
-            pr_url=pr_url,
+            build_prompt(
+                spec,
+                branch=branch,
+                prior_failures=prior_failures,
+                operator_setup=setup_block,
+                publish=not no_publish,
+                base_sha=base_sha,
+            ),
+            franky_img,
+            proxy_img,
+            bundle,
+            progress=progress,
+            timeout=timeout,
+            run_id=job_id,
+            diagnostics_sink=diagnostics,
+            snapshot_sink=None if no_publish else snapshot_sink,
+            **run_kwargs,
+        )
+
+        # Parse usage ONCE; both the prose econ line and the JSON economics block come from it.
+        usage = _parse_usage_safe(output)
+        econ = _economics_line(usage, duration, secrets)
+        if not as_json:
+            click.echo(econ, err=True)
+        log_path = _write_log(output, secrets, footer=econ, run_id=job_id, env=env)
+
+        # Scope PR-URL detection to the task's own repo so a hostile issue body cannot make Franky
+        # report a PR URL for some other (attacker) repo. Timeout is checked FIRST: a timed-out run
+        # returns the CONTAINER_TIMEOUT_CODE sentinel (124, nonzero), so it must be distinguished
+        # before the generic agent_error branch and mapped to the dedicated timeout status.
+        pr_url = None if no_publish else cfg.engine.parse_pr_url(output, repo=spec.repo)
+        head_sha = bundle_path = None
+        if code == CONTAINER_TIMEOUT_CODE:
+            status, reason, exit_code = "timeout", "exceeded max-duration", EXIT_TIMEOUT
+        elif code != 0:
+            status, reason, exit_code = "agent_error", f"agent exited {code}", EXIT_AGENT
+        elif no_publish:
+            sink = run_kwargs["workspace_sink"]
+            status, reason, exit_code, head_sha = _classify_export(sink, branch, bundle_dest)
+            if status == "branch_ready":
+                bundle_path = str(bundle_dest)
+        elif pr_url:
+            status, reason, exit_code = "pr_opened", "PR opened", EXIT_SUCCESS
+        else:
+            status, reason, exit_code = "no_pr", "agent produced no PR URL", EXIT_AGENT
+        _record_run_end(
+            job_id,
             status=status,
-            secrets=secrets,
+            pr_url=pr_url,
+            usage=usage,
+            duration=duration,
+            exit_code=exit_code,
+            log_path=log_path,
+            diagnostics=diagnostics,
+            snapshot_path=snapshot_sink.get("snapshot_path"),
+            extra={"head_sha": head_sha, "bundle_path": bundle_path},
             env=env,
         )
-    # Only the FIRST attempt: an earlier attempt of a --retry loop may already have pushed.
-    if first_attempt and (auth_error := _engine_auth_error(cfg, code, output)):
-        raise auth_error
-    return outcome
+        outcome = {
+            "job_id": job_id,
+            "status": status,
+            "reason": reason,
+            "exit_code": exit_code,
+            "pr_url": pr_url,
+            "output": output,
+            "log_path": log_path,
+            "usage": usage,
+            "duration": duration,
+            "diagnostics": diagnostics,
+        }
+        if no_publish:
+            outcome["base_sha"] = base_sha
+            if head_sha:
+                outcome["head_sha"], outcome["bundle_path"] = head_sha, bundle_path
+        if thread:
+            outcome["thread"], outcome["handoff"] = _settle_author_session(
+                cfg,
+                job_id=job_id,
+                repo=spec.repo,
+                branch=branch,
+                session_id=session_id,
+                sink=run_kwargs.get("session_sink"),
+                code=code,
+                pr_url=pr_url,
+                status=status,
+                secrets=secrets,
+                env=env,
+            )
+        # Only the FIRST attempt: an earlier attempt of a --retry loop may already have pushed.
+        if first_attempt and (auth_error := _engine_auth_error(cfg, code, output)):
+            raise auth_error
+        keep_bundle = status == "branch_ready"  # fully established only now
+        return outcome
+    finally:
+        if no_publish and not keep_bundle:
+            try:
+                bundle_dest.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _diagnose(
@@ -4618,6 +4634,12 @@ def job_replay(
                 code=EXIT_USAGE,
                 kind="not_replayable",
                 hint="see `franky jobs` for build runs",
+            )
+        # A replay would run the normal build prompt, which pushes and opens a PR.
+        if record.get("no_publish"):
+            raise TaskRejected(
+                "cannot replay a --no-publish build - replay can open a PR",
+                hint="run `franky build --no-publish` again",
             )
 
         # Reconstruct the original TaskSpec from the saved inputs. A record written before

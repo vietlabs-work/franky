@@ -45,8 +45,8 @@ Result fields, absent when they do not apply and never null (except `pr_url`):
 |--------|-----:|---------|
 | `branch_ready` | `0` | The bundle holds `base_sha..branch` as `refs/heads/<branch>`. |
 | `no_changes` | `7` | The branch has no commit beyond `base_sha`. A `--retry` may retry it. |
-| `export_failed` | `7` | The helper or Docker failed, the branch is missing or not a descendant of `base_sha`, the output passed 256 MiB, the export ran out of its 45 s budget, or the bundle header failed verification. |
-| `export_refused` | `4` | A secret value of the run is in the new commits. Franky deleted the bundle. |
+| `export_failed` | `7` | The helper or Docker failed, the clone or branch is missing or not a descendant of `base_sha`, the branch moved during the export, the output passed 256 MiB, the 30 s export budget left too little time, or the bundle header failed verification or did not name the scanned tip. The `reason` is a fixed phrase. |
+| `export_refused` | `4` | A credential value of the run is in the objects to be exported. Franky deleted the bundle. |
 | `timeout` | `9` | The run exceeded `--max-duration`. |
 | `agent_error` | `7` | The engine exited non-zero. |
 | `auth_error` | `5` | The engine login was refused, as for other builds. |

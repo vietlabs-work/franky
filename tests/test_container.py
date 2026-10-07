@@ -2388,19 +2388,36 @@ def test_run_in_container_extra_secrets_redacted_from_stream_and_output():
 # ---------------------------------------------------------------------------
 
 _BASE = "c" * 40
+_TIP = "d" * 40
 _BRANCH = "franky/add-flag"
+_CLONE = "/work/repo"
+_MOUNTS = (
+    '[{"Type":"volume","Name":"vol-work","Destination":"/work"},'
+    '{"Type":"volume","Name":"vol-home","Destination":"/home/franky"},'
+    '{"Type":"volume","Name":"vol-tmp","Destination":"/tmp"}]'
+)
 
 
 class _ExportPopen:
     """Fake helper `docker run`: stdout is the exported stream; records a kill."""
 
-    def __init__(self, data=b"", code=0, err=b""):
+    def __init__(self, data=b"", code=0, err=b"", on_read=None):
         import io
 
         self.stdout = io.BytesIO(data)
         self.stderr = io.BytesIO(err)
         self.returncode = code
         self.killed = False
+        if on_read is not None:
+            real, fired = self.stdout.read, []
+
+            def read(size=-1):
+                if not fired:  # the helper "runs" for a while, once
+                    fired.append(1)
+                    on_read()
+                return real(size)
+
+            self.stdout.read = read
 
     def kill(self):
         self.killed = True
@@ -2409,29 +2426,58 @@ class _ExportPopen:
         return self.returncode
 
 
-def _export_popen(*, log=None, bundle=None, started=None):
-    """popen fake keyed on the helper mode argument (`log` | `bundle`)."""
+def _scan_out(body=b"blob 3\nabc\n", tip=_TIP):
+    return tip.encode() + b"\n" + body
+
+
+def _export_popen(*, scan=None, bundle=None, started=None):
+    """popen fake keyed on the helper mode argument (`scan` | `bundle`)."""
 
     def popen(argv, **kwargs):
-        mode = argv[-3]
+        mode = argv[-5]
         if started is not None:
             started.append((mode, argv))
-        proc = {"log": log, "bundle": bundle}[mode]
+        proc = {"scan": scan, "bundle": bundle}[mode]
         return proc if proc is not None else _ExportPopen(b"", 1)
 
     return popen
 
 
-def _export_runner(calls):
+def _export_runner(calls, *, mounts=_MOUNTS):
     def runner(argv, **kwargs):
         calls.append(argv)
+        if argv[:2] == ["docker", "inspect"] and "{{json .Mounts}}" in argv:
+            return subprocess.CompletedProcess(argv, 0, stdout=mounts, stderr="")
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
     return runner
 
 
+def _export(tmp_path, *, scan, bundle=None, secrets=(SECRET,), started=None, calls=None, **kw):
+    return container_mod.export_workspace(
+        "task1",
+        "franky",
+        _BRANCH,
+        _BASE,
+        tmp_path / "j.bundle",
+        list(secrets),
+        clone_dir=_CLONE,
+        popen=_export_popen(scan=scan, bundle=bundle, started=started),
+        runner=_export_runner([] if calls is None else calls),
+        **kw,
+    )
+
+
+def _argv(mode="scan", **kw):
+    kw.setdefault("work_volume", "vol-work")
+    kw.setdefault("clone_dir", _CLONE)
+    if mode == "bundle":
+        kw.setdefault("tip", _TIP)
+    return container_mod.build_export_argv("task1", "franky", mode, _BRANCH, _BASE, **kw)
+
+
 def test_build_export_argv_is_a_sandboxed_read_only_helper():
-    argv = container_mod.build_export_argv("task1", "franky", "bundle", _BRANCH, _BASE)
+    argv = _argv()
     assert argv[:3] == ["docker", "run", "--rm"]
     for flag in (
         "--network=none",
@@ -2441,222 +2487,290 @@ def test_build_export_argv_is_a_sandboxed_read_only_helper():
         "--log-driver=none",
         "--pids-limit=64",
         "--memory=256m",
+        "--entrypoint=bash",
     ):
         assert flag in argv
     assert any(a.startswith("--security-opt=seccomp=") for a in argv)
-    assert argv[argv.index("--volumes-from") + 1] == "task1:ro"
-    # No bind mount, no published port, no secret by name or value.
-    assert not any(a in ("-v", "--volume", "--mount", "-p", "--privileged") for a in argv)
+    # Exactly one mount: the task's /work volume, read-only. Never --volumes-from (that would
+    # bring HOME, /tmp and the Codex auth volume), a bind mount or a socket.
+    assert [argv[i + 1] for i, a in enumerate(argv) if a == "--mount"] == [
+        "type=volume,src=vol-work,dst=/work,readonly"
+    ]
+    assert not any(
+        a in ("--volumes-from", "-v", "--volume", "-p", "--privileged", "--device") for a in argv
+    )
     env = [argv[i + 1] for i, a in enumerate(argv) if a == "-e"]
     assert all("=" in e for e in env)
-    assert not any(k in " ".join(env) for k in ("TOKEN", "KEY", "GH_", "SECRET"))
-    # The helper name derives from the task so the reaper can find it.
+    assert not any(k in " ".join(env) for k in ("TOKEN_", "KEY", "GH_", "SECRET"))
     assert argv[argv.index("--name") + 1] == container_mod.export_container_name("task1")
 
 
-def test_build_export_argv_passes_branch_and_base_as_arguments_only():
-    argv = container_mod.build_export_argv("task1", "franky", "log", _BRANCH, _BASE)
-    assert argv[-4:] == ["franky-export", "log", _BRANCH, _BASE]
-    script = argv[-5]
-    assert _BRANCH not in script and _BASE not in script
-    # Fail-closed contract with the host: distinct exits for no branch, no change, not a descendant.
-    assert "exit 3" in script and "exit 4" in script and "exit 5" in script
-    assert "--no-ext-diff" in script and "--no-textconv" in script and "--text" in script
+def test_build_export_argv_passes_every_value_as_an_argument_only():
+    argv = _argv("bundle")
+    assert argv[-6:] == ["franky-export", "bundle", _BRANCH, _BASE, _CLONE, _TIP]
+    script = argv[-7]
+    for value in (_BRANCH, _BASE, _CLONE, _TIP, "vol-work"):
+        assert value not in script
+    # Fail-closed contract with the host: distinct exits for each refusal.
+    for code in ("exit 3", "exit 4", "exit 5", "exit 6"):
+        assert code in script
+    assert argv[-7 - 1] == "-c"
+    assert _argv()[-1] == ""  # the scan takes no tip
+
+
+def test_export_script_pins_git_to_the_objects_that_will_be_packed():
+    script = _argv()[-7]
+    for needle in (
+        "pipefail",
+        "GIT_NO_REPLACE_OBJECTS=1",
+        "GIT_CONFIG_NOSYSTEM=1",
+        "GIT_CONFIG_GLOBAL=/dev/null",
+        "core.useReplaceRefs=false",
+        "rev-list --objects --no-object-names",
+        "cat-file --batch",
+    ):
+        assert needle in script
+    assert "git log" not in script and " log " not in script  # nothing follows config or replace
 
 
 @pytest.mark.parametrize(
-    "mode,branch,base",
+    "kw",
     [
-        ("tar", _BRANCH, _BASE),
-        ("log", "", _BASE),
-        ("log", "-evil", _BASE),
-        ("log", "a b", _BASE),
-        ("log", "a/../b", _BASE),
-        ("log", "a;rm", _BASE),
-        ("log", _BRANCH, "main"),
-        ("log", _BRANCH, "C" * 40),
-        ("log", _BRANCH, "c" * 39),
+        {"mode": "tar"},
+        {"branch": ""},
+        {"branch": "-evil"},
+        {"branch": "a b"},
+        {"branch": "a/../b"},
+        {"branch": "a;rm"},
+        {"base": "main"},
+        {"base": "C" * 40},
+        {"base": "c" * 39},
+        {"tip": "x"},  # a scan takes none
+        {"mode": "bundle", "tip": ""},  # a bundle needs one
+        {"mode": "bundle", "tip": "D" * 40},
+        {"clone_dir": "repo"},
+        {"clone_dir": "/etc"},
+        {"clone_dir": "/work"},
+        {"clone_dir": "/work/.."},
+        {"clone_dir": "/work/a/b"},
+        {"clone_dir": "/work/a b"},
+        {"clone_dir": "/work/$(x)"},
+        {"work_volume": "-x"},
+        {"work_volume": "a,dst=/etc"},
+        {"work_volume": ""},
     ],
 )
-def test_build_export_argv_refuses_unsafe_values(mode, branch, base):
+def test_build_export_argv_refuses_unsafe_values(kw):
+    args = {
+        "mode": "scan",
+        "branch": _BRANCH,
+        "base": _BASE,
+        "work_volume": "vol-work",
+        "clone_dir": _CLONE,
+    }
+    args.update(kw)
+    mode = args.pop("mode")
+    branch = args.pop("branch")
+    base = args.pop("base")
     with pytest.raises(ValueError):
-        container_mod.build_export_argv("task1", "franky", mode, branch, base)
+        container_mod.build_export_argv("task1", "franky", mode, branch, base, **args)
 
 
-def test_export_workspace_writes_a_private_bundle_after_a_clean_log_scan(tmp_path):
+def test_export_workspace_scans_then_writes_a_private_bundle_pinned_to_the_scanned_tip(tmp_path):
     calls, started = [], []
-    dest = tmp_path / "j.bundle"
-    status, detail = container_mod.export_workspace(
-        "task1",
-        "franky",
-        _BRANCH,
-        _BASE,
-        dest,
-        [SECRET],
-        popen=_export_popen(
-            log=_ExportPopen(b"+print('hi')\n"),
-            bundle=_ExportPopen(b"# v2 git bundle\n\nPACK"),
-            started=started,
-        ),
-        runner=_export_runner(calls),
+    status, detail, tip = _export(
+        tmp_path,
+        scan=_ExportPopen(_scan_out()),
+        bundle=_ExportPopen(b"# v2 git bundle\n\nPACK"),
+        started=started,
+        calls=calls,
     )
-    assert (status, detail) == ("ok", "")
+    assert (status, detail, tip) == ("ok", "", _TIP)
+    dest = tmp_path / "j.bundle"
     assert dest.read_bytes() == b"# v2 git bundle\n\nPACK"
     assert oct(dest.stat().st_mode & 0o777) == "0o600"
-    assert [m for m, _ in started] == ["log", "bundle"]
-    # Both helpers are reaped by name.
+    assert [m for m, _ in started] == ["scan", "bundle"]
+    assert started[1][1][-1] == _TIP  # the bundle step is told which tip to expect
+    for _, argv in started:  # both helpers mount only the resolved /work volume
+        assert [argv[i + 1] for i, a in enumerate(argv) if a == "--mount"] == [
+            "type=volume,src=vol-work,dst=/work,readonly"
+        ]
     helper = container_mod.export_container_name("task1")
     assert sum(1 for c in calls if c[:3] == ["docker", "rm", "-f"] and helper in c) == 2
 
 
-def test_export_workspace_refuses_when_a_run_secret_is_in_the_new_commits(tmp_path):
+def test_export_workspace_refuses_when_a_run_secret_is_in_the_scanned_objects(tmp_path):
     started = []
-    dest = tmp_path / "j.bundle"
-    status, detail = container_mod.export_workspace(
-        "task1",
-        "franky",
-        _BRANCH,
-        _BASE,
-        dest,
-        [SECRET],
-        popen=_export_popen(
-            log=_ExportPopen(b"+key = " + SECRET.encode() + b"\n"), started=started
-        ),
-        runner=_export_runner([]),
-    )
-    assert status == "refused"
+    scan = _ExportPopen(_scan_out(b"blob 40\nkey = " + SECRET.encode() + b"\n"))
+    status, detail, tip = _export(tmp_path, scan=scan, started=started)
+    assert status == "refused" and tip is None
     assert SECRET not in detail
-    assert [m for m, _ in started] == ["log"]  # no bundle was ever produced
-    assert not dest.exists()
+    assert [m for m, _ in started] == ["scan"]  # no bundle was ever produced
+    assert scan.killed  # the helper is stopped as soon as the value is seen
+    assert not (tmp_path / "j.bundle").exists()
 
 
 @pytest.mark.parametrize(
-    "code,status",
-    [(4, "no_changes"), (3, "failed"), (5, "failed"), (125, "failed"), (1, "failed")],
+    "code,status,fixed",
+    [
+        (4, "no_changes", "no commits beyond the base"),
+        (3, "failed", "the branch or the clone was not found in the workspace"),
+        (5, "failed", "the base commit is not an ancestor of the branch"),
+        (6, "failed", "the branch moved while it was being exported"),
+        (125, "failed", "the export helper failed"),
+        (1, "failed", "the export helper failed"),
+    ],
 )
-def test_export_workspace_maps_helper_exit_codes(tmp_path, code, status):
-    dest = tmp_path / "j.bundle"
-    got, detail = container_mod.export_workspace(
-        "task1",
-        "franky",
-        _BRANCH,
-        _BASE,
-        dest,
-        [],
-        popen=_export_popen(log=_ExportPopen(b"", code, b"franky-export: boom")),
-        runner=_export_runner([]),
+def test_export_workspace_maps_exit_codes_to_fixed_strings_and_logs_stderr_only(
+    tmp_path, code, status, fixed
+):
+    crafted = b"franky-export: ghp_FAKE INJECTED-INSTRUCTION \x1b[31m"
+    logged = []
+    got, detail, tip = _export(
+        tmp_path, scan=_ExportPopen(b"", code, crafted), on_stderr=logged.append
     )
-    assert got == status
-    assert not dest.exists()
+    assert (got, detail, tip) == (status, fixed, None)
+    assert logged and "INJECTED-INSTRUCTION" in logged[0]  # the run log gets it
+    assert "INJECTED" not in detail
+    assert not (tmp_path / "j.bundle").exists()
 
 
-def test_export_workspace_bundle_helper_failure_removes_the_partial_file(tmp_path):
-    dest = tmp_path / "j.bundle"
-    got, _ = container_mod.export_workspace(
-        "task1",
-        "franky",
-        _BRANCH,
-        _BASE,
-        dest,
-        [],
-        popen=_export_popen(log=_ExportPopen(b"x"), bundle=_ExportPopen(b"partial", 1)),
-        runner=_export_runner([]),
+def test_export_workspace_bundle_failure_text_is_fixed_too(tmp_path):
+    got, detail, tip = _export(
+        tmp_path,
+        scan=_ExportPopen(_scan_out()),
+        bundle=_ExportPopen(b"partial", 6, b"INJECTED"),
     )
-    assert got == "failed" and not dest.exists()
+    assert (got, detail, tip) == ("failed", "the branch moved while it was being exported", _TIP)
+    assert not (tmp_path / "j.bundle").exists()
+
+
+@pytest.mark.parametrize("out", [b"", b"not a tip\nblob", b"d" * 40, b"D" * 40 + b"\nx"])
+def test_export_workspace_needs_a_valid_tip_line(tmp_path, out):
+    got, _, tip = _export(tmp_path, scan=_ExportPopen(out))
+    assert got == "failed" and tip is None
 
 
 def test_export_workspace_empty_bundle_is_a_failure(tmp_path):
-    dest = tmp_path / "j.bundle"
-    got, _ = container_mod.export_workspace(
-        "task1",
-        "franky",
-        _BRANCH,
-        _BASE,
-        dest,
-        [],
-        popen=_export_popen(log=_ExportPopen(b"x"), bundle=_ExportPopen(b"")),
-        runner=_export_runner([]),
-    )
-    assert got == "failed" and not dest.exists()
+    got, _, _ = _export(tmp_path, scan=_ExportPopen(_scan_out()), bundle=_ExportPopen(b""))
+    assert got == "failed" and not (tmp_path / "j.bundle").exists()
 
 
 def test_export_workspace_size_cap_kills_the_helper_and_removes_the_file(tmp_path, monkeypatch):
     monkeypatch.setattr(container_mod, "EXPORT_MAX_BYTES", 100)
     bundle = _ExportPopen(b"x" * 1000)
-    dest = tmp_path / "j.bundle"
-    got, detail = container_mod.export_workspace(
-        "task1",
-        "franky",
-        _BRANCH,
-        _BASE,
-        dest,
-        [],
-        popen=_export_popen(log=_ExportPopen(b"x"), bundle=bundle),
-        runner=_export_runner([]),
-    )
+    got, detail, _ = _export(tmp_path, scan=_ExportPopen(_scan_out()), bundle=bundle)
     assert got == "failed" and "exceeded" in detail
-    assert bundle.killed and not dest.exists()
+    assert bundle.killed and not (tmp_path / "j.bundle").exists()
 
 
-def test_export_workspace_log_over_the_cap_is_a_failure_not_a_pass(tmp_path, monkeypatch):
+def test_export_workspace_object_stream_over_the_cap_is_a_failure_not_a_pass(tmp_path, monkeypatch):
     monkeypatch.setattr(container_mod, "EXPORT_MAX_BYTES", 100)
-    log = _ExportPopen(b"x" * 1000)
-    got, _ = container_mod.export_workspace(
-        "task1",
-        "franky",
-        _BRANCH,
-        _BASE,
-        tmp_path / "j.bundle",
-        [],
-        popen=_export_popen(log=log),
-        runner=_export_runner([]),
-    )
-    assert got == "failed" and log.killed
+    scan = _ExportPopen(_scan_out(b"x" * 1000))
+    got, _, _ = _export(tmp_path, scan=scan)
+    assert got == "failed" and scan.killed
 
 
-def test_export_workspace_never_raises_and_never_overwrites(tmp_path):
-    dest = tmp_path / "j.bundle"
-    dest.write_bytes(b"old")
-    got, _ = container_mod.export_workspace(
-        "task1",
-        "franky",
-        _BRANCH,
-        _BASE,
-        dest,
-        [],
-        popen=_export_popen(log=_ExportPopen(b"x"), bundle=_ExportPopen(b"NEW")),
-        runner=_export_runner([]),
-    )
+def test_export_workspace_never_overwrites_and_never_raises(tmp_path):
+    (tmp_path / "j.bundle").write_bytes(b"old")
+    got, _, _ = _export(tmp_path, scan=_ExportPopen(_scan_out()), bundle=_ExportPopen(b"NEW"))
     assert got == "failed"
-    assert dest.read_bytes() == b"old"  # O_EXCL: an existing file is never clobbered or deleted
+    assert (tmp_path / "j.bundle").read_bytes() == b"old"  # O_EXCL: never clobbered or deleted
 
     def boom(argv, **kwargs):
         raise OSError("docker gone")
 
-    got, _ = container_mod.export_workspace(
+    got, _, _ = container_mod.export_workspace(
         "task1",
         "franky",
         _BRANCH,
         _BASE,
         tmp_path / "k.bundle",
         [],
+        clone_dir=_CLONE,
         popen=boom,
         runner=_export_runner([]),
     )
     assert got == "failed"
 
 
-def _export_run(tmp_path, *, stream, task_code=0, log=None, bundle=None, with_session=False):
-    """run_in_container with a workspace_sink; returns (calls, sink)."""
+def test_export_workspace_fails_closed_when_the_work_volume_cannot_be_resolved(tmp_path):
+    started = []
+    got, _, _ = container_mod.export_workspace(
+        "task1",
+        "franky",
+        _BRANCH,
+        _BASE,
+        tmp_path / "j.bundle",
+        [],
+        clone_dir=_CLONE,
+        popen=_export_popen(scan=_ExportPopen(_scan_out()), started=started),
+        runner=_export_runner([], mounts="[]"),
+    )
+    assert got == "failed" and not started
+
+
+class _Clock:
+    def __init__(self):
+        self.now = 1000.0
+
+    def __call__(self):
+        return self.now
+
+
+def test_export_budget_counts_the_scan_and_skips_the_bundle_when_too_little_is_left(tmp_path):
+    clock, started = _Clock(), []
+    # The scan "takes" 21 s of a 30 s budget, so 9 s remain: not enough to start the bundle.
+    scan = _ExportPopen(_scan_out(), on_read=lambda: setattr(clock, "now", clock.now + 21))
+    got, detail, tip = _export(
+        tmp_path, scan=scan, bundle=_ExportPopen(b"B"), started=started, clock=clock
+    )
+    assert got == "failed" and "not enough time" in detail and tip == _TIP
+    assert [m for m, _ in started] == ["scan"]
+    assert not (tmp_path / "j.bundle").exists()
+
+
+def test_export_budget_still_bundles_with_enough_time_left(tmp_path):
+    clock, started = _Clock(), []
+    scan = _ExportPopen(_scan_out(), on_read=lambda: setattr(clock, "now", clock.now + 15))
+    got, _, _ = _export(
+        tmp_path, scan=scan, bundle=_ExportPopen(b"B"), started=started, clock=clock
+    )
+    assert got == "ok" and [m for m, _ in started] == ["scan", "bundle"]
+
+
+def test_export_helper_reaps_are_capped_short():
+    seen = []
+
+    def runner(argv, **kwargs):
+        seen.append((argv, kwargs.get("timeout")))
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    container_mod._run_export_helper(
+        ["docker", "run"],
+        "task1",
+        lambda s: s.read(1),
+        5,
+        lambda *a, **k: _ExportPopen(b"x"),
+        runner,
+    )
+    reap = next(t for a, t in seen if a[:3] == ["docker", "rm", "-f"])
+    assert reap <= 5
+
+
+def _export_run(tmp_path, *, stream, task_code=0, scan=None, bundle=None, cfg=None, session=False):
+    """run_in_container with a workspace_sink; returns (calls, sink, output)."""
     calls = []
     runner, _ = _orchestration_runner(lambda *a, **k: None)
 
     def logged_runner(argv, **kwargs):
         calls.append(argv)
+        if argv[:2] == ["docker", "inspect"] and "{{json .Mounts}}" in argv:
+            return subprocess.CompletedProcess(argv, 0, stdout=_MOUNTS, stderr="")
         return runner(argv, **kwargs)
 
     helper = _export_popen(
-        log=log if log is not None else _ExportPopen(b"+ok\n"),
+        scan=scan if scan is not None else _ExportPopen(_scan_out()),
         bundle=bundle if bundle is not None else _ExportPopen(b"# v2 git bundle\n\nPACK"),
     )
 
@@ -2666,17 +2780,15 @@ def _export_run(tmp_path, *, stream, task_code=0, log=None, bundle=None, with_se
             return helper(argv, **kwargs)
         return _FakePopen(stream, returncode=task_code)
 
-    sink = {"dest": str(tmp_path / "j.bundle"), "branch": _BRANCH, "base": _BASE}
-    extra = {}
-    if with_session:
-        extra["session_sink"] = {
-            "paths": [".claude/s1.jsonl"],
-            "dest": str(tmp_path),
-            "max_bytes": 10**6,
-        }
+    sink = {
+        "dest": str(tmp_path / "j.bundle"),
+        "branch": _BRANCH,
+        "base": _BASE,
+        "clone_dir": _CLONE,
+    }
     with mock.patch.object(container_mod, "_hold_nonce", return_value="n0nce"):
-        run_in_container(
-            _cfg(),
+        _code, out = run_in_container(
+            cfg or _cfg(),
             ["claude"],
             runner=logged_runner,
             env={},
@@ -2684,9 +2796,8 @@ def _export_run(tmp_path, *, stream, task_code=0, log=None, bundle=None, with_se
             popen=popen,
             run_id="abc123def456",
             workspace_sink=sink,
-            **extra,
         )
-    return calls, sink
+    return calls, sink, out
 
 
 def _helper_runs(calls):
@@ -2694,7 +2805,7 @@ def _helper_runs(calls):
 
 
 def test_workspace_sink_arms_the_hold_keeps_rm_and_exports_inside_it(tmp_path):
-    calls, sink = _export_run(tmp_path, stream=_HOLD_STREAM)
+    calls, sink, _ = _export_run(tmp_path, stream=_HOLD_STREAM)
     task = "franky-run-abc123def456"
     run = next(
         c for c in calls if c[:2] == ["docker", "run"] and task in c and "franky-export" not in c
@@ -2704,23 +2815,60 @@ def test_workspace_sink_arms_the_hold_keeps_rm_and_exports_inside_it(tmp_path):
     marker = calls.index(_MARKER)
     reap = next(i for i, c in enumerate(calls) if c[:3] == ["docker", "rm", "-f"] and c[-1] == task)
     assert first_export < marker < reap
-    assert sink["status"] == "ok"
+    assert (sink["status"], sink["tip"]) == ("ok", _TIP)
     assert (tmp_path / "j.bundle").read_bytes() == b"# v2 git bundle\n\nPACK"
-    # The helper mounts the still-existing task container's volumes read-only.
-    export = _helper_runs(calls)[0]
-    assert export[export.index("--volumes-from") + 1] == f"{task}:ro"
+    # Each helper mounts only the task's /work volume, not the task container's volumes.
+    for export in _helper_runs(calls):
+        assert "--volumes-from" not in export
 
 
 def test_workspace_sink_releases_the_hold_even_when_the_export_fails(tmp_path):
-    calls, sink = _export_run(tmp_path, stream=_HOLD_STREAM, log=_ExportPopen(b"", 3))
+    calls, sink, _ = _export_run(tmp_path, stream=_HOLD_STREAM, scan=_ExportPopen(b"", 3))
     assert sink["status"] == "failed"
     assert _MARKER in calls
     assert not (tmp_path / "j.bundle").exists()
 
 
 def test_workspace_sink_does_nothing_without_the_hold_line(tmp_path):
-    calls, sink = _export_run(tmp_path, stream=["event\n"])
+    calls, sink, _ = _export_run(tmp_path, stream=["event\n"])
     assert "status" not in sink and not _helper_runs(calls) and _MARKER not in calls
+
+
+def test_workspace_sink_helper_stderr_goes_to_the_run_log_only(tmp_path):
+    calls, sink, out = _export_run(
+        tmp_path, stream=_HOLD_STREAM, scan=_ExportPopen(b"", 3, b"franky-export: INJECTED")
+    )
+    assert "INJECTED" not in sink["detail"]
+    assert "export helper: franky-export: INJECTED" in out
+
+
+def test_workspace_sink_scan_uses_credentials_only_not_the_jira_email(tmp_path):
+    email, token = "ops@example.test", "jira-token-ABCDEF123456"
+    cfg = Config(
+        engine=PiEngine(),
+        allowed_repos=["me/repo"],
+        passthrough_env={"GH_TOKEN": "ghp_fake"},
+        jira_secrets=[email, token],
+        jira_email=email,
+    )
+    # An email in a changed file does not refuse the export ...
+    (tmp_path / "a").mkdir()
+    _, sink, _ = _export_run(
+        tmp_path / "a",
+        stream=_HOLD_STREAM,
+        cfg=cfg,
+        scan=_ExportPopen(_scan_out(b"author " + email.encode() + b"\n")),
+    )
+    assert sink["status"] == "ok"
+    # ... a JIRA token still does.
+    (tmp_path / "b").mkdir()
+    _, sink, _ = _export_run(
+        tmp_path / "b",
+        stream=_HOLD_STREAM,
+        cfg=cfg,
+        scan=_ExportPopen(_scan_out(b"t=" + token.encode() + b"\n")),
+    )
+    assert sink["status"] == "refused"
 
 
 def test_workspace_and_session_sinks_share_one_hold(tmp_path):
@@ -2729,10 +2877,12 @@ def test_workspace_and_session_sinks_share_one_hold(tmp_path):
 
     calls = []
     runner, _ = _orchestration_runner(lambda *a, **k: None)
-    helper = _export_popen(log=_ExportPopen(b"x"), bundle=_ExportPopen(b"B"))
+    helper = _export_popen(scan=_ExportPopen(_scan_out()), bundle=_ExportPopen(b"B"))
 
     def logged_runner(argv, **kwargs):
         calls.append(argv)
+        if argv[:2] == ["docker", "inspect"] and "{{json .Mounts}}" in argv:
+            return subprocess.CompletedProcess(argv, 0, stdout=_MOUNTS, stderr="")
         return runner(argv, **kwargs)
 
     def popen(argv, **kwargs):
@@ -2743,7 +2893,12 @@ def test_workspace_and_session_sinks_share_one_hold(tmp_path):
             return helper(argv, **kwargs)
         return _FakePopen(_HOLD_STREAM)
 
-    wsink = {"dest": str(tmp_path / "j.bundle"), "branch": _BRANCH, "base": _BASE}
+    wsink = {
+        "dest": str(tmp_path / "j.bundle"),
+        "branch": _BRANCH,
+        "base": _BASE,
+        "clone_dir": _CLONE,
+    }
     ssink = {"paths": [".claude/s1.jsonl"], "dest": str(tmp_path / "s"), "max_bytes": 10**6}
     with mock.patch.object(container_mod, "_hold_nonce", return_value="n0nce"):
         run_in_container(

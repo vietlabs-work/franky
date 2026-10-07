@@ -86,6 +86,8 @@ class Config:
     # Every classic JIRA secret string the host holds (and, once enabled, the Atlassian access
     # token), whether or not the tools are on.
     jira_secrets: list[str] = field(default_factory=list)
+    # The JIRA email is redacted like a secret but is not a credential (see `--no-publish`'s scan).
+    jira_email: str = ""
     atlassian_tools: bool = False
 
     def enable_atlassian(self, token: str) -> None:
@@ -232,7 +234,7 @@ def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
     extra_domains = [d.strip() for d in raw_extra.split(",") if d.strip()]
 
     # Imported here: jira pulls in urllib.request, which every `redact` caller would pay for.
-    from .jira import jira_secret_strings
+    from .jira import JIRA_EMAIL_VAR, jira_secret_strings
 
     auth_volume: str | None = None
     if subscription_auth:
@@ -252,6 +254,7 @@ def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
         memory_mb=_resource_budget(env, MEMORY_MB_VAR, DEFAULT_MEMORY_MB, 256, 8192),
         disk_mb=_resource_budget(env, DISK_MB_VAR, DEFAULT_DISK_MB, 1024, 32768),
         jira_secrets=jira_secret_strings(env),
+        jira_email=(env.get(JIRA_EMAIL_VAR) or "").strip(),
     )
 
 
