@@ -254,6 +254,25 @@ def test_wrong_state_error_or_missing_code_stores_nothing(params):
     assert not net.calls(TOKEN) and not atlassian.store_path({}).exists()
 
 
+def test_atlassian_error_page_shows_its_error_code():
+    net = Net()
+    page = {"error": "invalid_request", "error_description": "Incorrect request parameters"}
+    with pytest.raises(ConfigError, match="login failed: invalid_request") as exc:
+        _connect(net, receive=lambda s: page)
+    assert "Rovo MCP server > Domain settings" in str(exc.value)
+    assert not net.calls(TOKEN) and not atlassian.store_path({}).exists()
+
+
+def test_pasted_error_page_keeps_the_existing_connection():
+    _connect(Net())
+    before = _stored()
+    net = Net()
+    page = "https://id.atlassian.com/error?error=invalid_request&error_description=Incorrect"
+    with pytest.raises(ConfigError, match="login failed: invalid_request"):
+        _connect(net, prompt=lambda text: page, no_browser=True)
+    assert not net.calls(TOKEN) and _stored() == before
+
+
 def test_token_exchange_body_and_client_secret():
     net = Net(**{REG: {"client_id": "cid", "client_secret": "csec"}})
     _connect(net)

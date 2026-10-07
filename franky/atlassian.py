@@ -373,12 +373,23 @@ def connect(
             params = receive(server)
     finally:
         server.server_close()
-    if params.get("state") != state:
-        raise ConfigError("Atlassian login failed: no authorization code or state mismatch")
+    # An error ends the login before the state check: an Atlassian error page carries no state,
+    # and nothing is exchanged or stored either way.
     error = params.get("error")
     if error:
         shown = error if _ERROR_CODE.fullmatch(error) else "error"
-        raise ConfigError(f"Atlassian login failed: {shown}")
+        hint = (
+            # Atlassian shows this after the consent click, most likely when the org has not
+            # allowlisted the loopback redirect (no request change on Franky's side got past it).
+            ". Your Atlassian org may block local redirect URLs: an org admin must add"
+            " http://127.0.0.1:*/** in Atlassian Administration > Rovo > Rovo MCP server >"
+            " Domain settings"
+            if shown == "invalid_request"
+            else ""
+        )
+        raise ConfigError(f"Atlassian login failed: {shown}{hint}")
+    if params.get("state") != state:
+        raise ConfigError("Atlassian login failed: no authorization code or state mismatch")
     if not params.get("code"):
         raise ConfigError("Atlassian login failed: no authorization code or state mismatch")
     fields = {

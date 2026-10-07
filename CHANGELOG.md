@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - A threaded `review-pr` re-review that leaves out an earlier finding above `nit` no longer lets it disappear. The finding stays open: it blocks `--allow-approve` for that run, and it is carried into the thread's next handoff, so the next re-review must report it again. The review body lists it as "Not re-reported, still open", and an omitted blocking finding gives `REQUEST_CHANGES`. Each reported finding accounts for one earlier finding (same file and title first, then the same title, ignoring case and end punctuation), so a repeated title cannot clear two. Before, an omitted finding left the gate and the handoff, and the following run could post an `APPROVE`.
+- A failed `franky connect jira` login now shows the Atlassian error code, not "no authorization code or state mismatch". For `invalid_request`, it also says that the Atlassian org can block local redirect URLs, and names the Rovo MCP server domain settings an org admin must change.
 - The thread handoff keeps questions ahead of nits under its 40-finding cap. If the cap ever cuts a finding above `nit`, the handoff records `overflow`, and that thread never auto-approves again (`franky threads purge` resets it).
 
 ## [0.3.14] - 2026-10-07
