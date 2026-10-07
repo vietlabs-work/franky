@@ -12,6 +12,21 @@ franky build "fix the flaky retry test" --repo you/repo --retry 2
 
 Before each build attempt, Franky checks for an open PR on the predicted branch. `--force` skips this idempotency check.
 
+## Build without publishing
+
+```bash
+franky build "fix the flaky retry test" --repo you/repo --no-publish --json
+```
+
+`build --no-publish` writes nothing to GitHub. The agent cuts `franky/<slug>` from the default-branch tip that Franky pins at start (`base_sha`), commits its work there, and does not push or open a PR. A host caller that holds the write credential takes the commits from the result. Franky never pushes them.
+
+- Supply a read-only `GH_TOKEN`. Franky cannot enforce this: the token is the only thing that stops the agent from pushing.
+- A start that cannot resolve the default-branch tip exits `8` before any container runs. `--thread` is refused with exit `2`. The open-PR check is skipped, and a retry never looks for a PR.
+- After a clean exit, two networkless, read-only helpers read the stopped task's volumes during the entrypoint's session hold. The first reads the new commits as patch text, and the host scans them for the run's secret values. The second writes `base_sha..branch` as one git bundle to `<FRANKY_RUNS_DIR>/<job_id>.bundle` (0600). The host reads only the bundle header, and never runs git on the container's checkout.
+- Status `branch_ready` (exit `0`) returns `branch`, `base_sha`, `head_sha`, and `bundle_path`. The bundle holds exactly `refs/heads/<branch>`. `no_changes`, `export_failed`, `timeout`, and `agent_error` exit `7` or `9`. `export_refused` exits `4`. [Automation](automation.md#build---no-publish) lists every field and status.
+- Franky deletes the bundle on every outcome except `branch_ready`. Run-record pruning deletes it with its record, so a caller should take it promptly.
+- `job resume` refuses these runs, and `job status` never offers a resume.
+
 `iterate` only targets an allowlisted PR from a same-repository `franky/*` branch. Its prompt forbids force pushes, new PRs, and merges.
 
 The `review-pr` prompt tells the agent to inspect only. The host publishes comments or change requests after it rechecks the PR head.

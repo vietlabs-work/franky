@@ -119,6 +119,7 @@ from .result import (
     EXIT_CONFIG,
     EXIT_NETWORK,
     EXIT_SUCCESS,
+    EXIT_TASK_REJECTED,
     EXIT_TIMEOUT,
     EXIT_USAGE,
     AuthError,
@@ -185,7 +186,7 @@ _JOB_TASK_SUMMARY_MAX = 200
 
 # Build statuses a `--retry` build may retry (issue #64 #5). pr_opened is success; config/auth/
 # docker/task failures raise a FrankyError BEFORE the attempt loop, so they never reach here.
-_RETRYABLE_STATUSES = frozenset({"timeout", "agent_error", "no_pr"})
+_RETRYABLE_STATUSES = frozenset({"timeout", "agent_error", "no_pr", "no_changes"})
 
 # Default time budget for a `job diagnose` pass (seconds). Diagnosis is a read-only summarization
 # of an existing transcript, not agentic work, and `--retry` fires it automatically, so it caps
@@ -321,6 +322,10 @@ def _emit_result(
             f"({result.get('log_path')})",
             err=True,
         )
+    elif status == "branch_ready" and result.get("bundle_path"):
+        click.echo(result["bundle_path"])
+    elif status in ("no_changes", "export_failed", "export_refused"):
+        click.echo(f"franky: {result.get('reason')}", err=True)
     elif status == "iterate_complete" and not quiet:
         # iterate opens no new PR; report a labeled completion line (never a bare success URL)
         # on stderr so stdout stays pure. Suppressed under --quiet.
@@ -453,6 +458,14 @@ def apparmor_profile() -> None:
     help="Hand this run's engine session to the PR's author thread once the PR exists, so "
     "`iterate --thread` continues it (see `franky threads`).",
 )
+@click.option(
+    "--no-publish",
+    "no_publish",
+    is_flag=True,
+    default=False,
+    help="Commit locally and export the new commits as a git bundle; push nothing, open no PR. "
+    "Needs a resolvable default-branch tip. Refused with --thread.",
+)
 @click.pass_context
 def build(
     ctx: click.Context,
@@ -469,6 +482,7 @@ def build(
     force: bool,
     retry: int,
     use_thread: bool,
+    no_publish: bool,
 ) -> None:
     """Build TASK_INPUT (a GitHub issue URL, a JIRA key, or a prose request) and open a PR.
 
@@ -488,6 +502,11 @@ def build(
     thread (repo + PR number, role author), which `franky iterate --thread` resumes. A timed-out
     or killed --thread build keeps its session for `franky job resume`.
 
+    --no-publish writes nothing to GitHub: the agent commits on a branch cut from the
+    default-branch tip, and a networkless read-only helper exports those commits as a git bundle
+    (`bundle_path`, status `branch_ready`) for a caller that holds the write credential. Franky
+    never pushes it. Use a read-only GH_TOKEN; Franky cannot enforce that.
+
     --json emits one machine-readable result/error object on stdout; exit codes follow the
     documented taxonomy (0 ok, 2 usage, 3 config, 4 task, 5 auth, 6 docker, 7 agent, 8 net,
     9 timeout).
@@ -498,6 +517,13 @@ def build(
     secrets = cfg_secrets_safe()
     process_env = dict(os.environ)
     try:
+        if no_publish and use_thread:
+            raise FrankyError(
+                "--thread needs a PR to bind the session to and cannot be combined with "
+                "--no-publish",
+                code=EXIT_USAGE,
+                kind="usage_error",
+            )
         # stdin task input: `build - --repo ...`. A TTY on `-` would block forever, so fail
         # fast (never-hang); otherwise read the prose task from stdin.
         task_input_str = _read_task_input(task_input)
@@ -514,8 +540,9 @@ def build(
         # Idempotency pre-check (issue #50): if a Franky PR is already open on the predicted
         # branch, a retry must NOT open a second one. Report the existing PR and stop without
         # launching the container. Best-effort - find_open_pr returns None on any error, so a
-        # flaky check never blocks a build. --force skips the check entirely.
-        if not force:
+        # flaky check never blocks a build. --force skips the check entirely. --no-publish opens
+        # no PR, so there is nothing to find.
+        if not force and not no_publish:
             existing = find_open_pr(spec.repo, branch, os.environ)
             if existing:
                 result = build_result(
@@ -534,6 +561,18 @@ def build(
                     result, as_json, secrets, pr_url=existing, status="already_open", quiet=quiet
                 )
                 ctx.exit(EXIT_SUCCESS)
+
+        # --no-publish pins the branch to the default-branch tip, so an unresolved tip stops the
+        # run here, before any image pull or container. Other builds resolve it later (below).
+        base_sha = None
+        if no_publish:
+            base_sha = baseref.resolve_base_sha(spec.repo, os.environ)
+            if not (base_sha and _FULL_SHA_RE.match(base_sha)):
+                raise NetworkError(
+                    "could not resolve the default-branch commit - refusing --no-publish "
+                    "without a pinned base",
+                    hint="check GH_TOKEN and network access to api.github.com, then retry",
+                )
 
         # After the idempotency short-circuit: an already-open run makes no GitHub or token call.
         _enable_atlassian(cfg, spec.repo, secrets, prose=not (quiet or as_json))
@@ -609,7 +648,8 @@ def build(
         # still reproducing the same starting state, not a moving target. Best-effort: one extra
         # GitHub GET alongside the existing idempotency check; None (unresolved) just means a
         # later `job replay` of this run cannot pin a commit, never a build failure.
-        base_sha = baseref.resolve_base_sha(spec.repo, os.environ)
+        if not no_publish:
+            base_sha = baseref.resolve_base_sha(spec.repo, os.environ)
         task_full = redact(spec.text, secrets)[:PROSE_MAX_CHARS]
 
         # PHASE 2 (or the only phase without --plan-first): build it and open the PR, with up to
@@ -624,7 +664,7 @@ def build(
             # failed may actually have opened a PR (e.g. a timeout AFTER `gh pr create`, or a
             # no_pr from truncated output). Re-check before spending another attempt so a retry
             # never opens a SECOND PR. --force skips it, matching the pre-loop pre-check.
-            if attempt_no > 1 and not force:
+            if attempt_no > 1 and not force and not no_publish:
                 existing = find_open_pr(spec.repo, branch, os.environ)
                 if existing:
                     final = {
@@ -658,13 +698,14 @@ def build(
                 task_full=task_full,
                 base_sha=base_sha,
                 thread=use_thread,
+                no_publish=no_publish,
                 # A --plan-first plan pass already ran in this invocation: not the first pass.
                 first_attempt=attempt_no == 1 and not plan_first,
             )
             attempts.append(
                 {"job_id": final["job_id"], "status": final["status"], "retry_hint": ""}
             )
-            if final["status"] == "pr_opened":
+            if final["status"] in ("pr_opened", "branch_ready"):
                 break
             if attempt_no >= total_attempts or final["status"] not in _RETRYABLE_STATUSES:
                 break
@@ -726,6 +767,9 @@ def build(
             attempts=attempts if retry > 0 else None,
             thread=final.get("thread"),
             handoff=final.get("handoff"),
+            base_sha=final.get("base_sha"),
+            head_sha=final.get("head_sha"),
+            bundle_path=final.get("bundle_path"),
         )
         _emit_result(
             result, as_json, secrets, pr_url=final["pr_url"], status=final["status"], quiet=quiet
@@ -2860,6 +2904,7 @@ def _run_pass(
     session: tuple[str, bool] | None = None,
     session_tar: str | None = None,
     session_sink: dict | None = None,
+    workspace_sink: dict | None = None,
     private_prompt: bool = False,
     extra_secrets: Sequence[str] = (),
 ) -> tuple[int, str, float]:
@@ -2879,7 +2924,8 @@ def _run_pass(
     snapshot-on-timeout sink and a workspace-to-restore path respectively; both None by default.
     `session` = (session_id, resume) reaches the engine argv; `session_tar`/`session_sink` are
     forwarded to run_in_container (`review-pr --thread`). Each is passed on only when set, so a
-    run without them is unchanged. `extra_secrets` (host-only values such as the JIRA token) are
+    run without them is unchanged. `workspace_sink` (`build --no-publish`) is forwarded the same
+    way. `extra_secrets` (host-only values such as the JIRA token) are
     redacted from the streamed output and heartbeat; never added to the container env.
     """
     session_kwargs = {} if session is None else {"session_id": session[0], "resume": session[1]}
@@ -2927,6 +2973,8 @@ def _run_pass(
         extra["session_tar"] = session_tar
     if session_sink is not None:
         extra["session_sink"] = session_sink
+    if workspace_sink is not None:
+        extra["workspace_sink"] = workspace_sink
     if extra_secrets:
         extra["extra_secrets"] = list(extra_secrets)
     hb = _HEARTBEATS.get(run_id) if run_id else None
@@ -3249,6 +3297,7 @@ def _record_run_start(
     thread_id=None,
     session_id=None,
     threaded=False,
+    no_publish=False,
     env=None,
 ) -> None:
     """Write a status=running registry record before the container pass (issues #63, #64).
@@ -3289,6 +3338,7 @@ def _record_run_start(
             session_id=session_id,
             model=cfg.model if session_id else None,
             threaded=threaded,
+            no_publish=no_publish,
         )
         jobs.write_record(record, env)
         jobs.prune(env)  # only on the write path; never a side effect of a read
@@ -3355,6 +3405,35 @@ def _record_run_end(
         pass
 
 
+def _classify_export(sink: dict, branch: str, bundle: Path) -> tuple[str, str, int, str | None]:
+    """Turn a `--no-publish` export sink into (status, reason, exit_code, head_sha).
+
+    Only `ok` with a bundle whose header names exactly `refs/heads/<branch>` is `branch_ready`.
+    A missing status means the hold line never came (nothing was exported) and is a failure."""
+    export = sink.get("status")
+    if export == "no_changes":
+        return "no_changes", "the agent made no commits beyond the base", EXIT_AGENT, None
+    if export == "refused":
+        return (
+            "export_refused",
+            "a run secret value was found in the new commits; nothing was exported",
+            EXIT_TASK_REJECTED,
+            None,
+        )
+    if export == "ok":
+        try:
+            return (
+                "branch_ready",
+                "branch exported",
+                EXIT_SUCCESS,
+                snapshot.parse_bundle_header(bundle, branch),
+            )
+        except ValueError:
+            return "export_failed", "the exported bundle failed verification", EXIT_AGENT, None
+    reason = sink.get("detail") or "the workspace was not exported"
+    return "export_failed", f"export failed: {reason}"[:300], EXIT_AGENT, None
+
+
 def _build_once(
     cfg,
     spec,
@@ -3375,6 +3454,7 @@ def _build_once(
     base_sha=None,
     setup_block="",
     thread=False,
+    no_publish=False,
     first_attempt=False,
 ) -> dict:
     """Run ONE build attempt end to end and return its outcome (issue #64 #5).
@@ -3393,6 +3473,13 @@ def _build_once(
     job record BEFORE launch and copied out on a clean exit or a timeout; `_settle_author_session`
     then stores it as the job's sidecar and binds it to the PR's author thread. The outcome gains
     `thread`/`handoff` only then.
+
+    `no_publish` (`build --no-publish`, needs `base_sha`): the agent only commits; the host
+    exports `base_sha..branch` as a bundle at `<runs_dir>/<job_id>.bundle`. Classification is
+    timeout, then non-zero exit, then the export result (`branch_ready` | `no_changes` |
+    `export_refused` | `export_failed`); the agent's output is never searched for a PR URL. The
+    bundle is deleted on every outcome except `branch_ready`. The outcome gains
+    `base_sha`/`head_sha`/`bundle_path`.
     """
     job_id = jobs.new_job_id()
     session_id = str(uuid.uuid4()) if thread and cfg.engine.session_dir else None
@@ -3408,18 +3495,33 @@ def _build_once(
         base_sha=base_sha,
         session_id=session_id,
         threaded=thread,
+        no_publish=no_publish,
         env=env,
     )
     _announce_start(job_id, "build", as_json, quiet)
     # Populated (best-effort) by run_in_container just before container teardown (issue #69).
     diagnostics: dict = {}
     # A timed-out build leaves a resumable workspace snapshot (issue #71) keyed to this job id.
+    # A --no-publish run is never resumed, so it keeps no workspace snapshot either.
     snapshot_sink: dict = {"dest": str(snapshot.snapshot_path_for(job_id, env))}
     run_kwargs = _session_capture(cfg, session_id, resume=False, env=env) if session_id else {}
+    bundle_dest = None
+    if no_publish:
+        bundle_dest = (jobs.runs_dir(env) / f"{job_id}.bundle").resolve()
+        run_kwargs["workspace_sink"] = {
+            "dest": str(bundle_dest),
+            "branch": branch,
+            "base": base_sha,
+        }
     code, output, duration = _run_pass(
         cfg,
         build_prompt(
-            spec, branch=branch, prior_failures=prior_failures, operator_setup=setup_block
+            spec,
+            branch=branch,
+            prior_failures=prior_failures,
+            operator_setup=setup_block,
+            publish=not no_publish,
+            base_sha=base_sha,
         ),
         franky_img,
         proxy_img,
@@ -3428,7 +3530,7 @@ def _build_once(
         timeout=timeout,
         run_id=job_id,
         diagnostics_sink=diagnostics,
-        snapshot_sink=snapshot_sink,
+        snapshot_sink=None if no_publish else snapshot_sink,
         **run_kwargs,
     )
 
@@ -3443,15 +3545,27 @@ def _build_once(
     # report a PR URL for some other (attacker) repo. Timeout is checked FIRST: a timed-out run
     # returns the CONTAINER_TIMEOUT_CODE sentinel (124, nonzero), so it must be distinguished
     # before the generic agent_error branch and mapped to the dedicated timeout status.
-    pr_url = cfg.engine.parse_pr_url(output, repo=spec.repo)
+    pr_url = None if no_publish else cfg.engine.parse_pr_url(output, repo=spec.repo)
+    head_sha = bundle_path = None
     if code == CONTAINER_TIMEOUT_CODE:
         status, reason, exit_code = "timeout", "exceeded max-duration", EXIT_TIMEOUT
     elif code != 0:
         status, reason, exit_code = "agent_error", f"agent exited {code}", EXIT_AGENT
+    elif no_publish:
+        sink = run_kwargs["workspace_sink"]
+        status, reason, exit_code, head_sha = _classify_export(sink, branch, bundle_dest)
+        if status == "branch_ready":
+            bundle_path = str(bundle_dest)
     elif pr_url:
         status, reason, exit_code = "pr_opened", "PR opened", EXIT_SUCCESS
     else:
         status, reason, exit_code = "no_pr", "agent produced no PR URL", EXIT_AGENT
+    if no_publish and status != "branch_ready":
+        # Container-made bytes stay on the host only when they are the deliverable.
+        try:
+            bundle_dest.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     _record_run_end(
         job_id,
@@ -3463,6 +3577,7 @@ def _build_once(
         log_path=log_path,
         diagnostics=diagnostics,
         snapshot_path=snapshot_sink.get("snapshot_path"),
+        extra={"head_sha": head_sha, "bundle_path": bundle_path},
         env=env,
     )
     outcome = {
@@ -3477,6 +3592,10 @@ def _build_once(
         "duration": duration,
         "diagnostics": diagnostics,
     }
+    if no_publish:
+        outcome["base_sha"] = base_sha
+        if head_sha:
+            outcome["head_sha"], outcome["bundle_path"] = head_sha, bundle_path
     if thread:
         outcome["thread"], outcome["handoff"] = _settle_author_session(
             cfg,
@@ -4794,6 +4913,13 @@ def job_resume(
                 code=EXIT_USAGE,
                 kind="not_resumable",
                 hint="see `franky jobs`",
+            )
+
+        # Resume would push and open a PR, which a --no-publish run never does.
+        if record.get("no_publish"):
+            raise TaskRejected(
+                "cannot resume a --no-publish build - resume pushes and opens a PR",
+                hint="run `franky build --no-publish` again",
             )
 
         # A snapshot only exists for a hung/timed-out/killed run - guard on it up front so a run

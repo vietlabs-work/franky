@@ -667,17 +667,49 @@ def _hold_nonce() -> str:
     return secrets.token_hex(8)
 
 
-def _copy_session_in_hold(task: str, sink: dict, nonce: str, runner, popen) -> None:
+def _run_in_hold(
+    task: str,
+    image: str,
+    nonce: str,
+    session_sink: dict | None,
+    workspace_sink: dict | None,
+    secrets: list[str],
+    runner,
+    popen,
+) -> None:
     """The engine exited cleanly and the entrypoint holds the --rm container: copy the session
-    out while it still exists, then release the hold. The release runs even when the copy fails
-    or is interrupted, so the container exits; if the release itself fails, the entrypoint's cap
-    ends the hold and --rm still removes the container. Never raises an Exception."""
+    out and export the workspace while it still exists, then release the hold. The release runs
+    even when a step fails or is interrupted, so the container exits; if the release itself
+    fails, the entrypoint's cap ends the hold and --rm still removes the container. Never raises
+    an Exception."""
     try:
-        sink["status"] = snapshot.copy_session(
-            task, sink["paths"], sink["dest"], max_bytes=sink["max_bytes"], popen=popen
-        )
-    except Exception:
-        pass
+        if session_sink is not None:
+            try:
+                session_sink["status"] = snapshot.copy_session(
+                    task,
+                    session_sink["paths"],
+                    session_sink["dest"],
+                    max_bytes=session_sink["max_bytes"],
+                    popen=popen,
+                )
+            except Exception:
+                pass
+        if workspace_sink is not None:
+            try:
+                status, detail = export_workspace(
+                    task,
+                    image,
+                    str(workspace_sink["branch"]),
+                    str(workspace_sink["base"]),
+                    str(workspace_sink["dest"]),
+                    secrets,
+                    popen=popen,
+                    runner=runner,
+                )
+            except Exception as exc:
+                status, detail = "failed", f"export failed: {type(exc).__name__}"
+            workspace_sink["status"] = status
+            workspace_sink["detail"] = redact(detail, secrets)
     finally:
         try:
             runner(
@@ -690,6 +722,260 @@ def _copy_session_in_hold(task: str, sink: dict, nonce: str, runner, popen) -> N
             )
         except Exception:
             pass
+
+
+# --- Workspace export (`build --no-publish`) ---------------------------------------------------
+#
+# WHY a helper and not `docker cp` of /work: the checkout in /work is AUTHORED BY THE CONTAINER.
+# Any host git command inside it would run container-chosen hooks and config with the host's
+# environment, so the host never touches that tree. A throwaway sandbox reads it instead: it is
+# networkless, read-only, capability-free, runs the packaged seccomp policy, mounts the task's
+# volumes read-only, and writes only to stdout and a small tmpfs HOME. Two short runs in turn:
+# `log` (the new commits as patch text, scanned on the host for the run's secret values) and
+# `bundle` (one inert git bundle of base..branch, written to a 0600 host file).
+#
+# It runs inside the entrypoint's session hold, so the task container still exists (--rm) and no
+# stopped container ever keeps the tokens. The hold lasts 60 s; the helpers share a 45 s budget.
+EXPORT_HELPER_HOME = "/run/franky-export"
+EXPORT_BUDGET_SECS = 45
+# ponytail: fixed 256 MiB cap on a bundle and on the scanned patch text; make it a setting only
+# if real work needs more (the hold and the helper memory limit bound it either way).
+EXPORT_MAX_BYTES = 256 * 1024**2
+
+_EXPORT_BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+_EXPORT_BASE_RE = re.compile(r"^[0-9a-f]{40}$")
+
+# Runs INSIDE the sandbox. $1 = log|bundle, $2 = branch, $3 = base sha: arguments, never
+# interpolated into the script. Exit 3: not exactly one checkout or no such branch. Exit 4: the
+# branch tip is the base (no new commits). Exit 5: the base is not an ancestor of the branch.
+_EXPORT_SCRIPT = """set -eu
+found=$(find /work -mindepth 2 -maxdepth 4 -name .git -type d 2>/dev/null || true)
+count=$(printf '%s' "$found" | grep -c . || true)
+if [ "$count" != "1" ]; then
+  echo "franky-export: expected exactly one checkout under /work, found $count" >&2
+  exit 3
+fi
+cd "$(dirname "$found")"
+mode=$1; branch=$2; base=$3
+tip=$(git -c safe.directory='*' rev-parse --verify --quiet "refs/heads/$branch^{commit}") || {
+  echo "franky-export: branch $branch does not exist" >&2
+  exit 3
+}
+if [ "$tip" = "$base" ]; then
+  echo "franky-export: branch has no commits beyond the base" >&2
+  exit 4
+fi
+git -c safe.directory='*' merge-base --is-ancestor "$base" "$tip" || {
+  echo "franky-export: base is not an ancestor of the branch" >&2
+  exit 5
+}
+case "$mode" in
+  bundle) exec git -c safe.directory='*' bundle create -q - "$base..refs/heads/$branch" ;;
+  log) exec git -c safe.directory='*' -c core.fsmonitor=false log -p -m --text --no-ext-diff \\
+         --no-textconv --no-color "$base..refs/heads/$branch" ;;
+esac
+echo "franky-export: unknown mode" >&2
+exit 2
+"""
+
+
+def export_container_name(task: str) -> str:
+    """The helper's container name, derived from the task's so a reaper can find both."""
+    return f"{task}-export"
+
+
+def build_export_argv(task: str, image: str, mode: str, branch: str, base: str) -> list[str]:
+    """`docker run` argv for the sandboxed exporter. Pure - no docker invoked.
+
+    `mode` is `log` or `bundle`. `branch` and `base` are validated here (a branch name with no
+    shell, option or `..` shape; a full lowercase 40-hex SHA) and passed as ARGUMENTS."""
+    if mode not in ("log", "bundle"):
+        raise ValueError(f"unknown export mode: {mode!r}")
+    if not _EXPORT_BRANCH_RE.match(branch) or ".." in branch or branch.endswith((".lock", "/")):
+        raise ValueError(f"unsafe branch name: {branch!r}")
+    if not _EXPORT_BASE_RE.match(base):
+        raise ValueError("base must be a full lowercase 40-hex commit SHA")
+    return [
+        "docker",
+        "run",
+        "--rm",
+        "--name",
+        export_container_name(task),
+        "--network=none",
+        "--read-only",
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges",
+        f"--security-opt=seccomp={DEFAULT_SECCOMP}",
+        "--volumes-from",
+        f"{task}:ro",
+        # NOT /tmp: the task's /tmp is an inherited volume, and a tmpfs at the same destination
+        # is a duplicate mount point.
+        "--tmpfs",
+        f"{EXPORT_HELPER_HOME}:exec,uid={_RUN_UID},gid={_RUN_GID},size=16m",
+        "-e",
+        f"HOME={EXPORT_HELPER_HOME}",
+        "-e",
+        "GIT_CONFIG_NOSYSTEM=1",
+        "-e",
+        "GIT_TERMINAL_PROMPT=0",
+        "-e",
+        "GIT_OPTIONAL_LOCKS=0",
+        "--pids-limit=64",
+        "--memory=256m",
+        "--memory-swap=256m",
+        "--log-driver=none",
+        "--entrypoint=sh",
+        image,
+        "-c",
+        _EXPORT_SCRIPT,
+        "franky-export",
+        mode,
+        branch,
+        base,
+    ]
+
+
+class _Oversize(Exception):
+    pass
+
+
+class _CappedStream:
+    """Read-only view of a helper's stdout that refuses to deliver more than `limit` bytes."""
+
+    def __init__(self, stream, limit: int) -> None:
+        self._stream = stream
+        self._left = limit
+
+    def read(self, size: int = -1) -> bytes:
+        data = self._stream.read(size)
+        self._left -= len(data)
+        if self._left < 0:
+            raise _Oversize()
+        return data
+
+
+def _run_export_helper(task, image, mode, branch, base, consume, timeout, popen, runner):
+    """Run one helper and feed its stdout to `consume(stream)`.
+
+    Returns (code, stderr_text, consumed_result). A timer kills the client process at the
+    deadline; the helper container is reaped by name afterwards, always. Raises whatever
+    `consume` raises (the caller classifies); the reap still runs."""
+    proc = popen(
+        build_export_argv(task, image, mode, branch, base),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    timer = threading.Timer(max(1.0, timeout), proc.kill)
+    timer.daemon = True
+    timer.start()
+    try:
+        try:
+            result = consume(_CappedStream(proc.stdout, EXPORT_MAX_BYTES))
+        except BaseException:
+            proc.kill()
+            raise
+        code = proc.wait(timeout=max(1.0, timeout))
+        detail = (proc.stderr.read(4096) or b"").decode("utf-8", errors="replace").strip()
+        return code, detail, result
+    finally:
+        timer.cancel()
+        for stream in (proc.stdout, proc.stderr):
+            try:
+                stream.close()
+            except Exception:
+                pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        _reap(export_container_name(task), runner)
+
+
+def _export_status(code: int, detail: str) -> tuple[str, str]:
+    if code == 4:
+        return "no_changes", detail or "no commits beyond the base"
+    return "failed", detail or f"export helper exited {code}"
+
+
+def export_workspace(
+    task,
+    image,
+    branch,
+    base,
+    dest,
+    secrets,
+    *,
+    popen=subprocess.Popen,
+    runner=subprocess.run,
+    budget: float = EXPORT_BUDGET_SECS,
+) -> tuple[str, str]:
+    """Export `base..refs/heads/<branch>` from `task`'s /work as a git bundle at host file `dest`.
+
+    Returns (status, detail): `ok` | `no_changes` | `refused` (a run secret VALUE is in the new
+    commits; nothing written) | `failed`. `detail` never carries a secret value. The patch text
+    is scanned first, so a refused run never produces a bundle. `dest` is created 0600 with
+    O_EXCL and removed on any non-ok result. Never raises. The two helpers share `budget`."""
+    deadline = time.monotonic() + budget
+    dest = Path(dest)
+    created = False
+    try:
+
+        def scan(stream):
+            return snapshot.stream_contains_values(stream, secrets)
+
+        try:
+            code, detail, found = _run_export_helper(
+                task, image, "log", branch, base, scan, deadline - time.monotonic(), popen, runner
+            )
+        except _Oversize:
+            return "failed", f"patch text exceeded {EXPORT_MAX_BYTES} bytes"
+        if found:
+            return "refused", "a run secret value appears in the new commits"
+        if code != 0:
+            return _export_status(code, detail)
+
+        dest.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # 0600, O_EXCL: the bundle is container-derived bytes staged on the host.
+        target = os.fdopen(os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb")
+        created = True
+        written = 0
+
+        def copy(stream):
+            nonlocal written
+            while chunk := stream.read(CHUNK_SIZE):
+                written += len(chunk)
+                target.write(chunk)
+
+        try:
+            code, detail, _ = _run_export_helper(
+                task,
+                image,
+                "bundle",
+                branch,
+                base,
+                copy,
+                deadline - time.monotonic(),
+                popen,
+                runner,
+            )
+        except _Oversize:
+            return "failed", f"workspace bundle exceeded {EXPORT_MAX_BYTES} bytes"
+        finally:
+            target.close()
+        if code != 0:
+            return _export_status(code, detail)
+        if written == 0:
+            return "failed", "export helper produced no bundle"
+        created = False
+        return "ok", ""
+    except Exception as exc:
+        return "failed", f"export helper failed: {type(exc).__name__}"
+    finally:
+        if created:
+            try:
+                dest.unlink()
+            except OSError:
+                pass
 
 
 def capture_diagnostics(
@@ -1172,6 +1458,7 @@ def run_in_container(
     apparmor_selector=select_task_apparmor,
     session_tar: str | None = None,
     session_sink: dict | None = None,
+    workspace_sink: dict | None = None,
     private_prompt_tar: bytes | None = None,
     extra_secrets: Iterable[str] = (),
 ) -> tuple[int, str | Transcript]:
@@ -1201,6 +1488,12 @@ def run_in_container(
     `dest`. The first path is required, the rest optional; the sink gains `"status"`: ok,
     too_large (the combined stream passed `max_bytes`), or failed. `"on_timeout": True` also
     copies the session out of a timed-out run (`build --thread`, `job resume`).
+
+    `workspace_sink` (`build --no-publish`) = {"dest": host file, "branch": name, "base": 40-hex
+    SHA} exports `base..branch` out of `/work` as a git bundle, inside the same session hold and
+    through networkless read-only helpers (see `export_workspace`). The sink gains `"status"`
+    (`ok` | `no_changes` | `refused` | `failed`) and a redacted `"detail"` only when the hold line
+    was seen, which needs a clean engine exit; a missing status means nothing was exported.
 
     `extra_secrets` are host-only values (the JIRA token and email) added to the redaction set
     for the streamed and stored output. They are never passed into the container.
@@ -1248,7 +1541,8 @@ def run_in_container(
     storage_failures: list[str] = []
     storage_thread = None
     hold_copied = False  # the session was copied while the entrypoint held the container
-    hold_nonce = _hold_nonce() if session_sink is not None else ""
+    holding = session_sink is not None or workspace_sink is not None
+    hold_nonce = _hold_nonce() if holding else ""
     hold_want = f"{snapshot.SESSION_HOLD_LINE} {hold_nonce}"
     hold_buf, hold_at_line_start = "", True
 
@@ -1426,7 +1720,7 @@ def run_in_container(
                             break
                         text = decoder.decode(line) if isinstance(line, bytes) else line
                         emit(text)
-                        if session_sink is not None and not hold_copied:
+                        if holding and not hold_copied:
                             # Only a WHOLE line equal to the hold line counts. The run timeout
                             # stays armed: the agent can read the nonce and print the line, which
                             # only buys an early, partial copy of its own session. Known limit:
@@ -1440,7 +1734,16 @@ def run_in_container(
                             if len(hold_buf) > _HOLD_LINE_MAX:
                                 hold_buf, hold_at_line_start = "", False
                             if hold_copied:
-                                _copy_session_in_hold(task, session_sink, hold_nonce, runner, popen)
+                                _run_in_hold(
+                                    task,
+                                    image,
+                                    hold_nonce,
+                                    session_sink,
+                                    workspace_sink,
+                                    secrets,
+                                    runner,
+                                    popen,
+                                )
                         # Belt-and-suspenders: the per-line elapsed check still catches a slow
                         # trickle of output between deadline checks; the watchdog above catches a
                         # total silence.

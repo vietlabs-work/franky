@@ -702,3 +702,36 @@ def test_review_prompt_sets_severity_from_the_method_scale():
     assert "<blocking|normal|question|nit>" in prompt  # question stays reachable
     assert 'use "normal"/"nit" otherwise' not in prompt  # the old fallback rated defects as nit
     assert "Decide the severity last, after you write the impact" in prompt
+
+
+_BASE = "c" * 40
+
+
+def test_build_prompt_no_publish_pins_the_base_and_never_pushes():
+    spec = TaskSpec(
+        repo="octocat/hello", text="https://github.com/octocat/hello/issues/42", source="issue"
+    )
+    p = build_prompt(spec, branch="franky/fix-42", publish=False, base_sha=_BASE)
+    assert f"git checkout -b franky/fix-42 {_BASE}" in p
+    assert "Do NOT push, do NOT run `gh pr create`" in p
+    assert "Open the PR with" not in p
+    # No PR to close, no PR text to write.
+    assert "Closes #" not in p and "PR title" not in p and "PR body" not in p
+    # Commits are still conventional, and tests must pass before the final commit.
+    assert "conventional" in p.lower() and "tests" in p.lower()
+    assert "commit" in p.lower() and "full history" in p.lower()
+
+
+def test_build_prompt_no_publish_requires_a_base_sha():
+    import pytest
+
+    spec = TaskSpec(repo="me/repo", text="add a flag", source="prose")
+    for bad in (None, "", "main", "C" * 40):
+        with pytest.raises(ValueError):
+            build_prompt(spec, publish=False, base_sha=bad)
+
+
+def test_build_prompt_default_is_unchanged_by_the_publish_flag():
+    spec = TaskSpec(repo="me/repo", text="add a flag", source="prose")
+    assert build_prompt(spec) == build_prompt(spec, publish=True, base_sha=_BASE)
+    assert "gh pr create" in build_prompt(spec)

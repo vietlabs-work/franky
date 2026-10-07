@@ -777,3 +777,77 @@ def test_extract_plain_refuses_more_than_max_bytes(tmp_path):
         snapshot._extract_plain(io.BytesIO(data), tmp_path, max_bytes=100)
     snapshot._extract_plain(io.BytesIO(data), tmp_path / "ok", max_bytes=120)
     assert (tmp_path / "ok" / "b").read_bytes() == b"x" * 60
+
+
+# ---------------------------------------------------------------------------
+# Bundle header (`build --no-publish`)
+# ---------------------------------------------------------------------------
+
+_SHA_A = "a" * 40
+_SHA_B = "b" * 40
+
+
+def _bundle(tmp_path, header: str, body: bytes = b"PACK\x00\x00") -> Path:
+    path = tmp_path / "x.bundle"
+    path.write_bytes(header.encode() + b"\n" + body)
+    return path
+
+
+@pytest.mark.parametrize("version", ["v2", "v3"])
+def test_parse_bundle_header_returns_the_head_sha(tmp_path, version):
+    lines = [f"# {version} git bundle"]
+    if version == "v3":
+        lines.append("@object-format=sha1")
+    lines += [f"-{_SHA_A} base commit", f"{_SHA_B} refs/heads/franky/fix-a"]
+    path = _bundle(tmp_path, "\n".join(lines) + "\n")
+    assert snapshot.parse_bundle_header(path, "franky/fix-a") == _SHA_B
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        # wrong ref
+        f"# v2 git bundle\n{_SHA_B} refs/heads/franky/other\n",
+        # a tag or HEAD is not a branch
+        f"# v2 git bundle\n{_SHA_B} refs/tags/franky/fix-a\n",
+        f"# v2 git bundle\n{_SHA_B} HEAD\n",
+        # two refs, even when one is right
+        f"# v2 git bundle\n{_SHA_B} refs/heads/franky/fix-a\n{_SHA_A} refs/heads/main\n",
+        # no ref at all
+        f"# v2 git bundle\n-{_SHA_A} base\n",
+        # malformed: bad version, short sha, upper-case sha, missing space, unknown capability
+        f"# v1 git bundle\n{_SHA_B} refs/heads/franky/fix-a\n",
+        "# v2 git bundle\nabc refs/heads/franky/fix-a\n",
+        f"# v2 git bundle\n{'B' * 40} refs/heads/franky/fix-a\n",
+        f"# v2 git bundle\n{_SHA_B}refs/heads/franky/fix-a\n",
+        f"# v3 git bundle\n@object-format=sha256\n{'b' * 64} refs/heads/franky/fix-a\n",
+        f"# v3 git bundle\n@filter=blob:none\n{_SHA_B} refs/heads/franky/fix-a\n",
+        f"# v2 git bundle\n-xyz base\n{_SHA_B} refs/heads/franky/fix-a\n",
+        "",
+        "not a bundle\n",
+    ],
+)
+def test_parse_bundle_header_refuses_anything_else(tmp_path, header):
+    with pytest.raises(ValueError):
+        snapshot.parse_bundle_header(_bundle(tmp_path, header), "franky/fix-a")
+
+
+def test_parse_bundle_header_is_bounded(tmp_path):
+    # A header with no terminating blank line inside 64 KiB is refused, not read to the end.
+    path = tmp_path / "big.bundle"
+    path.write_bytes(b"# v2 git bundle\n" + (f"-{_SHA_A} c\n".encode() * 5000))
+    with pytest.raises(ValueError):
+        snapshot.parse_bundle_header(path, "franky/fix-a")
+
+
+def test_parse_bundle_header_missing_file(tmp_path):
+    with pytest.raises(ValueError):
+        snapshot.parse_bundle_header(tmp_path / "gone.bundle", "franky/fix-a")
+
+
+def test_values_in_a_stream_are_found_across_chunk_edges():
+    secret = "ghp_" + "x" * 60
+    data = b"a" * (snapshot._CHUNK_BYTES - 10) + secret.encode() + b"b" * 100
+    assert snapshot.stream_contains_values(io.BytesIO(data), [secret]) is True
+    assert snapshot.stream_contains_values(io.BytesIO(b"clean " * 50), [secret]) is False
+    assert snapshot.stream_contains_values(io.BytesIO(data), []) is False

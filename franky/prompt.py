@@ -202,6 +202,8 @@ def build_prompt(
     branch: str | None = None,
     prior_failures: tuple[str, ...] | list[str] = (),
     operator_setup: str = "",
+    publish: bool = True,
+    base_sha: str | None = None,
 ) -> str:
     """Compose the build prompt, pinning the branch the agent must use.
 
@@ -216,11 +218,34 @@ def build_prompt(
 
     `operator_setup` is `build_setup_block`'s output when the profile injected the operator's
     agentic-coding setup; "" (the default) leaves the prompt exactly as it was.
+
+    `publish=False` (`build --no-publish`) swaps the PR conventions for local ones: the branch is
+    created from the pinned `base_sha`, everything is committed, and nothing is pushed or opened;
+    the host exports the commits afterwards. It needs a full lowercase 40-hex `base_sha`.
     """
     persona = load_persona()
 
     task_block, close_line = _task_block(spec, plan=False)
     branch = branch or f"franky/{task_slug(spec)}"
+    if not publish:
+        if not (isinstance(base_sha, str) and re.fullmatch(r"[0-9a-f]{40}", base_sha)):
+            raise ValueError("a --no-publish prompt needs a full 40-hex base_sha")
+        conventions = (
+            "Conventions (follow exactly):\n"
+            f"- Clone {spec.repo} with its full history (no --depth), then run "
+            f"`git checkout -b {branch} {base_sha}`. Work only on that branch.\n"
+            "- Run the repo's tests and make them pass BEFORE your final commit.\n"
+            "- Commit all your work on that branch with conventional-commit messages: "
+            "`<type>: <summary>` (e.g. `feat:`, `fix:`, `chore:`). Leave nothing uncommitted.\n"
+            "- Do NOT push, do NOT run `gh pr create`, do NOT merge, and do NOT rewrite history "
+            "of commits before your own: a separate step takes your commits from this clone.\n"
+            "- Keep commit messages professional; no persona flavor in the deliverables.\n"
+            f"{_STEER_CONVENTION}"
+        )
+        return (
+            f"{persona}\n\n{task_block}\n"
+            f"{_prior_failures_block(prior_failures)}{conventions}{operator_setup}"
+        )
 
     conventions = (
         "Conventions (follow exactly):\n"

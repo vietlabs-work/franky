@@ -2381,3 +2381,381 @@ def test_run_in_container_extra_secrets_redacted_from_stream_and_output():
     assert planted not in out and planted not in "".join(seen)
     assert "***REDACTED***" in out
     assert all(planted not in " ".join(map(str, c)) for c in calls)
+
+
+# ---------------------------------------------------------------------------
+# Workspace export (`build --no-publish`)
+# ---------------------------------------------------------------------------
+
+_BASE = "c" * 40
+_BRANCH = "franky/add-flag"
+
+
+class _ExportPopen:
+    """Fake helper `docker run`: stdout is the exported stream; records a kill."""
+
+    def __init__(self, data=b"", code=0, err=b""):
+        import io
+
+        self.stdout = io.BytesIO(data)
+        self.stderr = io.BytesIO(err)
+        self.returncode = code
+        self.killed = False
+
+    def kill(self):
+        self.killed = True
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
+def _export_popen(*, log=None, bundle=None, started=None):
+    """popen fake keyed on the helper mode argument (`log` | `bundle`)."""
+
+    def popen(argv, **kwargs):
+        mode = argv[-3]
+        if started is not None:
+            started.append((mode, argv))
+        proc = {"log": log, "bundle": bundle}[mode]
+        return proc if proc is not None else _ExportPopen(b"", 1)
+
+    return popen
+
+
+def _export_runner(calls):
+    def runner(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    return runner
+
+
+def test_build_export_argv_is_a_sandboxed_read_only_helper():
+    argv = container_mod.build_export_argv("task1", "franky", "bundle", _BRANCH, _BASE)
+    assert argv[:3] == ["docker", "run", "--rm"]
+    for flag in (
+        "--network=none",
+        "--read-only",
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges",
+        "--log-driver=none",
+        "--pids-limit=64",
+        "--memory=256m",
+    ):
+        assert flag in argv
+    assert any(a.startswith("--security-opt=seccomp=") for a in argv)
+    assert argv[argv.index("--volumes-from") + 1] == "task1:ro"
+    # No bind mount, no published port, no secret by name or value.
+    assert not any(a in ("-v", "--volume", "--mount", "-p", "--privileged") for a in argv)
+    env = [argv[i + 1] for i, a in enumerate(argv) if a == "-e"]
+    assert all("=" in e for e in env)
+    assert not any(k in " ".join(env) for k in ("TOKEN", "KEY", "GH_", "SECRET"))
+    # The helper name derives from the task so the reaper can find it.
+    assert argv[argv.index("--name") + 1] == container_mod.export_container_name("task1")
+
+
+def test_build_export_argv_passes_branch_and_base_as_arguments_only():
+    argv = container_mod.build_export_argv("task1", "franky", "log", _BRANCH, _BASE)
+    assert argv[-4:] == ["franky-export", "log", _BRANCH, _BASE]
+    script = argv[-5]
+    assert _BRANCH not in script and _BASE not in script
+    # Fail-closed contract with the host: distinct exits for no branch, no change, not a descendant.
+    assert "exit 3" in script and "exit 4" in script and "exit 5" in script
+    assert "--no-ext-diff" in script and "--no-textconv" in script and "--text" in script
+
+
+@pytest.mark.parametrize(
+    "mode,branch,base",
+    [
+        ("tar", _BRANCH, _BASE),
+        ("log", "", _BASE),
+        ("log", "-evil", _BASE),
+        ("log", "a b", _BASE),
+        ("log", "a/../b", _BASE),
+        ("log", "a;rm", _BASE),
+        ("log", _BRANCH, "main"),
+        ("log", _BRANCH, "C" * 40),
+        ("log", _BRANCH, "c" * 39),
+    ],
+)
+def test_build_export_argv_refuses_unsafe_values(mode, branch, base):
+    with pytest.raises(ValueError):
+        container_mod.build_export_argv("task1", "franky", mode, branch, base)
+
+
+def test_export_workspace_writes_a_private_bundle_after_a_clean_log_scan(tmp_path):
+    calls, started = [], []
+    dest = tmp_path / "j.bundle"
+    status, detail = container_mod.export_workspace(
+        "task1",
+        "franky",
+        _BRANCH,
+        _BASE,
+        dest,
+        [SECRET],
+        popen=_export_popen(
+            log=_ExportPopen(b"+print('hi')\n"),
+            bundle=_ExportPopen(b"# v2 git bundle\n\nPACK"),
+            started=started,
+        ),
+        runner=_export_runner(calls),
+    )
+    assert (status, detail) == ("ok", "")
+    assert dest.read_bytes() == b"# v2 git bundle\n\nPACK"
+    assert oct(dest.stat().st_mode & 0o777) == "0o600"
+    assert [m for m, _ in started] == ["log", "bundle"]
+    # Both helpers are reaped by name.
+    helper = container_mod.export_container_name("task1")
+    assert sum(1 for c in calls if c[:3] == ["docker", "rm", "-f"] and helper in c) == 2
+
+
+def test_export_workspace_refuses_when_a_run_secret_is_in_the_new_commits(tmp_path):
+    started = []
+    dest = tmp_path / "j.bundle"
+    status, detail = container_mod.export_workspace(
+        "task1",
+        "franky",
+        _BRANCH,
+        _BASE,
+        dest,
+        [SECRET],
+        popen=_export_popen(
+            log=_ExportPopen(b"+key = " + SECRET.encode() + b"\n"), started=started
+        ),
+        runner=_export_runner([]),
+    )
+    assert status == "refused"
+    assert SECRET not in detail
+    assert [m for m, _ in started] == ["log"]  # no bundle was ever produced
+    assert not dest.exists()
+
+
+@pytest.mark.parametrize(
+    "code,status",
+    [(4, "no_changes"), (3, "failed"), (5, "failed"), (125, "failed"), (1, "failed")],
+)
+def test_export_workspace_maps_helper_exit_codes(tmp_path, code, status):
+    dest = tmp_path / "j.bundle"
+    got, detail = container_mod.export_workspace(
+        "task1",
+        "franky",
+        _BRANCH,
+        _BASE,
+        dest,
+        [],
+        popen=_export_popen(log=_ExportPopen(b"", code, b"franky-export: boom")),
+        runner=_export_runner([]),
+    )
+    assert got == status
+    assert not dest.exists()
+
+
+def test_export_workspace_bundle_helper_failure_removes_the_partial_file(tmp_path):
+    dest = tmp_path / "j.bundle"
+    got, _ = container_mod.export_workspace(
+        "task1",
+        "franky",
+        _BRANCH,
+        _BASE,
+        dest,
+        [],
+        popen=_export_popen(log=_ExportPopen(b"x"), bundle=_ExportPopen(b"partial", 1)),
+        runner=_export_runner([]),
+    )
+    assert got == "failed" and not dest.exists()
+
+
+def test_export_workspace_empty_bundle_is_a_failure(tmp_path):
+    dest = tmp_path / "j.bundle"
+    got, _ = container_mod.export_workspace(
+        "task1",
+        "franky",
+        _BRANCH,
+        _BASE,
+        dest,
+        [],
+        popen=_export_popen(log=_ExportPopen(b"x"), bundle=_ExportPopen(b"")),
+        runner=_export_runner([]),
+    )
+    assert got == "failed" and not dest.exists()
+
+
+def test_export_workspace_size_cap_kills_the_helper_and_removes_the_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(container_mod, "EXPORT_MAX_BYTES", 100)
+    bundle = _ExportPopen(b"x" * 1000)
+    dest = tmp_path / "j.bundle"
+    got, detail = container_mod.export_workspace(
+        "task1",
+        "franky",
+        _BRANCH,
+        _BASE,
+        dest,
+        [],
+        popen=_export_popen(log=_ExportPopen(b"x"), bundle=bundle),
+        runner=_export_runner([]),
+    )
+    assert got == "failed" and "exceeded" in detail
+    assert bundle.killed and not dest.exists()
+
+
+def test_export_workspace_log_over_the_cap_is_a_failure_not_a_pass(tmp_path, monkeypatch):
+    monkeypatch.setattr(container_mod, "EXPORT_MAX_BYTES", 100)
+    log = _ExportPopen(b"x" * 1000)
+    got, _ = container_mod.export_workspace(
+        "task1",
+        "franky",
+        _BRANCH,
+        _BASE,
+        tmp_path / "j.bundle",
+        [],
+        popen=_export_popen(log=log),
+        runner=_export_runner([]),
+    )
+    assert got == "failed" and log.killed
+
+
+def test_export_workspace_never_raises_and_never_overwrites(tmp_path):
+    dest = tmp_path / "j.bundle"
+    dest.write_bytes(b"old")
+    got, _ = container_mod.export_workspace(
+        "task1",
+        "franky",
+        _BRANCH,
+        _BASE,
+        dest,
+        [],
+        popen=_export_popen(log=_ExportPopen(b"x"), bundle=_ExportPopen(b"NEW")),
+        runner=_export_runner([]),
+    )
+    assert got == "failed"
+    assert dest.read_bytes() == b"old"  # O_EXCL: an existing file is never clobbered or deleted
+
+    def boom(argv, **kwargs):
+        raise OSError("docker gone")
+
+    got, _ = container_mod.export_workspace(
+        "task1",
+        "franky",
+        _BRANCH,
+        _BASE,
+        tmp_path / "k.bundle",
+        [],
+        popen=boom,
+        runner=_export_runner([]),
+    )
+    assert got == "failed"
+
+
+def _export_run(tmp_path, *, stream, task_code=0, log=None, bundle=None, with_session=False):
+    """run_in_container with a workspace_sink; returns (calls, sink)."""
+    calls = []
+    runner, _ = _orchestration_runner(lambda *a, **k: None)
+
+    def logged_runner(argv, **kwargs):
+        calls.append(argv)
+        return runner(argv, **kwargs)
+
+    helper = _export_popen(
+        log=log if log is not None else _ExportPopen(b"+ok\n"),
+        bundle=bundle if bundle is not None else _ExportPopen(b"# v2 git bundle\n\nPACK"),
+    )
+
+    def popen(argv, **kwargs):
+        calls.append(argv)
+        if "franky-export" in argv:
+            return helper(argv, **kwargs)
+        return _FakePopen(stream, returncode=task_code)
+
+    sink = {"dest": str(tmp_path / "j.bundle"), "branch": _BRANCH, "base": _BASE}
+    extra = {}
+    if with_session:
+        extra["session_sink"] = {
+            "paths": [".claude/s1.jsonl"],
+            "dest": str(tmp_path),
+            "max_bytes": 10**6,
+        }
+    with mock.patch.object(container_mod, "_hold_nonce", return_value="n0nce"):
+        run_in_container(
+            _cfg(),
+            ["claude"],
+            runner=logged_runner,
+            env={},
+            sleeper=NOOP_SLEEP,
+            popen=popen,
+            run_id="abc123def456",
+            workspace_sink=sink,
+            **extra,
+        )
+    return calls, sink
+
+
+def _helper_runs(calls):
+    return [c for c in calls if "franky-export" in c]
+
+
+def test_workspace_sink_arms_the_hold_keeps_rm_and_exports_inside_it(tmp_path):
+    calls, sink = _export_run(tmp_path, stream=_HOLD_STREAM)
+    task = "franky-run-abc123def456"
+    run = next(
+        c for c in calls if c[:2] == ["docker", "run"] and task in c and "franky-export" not in c
+    )
+    assert "FRANKY_SESSION_HOLD=n0nce" in run and "--rm" in run
+    first_export = calls.index(_helper_runs(calls)[0])
+    marker = calls.index(_MARKER)
+    reap = next(i for i, c in enumerate(calls) if c[:3] == ["docker", "rm", "-f"] and c[-1] == task)
+    assert first_export < marker < reap
+    assert sink["status"] == "ok"
+    assert (tmp_path / "j.bundle").read_bytes() == b"# v2 git bundle\n\nPACK"
+    # The helper mounts the still-existing task container's volumes read-only.
+    export = _helper_runs(calls)[0]
+    assert export[export.index("--volumes-from") + 1] == f"{task}:ro"
+
+
+def test_workspace_sink_releases_the_hold_even_when_the_export_fails(tmp_path):
+    calls, sink = _export_run(tmp_path, stream=_HOLD_STREAM, log=_ExportPopen(b"", 3))
+    assert sink["status"] == "failed"
+    assert _MARKER in calls
+    assert not (tmp_path / "j.bundle").exists()
+
+
+def test_workspace_sink_does_nothing_without_the_hold_line(tmp_path):
+    calls, sink = _export_run(tmp_path, stream=["event\n"])
+    assert "status" not in sink and not _helper_runs(calls) and _MARKER not in calls
+
+
+def test_workspace_and_session_sinks_share_one_hold(tmp_path):
+    def cp(argv):
+        return _CpPopen(_session_tar_bytes("s1.jsonl"))
+
+    calls = []
+    runner, _ = _orchestration_runner(lambda *a, **k: None)
+    helper = _export_popen(log=_ExportPopen(b"x"), bundle=_ExportPopen(b"B"))
+
+    def logged_runner(argv, **kwargs):
+        calls.append(argv)
+        return runner(argv, **kwargs)
+
+    def popen(argv, **kwargs):
+        calls.append(argv)
+        if argv[:2] == ["docker", "cp"]:
+            return cp(argv)
+        if "franky-export" in argv:
+            return helper(argv, **kwargs)
+        return _FakePopen(_HOLD_STREAM)
+
+    wsink = {"dest": str(tmp_path / "j.bundle"), "branch": _BRANCH, "base": _BASE}
+    ssink = {"paths": [".claude/s1.jsonl"], "dest": str(tmp_path / "s"), "max_bytes": 10**6}
+    with mock.patch.object(container_mod, "_hold_nonce", return_value="n0nce"):
+        run_in_container(
+            _cfg(),
+            ["claude"],
+            runner=logged_runner,
+            env={},
+            sleeper=NOOP_SLEEP,
+            popen=popen,
+            run_id="abc123def456",
+            workspace_sink=wsink,
+            session_sink=ssink,
+        )
+    assert wsink["status"] == "ok" and ssink["status"] == "ok"
+    assert sum(1 for c in calls if c == _MARKER) == 1

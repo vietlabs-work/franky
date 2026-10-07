@@ -142,6 +142,12 @@ def test_next_resume_needs_an_existing_snapshot():
     assert _next(record, snap=False)["action"] == "inspect"
 
 
+def test_next_never_offers_resume_for_a_no_publish_build():
+    record = _rec(status="timeout", snapshot_path="/x/abc123.snapshot.tar.gz", no_publish=True)
+    assert _next(record, snap=True)["action"] == "inspect"
+    assert _next(_rec(status="branch_ready", no_publish=True))["action"] == "done"
+
+
 def test_next_review_rerun_only_for_pre_publish_statuses():
     url = "https://github.com/o/r/pull/9"
     for status in ("timeout", "agent_error", "no_findings"):

@@ -39,10 +39,11 @@ EXIT_CODES: dict[int, str] = {
     EXIT_USAGE: "usage/flag error, or interactive input required in a non-TTY (never-hang)",
     EXIT_CONFIG: "bad config file, allowlist unset/empty/malformed, or unknown engine",
     EXIT_TASK_REJECTED: "task rejected: off-allowlist repo, missing --repo, or bad URL/key, "
-    "or a busy thread",
+    "a busy thread, or a --no-publish export refused because a run secret is in the commits",
     EXIT_AUTH: "missing or refused engine creds, missing GH_TOKEN/JIRA creds, or JIRA 401/403",
     EXIT_DOCKER: "docker or image unavailable, or a required host tool (e.g. gh) is missing",
-    EXIT_AGENT: "agent/result failure, including no PR, invalid output, or stale review head",
+    EXIT_AGENT: "agent/result failure, including no PR, invalid output, stale review head, "
+    "or a --no-publish run with no new commits or a failed export",
     EXIT_NETWORK: "JIRA/network failure, including GitHub review publication failure",
     EXIT_TIMEOUT: "run exceeded --max-duration (the container was killed)",
 }
@@ -140,6 +141,9 @@ def build_result(
     thread: dict | None = None,
     handoff: dict | None = None,
     context_sources: list | None = None,
+    base_sha: str | None = None,
+    head_sha: str | None = None,
+    bundle_path: str | None = None,
 ) -> dict:
     """Shape the success/agent-result object emitted on stdout under `--json`.
 
@@ -186,6 +190,12 @@ def build_result(
     `context_sources` is `review-pr`-only (absent, not null, elsewhere): one
     {kind, ref, status} entry per linked JIRA key Franky looked for, `[]` when none. It never
     carries ticket text.
+
+    `base_sha`/`head_sha`/`bundle_path` are `build --no-publish`-only, each included ONLY when not
+    None: the pinned default-branch tip the branch starts from (every --no-publish result), the
+    exported branch tip and the host path of its git bundle (only `branch_ready`). Statuses
+    there: branch_ready | no_changes | export_failed | export_refused (plus timeout and
+    agent_error); `pr_url` is always null.
 
     `thread`/`handoff` are `--thread`-only (review-pr, build, iterate, and a `job resume` of a
     `--thread` build): both keys appear exactly when `thread` is
@@ -237,6 +247,12 @@ def build_result(
         result["threads_resolved"] = threads_resolved
     if context_sources is not None:
         result["context_sources"] = context_sources
+    if base_sha is not None:
+        result["base_sha"] = base_sha
+    if head_sha is not None:
+        result["head_sha"] = head_sha
+    if bundle_path is not None:
+        result["bundle_path"] = bundle_path
     if thread is not None:
         result["thread"] = thread
         result["handoff"] = handoff

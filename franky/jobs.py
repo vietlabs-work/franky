@@ -53,9 +53,10 @@ DEFAULT_KEEP = 200
 STALE_RUNNING_SECS = 24 * 3600
 
 # Host-local sidecars that live beside a run record: the workspace snapshot (issue #71), the
-# engine session of a `--thread` run, and the liveness heartbeat. Pruned with the record, never
+# engine session of a `--thread` run, the git bundle of a `build --no-publish` run, and the
+# liveness heartbeat. Pruned with the record, never
 # exported. The heartbeat file carries no `job_id` key so list_records never mistakes it for a run.
-_SIDECAR_SUFFIXES = (".snapshot.tar.gz", ".session.tar.gz", ".progress.json")
+_SIDECAR_SUFFIXES = (".snapshot.tar.gz", ".session.tar.gz", ".progress.json", ".bundle")
 
 # Temp session dirs and packed tars that `--thread` runs create in the runs dir (`.tmp-session-`,
 # `.tmp-pack-`). A crash can leave one behind; prune sweeps those older than a real run can last.
@@ -74,7 +75,7 @@ TMP_PREFIX = ".tmp-"
 # failure status). `publish_blocked_stale_head`/`publish_failed` are review-pr failures too -
 # the review ran but its outcome could not reach the PR.
 _SUCCESS_STATUSES = frozenset(
-    {"pr_opened", "iterate_complete", "review_published", "review_complete"}
+    {"pr_opened", "iterate_complete", "review_published", "review_complete", "branch_ready"}
 )
 _FAILURE_STATUSES = frozenset(
     {
@@ -86,6 +87,9 @@ _FAILURE_STATUSES = frozenset(
         "publish_blocked_stale_head",
         "publish_failed",
         "publish_uncertain",
+        "no_changes",
+        "export_failed",
+        "export_refused",
     }
 )
 
@@ -131,6 +135,7 @@ def new_record(
     session_id: str | None = None,
     model: str | None = None,
     threaded: bool = False,
+    no_publish: bool = False,
 ) -> dict:
     """Shape the initial (status=running) record written before the container pass starts.
 
@@ -204,6 +209,8 @@ def new_record(
         record["thread_id"] = thread_id
     if threaded:
         record["threaded"] = True
+    if no_publish:
+        record["no_publish"] = True
     if session_id is not None:
         record["session_id"] = session_id
         record["model"] = model
@@ -775,7 +782,14 @@ def _next_step(
         return step(
             "done", None, False, f"finished with status {status}" + (f": {url}" if url else "")
         )
-    if command in ("build", "resume", "replay") and record.get("snapshot_path") and snapshot_exists:
+    if (
+        command in ("build", "resume", "replay")
+        and record.get("snapshot_path")
+        and snapshot_exists
+        and not record.get(
+            "no_publish"
+        )  # resume would push and open a PR; a no-publish run never does
+    ):
         return step(
             "resume",
             f"franky job resume {job_id} --json",

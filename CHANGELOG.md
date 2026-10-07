@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `review-pr` now treats any line containing `GitHub wrapper refused:` as a refused `APPROVE` and posts a `COMMENT` instead.
 
+### Added
+
+- `franky build --no-publish`: the agent commits on a branch cut from the pinned default-branch tip and does not push or open a PR. Two networkless, read-only helpers then export `base_sha..branch` as a git bundle (`bundle_path`, mode 0600) after a scan of the new commits for the run's secret values. The result reports `branch_ready` with `branch`, `base_sha`, `head_sha`, and `bundle_path`, or `no_changes`, `export_failed`, or `export_refused`. `--thread` is refused, and `job resume` refuses such a run. See [Build without publishing](docs/review.md#build-without-publishing).
+
 ## [0.3.15] - 2026-10-07
 
 ### Changed

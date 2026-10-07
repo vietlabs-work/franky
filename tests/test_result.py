@@ -300,3 +300,35 @@ def test_build_result_includes_findings_only_when_supplied():
     assert "findings" not in plain and "findings_total" not in plain
     out = result_mod.build_result(**base, findings=[], findings_total=0)
     assert out["findings"] == [] and out["findings_total"] == 0
+
+
+def test_build_result_no_publish_fields_are_absent_unless_set():
+    base = dict(
+        status="branch_ready",
+        pr_url=None,
+        reason="r",
+        exit_code=0,
+        usage=Usage(),
+        duration=1.0,
+        log_path="l",
+        engine="pi",
+        repo="me/repo",
+    )
+    plain = build_result(**base)
+    assert not {"base_sha", "head_sha", "bundle_path"} & set(plain)
+    full = build_result(**base, base_sha="a" * 40, head_sha="b" * 40, bundle_path="/r/j.bundle")
+    assert (full["base_sha"], full["head_sha"], full["bundle_path"]) == (
+        "a" * 40,
+        "b" * 40,
+        "/r/j.bundle",
+    )
+    assert full["pr_url"] is None
+    # Never null: a failed export reports its base only.
+    failed = build_result(**{**base, "status": "export_failed"}, base_sha="a" * 40)
+    assert "head_sha" not in failed and "bundle_path" not in failed
+
+
+def test_new_build_statuses_have_exit_codes_in_the_docs():
+    from franky.result import EXIT_CODES
+
+    assert "--no-publish" in EXIT_CODES[4] and "--no-publish" in EXIT_CODES[7]

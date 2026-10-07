@@ -6189,3 +6189,236 @@ def test_build_plan_first_refusal_in_build_pass_stays_agent_error(monkeypatch):
         )
     assert res.exit_code == 7, res.output
     assert json.loads(res.stdout)["status"] == "agent_error"
+
+
+# ---------------------------------------------------------------------------
+# `build --no-publish`: commit locally, export a bundle, push nothing
+# ---------------------------------------------------------------------------
+
+_NP_BASE = "c" * 40
+_NP_HEAD = "d" * 40
+
+
+def _np_header(branch, head=_NP_HEAD, extra_ref=None):
+    lines = ["# v2 git bundle", f"-{_NP_BASE} base", f"{head} refs/heads/{branch}"]
+    if extra_ref:
+        lines.append(f"{head} {extra_ref}")
+    return ("\n".join(lines) + "\n\nPACK").encode()
+
+
+def _np_setup(
+    monkeypatch,
+    tmp_path,
+    *,
+    code=0,
+    export="ok",
+    base=_NP_BASE,
+    header=None,
+    output="did the work",
+):
+    """Hermetic `build --no-publish`. Returns (env, seen) where `seen` records the container call."""
+    env = {
+        "FRANKY_ALLOWED_REPOS": "me/repo",
+        "GH_TOKEN": "ghp_fake",
+        "OPENROUTER_API_KEY": "sk-or-fake",
+        "FRANKY_RUNS_DIR": str(tmp_path / "runs"),
+        "FRANKY_CONFIG_FILE": str(tmp_path / "config"),
+    }
+    monkeypatch.setattr(cli.os, "environ", env)
+    seen = {"container": 0, "images": 0, "open_pr_checks": 0, "inner": []}
+
+    def images(*a, **k):
+        seen["images"] += 1
+        return (True, "")
+
+    def open_pr(*a, **k):
+        seen["open_pr_checks"] += 1
+        return PR_URL
+
+    monkeypatch.setattr(cli, "ensure_image_available", images)
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    monkeypatch.setattr(cli, "find_open_pr", open_pr)
+    monkeypatch.setattr(cli.baseref, "resolve_base_sha", lambda *a, **k: base)
+
+    def fake_run(cfg, inner_argv, **kwargs):
+        seen["container"] += 1
+        seen["inner"] = inner_argv
+        seen["kwargs"] = kwargs
+        sink = kwargs.get("workspace_sink")
+        if sink is not None and code == 0 and export:
+            sink["status"] = export
+            if export == "ok":
+                path = Path(sink["dest"])
+                path.parent.mkdir(parents=True, exist_ok=True)
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "wb") as target:
+                    target.write(header or _np_header(sink["branch"]))
+            else:
+                sink["detail"] = "helper said no"
+        return code, output
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+    return env, seen
+
+
+def _np_build(*extra):
+    return CliRunner().invoke(
+        cli.main, ["build", "add a flag", "--repo", "me/repo", "--no-publish", "--json", *extra]
+    )
+
+
+def test_build_no_publish_branch_ready_contract(monkeypatch, tmp_path):
+    env, seen = _np_setup(monkeypatch, tmp_path)
+    res = _np_build()
+    assert res.exit_code == 0, res.output
+    data = json.loads(res.stdout)
+    assert data["status"] == "branch_ready" and data["exit_code"] == 0
+    assert data["pr_url"] is None
+    assert data["branch"] == "franky/add-a-flag"
+    assert data["base_sha"] == _NP_BASE and data["head_sha"] == _NP_HEAD
+    bundle = Path(data["bundle_path"])
+    assert bundle.is_absolute() and bundle.name == f"{data['job_id']}.bundle"
+    assert bundle.parent == (tmp_path / "runs").resolve()
+    assert stat.S_IMODE(bundle.stat().st_mode) == 0o600
+    # The container got the export sink pinned to the base, and a prompt that never publishes.
+    sink = seen["kwargs"]["workspace_sink"]
+    assert sink["branch"] == "franky/add-a-flag" and sink["base"] == _NP_BASE
+    prompt = " ".join(seen["inner"])
+    assert f"git checkout -b franky/add-a-flag {_NP_BASE}" in prompt
+    assert "Open the PR with" not in prompt
+    # The run record says so, and carries the export facts.
+    rec = jobs.read_record(data["job_id"], env)
+    assert rec["no_publish"] is True and rec["status"] == "branch_ready"
+    assert rec["head_sha"] == _NP_HEAD and rec["base_sha"] == _NP_BASE
+    assert rec["bundle_path"] == str(bundle)
+    assert "snapshot_sink" not in seen["kwargs"] or seen["kwargs"]["snapshot_sink"] is None
+
+
+def test_build_no_publish_human_output_is_the_bundle_path(monkeypatch, tmp_path):
+    _np_setup(monkeypatch, tmp_path)
+    res = CliRunner().invoke(
+        cli.main, ["build", "add a flag", "--repo", "me/repo", "--no-publish", "-q"]
+    )
+    assert res.exit_code == 0, res.output
+    assert res.stdout.strip().endswith(".bundle")
+
+
+@pytest.mark.parametrize(
+    "export,status,exit_code",
+    [
+        ("no_changes", "no_changes", 7),
+        ("failed", "export_failed", 7),
+        ("refused", "export_refused", 4),
+        (None, "export_failed", 7),  # the hold line never came: nothing was exported
+    ],
+)
+def test_build_no_publish_export_outcomes(monkeypatch, tmp_path, export, status, exit_code):
+    _np_setup(monkeypatch, tmp_path, export=export)
+    res = _np_build()
+    assert res.exit_code == exit_code, res.output
+    data = json.loads(res.stdout)
+    assert data["status"] == status and data["exit_code"] == exit_code
+    assert data["pr_url"] is None and data["base_sha"] == _NP_BASE
+    assert "head_sha" not in data and "bundle_path" not in data
+    assert not list((tmp_path / "runs").glob("*.bundle"))
+
+
+@pytest.mark.parametrize("code,status,exit_code", [(124, "timeout", 9), (1, "agent_error", 7)])
+def test_build_no_publish_agent_failures_keep_their_codes_and_leave_no_bundle(
+    monkeypatch, tmp_path, code, status, exit_code
+):
+    # Even an output that quotes a PR URL cannot turn a failed run into anything else.
+    _np_setup(monkeypatch, tmp_path, code=code, output=f"opened {PR_URL}")
+    res = _np_build()
+    assert res.exit_code == exit_code, res.output
+    data = json.loads(res.stdout)
+    assert data["status"] == status and data["pr_url"] is None and data["base_sha"] == _NP_BASE
+    assert not list((tmp_path / "runs").glob("*.bundle"))
+
+
+def test_build_no_publish_ignores_a_pr_url_in_the_output(monkeypatch, tmp_path):
+    _np_setup(monkeypatch, tmp_path, export="no_changes", output=f"opened {PR_URL}")
+    data = json.loads(_np_build().stdout)
+    assert data["status"] == "no_changes" and data["pr_url"] is None
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        _np_header("franky/other-branch"),
+        _np_header("franky/add-a-flag", extra_ref="refs/heads/main"),
+        b"not a bundle at all",
+    ],
+)
+def test_build_no_publish_deletes_a_bundle_that_fails_verification(monkeypatch, tmp_path, header):
+    _np_setup(monkeypatch, tmp_path, header=header)
+    res = _np_build()
+    assert res.exit_code == 7, res.output
+    data = json.loads(res.stdout)
+    assert data["status"] == "export_failed"
+    assert "bundle_path" not in data and not list((tmp_path / "runs").glob("*.bundle"))
+
+
+def test_build_no_publish_refuses_thread_before_anything_runs(monkeypatch, tmp_path):
+    _, seen = _np_setup(monkeypatch, tmp_path)
+    res = _np_build("--thread")
+    assert res.exit_code == 2, res.output
+    assert json.loads(res.stdout)["error"]["kind"] == "usage_error"
+    assert seen["container"] == 0 and seen["images"] == 0
+
+
+@pytest.mark.parametrize("base", [None, "", "main", "ABC", "c" * 39])
+def test_build_no_publish_needs_a_resolved_base_and_runs_no_container(monkeypatch, tmp_path, base):
+    _, seen = _np_setup(monkeypatch, tmp_path, base=base)
+    res = _np_build()
+    assert res.exit_code == 8, res.output
+    assert json.loads(res.stdout)["error"]["kind"] == "network_error"
+    assert seen["container"] == 0 and seen["images"] == 0
+
+
+def test_build_no_publish_never_checks_for_an_open_pr(monkeypatch, tmp_path):
+    # An open PR on the branch is irrelevant: nothing is opened. Covers the retry re-check too.
+    _, seen = _np_setup(monkeypatch, tmp_path, export="no_changes")
+    monkeypatch.setattr(
+        cli, "_diagnose", lambda *a, **k: ({"retryable": True, "retry_hint": "try again"}, 0)
+    )
+    res = _np_build("--retry", "1")
+    data = json.loads(res.stdout)
+    assert seen["open_pr_checks"] == 0
+    assert seen["container"] == 2  # no_changes is retryable, and the second attempt ran
+    assert [a["status"] for a in data["attempts"]] == ["no_changes", "no_changes"]
+
+
+def test_build_no_publish_stops_retrying_after_branch_ready(monkeypatch, tmp_path):
+    _, seen = _np_setup(monkeypatch, tmp_path)
+    res = _np_build("--retry", "2")
+    assert res.exit_code == 0 and seen["container"] == 1
+
+
+def test_build_without_no_publish_still_resolves_the_base_late_and_never_exports(
+    monkeypatch, tmp_path
+):
+    env, seen = _np_setup(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli, "find_open_pr", lambda *a, **k: None)
+    monkeypatch.setattr(
+        cli, "run_in_container", lambda *a, **k: seen.update(kw=k) or (0, f"opened {PR_URL}")
+    )
+    res = CliRunner().invoke(cli.main, ["build", "add a flag", "--repo", "me/repo", "--json"])
+    data = json.loads(res.stdout)
+    assert data["status"] == "pr_opened" and "workspace_sink" not in seen["kw"]
+    assert not {"base_sha", "head_sha", "bundle_path"} & set(data)
+    assert "no_publish" not in jobs.read_record(data["job_id"], env)
+
+
+def test_job_resume_refuses_a_no_publish_run(monkeypatch, tmp_path):
+    env = _resume_env(monkeypatch, tmp_path, (0, "x"))
+    job_id = _write_resumable_run(env, tmp_path, job_id="beef0a")
+    jobs.update_record(job_id, {"no_publish": True}, env)
+    res = CliRunner().invoke(cli.main, ["job", "resume", job_id, "--json"])
+    assert res.exit_code == 4, res.output
+    assert json.loads(res.stdout)["error"]["kind"] == "task_rejected"
+
+
+def test_schema_build_lists_no_publish():
+    data = json.loads(CliRunner().invoke(cli.main, ["schema"]).output)
+    assert any(f["name"] == "no_publish" for f in data["commands"]["build"]["flags"])

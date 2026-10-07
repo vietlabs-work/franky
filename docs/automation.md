@@ -19,12 +19,39 @@ Interactive commands fail with exit `2` in a non-TTY. They do not wait forever. 
 | `0` | Success, including an existing open PR. |
 | `2` | Usage error or required interactive input. |
 | `3` | Invalid configuration. |
-| `4` | Rejected task or repository. |
+| `4` | Rejected task or repository, or a `--no-publish` export refused because a run secret is in the commits. |
 | `5` | Missing or rejected authentication. |
 | `6` | Docker, image, or required host tool unavailable. |
-| `7` | Agent or result failure, including a stale review head. |
+| `7` | Agent or result failure, including a stale review head, or a `--no-publish` run with no new commits or a failed export. |
 | `8` | JIRA or network failure, including review publication. |
 | `9` | Run timeout. |
+
+## Build `--no-publish`
+
+`franky build TASK --repo OWNER/REPO --no-publish --json` commits on a branch and exports it as a git bundle. It pushes nothing and opens no PR. See [Build without publishing](review.md#build-without-publishing).
+
+Result fields, absent when they do not apply and never null (except `pr_url`):
+
+| Field | Value |
+|-------|-------|
+| `status` | Always present. See the table below. |
+| `pr_url` | Always `null`. |
+| `branch` | The local ref in the bundle, `franky/<slug>`. |
+| `base_sha` | The 40-hex default-branch tip the branch starts from. Present in every `--no-publish` result. |
+| `head_sha` | The 40-hex tip of `branch`. Only with `branch_ready`. |
+| `bundle_path` | Absolute path of the bundle (0600). Only with `branch_ready`. |
+
+| Status | Exit | Meaning |
+|--------|-----:|---------|
+| `branch_ready` | `0` | The bundle holds `base_sha..branch` as `refs/heads/<branch>`. |
+| `no_changes` | `7` | The branch has no commit beyond `base_sha`. A `--retry` may retry it. |
+| `export_failed` | `7` | The helper or Docker failed, the branch is missing or not a descendant of `base_sha`, the output passed 256 MiB, the export ran out of its 45 s budget, or the bundle header failed verification. |
+| `export_refused` | `4` | A secret value of the run is in the new commits. Franky deleted the bundle. |
+| `timeout` | `9` | The run exceeded `--max-duration`. |
+| `agent_error` | `7` | The engine exited non-zero. |
+| `auth_error` | `5` | The engine login was refused, as for other builds. |
+
+The result always reports `status`, so branch on it, not on the exit code alone.
 
 Every run stores a small JSON record and a redacted transcript under `FRANKY_RUNS_DIR`. The default is `~/.franky/runs`.
 
