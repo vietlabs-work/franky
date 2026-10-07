@@ -26,6 +26,9 @@ docker build -t franky-proxy proxy/
 ruff check .
 ruff format --check .
 
+python3 scripts/private_terms.py files
+python3 scripts/private_terms.py commits origin/main..HEAD
+
 make footprint
 make smoke-security
 make smoke-dind
@@ -113,6 +116,12 @@ Do not weaken these rules.
 - `config list --reveal` is explicit operator output. Do not claim that Franky redacts it.
 - Codex subscription auth is the only persistent task volume. Scrub it to `auth.json` before each run.
 - Never mount the subscription volume into helpers, proxies, or non-subscription tasks.
+
+### Private terms
+
+This repo is public. Never write employer, private repo or agent names, real ticket keys, eval sources, spend figures or personal emails into code, commits, PR text or comments. Use made-up names in tests and examples.
+
+The term list lives outside the repo: the Actions secret `FRANKY_PRIVATE_TERMS` and, locally, `~/.config/franky/private-terms`. Before pushing, run `python3 scripts/private_terms.py files` and `python3 scripts/private_terms.py commits origin/main..HEAD`. The script never prints a term, only `<location>: private term #N`.
 
 ### Fail-closed policy
 

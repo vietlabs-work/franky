@@ -25,7 +25,7 @@ JIRA_API_TOKEN_VAR = "JIRA_API_TOKEN"
 
 # Keys scanned out of free text (PR title, branch, body). Not anchored like task.py's
 # JIRA_KEY_RE: a key may sit mid-sentence or inside a /browse/ URL, but not glued to a
-# preceding word character (foo_FBT-1 is not a key).
+# preceding word character (foo_ABC-1 is not a key).
 # A `/browse/KEY` URL is explicit (group "url"): its key skips the `_NOT_PROJECTS` denylist.
 _KEY_SCAN_RE = re.compile(r"(?P<url>/browse/)?(?<![A-Za-z0-9_])(?P<key>[A-Z][A-Z0-9]+-\d+)")
 # A branch key only counts at a path-segment start and when followed by end, `-`, `_` or `/`:

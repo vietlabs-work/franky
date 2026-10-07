@@ -16,7 +16,7 @@ def franky_version() -> str:
     except Exception:
         return __version__
     if meta != __version__:
-        # Held behind the `started` event inside a command (job-tracking callers read line 1).
+        # Held behind the `started` event inside a command (callers that track jobs read line 1).
         from .cli import _note
 
         _note(

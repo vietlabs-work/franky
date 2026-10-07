@@ -155,7 +155,7 @@ from .userconfig import (
 )
 
 # Shape for `review-pr --expected-head-sha` - a bare git SHA, 7-40 hex chars (mirrors the
-# the bridge's own `_SHA_RE` shape check, which Franky re-validates independently since
+# bridge's own `_SHA_RE` shape check, which Franky re-validates independently since
 # this CLI is also reachable directly, not only via the bridge).
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
 _RESULT_FINDING_KEYS = (
@@ -3067,7 +3067,7 @@ def _economics_line(usage: Usage, duration: float, secrets: list[str]) -> str:
 class _PreStart:
     """Stderr notes that would print before the `started` event, held for one command invocation.
 
-    callers that track jobs read the job id from the first stderr line, so `started` must come first.
+    Callers that track jobs read the job id from the first stderr line, so `started` must come first.
     Lives in the click context meta (never a module global), so invocations cannot leak into
     each other. `flush` opens it: later notes print at once."""
 

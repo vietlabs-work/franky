@@ -5422,7 +5422,7 @@ def test_review_pr_jira_context_with_instructions_file(monkeypatch, tmp_path):
 # review-pr --allow-approve / --resolve-fixed (host-side event choice, fallback, thread resolve)
 # ---------------------------------------------------------------------------
 
-REFUSED = "GitHub wrapper refused: approve is not allowed"
+REFUSED = "Team GitHub wrapper refused: approve is not allowed"
 THREADS_PAGE = lambda nodes, nxt=None: json.dumps(  # noqa: E731
     {
         "data": {

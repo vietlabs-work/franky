@@ -353,7 +353,7 @@ def test_extract_keys_caps_at_three_in_order():
 
 
 def test_extract_keys_ignores_non_tickets():
-    assert extract_jira_keys("UTF-8 and SHA-256 foo_FBT-1", "", "") == []
+    assert extract_jira_keys("UTF-8 and SHA-256 foo_ABC-1", "", "") == []
 
 
 def test_jira_configured():
