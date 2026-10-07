@@ -1457,7 +1457,8 @@ def _review_ticket_context(
     "allow_approve",
     is_flag=True,
     default=False,
-    help="Let the review be an APPROVE when no blocking or Major finding is left open and "
+    help="Let the review be an APPROVE when no finding above nit (blocking, Major, or question) "
+    "is left open and "
     "nothing was dropped as malformed. The caller must gate this (e.g. branch protection). "
     "Refused with --no-publish.",
 )
@@ -1546,7 +1547,7 @@ def review_pr(
     Runs the SAME hardened, egress-controlled container as `build`/`iterate`. The prompt directs
     the agent to inspect the PR and run existing checks without changing GitHub or the checkout.
     The host publishes the result as COMMENT or REQUEST_CHANGES. Only --allow-approve can make it
-    an APPROVE (no blocking or Major finding left open, nothing dropped as malformed); if GitHub or
+    an APPROVE (no blocking, Major, or question finding left open, nothing dropped as malformed); if GitHub or
     a wrapper refuses it, the host posts a COMMENT instead and reports `review_event`.
     --resolve-fixed (needs --thread) then resolves the bot's own threads for fixed findings and
     reports `threads_resolved`. Nits are posted inline or not at all. Token permissions remain

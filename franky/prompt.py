@@ -419,7 +419,8 @@ def build_review_pr_prompt(
             f"{prior_end}\n"
             "Scope rules for this re-review:\n"
             "1. Verify each prior finding against the current code and report it with status "
-            '"open" (still present) or "resolved" (fixed).\n'
+            '"open" (still present) or "resolved" (fixed). A prior question is "resolved" only '
+            "when the code or the PR now answers its unknown fact; quote where.\n"
             f"2. Review the delta {since}..HEAD fully.\n"
             f"3. On code unchanged since {since}, report new findings only at blocking "
             "severity, unless the ticket context shows the code misses a stated requirement.\n"

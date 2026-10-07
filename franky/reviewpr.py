@@ -175,8 +175,8 @@ def build_review_findings(parsed: dict, threaded: bool = False) -> dict:
     """Normalize the parsed review payload into {summary, findings, checks, verified, has_blocking,
     dropped_malformed}.
 
-    `dropped_malformed` counts findings dropped as malformed; any of them blocks APPROVE, because
-    the dropped finding might have been a blocker.
+    `dropped_malformed` counts findings dropped as malformed, and open questions over the cap;
+    any of them blocks APPROVE, because the dropped finding might have been a blocker.
 
     `has_blocking` is derived (never trusted from the agent directly) so `review_event` has a
     single, grounded signal for whether REQUEST_CHANGES is warranted. A resolved finding never
@@ -192,9 +192,10 @@ def build_review_findings(parsed: dict, threaded: bool = False) -> dict:
             if shaped is None:
                 dropped += 1
                 continue
-            if shaped["severity"] == "question":
+            if shaped["severity"] == "question" and shaped["status"] != "resolved":
                 questions += 1
-                if questions > MAX_QUESTIONS:  # the method allows at most 2
+                if questions > MAX_QUESTIONS:  # the method allows at most 2 open
+                    dropped += 1  # an unshown open question must still block APPROVE
                     continue
             findings.append(shaped)
 
@@ -475,9 +476,10 @@ def render_review_body(shaped: dict, sha: str = "", prior_url: str | None = None
 def review_event(shaped: dict, allow_approve: bool = False) -> str:
     """COMMENT, REQUEST_CHANGES or (only with `allow_approve`) APPROVE.
 
-    The default can never return APPROVE. With `allow_approve`, APPROVE needs every finding that
-    is blocking or Major to be resolved, no finding dropped as malformed, and no failed check. The
-    decision reads the full structured list, never the rendered or truncated text.
+    The default can never return APPROVE. With `allow_approve`, APPROVE needs every finding above
+    nit (blocking, Major, or an open question, whose deciding fact is still unknown) to be resolved,
+    no finding dropped as malformed, and no failed check. The decision reads the full structured
+    list, never the rendered or truncated text.
     """
     if shaped["has_blocking"]:
         return "REQUEST_CHANGES"
@@ -486,8 +488,7 @@ def review_event(shaped: dict, allow_approve: bool = False) -> str:
         and not shaped.get("dropped_malformed")
         and not any(c["outcome"] == "fail" for c in shaped["checks"])
         and not any(
-            f["severity"] in ("blocking", "normal") and f["status"] != "resolved"
-            for f in shaped["findings"]
+            f["severity"] != "nit" and f["status"] != "resolved" for f in shaped["findings"]
         )
     ):
         return "APPROVE"

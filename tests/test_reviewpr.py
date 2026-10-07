@@ -299,6 +299,10 @@ def test_approve_needs_the_flag_and_no_open_major():
     assert review_event(new_major, allow_approve=True) == "COMMENT"
     block = _shaped({"title": "b", "severity": "blocking"})
     assert review_event(block, allow_approve=True) == "REQUEST_CHANGES"
+    question = _shaped({"title": "q", "severity": "question"})
+    assert review_event(question, allow_approve=True) == "COMMENT"  # an unknown fact blocks
+    answered = _shaped({"title": "q", "severity": "question", "status": "resolved"})
+    assert review_event(answered, allow_approve=True) == "APPROVE"
 
 
 def test_failed_check_blocks_approve():
@@ -456,6 +460,25 @@ def test_body_only_fallback_keeps_up_to_eight_findings():
     shaped = _shape(*[_f(f"t{i}", line=i + 1) for i in range(MAX_INLINE)])
     body = build_body_only_payload(shaped, "s", [])["body"]
     assert all(f"**Major: t{i}**" in body for i in range(MAX_INLINE)) and "more" not in body
+
+
+def test_open_question_over_the_cap_still_blocks_approve():
+    def q(t, status):
+        return {"title": t, "body": "why", "severity": "question", "status": status}
+
+    # Resolved questions do not use the cap, so a third open one is kept and shown.
+    shaped = _shape(q("a", "resolved"), q("b", "resolved"), q("c", "new"), threaded=True)
+    assert [f["title"] for f in shaped["findings"]] == ["a", "b", "c"]
+    assert review_event(shaped, allow_approve=True) == "COMMENT"
+    # A third OPEN question is not shown, but it is counted, so it still blocks APPROVE.
+    over = _shape(q("a", "open"), q("b", "open"), q("c", "new"), threaded=True)
+    assert [f["title"] for f in over["findings"]] == ["a", "b"]
+    assert over["dropped_malformed"] == 1
+    assert review_event(over, allow_approve=True) == "COMMENT"
+    # An explicit open question blocks; resolving every question allows APPROVE.
+    assert review_event(_shape(q("a", "open"), threaded=True), allow_approve=True) == "COMMENT"
+    done = _shape(q("a", "resolved"), q("b", "resolved"), q("c", "resolved"), threaded=True)
+    assert review_event(done, allow_approve=True) == "APPROVE"
 
 
 def test_question_severity_is_kept_capped_and_never_blocks():
