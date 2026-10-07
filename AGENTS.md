@@ -48,6 +48,32 @@ Real Docker gates stay outside the unit suite. The footprint workflow uses fixed
 
 A PR that changes shipped code (`franky/`, `proxy/`, `Dockerfile`, the entrypoint or install scripts, `pyproject.toml`) must add a bullet under `## [Unreleased]` in `CHANGELOG.md`. The `changelog` workflow runs `scripts/release.py changelog-check` and fails otherwise. Label the PR `no-changelog` only when users see no change.
 
+## Documentation
+
+The README is a fast scan for a new user. Detail lives in `docs/`. `tests/test_doc_coherence.py` enforces these rules in CI.
+
+- Keep `README.md` at 120 lines or fewer.
+- Keep only these README sections: Install, Configure, Engines, Commands, Docs, Status. `scripts/release.py` bumps the Status line.
+- Give each fact one home. Link to it from other files. Do not copy it.
+- Link every `docs/*.md` file from the README Docs table.
+- Use relative links that resolve. Point to a heading with `file.md#anchor`.
+
+| Topic | Home |
+|-------|------|
+| First run, engine table, main commands | `README.md` |
+| Settings, AppArmor, engine logins, model names, Atlassian tools, images | `docs/configuration.md` |
+| Job, thread, auth, config, and profile command tables | `docs/commands.md` |
+| Build, iterate, and review-pr behavior | `docs/review.md` |
+| Review and author threads, session transfer | `docs/threads.md` |
+| Schema, JSON events, job state, exit codes | `docs/automation.md` |
+| Profiles, profile limits, MCP | `docs/profiles.md` |
+| Resource defaults and concurrency | `docs/resources.md` |
+| User-facing threat model | `docs/security.md` |
+| Maintainer rules, invariants, dev commands | `AGENTS.md` |
+| Release steps | `docs/releasing.md` |
+
+If a new topic has no home, add a row here and a docs file. Do not grow the README.
+
 ## Architecture
 
 ```text
@@ -83,24 +109,11 @@ Keep policy code pure where practical. Keep subprocess calls injectable so tests
 - Keep the proxy user as numeric `13:13` across image bases.
 - Keep the Codex native launcher, platform package, companion executable, and managed-package metadata.
 
-Resource defaults:
+Resource defaults and their settings live in [`docs/resources.md`](docs/resources.md).
 
-| Resource | Limit |
-|----------|-------|
-| Task tree | 2048 MiB, configurable from 256 through 8192 MiB |
-| Proxy | 128 MiB |
-| Task disk | 8192 MiB soft budget, configurable from 1024 through 32768 MiB |
-| Disk helper | 64 MiB, short-lived and networkless |
+Profile limits live in [`docs/profiles.md`](docs/profiles.md).
 
-`/work`, HOME, and `/tmp` use anonymous disk volumes. Small runtime paths use tmpfs.
-
-The disk watchdog samples approximately every five seconds. It is not a filesystem quota. Volume deletion is not secure erasure.
-
-Profiles allow 5,000 files and 20 MiB across explicit, swept, and MCP files. The profile file has a separate 20 MiB limit.
-
-Glob and setup scans can inspect 5,000 entries. Setup traversal can visit 5,000 directories.
-
-Skipped binary or unreadable sweep files consume the budget. Snapshot and transcript reads also use fail-closed size limits.
+Snapshot and transcript reads also use fail-closed size limits.
 
 ## Security invariants
 

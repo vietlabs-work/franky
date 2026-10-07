@@ -170,3 +170,113 @@ def test_real_repo_is_coherent():
     assert (not sections) or _as_tuple(sections[0]) <= _as_tuple(version), (
         "newest CHANGELOG version is ahead of pyproject"
     )
+
+
+# --- README stays short and every fact has one home (AGENTS.md "Documentation") ---
+
+README_MAX_LINES = 120
+README_SECTIONS = {"Install", "Configure", "Engines", "Commands", "Docs", "Status"}
+_DUP_MIN_CHARS = 60
+_LINK = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
+_INLINE_CODE = re.compile(r"`[^`\n]*`")
+
+
+def doc_files() -> list[Path]:
+    return [ROOT / "README.md", ROOT / "AGENTS.md", *sorted((ROOT / "docs").glob("*.md"))]
+
+
+def prose_lines(text: str) -> list[str]:
+    """Lines outside code fences, whitespace-collapsed."""
+    return [" ".join(line.split()) for line in _FENCED_BLOCK.sub("", text).splitlines()]
+
+
+def duplicate_lines(texts: dict[str, str]) -> dict[str, list[str]]:
+    """Long prose lines or table rows that appear more than once across the docs."""
+    seen: dict[str, list[str]] = {}
+    for name, text in texts.items():
+        for line in prose_lines(text):
+            if len(line) >= _DUP_MIN_CHARS:
+                seen.setdefault(line, []).append(name)
+    return {line: names for line, names in seen.items() if len(names) > 1}
+
+
+def heading_anchors(text: str) -> set[str]:
+    """GitHub-style anchors of every markdown heading."""
+    out = set()
+    for line in prose_lines(text):
+        if line.startswith("#"):
+            title = line.lstrip("#").strip().lower()
+            out.add(re.sub(r"\s", "-", re.sub(r"[^\w\s-]", "", title)))
+    return out
+
+
+def broken_links(path: Path, text: str) -> list[str]:
+    """Relative links whose file or heading anchor does not exist."""
+    bad = []
+    for target in _LINK.findall(_INLINE_CODE.sub("", _FENCED_BLOCK.sub("", text))):
+        if re.match(r"[a-z]+:", target):
+            continue
+        file_part, _, anchor = target.partition("#")
+        dest = (path.parent / file_part).resolve() if file_part else path
+        if not dest.exists():
+            bad.append(target)
+        elif anchor and dest.suffix == ".md":
+            if anchor not in heading_anchors(dest.read_text(encoding="utf-8")):
+                bad.append(target)
+    return bad
+
+
+@pytest.mark.parametrize(
+    "texts,dups",
+    [
+        ({"a": "x" * 60, "b": "x" * 60}, 1),  # copied line
+        ({"a": "x" * 59, "b": "x" * 59}, 0),  # short lines may repeat
+        ({"a": "```\n" + "x" * 60 + "\n```", "b": "x" * 60}, 0),  # code is exempt
+        ({"a": "| " + "y" * 60 + " |", "b": "|  " + "y" * 60 + "  |"}, 1),  # spacing ignored
+    ],
+)
+def test_duplicate_lines(texts, dups):
+    assert len(duplicate_lines(texts)) == dups
+
+
+def test_heading_anchors():
+    assert heading_anchors("## Review threads\n### `--thread` flag") == {
+        "review-threads",
+        "--thread-flag",
+    }
+
+
+def test_readme_is_short():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert len(readme.splitlines()) <= README_MAX_LINES, (
+        f"README.md is over {README_MAX_LINES} lines; move detail to docs/ (AGENTS.md Documentation)"
+    )
+
+
+def test_readme_sections_allowed():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    sections = set(re.findall(r"^## (.+)$", _FENCED_BLOCK.sub("", readme), re.MULTILINE))
+    assert sections <= README_SECTIONS, f"README sections not allowed: {sections - README_SECTIONS}"
+
+
+def test_every_doc_linked_from_readme():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    unlinked = [p.name for p in (ROOT / "docs").glob("*.md") if f"(docs/{p.name})" not in readme]
+    assert unlinked == [], f"docs not in the README Docs table: {unlinked}"
+
+
+def test_doc_links_resolve():
+    bad = {
+        p.name: links
+        for p in doc_files()
+        if (links := broken_links(p, p.read_text(encoding="utf-8")))
+    }
+    assert bad == {}, f"broken doc links: {bad}"
+
+
+def test_no_repeated_doc_lines():
+    texts = {str(p.relative_to(ROOT)): p.read_text(encoding="utf-8") for p in doc_files()}
+    dups = duplicate_lines(texts)
+    assert dups == {}, "lines repeated across docs; keep one home and link to it:\n" + "\n".join(
+        f"{names}: {line[:80]}" for line, names in dups.items()
+    )
