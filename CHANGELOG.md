@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.16] - 2026-10-09
+
 - `review-pr` now treats any line containing `GitHub wrapper refused:` as a refused `APPROVE` and posts a `COMMENT` instead.
 
 ### Added
