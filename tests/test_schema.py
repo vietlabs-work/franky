@@ -381,3 +381,19 @@ def test_schema_context_sources_reason_lists_every_reason():
         "network",
     ):
         assert name in reason
+
+
+def test_schema_documents_the_no_publish_build_contract():
+    schema = build_schema(cli.main)
+    flags = {f["name"] for f in schema["commands"]["build"]["flags"]}
+    assert "no_publish" in flags
+    result = schema["result_schema"]
+    for field in ("base_sha", "head_sha", "bundle_path"):
+        assert field in result and "--no-publish" in result[field]
+    for status in ("branch_ready", "no_changes", "export_failed", "export_refused"):
+        assert status in result["status"]
+        assert status in schema["job_record_schema"]["status"]
+    assert "no_publish" in schema["job_record_schema"]
+    assert (
+        "head_sha" in schema["job_record_schema"] and "bundle_path" in schema["job_record_schema"]
+    )

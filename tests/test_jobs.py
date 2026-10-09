@@ -1163,3 +1163,60 @@ def test_new_record_marks_threaded_runs_only():
         threaded=True,
     )
     assert record["threaded"] is True and "session_id" not in record
+
+
+def test_new_record_marks_a_no_publish_run_only_when_asked():
+    assert "no_publish" not in _rec()
+    record = jobs.new_record(
+        job_id="ab12cd",
+        command="build",
+        repo="o/r",
+        engine="pi",
+        task="t",
+        container="c",
+        network="n",
+        proxy="p",
+        branch="franky/thing",
+        started_at="2026-07-05T10:00:00+00:00",
+        no_publish=True,
+    )
+    assert record["no_publish"] is True
+
+
+def test_prune_unlinks_the_bundle_sidecar_with_its_record_and_sweeps_orphans(tmp_path):
+    env = _env(tmp_path)
+    now = datetime.now(timezone.utc)
+    jobs.write_record(_rec("aa0002", status="pr_opened", started_at=now.isoformat()), env)
+    jobs.write_record(
+        _rec("aa0001", status="pr_opened", started_at=(now - timedelta(hours=1)).isoformat()), env
+    )
+    old = jobs.runs_dir(env) / "aa0001.bundle"
+    old.write_bytes(b"bundle")
+    orphan = jobs.runs_dir(env) / "0badf00d.bundle"
+    orphan.write_bytes(b"orphan")
+    jobs.prune(env, keep=1)
+    assert not old.exists() and not orphan.exists()
+
+
+def test_a_fresh_running_runs_bundle_survives_prune(tmp_path):
+    env = _env(tmp_path)
+    jobs.write_record(
+        _rec("cc0001", status="running", started_at=datetime.now(timezone.utc).isoformat()), env
+    )
+    sidecar = jobs.runs_dir(env) / "cc0001.bundle"
+    sidecar.write_bytes(b"in flight")
+    jobs.prune(env)
+    assert sidecar.exists()
+
+
+def test_export_bundle_excludes_the_git_bundle_sidecar(tmp_path):
+    env = _env(tmp_path)
+    rec = _rec("da7a06", status="branch_ready")
+    jobs.write_record(rec, env)
+    (jobs.runs_dir(env) / "da7a06.bundle").write_bytes(b"workspace commits")
+    dest = tmp_path / "bundle.tar.gz"
+    jobs.export_bundle(rec, dest)
+    import tarfile
+
+    with tarfile.open(dest) as tar:
+        assert not any(n.endswith(".bundle") for n in tar.getnames())

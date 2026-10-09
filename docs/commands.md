@@ -11,8 +11,8 @@ Run `franky COMMAND --help` for flags and examples. Run `franky schema` for the 
 | `franky job kill JOB_ID` | Stop a run and remove its task, proxy, network, and volumes. A `--thread` build also keeps its engine session. |
 | `franky job export JOB_ID` | Export the record and redacted transcript as a portable archive. |
 | `franky job diagnose JOB_ID` | Request a read-only failure analysis. |
-| `franky job replay JOB_ID` | Reproduce a build from saved inputs in a fresh container. |
-| `franky job resume JOB_ID` | Continue a stopped run from its saved workspace, and for a `--thread` build also its engine session. |
+| `franky job replay JOB_ID` | Reproduce a build from saved inputs in a fresh container. Refuses a `build --no-publish` run. |
+| `franky job resume JOB_ID` | Continue a stopped run from its saved workspace, and for a `--thread` build also its engine session. Refuses a `build --no-publish` run. |
 | `franky job attach JOB_ID` | Send one correction to a running steerable engine. |
 
 `replay` starts from saved inputs. `resume` restores `/work`, plus the engine session when it can (see [Author threads](threads.md#author-threads)). Use `replay --open-pr` only when the reproduced run should open a PR.

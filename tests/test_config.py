@@ -474,3 +474,17 @@ def test_load_config_opencode_missing_credential_uses_engine_requires_wording():
     with pytest.raises(ValueError) as exc:
         load_config("opencode", env)
     assert str(exc.value).startswith("engine 'opencode' requires OPENROUTER_API_KEY ")
+
+
+def test_load_config_records_the_jira_email_apart_from_the_secrets():
+    env = {
+        "FRANKY_ALLOWED_REPOS": "me/repo",
+        "GH_TOKEN": "ghp_fake",
+        "OPENROUTER_API_KEY": SECRET,
+        "JIRA_EMAIL": " ops@example.test ",
+        "JIRA_API_TOKEN": "jira-token-123",
+    }
+    cfg = load_config(None, env)
+    assert cfg.jira_email == "ops@example.test"
+    assert "ops@example.test" in cfg.secret_values()  # still redacted from output
+    assert load_config(None, {k: v for k, v in env.items() if "JIRA" not in k}).jira_email == ""

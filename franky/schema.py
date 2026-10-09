@@ -22,8 +22,11 @@ from . import result
 _RESULT_SCHEMA: dict = {
     "status": "result class: pr_opened | no_pr | agent_error | timeout | already_open | "
     "iterate_complete | replay_complete | review_published | review_complete | no_findings | "
-    "publish_blocked_stale_head | publish_failed | publish_uncertain",
-    "pr_url": "the PR URL (string) or null when none was produced",
+    "publish_blocked_stale_head | publish_failed | publish_uncertain | branch_ready | "
+    "no_changes | export_failed | export_refused (the last four only for `build --no-publish`: "
+    "branch_ready exit 0, no_changes and export_failed exit 7, export_refused exit 4)",
+    "pr_url": "the PR URL (string) or null when none was produced; always null for "
+    "`build --no-publish`",
     "branch": "the PREDICTED branch name (`franky/<slug>`) computed host-side; MAY differ "
     "from the branch the agent actually created. null for iterate.",
     "reason": "a short human-readable explanation of the status",
@@ -47,6 +50,13 @@ _RESULT_SCHEMA: dict = {
     "being reproduced. Absent on build/iterate.",
     "resumed_from": "present ONLY on a `franky job resume` run: the job_id of the original run "
     "whose workspace was restored. Absent on build/iterate.",
+    "base_sha": "string; present ONLY for `build --no-publish` (every result of it): the "
+    "40-hex default-branch tip the branch was started from",
+    "head_sha": "string; present ONLY for `build --no-publish` with status branch_ready: the "
+    "40-hex tip of `branch` in the bundle",
+    "bundle_path": "string; present ONLY for `build --no-publish` with status branch_ready: "
+    "absolute path of the git bundle (mode 0600) holding `base_sha..branch` as "
+    "refs/heads/<branch>; host-local, never exported, deleted with the run record",
     "reviewed_sha": "string; present ONLY for `review-pr`: the reviewed PR head commit",
     "findings_summary": "string; present ONLY for `review-pr`: the review findings summary",
     "review_body": "string; present ONLY for a successful unpublished `review-pr`: the complete rendered review",
@@ -195,7 +205,8 @@ _JOB_RECORD_SCHEMA: dict = {
     "status": "running | pr_opened | no_pr | agent_error | timeout | already_open | "
     "iterate_complete | killed | diagnosed | diagnose_failed | replay_complete | "
     "review_published | review_complete | no_findings | publish_blocked_stale_head | "
-    "publish_failed | publish_uncertain",
+    "publish_failed | publish_uncertain | branch_ready | no_changes | export_failed | "
+    "export_refused",
     "started_at": "ISO-8601 UTC timestamp when the run was registered",
     "ended_at": "ISO-8601 UTC timestamp when the run finished, or null while running",
     "pr_url": "the PR URL (string) or null when none was produced",
@@ -230,6 +241,12 @@ _JOB_RECORD_SCHEMA: dict = {
     "thread_id": "present ONLY on a `review-pr --thread` or `iterate --thread` run, or a "
     "`build --thread` / resumed run once its session is bound: the thread it belongs to (see "
     "thread_record_schema). Absent on every other run.",
+    "no_publish": "present ONLY on a `build --no-publish` or `review-pr --no-publish` run: "
+    "true. `job resume` and `job replay` refuse a `build --no-publish` record.",
+    "head_sha": "present ONLY on a `build --no-publish` run that reached branch_ready: the "
+    "exported branch tip (see result_schema.head_sha)",
+    "bundle_path": "present ONLY on a `build --no-publish` run that reached branch_ready: the "
+    "host-local `<job_id>.bundle` (see result_schema.bundle_path); never exported",
     "threaded": "present ONLY on a `build --thread` run or a `job resume` of one: true.",
     "session_id": "present ONLY on a `build --thread` run with native resume, or a `job resume` "
     "of one: the engine session id, written BEFORE launch.",

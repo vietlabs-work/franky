@@ -667,17 +667,53 @@ def _hold_nonce() -> str:
     return secrets.token_hex(8)
 
 
-def _copy_session_in_hold(task: str, sink: dict, nonce: str, runner, popen) -> None:
+def _run_in_hold(
+    task: str,
+    image: str,
+    nonce: str,
+    session_sink: dict | None,
+    workspace_sink: dict | None,
+    scan_secrets: list[str],
+    runner,
+    popen,
+    log=None,
+) -> None:
     """The engine exited cleanly and the entrypoint holds the --rm container: copy the session
-    out while it still exists, then release the hold. The release runs even when the copy fails
-    or is interrupted, so the container exits; if the release itself fails, the entrypoint's cap
-    ends the hold and --rm still removes the container. Never raises an Exception."""
+    out and export the workspace while it still exists, then release the hold. The release runs
+    even when a step fails or is interrupted, so the container exits; if the release itself
+    fails, the entrypoint's cap ends the hold and --rm still removes the container. Never raises
+    an Exception."""
     try:
-        sink["status"] = snapshot.copy_session(
-            task, sink["paths"], sink["dest"], max_bytes=sink["max_bytes"], popen=popen
-        )
-    except Exception:
-        pass
+        if session_sink is not None:
+            try:
+                session_sink["status"] = snapshot.copy_session(
+                    task,
+                    session_sink["paths"],
+                    session_sink["dest"],
+                    max_bytes=session_sink["max_bytes"],
+                    popen=popen,
+                )
+            except Exception:
+                pass
+        if workspace_sink is not None:
+            try:
+                status, detail, tip = export_workspace(
+                    task,
+                    image,
+                    str(workspace_sink["branch"]),
+                    str(workspace_sink["base"]),
+                    str(workspace_sink["dest"]),
+                    scan_secrets,
+                    clone_dir=str(workspace_sink["clone_dir"]),
+                    popen=popen,
+                    runner=runner,
+                    on_stderr=log,
+                )
+            except Exception as exc:
+                status, detail, tip = "failed", f"export failed ({type(exc).__name__})", None
+            workspace_sink["status"] = status
+            workspace_sink["detail"] = detail
+            workspace_sink["tip"] = tip
     finally:
         try:
             runner(
@@ -690,6 +726,360 @@ def _copy_session_in_hold(task: str, sink: dict, nonce: str, runner, popen) -> N
             )
         except Exception:
             pass
+
+
+# --- Workspace export (`build --no-publish`) ---------------------------------------------------
+#
+# WHY a helper and not `docker cp` of /work: the checkout in /work is AUTHORED BY THE CONTAINER.
+# Any host git command inside it would run container-chosen hooks and config with the host's
+# environment, so the host never touches that tree. A throwaway sandbox reads it instead: it is
+# networkless, read-only, capability-free, runs the packaged seccomp policy, and mounts ONLY the
+# task's /work volume read-only (never HOME, /tmp or the Codex auth volume). Two short runs in
+# turn: `scan` (prints the resolved branch tip, then the raw objects the bundle will carry, which
+# the host scans for the run's secret values) and `bundle` (one inert git bundle of
+# base..tip, written to a 0600 host file, refused if the branch moved since the scan).
+#
+# It runs inside the entrypoint's session hold, so the task container still exists (--rm) and no
+# stopped container ever keeps the tokens. The hold lasts 60 s; the export gets 30 s in total,
+# and the bundle step is skipped when less than 10 s of that remain.
+EXPORT_HELPER_HOME = "/run/franky-export"
+# ponytail: the budget counts docker start and both reaps; raise it only with the hold in
+# franky-dind-entrypoint.sh (60 s) and leave room for the release marker.
+EXPORT_BUDGET_SECS = 30
+EXPORT_MIN_BUNDLE_SECS = 10
+_EXPORT_REAP_SECS = 5
+# ponytail: fixed 256 MiB cap on a bundle and on the scanned object stream; make it a setting
+# only if real work needs more (the helper memory limit and the budget bound it either way).
+EXPORT_MAX_BYTES = 256 * 1024**2
+
+_EXPORT_BRANCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
+_EXPORT_BASE_RE = re.compile(r"^[0-9a-f]{40}$")
+_EXPORT_CLONE_RE = re.compile(r"^/work/(?!\.\.?$)[A-Za-z0-9._-]+$")
+_EXPORT_VOLUME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+# Fixed, public reasons per helper exit code. Helper stderr is container-influenced text, so it
+# goes to the run log only, never into a result.
+_EXPORT_REASONS = {
+    3: "the branch or the clone was not found in the workspace",
+    5: "the base commit is not an ancestor of the branch",
+    6: "the branch moved while it was being exported",
+}
+
+# Runs INSIDE the sandbox with bash. $1 = scan|bundle, $2 = branch, $3 = base sha, $4 = clone
+# directory, $5 = expected tip (bundle only): arguments, never interpolated into the script.
+# Replace refs, grafts-by-config, a global or system git config and optional locks are switched
+# off so git sees exactly the objects that will be packed. Exit 3: no clone or no such branch.
+# Exit 4: the branch tip is the base. Exit 5: the base is not an ancestor. Exit 6: the branch
+# is not at the expected tip.
+_EXPORT_SCRIPT = """set -euo pipefail
+export GIT_NO_REPLACE_OBJECTS=1 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+export GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0
+mode=$1; branch=$2; base=$3; dir=$4; want=$5
+if [ -L "$dir" ] || [ -L "$dir/.git" ] || [ ! -d "$dir/.git" ]; then
+  echo "franky-export: no checkout at $dir" >&2
+  exit 3
+fi
+cd "$dir"
+g() { git -c safe.directory='*' -c core.useReplaceRefs=false "$@"; }
+tip=$(g rev-parse --verify --quiet "refs/heads/$branch^{commit}") || {
+  echo "franky-export: branch $branch does not exist" >&2
+  exit 3
+}
+if [ "$tip" = "$base" ]; then
+  echo "franky-export: branch has no commits beyond the base" >&2
+  exit 4
+fi
+g merge-base --is-ancestor "$base" "$tip" || {
+  echo "franky-export: base is not an ancestor of the branch" >&2
+  exit 5
+}
+case "$mode" in
+  scan)
+    printf '%s\\n' "$tip"
+    g rev-list --objects --no-object-names "$base..$tip" | g cat-file --batch --buffer
+    ;;
+  bundle)
+    if [ "$tip" != "$want" ]; then
+      echo "franky-export: branch moved since the scan" >&2
+      exit 6
+    fi
+    exec git -c safe.directory='*' -c core.useReplaceRefs=false \\
+      bundle create -q - "$base..refs/heads/$branch"
+    ;;
+  *)
+    echo "franky-export: unknown mode" >&2
+    exit 2
+    ;;
+esac
+"""
+
+
+def export_container_name(task: str) -> str:
+    """The helper's container name, derived from the task's so a reaper can find both."""
+    return f"{task}-export"
+
+
+def build_export_argv(
+    task: str,
+    image: str,
+    mode: str,
+    branch: str,
+    base: str,
+    *,
+    work_volume: str,
+    clone_dir: str,
+    tip: str = "",
+) -> list[str]:
+    """`docker run` argv for the sandboxed exporter. Pure - no docker invoked.
+
+    `mode` is `scan` or `bundle` (which needs the `tip` the scan resolved). Every value is
+    validated here (a branch name with no shell, option or `..` shape; full lowercase 40-hex
+    SHAs; a `/work/<name>` clone path; a plain volume name) and passed as an ARGUMENT. Only the
+    task's /work volume is mounted, read-only."""
+    if mode not in ("scan", "bundle"):
+        raise ValueError(f"unknown export mode: {mode!r}")
+    if not _EXPORT_BRANCH_RE.match(branch) or ".." in branch or branch.endswith((".lock", "/")):
+        raise ValueError(f"unsafe branch name: {branch!r}")
+    if not _EXPORT_BASE_RE.match(base):
+        raise ValueError("base must be a full lowercase 40-hex commit SHA")
+    if mode == "bundle" and not _EXPORT_BASE_RE.match(tip):
+        raise ValueError("tip must be a full lowercase 40-hex commit SHA")
+    if mode == "scan" and tip:
+        raise ValueError("the scan takes no tip")
+    if not _EXPORT_CLONE_RE.match(clone_dir):
+        raise ValueError(f"unsafe clone directory: {clone_dir!r}")
+    if not _EXPORT_VOLUME_RE.match(work_volume):
+        raise ValueError("invalid work volume name")
+    return [
+        "docker",
+        "run",
+        "--rm",
+        "--name",
+        export_container_name(task),
+        "--network=none",
+        "--read-only",
+        "--cap-drop=ALL",
+        "--security-opt=no-new-privileges",
+        f"--security-opt=seccomp={DEFAULT_SECCOMP}",
+        "--mount",
+        f"type=volume,src={work_volume},dst=/work,readonly",
+        # A small writable scratch for git, away from any task mount.
+        "--tmpfs",
+        f"{EXPORT_HELPER_HOME}:exec,uid={_RUN_UID},gid={_RUN_GID},size=16m",
+        "-e",
+        f"HOME={EXPORT_HELPER_HOME}",
+        "-e",
+        "GIT_CONFIG_NOSYSTEM=1",
+        "-e",
+        "GIT_TERMINAL_PROMPT=0",
+        "-e",
+        "GIT_OPTIONAL_LOCKS=0",
+        "--pids-limit=64",
+        "--memory=256m",
+        "--memory-swap=256m",
+        "--log-driver=none",
+        "--entrypoint=bash",
+        image,
+        "-c",
+        _EXPORT_SCRIPT,
+        "franky-export",
+        mode,
+        branch,
+        base,
+        clone_dir,
+        tip,
+    ]
+
+
+class _Oversize(Exception):
+    pass
+
+
+class _SecretFound(Exception):
+    pass
+
+
+class _CappedStream:
+    """Read-only view of a helper's stdout that refuses to deliver more than `limit` bytes."""
+
+    def __init__(self, stream, limit: int) -> None:
+        self._stream = stream
+        self._left = limit
+
+    def read(self, size: int = -1) -> bytes:
+        data = self._stream.read(size)
+        self._left -= len(data)
+        if self._left < 0:
+            raise _Oversize()
+        return data
+
+
+def _run_export_helper(argv, task, consume, timeout, popen, runner):
+    """Run one helper and feed its stdout to `consume(stream)`.
+
+    Returns (code, stderr_text, consumed_result). A timer kills the client process after
+    `timeout`; the helper container is reaped by name afterwards, always, within a short cap.
+    Raises whatever `consume` raises (the caller classifies); the reap still runs."""
+    proc = popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    timer = threading.Timer(max(1.0, timeout), proc.kill)
+    timer.daemon = True
+    timer.start()
+    try:
+        try:
+            result = consume(_CappedStream(proc.stdout, EXPORT_MAX_BYTES))
+        except BaseException:
+            proc.kill()
+            raise
+        code = proc.wait(timeout=max(1.0, timeout))
+        detail = (proc.stderr.read(4096) or b"").decode("utf-8", errors="replace").strip()
+        return code, detail, result
+    finally:
+        timer.cancel()
+        for stream in (proc.stdout, proc.stderr):
+            try:
+                stream.close()
+            except Exception:
+                pass
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        _reap(export_container_name(task), runner, timeout=_EXPORT_REAP_SECS)
+
+
+def _export_status(code: int) -> tuple[str, str]:
+    if code == 4:
+        return "no_changes", "no commits beyond the base"
+    return "failed", _EXPORT_REASONS.get(code, "the export helper failed")
+
+
+def _read_tip_then_scan(secrets):
+    """Consume callback for the scan helper: a `<40-hex>\\n` tip line, then raw objects.
+
+    Returns the tip (None when the helper printed none) and raises `_SecretFound` as soon as a
+    secret value shows up in the object stream."""
+
+    def consume(stream):
+        line = b""
+        while len(line) < 41:
+            chunk = stream.read(41 - len(line))
+            if not chunk:
+                return None
+            line += chunk
+        if not re.fullmatch(rb"[0-9a-f]{40}\n", line):
+            return None
+        if snapshot.stream_contains_values(stream, secrets):
+            raise _SecretFound()
+        return line[:40].decode("ascii")
+
+    return consume
+
+
+def export_workspace(
+    task,
+    image,
+    branch,
+    base,
+    dest,
+    secrets,
+    *,
+    clone_dir,
+    popen=subprocess.Popen,
+    runner=subprocess.run,
+    budget: float = EXPORT_BUDGET_SECS,
+    min_bundle: float = EXPORT_MIN_BUNDLE_SECS,
+    clock=time.monotonic,
+    on_stderr=None,
+) -> tuple[str, str, str | None]:
+    """Export `base..refs/heads/<branch>` from `task`'s /work as a git bundle at host file `dest`.
+
+    Returns (status, detail, tip): `ok` | `no_changes` | `refused` (a run secret VALUE is in the
+    objects to be packed; nothing written) | `failed`. `detail` is a fixed phrase, never helper
+    output; helper stderr goes only to `on_stderr(text)` (the run log). `tip` is the branch tip
+    the scan resolved, and the bundle step refuses if the branch moved. `dest` is created 0600
+    with O_EXCL and removed on any non-ok result. Never raises. The two helpers, their docker
+    start and their reaps share `budget`; the bundle step is skipped with `min_bundle` or less
+    left. The scan is a guard against accidental leaks of exact values, not a detector: an
+    encoded or split value passes."""
+    deadline = clock() + budget
+    dest = Path(dest)
+    created = False
+    log = on_stderr or (lambda _text: None)
+    try:
+        work_volume = _task_storage_volumes(task, runner)[0]
+        scan_argv = build_export_argv(
+            task, image, "scan", branch, base, work_volume=work_volume, clone_dir=clone_dir
+        )
+        try:
+            code, stderr, tip = _run_export_helper(
+                scan_argv,
+                task,
+                _read_tip_then_scan(secrets),
+                deadline - clock() - _EXPORT_REAP_SECS,
+                popen,
+                runner,
+            )
+        except _SecretFound:
+            return "refused", "a run secret value appears in the objects to be exported", None
+        except _Oversize:
+            return "failed", f"objects to export exceeded {EXPORT_MAX_BYTES} bytes", None
+        if stderr:
+            log(stderr)
+        if code != 0:
+            return (*_export_status(code), None)
+        if tip is None:
+            return "failed", "the export helper reported no branch tip", None
+
+        remaining = deadline - clock()
+        if remaining <= min_bundle:
+            return "failed", "not enough time left in the session hold to export the bundle", tip
+        bundle_argv = build_export_argv(
+            task,
+            image,
+            "bundle",
+            branch,
+            base,
+            work_volume=work_volume,
+            clone_dir=clone_dir,
+            tip=tip,
+        )
+        dest.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # 0600, O_EXCL: the bundle is container-derived bytes staged on the host.
+        target = os.fdopen(os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb")
+        created = True
+        written = 0
+
+        def copy(stream):
+            nonlocal written
+            while chunk := stream.read(CHUNK_SIZE):
+                written += len(chunk)
+                target.write(chunk)
+
+        try:
+            code, stderr, _ = _run_export_helper(
+                bundle_argv, task, copy, remaining - _EXPORT_REAP_SECS, popen, runner
+            )
+        except _Oversize:
+            return "failed", f"workspace bundle exceeded {EXPORT_MAX_BYTES} bytes", tip
+        finally:
+            target.close()
+        if stderr:
+            log(stderr)
+        if code != 0:
+            status, detail = _export_status(code)
+            return status, detail, tip
+        if written == 0:
+            return "failed", "the export helper produced no bundle", tip
+        created = False
+        return "ok", "", tip
+    except Exception as exc:
+        return "failed", f"the export helper failed ({type(exc).__name__})", None
+    finally:
+        if created:
+            try:
+                dest.unlink()
+            except OSError:
+                pass
 
 
 def capture_diagnostics(
@@ -852,14 +1242,14 @@ def capture_diagnostics(
     return diag
 
 
-def _reap(name: str, runner) -> bool:
+def _reap(name: str, runner, timeout: float = 10) -> bool:
     """Best-effort `docker rm -f` so a container does not linger after a timeout/error.
     Returns True iff the reap succeeded. Never raises - the reaper must not mask the
     original outcome - but a failure is reported (see run_in_container) because a surviving
     container still holds the injected tokens in its env."""
     try:
         proc = runner(
-            ["docker", "rm", "-f", "-v", name], capture_output=True, text=True, timeout=10
+            ["docker", "rm", "-f", "-v", name], capture_output=True, text=True, timeout=timeout
         )
     except Exception:
         return False
@@ -1172,6 +1562,7 @@ def run_in_container(
     apparmor_selector=select_task_apparmor,
     session_tar: str | None = None,
     session_sink: dict | None = None,
+    workspace_sink: dict | None = None,
     private_prompt_tar: bytes | None = None,
     extra_secrets: Iterable[str] = (),
 ) -> tuple[int, str | Transcript]:
@@ -1201,6 +1592,12 @@ def run_in_container(
     `dest`. The first path is required, the rest optional; the sink gains `"status"`: ok,
     too_large (the combined stream passed `max_bytes`), or failed. `"on_timeout": True` also
     copies the session out of a timed-out run (`build --thread`, `job resume`).
+
+    `workspace_sink` (`build --no-publish`) = {"dest": host file, "branch": name, "base": 40-hex
+    SHA} exports `base..branch` out of `/work` as a git bundle, inside the same session hold and
+    through networkless read-only helpers (see `export_workspace`). The sink gains `"status"`
+    (`ok` | `no_changes` | `refused` | `failed`) and a redacted `"detail"` only when the hold line
+    was seen, which needs a clean engine exit; a missing status means nothing was exported.
 
     `extra_secrets` are host-only values (the JIRA token and email) added to the redaction set
     for the streamed and stored output. They are never passed into the container.
@@ -1248,7 +1645,8 @@ def run_in_container(
     storage_failures: list[str] = []
     storage_thread = None
     hold_copied = False  # the session was copied while the entrypoint held the container
-    hold_nonce = _hold_nonce() if session_sink is not None else ""
+    holding = session_sink is not None or workspace_sink is not None
+    hold_nonce = _hold_nonce() if holding else ""
     hold_want = f"{snapshot.SESSION_HOLD_LINE} {hold_nonce}"
     hold_buf, hold_at_line_start = "", True
 
@@ -1426,7 +1824,7 @@ def run_in_container(
                             break
                         text = decoder.decode(line) if isinstance(line, bytes) else line
                         emit(text)
-                        if session_sink is not None and not hold_copied:
+                        if holding and not hold_copied:
                             # Only a WHOLE line equal to the hold line counts. The run timeout
                             # stays armed: the agent can read the nonce and print the line, which
                             # only buys an early, partial copy of its own session. Known limit:
@@ -1440,7 +1838,25 @@ def run_in_container(
                             if len(hold_buf) > _HOLD_LINE_MAX:
                                 hold_buf, hold_at_line_start = "", False
                             if hold_copied:
-                                _copy_session_in_hold(task, session_sink, hold_nonce, runner, popen)
+                                _run_in_hold(
+                                    task,
+                                    image,
+                                    hold_nonce,
+                                    session_sink,
+                                    workspace_sink,
+                                    # Credential-class values only: the JIRA email is
+                                    # redacted from output but is no reason to refuse an export.
+                                    [
+                                        v
+                                        for v in secrets
+                                        if v and v != getattr(cfg, "jira_email", "")
+                                    ],
+                                    runner,
+                                    popen,
+                                    log=lambda text: output.write(
+                                        redact("\nfranky: export helper: " + text + "\n", secrets)
+                                    ),
+                                )
                         # Belt-and-suspenders: the per-line elapsed check still catches a slow
                         # trickle of output between deadline checks; the watchdog above catches a
                         # total silence.

@@ -27,6 +27,8 @@ The agent can also pass its credentials to nested containers. The outer limits a
 
 Opening a PR can start GitHub Actions. Review workflow changes before you allow a run to use repository secrets.
 
+`build --no-publish` exports commits without a write credential. Two networkless, read-only, capability-free helpers mount only the task's `/work` volume, read-only, during the entrypoint's session hold, so no stopped container ever keeps the tokens and the helpers never see HOME, `/tmp`, or the Codex login. Git in the helpers ignores replace refs and global or system config. Franky scans the raw objects the bundle will carry for the run's credential values, and refuses the export on a hit. This is a guard against accidental leaks of exact values only: an encoded or split value passes, and Franky does not scan for credential patterns, so the caller that pushes the bundle must. The host reads only the bundle header, which must name the scanned tip, and never runs git on a checkout the container wrote. Helper output reaches the run log only, never a result. Franky cannot enforce that the supplied `GH_TOKEN` is read-only.
+
 Codex subscription authentication is the only persistent task volume. Franky scrubs it to `auth.json` before each autonomous run.
 
 Read [`AGENTS.md`](../AGENTS.md) before changing security, container, egress, profile, or resource code.
