@@ -267,8 +267,10 @@ _JOB_RECORD_SCHEMA: dict = {
 _STARTED_EVENT_SCHEMA: dict = {
     "event": "string; always started",
     "job_id": "string; the 12-hex handle to poll",
-    "command": "string; build | iterate | review-pr | replay | resume",
+    "command": "string; build | iterate | review-pr | diagnose | replay | resume",
     "status_command": "string; the exact command to poll this run",
+    "profile_files": "integer; profile files injected into the container (0 when none); "
+    "always present",
     "atlassian": "optional; on | not_connected | expired | network | busy | not_private - "
     "absent when the Atlassian gate did not run",
     "atlassian_warning": "optional; broad_scope - the Atlassian grant includes write scopes or "

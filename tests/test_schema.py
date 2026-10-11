@@ -397,3 +397,9 @@ def test_schema_documents_the_no_publish_build_contract():
     assert (
         "head_sha" in schema["job_record_schema"] and "bundle_path" in schema["job_record_schema"]
     )
+
+
+def test_started_event_schema_documents_profile_files_and_diagnose():
+    started = build_schema(cli.main)["started_event_schema"]
+    assert "profile_files" in started and "always present" in started["profile_files"]
+    assert "diagnose" in started["command"]

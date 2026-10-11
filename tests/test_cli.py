@@ -2146,7 +2146,7 @@ def test_load_profile_bundle_applies_named_credential_egress_and_redaction(tmp_p
     cfg = Config(engine=PiEngine(), allowed_repos=["me/repo"])
     secrets = []
 
-    bundle, setup_block = cli._load_profile_bundle(
+    bundle, setup_block, _ro = cli._load_profile_bundle(
         str(prof), {"LINEAR_API_KEY": "mcp-secret-value"}, secrets, cfg
     )
 
@@ -2177,7 +2177,7 @@ def test_load_profile_bundle_warns_when_a_declared_setup_swept_nothing(tmp_path,
 
     runner = CliRunner()
     with runner.isolation() as (_out, err, _):
-        bundle, block = cli._load_profile_bundle(str(prof), {}, [], cfg)
+        bundle, block, _ro = cli._load_profile_bundle(str(prof), {}, [], cfg)
         warning = err.getvalue().decode()
 
     assert bundle is None
@@ -6478,3 +6478,112 @@ def test_job_replay_refuses_a_no_publish_run(monkeypatch, tmp_path):
     res = CliRunner().invoke(cli.main, ["job", "replay", job_id, "--json"])
     assert res.exit_code == 4, res.output
     assert json.loads(res.stdout)["error"]["kind"] == "task_rejected"
+
+
+def stub_profile(monkeypatch, tmp_path, files=3):
+    """A resolved profile with a claude setup and `files` injected files; no Docker, no disk."""
+    spec = type(
+        "Spec",
+        (),
+        {
+            "setup_scans": {},
+            "mcp_domains": [],
+            "all_files": lambda self: list(range(files)),
+            "setup_roots": lambda self: {"claude": tmp_path / ".claude"},
+            "pr_spec": lambda self: tmp_path / ".claude" / "pr.md",
+        },
+    )()
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setattr(cli, "load_profile", lambda path: spec)
+    monkeypatch.setattr(cli, "validate_mcp_engine", lambda *a: None)
+    monkeypatch.setattr(cli, "resolve_mcp_credentials", lambda *a: {})
+    monkeypatch.setattr(cli, "claude_mcp_config_path", lambda spec: None)
+    monkeypatch.setattr(cli, "build_bundle", lambda spec: b"bundle")
+    prof = tmp_path / "p.toml"
+    prof.write_text("")
+    return str(prof)
+
+
+def _assert_read_only_setup(prompt):
+    assert "Operator setup (injected)" in prompt
+    assert "open the PR" not in prompt
+    assert "relaxes this pass's read-only rules" in prompt
+
+
+def test_review_pr_prompt_names_the_injected_setup(monkeypatch, tmp_path):
+    _fix_review_nonce(monkeypatch)
+    _mc_review_setup(monkeypatch)
+    stub_profile(monkeypatch, tmp_path)
+    monkeypatch.setenv("FRANKY_PROFILE_PATH", str(tmp_path / "p.toml"))
+    seen = []
+
+    def fake_run(cfg, argv, *a, **k):
+        seen.append(" ".join(map(str, argv)))
+        return 0, _review_block({"summary": "ok", "findings": [], "checks": []})
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+    res = CliRunner().invoke(cli.main, ["review-pr", "--no-publish", "--", PR_URL])
+    assert res.exit_code == 0, res.output
+    _assert_read_only_setup(seen[0])
+
+
+def test_plan_prompt_names_the_injected_setup(monkeypatch, tmp_path):
+    _fix_plan_nonce(monkeypatch)
+    monkeypatch.setattr(cli.os, "environ", _build_env())
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    profile_path = stub_profile(monkeypatch, tmp_path)
+    seen = []
+
+    def fake_run(cfg, argv, *a, **k):
+        seen.append(" ".join(map(str, argv)))
+        return 0, _plan_block({"fits_one_pr": True, "subtasks": [], "rationale": "r"})
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+    res = CliRunner().invoke(
+        cli.main, ["plan", "tiny fix", "--repo", "me/repo", "--profile", profile_path]
+    )
+    assert res.exit_code == 0, res.output
+    _assert_read_only_setup(seen[0])
+
+
+def test_build_plan_first_pass_names_the_setup_read_only_and_build_keeps_the_pr_line(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(cli.os, "environ", _plan_first_env())
+    monkeypatch.setattr(cli, "_stdin_is_interactive", lambda: True)
+    monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
+    profile_path = stub_profile(monkeypatch, tmp_path)
+    seen = []
+    outputs = ["PLAN: do it", f"opened {PR_URL}"]
+
+    def fake_run(cfg, argv, *a, **k):
+        seen.append(" ".join(map(str, argv)))
+        return 0, outputs.pop(0)
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+    res = CliRunner().invoke(
+        cli.main,
+        ["build", "do it", "--repo", "me/repo", "--plan-first", "--profile", profile_path],
+        input="y\n",
+    )
+    assert res.exit_code == 0, res.output
+    _assert_read_only_setup(seen[0])
+    assert "Operator setup (injected)" in seen[1] and "open the PR" in seen[1]
+
+
+def test_frozen_review_pr_ignores_the_operator_profile(monkeypatch, tmp_path):
+    _frozen_setup(monkeypatch)
+    stub_profile(monkeypatch, tmp_path)
+    monkeypatch.setenv("FRANKY_PROFILE_PATH", str(tmp_path / "p.toml"))
+    seen = []
+
+    def fake_run(cfg, argv, *a, **k):
+        seen.append(" ".join(map(str, argv)))
+        return 0, _review_block({"summary": "ok", "findings": [], "checks": []})
+
+    monkeypatch.setattr(cli, "run_in_container", fake_run)
+    res = CliRunner().invoke(cli.main, ["review-pr", *FROZEN, "--", PR_URL])
+    assert res.exit_code == 0, res.output
+    assert seen and "Operator setup" not in seen[0]

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `review-pr`, `plan`, and the planning pass of `build --plan-first` now tell the agent about the injected operator setup, with read-only wording (no PR to open, read-only rules stay in force). Before, the profile files were injected but the prompt never named them.
+
+### Added
+
+- The `--json` `started` event always carries `profile_files`: the number of profile files injected into that pass's container (0 when none).
+
 ## [0.3.16] - 2026-10-09
 
 - `review-pr` now treats any line containing `GitHub wrapper refused:` as a refused `APPROVE` and posts a `COMMENT` instead.

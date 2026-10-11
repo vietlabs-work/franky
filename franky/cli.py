@@ -585,7 +585,9 @@ def build(
 
         # Build the profile bundle (optional). Auto-discovers ~/.franky/profile.toml unless
         # overridden by --profile or FRANKY_PROFILE_PATH. Fails closed on detected credentials.
-        bundle, setup_block = _load_profile_bundle(profile_path_opt, process_env, secrets, cfg)
+        bundle, setup_block, plan_setup = _load_profile_bundle(
+            profile_path_opt, process_env, secrets, cfg
+        )
 
         # Verbose mode: raw passthrough of agent output to stderr. Quiet (or --json) -> no
         # progress callback at all. Else distilled milestones (the default).
@@ -608,7 +610,10 @@ def build(
             # A plan that errored is not a plan to approve. No economics on this pass.
             code, output, _plan_dur = _run_pass(
                 cfg,
-                build_plan_prompt(spec),
+                build_plan_prompt(
+                    spec,
+                    operator_setup=plan_setup,
+                ),
                 franky_img,
                 proxy_img,
                 bundle,
@@ -891,7 +896,7 @@ def iterate(
 
         franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
 
-        bundle, setup_block = _load_profile_bundle(None, process_env, secrets, cfg)
+        bundle, setup_block, _ro = _load_profile_bundle(None, process_env, secrets, cfg)
         verbose = verbose or bool(os.environ.get(FRANKY_VERBOSE_VAR))
         progress = None if (quiet and not verbose) else _make_progress(cfg.engine, verbose)
         # Register the run before it starts (issue #63), same as build - iterate has no
@@ -906,7 +911,7 @@ def iterate(
             branch=None,
             thread_id=thread.id if thread else None,
         )
-        _announce_start(job_id, "iterate", as_json, quiet)
+        _announce_start(job_id, "iterate", as_json, quiet, profile_files=_profile_files(bundle))
 
         # Author thread plan. No record yet may mean a `build --thread` crashed between its job
         # record write and the end of its bind (no record, or one that never got a handoff):
@@ -1776,7 +1781,7 @@ def review_pr(
                 prose=not (quiet or as_json),
             )
         franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
-        bundle, _setup_block = _load_profile_bundle(None, process_env, secrets, cfg)
+        bundle, _setup_block, review_setup = _load_profile_bundle(None, process_env, secrets, cfg)
         if not frozen:
             # After the profile bundle: MCP env values are in `secrets` before ticket text is
             # redacted. Frozen (eval) mode never fetches tickets.
@@ -1800,7 +1805,7 @@ def review_pr(
             branch=None,
             thread_id=thread.id if thread else None,
         )
-        _announce_start(job_id, "review-pr", as_json, quiet)
+        _announce_start(job_id, "review-pr", as_json, quiet, profile_files=_profile_files(bundle))
 
         # Thread plan: the session id is written to record.json before the container starts.
         record = prior_sha = prior_handoff = incoming = None
@@ -1833,6 +1838,7 @@ def review_pr(
             tickets=tickets,
             tickets_missing=tickets_missing,
             jira_tools=cfg.atlassian_tools,
+            operator_setup="" if frozen else review_setup,
         )
 
         diagnostics: dict = {}
@@ -2136,7 +2142,9 @@ def plan(
         _enable_atlassian(cfg, spec.repo, secrets, prose=not (quiet or as_json))
 
         franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
-        bundle, _setup_block = _load_profile_bundle(profile_path_opt, process_env, secrets, cfg)
+        bundle, _setup_block, setup_block = _load_profile_bundle(
+            profile_path_opt, process_env, secrets, cfg
+        )
         _flush_notes()  # plan announces no job, so its notes may print now
         progress = None if quiet else _make_progress(cfg.engine, False)
 
@@ -2147,7 +2155,7 @@ def plan(
         nonce = _make_nonce()
         code, output, duration = _run_pass(
             cfg,
-            build_decompose_prompt(spec, nonce),
+            build_decompose_prompt(spec, nonce, operator_setup=setup_block),
             franky_img,
             proxy_img,
             bundle,
@@ -3009,19 +3017,21 @@ def _load_profile_bundle(
     credential_env: dict,
     secrets: list[str],
     cfg: Config,
-) -> tuple[bytes | None, str]:
+) -> tuple[bytes | None, str, str]:
     """Load, scan, and pack the operator profile; return (bundle_bytes, prompt_setup_block).
 
     Resolution order: --profile flag path > FRANKY_PROFILE_PATH env var > auto-discovered
     ~/.franky/profile.toml.  Fails closed (ConfigError, exit 3) on a detected credential or a
     malformed profile, so the failure stays inside the machine contract (right exit code + a
     JSON error object under --json) instead of a bare exit-1 ClickException.
-    An absent or empty profile is not an error; the caller treats (None, "") as "no bundle".
+    An absent or empty profile is not an error; the caller treats (None, "", "") as "no bundle".
 
     The second element is the operator-setup prompt block (empty unless the profile declares
     `[setups]`): the bundle puts the files in the container, and that block is what tells the
     agent they are there, where its PR-description spec is, and which rules win on conflict.
     Both come from the SAME resolved spec, so what the prompt names is always what shipped.
+    The third element is the read-only variant for the passes that open no PR (review-pr, plan,
+    the plan-first pass).
     """
     from pathlib import Path
 
@@ -3031,7 +3041,7 @@ def _load_profile_bundle(
         ppath = profile_path(dict(os.environ))
 
     if ppath is None:
-        return None, ""
+        return None, "", ""
 
     try:
         spec = load_profile(ppath)
@@ -3063,12 +3073,18 @@ def _load_profile_bundle(
                 "it will be injected. Run `franky profile check` to see what it expanded to."
             )
 
-    setup_block = build_setup_block(spec)
     if not spec.all_files():
-        return None, ""
+        return None, "", ""
+    pre = _pre_start()
+    if pre is not None:
+        pre.profile_files = len(spec.all_files())
 
     try:
-        return build_bundle(spec), setup_block
+        return (
+            build_bundle(spec),
+            build_setup_block(spec),
+            build_setup_block(spec, read_only=True),
+        )
     except ValueError as exc:
         raise ConfigError(redact(str(exc), secrets)) from exc
 
@@ -3129,6 +3145,8 @@ class _PreStart:
         self.lines: list[str] = []
         self.atlassian: str | None = None
         self.atlassian_warning: str | None = None
+        # Set by _load_profile_bundle: the number of profile files injected this invocation.
+        self.profile_files = 0
         self.open = False
 
     def flush(self) -> None:
@@ -3242,7 +3260,13 @@ def cfg_secrets_safe() -> list[str]:
 _HEARTBEATS: dict[str, jobs.Heartbeat] = {}
 
 
-def _announce_start(job_id, command, as_json, quiet, suffix="") -> None:
+def _profile_files(bundle) -> int:
+    """Profile files injected into THIS pass's container: 0 without a bundle."""
+    pre = _pre_start()
+    return pre.profile_files if (bundle and pre is not None) else 0
+
+
+def _announce_start(job_id, command, as_json, quiet, suffix="", profile_files=0) -> None:
     """Tell the caller the job id the moment it exists.
 
     --json: ALWAYS one machine-readable line on stderr (stdout stays exactly one result object),
@@ -3255,6 +3279,7 @@ def _announce_start(job_id, command, as_json, quiet, suffix="") -> None:
             "job_id": job_id,
             "command": command,
             "status_command": f"franky job status {job_id} --json",
+            "profile_files": profile_files,
         }
         if pre is not None and pre.atlassian:
             event["atlassian"] = pre.atlassian
@@ -3509,7 +3534,7 @@ def _build_once(
         no_publish=no_publish,
         env=env,
     )
-    _announce_start(job_id, "build", as_json, quiet)
+    _announce_start(job_id, "build", as_json, quiet, profile_files=_profile_files(bundle))
     # Populated (best-effort) by run_in_container just before container teardown (issue #69).
     diagnostics: dict = {}
     # A timed-out build leaves a resumable workspace snapshot (issue #71) keyed to this job id.

@@ -259,7 +259,7 @@ def test_profile_warning_prints_after_started(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "load_profile", lambda path: spec)
     monkeypatch.setattr(cli, "validate_mcp_engine", lambda *a: None)
     monkeypatch.setattr(cli, "resolve_mcp_credentials", lambda *a: {})
-    monkeypatch.setattr(cli, "build_setup_block", lambda spec: "")
+    monkeypatch.setattr(cli, "build_setup_block", lambda spec, **k: "")
     monkeypatch.setattr(cli, "claude_mcp_config_path", lambda spec: None)
     _gate(monkeypatch, "on")
     (tmp_path / "p.toml").write_text("")
@@ -398,3 +398,63 @@ def test_a_malformed_store_is_not_connected_not_network(monkeypatch, tmp_path):
     )
     event, rest = _first_event(_run(args, "--json"))
     assert event["atlassian"] == "not_connected" and rest == []
+
+
+def _profile_event_counts(res):
+    return [json.loads(line)["profile_files"] for line in res.stderr.splitlines()]
+
+
+def test_started_carries_profile_files_per_pass(monkeypatch, tmp_path):
+    args, _ = _command("build", monkeypatch, tmp_path)
+    _gate(monkeypatch, "on")
+    prof = tc.stub_profile(monkeypatch, tmp_path, files=3)
+    monkeypatch.setattr(cli, "_make_nonce", lambda: "n")
+    diag = '{"root_cause": "x", "category": "other", "retryable": true, "confidence": "low"}'
+    outputs = [(0, "no pr here"), (0, f"FRANKY_DIAG_n_BEGIN{diag}FRANKY_DIAG_n_END"), (0, PR_URL)]
+    bundles = []
+
+    def run(cfg, argv, *a, **k):
+        bundles.append(k.get("profile_bundle"))
+        return outputs.pop(0)
+
+    monkeypatch.setattr(cli, "run_in_container", run)
+    res = _run(args, "--json", "--retry", "1", "--profile", prof)
+    events = [json.loads(line) for line in res.stderr.splitlines()]
+    assert [e["command"] for e in events] == ["build", "diagnose", "build"]
+    # the diagnosis pass injects no bundle, so it never reports the build pass's count
+    assert [e["profile_files"] for e in events] == [3, 0, 3]
+    assert bundles == [b"bundle", None, b"bundle"]
+
+
+def test_started_profile_files_is_zero_without_a_profile(monkeypatch, tmp_path):
+    args, _ = _command("build", monkeypatch, tmp_path)
+    _gate(monkeypatch, "on")
+    res = _run(args, "--json")
+    assert _profile_event_counts(res) == [0]
+
+
+def test_started_profile_files_is_zero_for_an_empty_profile(monkeypatch, tmp_path):
+    args, _ = _command("build", monkeypatch, tmp_path)
+    _gate(monkeypatch, "on")
+    prof = tc.stub_profile(monkeypatch, tmp_path, files=0)
+    res = _run(args, "--json", "--profile", prof)
+    assert _profile_event_counts(res) == [0]
+
+
+@pytest.mark.parametrize("name", ["replay", "resume"])
+def test_started_profile_files_is_zero_for_replay_and_resume(monkeypatch, tmp_path, name):
+    args, _ = _command(name, monkeypatch, tmp_path)
+    _gate(monkeypatch, "on")
+    prof = tc.stub_profile(monkeypatch, tmp_path, files=3)
+    monkeypatch.setenv("FRANKY_PROFILE_PATH", prof)
+    res = _run(args, "--json")
+    assert _profile_event_counts(res) == [0]
+
+
+def test_started_profile_files_counts_review_pr(monkeypatch, tmp_path):
+    args, _ = _command("review-pr", monkeypatch, tmp_path)
+    _gate(monkeypatch, "on")
+    tc.stub_profile(monkeypatch, tmp_path, files=2)
+    monkeypatch.setenv("FRANKY_PROFILE_PATH", str(tmp_path / "p.toml"))
+    res = _run(args, "--json")
+    assert _profile_event_counts(res) == [2]

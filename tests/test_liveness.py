@@ -426,6 +426,7 @@ def test_json_start_event_on_stderr_even_when_quiet(monkeypatch, tmp_path):
             "job_id": result["job_id"],
             "command": "build",
             "status_command": f"franky job status {result['job_id']} --json",
+            "profile_files": 0,
         }
     ]
     record = jobs.read_record(result["job_id"], env)

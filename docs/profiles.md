@@ -138,7 +138,7 @@ Before the agent starts, Franky:
 
 The archive never appears in process arguments or environment values. No ready marker within 120 seconds stops the task.
 
-The prompt tells the agent where the setup exists and identifies a discovered PR specification.
+The prompt of `build`, `iterate`, `review-pr`, and `plan` (and the planning pass of `build --plan-first`) tells the agent where the setup exists. `build` and `iterate` also identify a discovered PR specification. The read-only passes (`review-pr`, `plan`, the planning pass) omit it, finish by reporting as their own prompt asks, and the setup files never relax their read-only rules.
 
 Franky's autonomous rules take precedence. The agent must not wait for approval or use tools and paths absent from the container.
 
