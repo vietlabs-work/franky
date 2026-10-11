@@ -39,10 +39,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Install test dependencies
@@ -79,7 +79,7 @@ jobs:
           fi
       - name: Upload bounded summary
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: footprint-host
           path: /tmp/footprint-*.json
@@ -96,7 +96,7 @@ jobs:
       matrix:
         variant: [all, pi, claude, codex, opencode, proxy]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Select bounded checks
@@ -134,7 +134,7 @@ jobs:
             --output "/tmp/footprint-images-$VARIANT.json"
       - name: Upload bounded summary
         if: always() && steps.want.outputs.run
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: footprint-images-${{ matrix.variant }}
           path: /tmp/footprint-*.json
@@ -158,7 +158,7 @@ jobs:
       matrix:
         include: ${{ fromJSON(github.event_name == 'pull_request' && '[{"suite":"smoke"},{"suite":"2-1","jobs":2,"repeats":"1"},{"suite":"2-2","jobs":2,"repeats":"2"},{"suite":"2-3","jobs":2,"repeats":"3"},{"suite":"4-1","jobs":4,"repeats":"1"},{"suite":"4-2","jobs":4,"repeats":"2"},{"suite":"4-3","jobs":4,"repeats":"3"}]' || '[{"suite":"smoke"},{"suite":"2","jobs":2,"repeats":"1 2 3"},{"suite":"4","jobs":4,"repeats":"1 2 3"}]') }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Select bounded checks
@@ -211,7 +211,7 @@ jobs:
               } < /dev/null > "$pulls/log" 2>&1 &
             fi
           fi
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         if: steps.want.outputs.run
         with:
           python-version: "3.12"
@@ -345,7 +345,7 @@ jobs:
         run: sudo dmesg | grep -E 'apparmor|audit|seccomp|DENIED' | tail -c 4096 || true
       - name: Upload bounded summary
         if: always() && steps.want.outputs.run
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: footprint-runtime-${{ matrix.suite }}
           path: /tmp/footprint-*.json
@@ -359,13 +359,13 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - name: Select bounded checks
         id: select
         run: bash scripts/footprint-select.sh
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         if: contains(steps.select.outputs.checks, 'runtime')
         with:
           pattern: footprint-runtime-*
@@ -391,7 +391,7 @@ jobs:
           done
       - name: Upload bounded summary
         if: always() && contains(steps.select.outputs.checks, 'runtime')
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: footprint-runtime-comparison
           path: /tmp/footprint-*.json
