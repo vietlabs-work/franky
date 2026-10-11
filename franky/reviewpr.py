@@ -553,6 +553,8 @@ def human_signoff_required(files: list | None, read_globs: Callable[[], list[str
         paths.append(name)
         if isinstance(entry.get("previous_filename"), str):
             paths.append(entry["previous_filename"])
+        elif entry.get("status") == "renamed":
+            return True  # a rename that hides its old path cannot be checked
     if not paths:
         return False
     if SIGNOFF_FILE in paths:

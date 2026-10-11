@@ -200,6 +200,7 @@ def test_signoff_globs_404_means_no_list_and_other_errors_fail_closed():
         _file_payload("a", size=64 * 1024 + 1),
         _file_payload("a", encoding="none"),
         _file_payload("a", content="!!not base64!!"),
+        _file_payload("a", content="!!!!"),
         _file_payload("a", content=base64.b64encode(b"\xff\xfe").decode()),
         ["not", "a", "dict"],
     ],

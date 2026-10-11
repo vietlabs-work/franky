@@ -209,7 +209,7 @@ def fetch_signoff_globs(
     if not isinstance(size, int) or size > _SIGNOFF_MAX_BYTES:
         return None
     try:
-        text = base64.b64decode(content, validate=False).decode("utf-8")
+        text = base64.b64decode(content.replace("\n", ""), validate=True).decode("utf-8")
     except (binascii.Error, ValueError):
         return None
     lines = (line.strip() for line in text.splitlines())

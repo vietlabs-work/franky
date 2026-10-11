@@ -360,7 +360,7 @@ def fetch_jira_comments(
     if not isinstance(comments, list):
         raise _tag(NetworkError(f"JIRA returned no comment list for {key}"), "network")
     lines = []
-    for comment in comments:
+    for comment in comments[:limit]:
         if not isinstance(comment, dict) or comment.get("visibility"):
             continue
         raw = comment.get("body")

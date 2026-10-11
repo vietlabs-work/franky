@@ -591,6 +591,12 @@ def test_fetch_jira_comments_skips_restricted_and_truncates():
     assert out.endswith("- 2026-03-03: " + "x" * 800 + " [truncated]")
 
 
+def test_fetch_jira_comments_never_exceeds_the_limit():
+    body = _comments(*({"created": "2026-03-04", "body": f"c{i}"} for i in range(9)))
+    out = fetch_jira_comments("FOO-1", _GOOD_ENV, opener=_make_opener(body), limit=5)
+    assert out.count("- 2026") == 5
+
+
 def test_fetch_jira_comments_empty_list_is_empty_string():
     assert fetch_jira_comments("FOO-1", _GOOD_ENV, opener=_make_opener(_comments())) == ""
 

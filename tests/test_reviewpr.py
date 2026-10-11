@@ -802,6 +802,7 @@ def test_human_signoff_floor_branches():
     assert human_signoff_required([_pf("a")] * 3000, _no_read) is True
     assert human_signoff_required([_pf("a"), "oops"], _no_read) is True
     assert human_signoff_required([{"filename": 3}], _no_read) is True
+    assert human_signoff_required([{"filename": "x", "status": "renamed"}], _no_read) is True
 
 
 def test_human_signoff_floor_skips_the_read_when_it_cannot_matter():
