@@ -5102,6 +5102,7 @@ def test_review_pr_frozen_mode_never_fetches_tickets(monkeypatch):
         raise AssertionError("frozen mode must not fetch tickets")
 
     monkeypatch.setattr(cli, "fetch_jira_issue", no_fetch)
+    monkeypatch.setattr(cli, "fetch_jira_comments", no_fetch)
     res = _run_frozen(FROZEN)
     assert res.exit_code == 0, res.output
     assert json.loads(res.stdout)["context_sources"] == []
@@ -5351,11 +5352,66 @@ def test_review_pr_fences_jira_tickets_and_reports_context_sources(monkeypatch, 
         {"kind": "jira", "ref": "ABC-123", "status": "included"},
         {"kind": "jira", "ref": "OPS-9", "status": "unavailable", "reason": "not_found"},
     ]
-    assert all(k["refuse_restricted"] is True and k["timeout"] == 5.0 for _, k in fetched)
+    assert all(
+        k["refuse_restricted"] is True and k["scope_first"] is True and k["timeout"] == 5.0
+        for _, k in fetched
+    )
     fence = f"FRANKY_TICKET_{REVIEW_NONCE}_BEGIN\n{_TICKET_TEXT}\nFRANKY_TICKET_{REVIEW_NONCE}_END"
     assert fence in prompts[0]
     assert "Acceptance: cap at 5." not in res.stdout
     assert "jira-tok-s3cret" not in prompts[0]
+
+
+def test_review_pr_appends_comments_after_the_truncated_description(monkeypatch, tmp_path):
+    notes = "Latest ticket comments, newest first (1 shown of 1):\n- 2026-01-02: use the cap"
+    monkeypatch.setattr(cli, "PROSE_MAX_CHARS", 20)
+    prompts, _ = _jira_review_setup(
+        monkeypatch, tmp_path, meta={"title": "ABC-123", "body": "", "head_ref": ""}
+    )
+    monkeypatch.setattr(cli, "fetch_jira_comments", lambda *a, **k: notes)
+    res = _review(["--engine", "claude", "--no-publish"])
+    assert res.exit_code == 0, res.output
+    assert json.loads(res.stdout)["context_sources"][0]["status"] == "partial"
+    assert "[truncated]\n\n" + notes in prompts[0]
+
+
+def test_review_pr_comment_failure_keeps_the_ticket_included(monkeypatch, tmp_path):
+    def boom(*a, **k):
+        raise _jira_tag(NetworkError("down"), "network", stop=True)
+
+    prompts, _ = _jira_review_setup(
+        monkeypatch, tmp_path, meta={"title": "ABC-123", "body": "", "head_ref": ""}
+    )
+    monkeypatch.setattr(cli, "fetch_jira_comments", boom)
+    res = _review(["--engine", "claude", "--no-publish"])
+    assert res.exit_code == 0, res.output
+    assert _reasons(res) == [("ABC-123", "included", None)]
+    assert _TICKET_TEXT + "\n\n(ticket comments unavailable)" in prompts[0]
+
+
+def test_review_pr_redacts_a_token_inside_a_ticket_comment(monkeypatch, tmp_path):
+    prompts, _ = _jira_review_setup(
+        monkeypatch, tmp_path, meta={"title": "ABC-123", "body": "", "head_ref": ""}
+    )
+    monkeypatch.setattr(cli, "fetch_jira_comments", lambda *a, **k: "- 2026-01-02: jira-tok-s3cret")
+    res = _review(["--engine", "claude", "--no-publish"])
+    assert res.exit_code == 0, res.output
+    assert "jira-tok-s3cret" not in prompts[0]
+    assert "- 2026-01-02: ***REDACTED***" in prompts[0]
+
+
+def test_review_pr_publish_passes_the_pr_base_sha_to_the_signoff_floor(monkeypatch, tmp_path):
+    _jira_review_setup(monkeypatch, tmp_path, meta={"base_sha": "b" * 40})
+    seen = []
+
+    def fake_publish(*a, **k):
+        seen.append(k)
+        return ("review_published", "ok", 0, None, None, "COMMENT", None)
+
+    monkeypatch.setattr(cli, "_publish_review", fake_publish)
+    res = _review(["--engine", "claude", "--allow-approve"])
+    assert res.exit_code == 0, res.output
+    assert seen[0]["base_sha"] == "b" * 40 and seen[0]["allow_approve"] is True
 
 
 def test_review_pr_without_jira_env_reports_unconfigured_and_never_fetches(monkeypatch, tmp_path):
@@ -5453,7 +5509,10 @@ CLEAN = {"summary": "ok", "findings": [], "checks": []}
 class _Gh:
     """Scripted `gh` for _publish_review: `posts` and `reviews`/`graphql` replies are queues."""
 
-    def __init__(self, monkeypatch, *, heads=None, posts=(), reviews=None, graphql=()):
+    def __init__(
+        self, monkeypatch, *, heads=None, posts=(), reviews=None, graphql=(), files="[[]]"
+    ):
+        self.files = files
         self.calls, self.inputs = [], []
         self.posts, self.graphql = list(posts), list(graphql)
         self.reviews = reviews if reviews is not None else (0, "[]", "")
@@ -5471,7 +5530,7 @@ class _Gh:
         self.calls.append(list(args))
         self.inputs.append(k.get("input"))
         if args[1].endswith("/files?per_page=100"):
-            return 0, "[[]]", ""
+            return 0, self.files, ""
         if args[1].endswith("/reviews?per_page=100"):
             return self.reviews() if callable(self.reviews) else self.reviews
         if args[1] == "graphql":
@@ -5501,6 +5560,98 @@ def _pub(shaped, **kw):
 
 def _clean():
     return build_review_findings(CLEAN)
+
+
+BASE_SHA40 = "b" * 40
+
+
+def _signoff_files(*names):
+    return json.dumps([[{"filename": n} for n in names]])
+
+
+def _floor_pub(monkeypatch, globs, files, *, shaped=None, **kw):
+    reads = []
+
+    def fake_globs(repo, sha, env, **k):
+        reads.append((repo, sha))
+        if isinstance(globs, Exception):
+            raise globs
+        return globs
+
+    monkeypatch.setattr(cli, "fetch_signoff_globs", fake_globs)
+    gh = _Gh(monkeypatch, posts=[OK_POST], files=files)
+    out = _pub(
+        shaped or _clean(), allow_approve=kw.pop("allow_approve", True), base_sha=BASE_SHA40, **kw
+    )
+    return gh, out, reads
+
+
+def test_publish_matching_signoff_glob_posts_comment_not_approve(monkeypatch):
+    gh, out, reads = _floor_pub(monkeypatch, ["**/pay/**"], _signoff_files("a/pay/X.java"))
+    assert out[0] == "review_published" and out[5] == "COMMENT"
+    assert "human sign-off" in out[1]
+    assert gh.post_events() == ["COMMENT"]
+    assert "code-clean, human sign-off required" in json.loads(gh.inputs[-1])["body"]
+    assert reads == [("me/repo", BASE_SHA40)]
+
+
+def test_publish_no_matching_signoff_glob_still_approves(monkeypatch):
+    gh, out, _ = _floor_pub(monkeypatch, ["**/pay/**"], _signoff_files("a/ok/X.java"))
+    assert out[5] == "APPROVE" and gh.post_events() == ["APPROVE"]
+
+
+def test_publish_absent_signoff_list_means_no_floor(monkeypatch):
+    gh, out, _ = _floor_pub(monkeypatch, [], _signoff_files("a/pay/X.java"))
+    assert gh.post_events() == ["APPROVE"]
+
+
+def test_publish_unreadable_signoff_list_never_approves(monkeypatch):
+    gh, out, _ = _floor_pub(monkeypatch, None, _signoff_files("a/ok/X.java"))
+    assert gh.post_events() == ["COMMENT"]
+
+
+def test_publish_without_a_base_sha_never_approves(monkeypatch):
+    monkeypatch.undo()
+    gh = _Gh(monkeypatch, posts=[OK_POST], files=_signoff_files("a/ok/X.java"))
+    monkeypatch.setattr(cli, "fetch_signoff_globs", lambda repo, sha, env, **k: [] if sha else None)
+    out = _pub(_clean(), allow_approve=True)
+    assert gh.post_events() == ["COMMENT"] and out[5] == "COMMENT"
+
+
+def test_publish_editing_the_signoff_list_is_a_floor_without_reading_it(monkeypatch):
+    gh, _, reads = _floor_pub(monkeypatch, [], _signoff_files(".github/human-signoff-paths"))
+    assert gh.post_events() == ["COMMENT"] and reads == []
+
+
+def test_publish_unreadable_file_list_never_approves(monkeypatch):
+    gh, _, reads = _floor_pub(monkeypatch, [], "not json")
+    assert gh.post_events() == ["COMMENT"] and reads == []
+
+
+def test_publish_does_not_consult_the_floor_for_blocking_or_without_allow_approve(monkeypatch):
+    blocking = build_review_findings(
+        {
+            "summary": "s",
+            "findings": [
+                {"title": "t", "severity": "blocking", "file": "a", "line": 1, "body": "b"}
+            ],
+            "checks": [],
+        }
+    )
+    gh, _, reads = _floor_pub(
+        monkeypatch,
+        AssertionError("must not read"),
+        _signoff_files("a/pay/X.java"),
+        shaped=blocking,
+    )
+    assert reads == [] and gh.post_events() == ["REQUEST_CHANGES"]
+    gh, _, reads = _floor_pub(
+        monkeypatch,
+        AssertionError("must not read"),
+        _signoff_files("a/pay/X.java"),
+        allow_approve=False,
+    )
+    assert reads == [] and gh.post_events() == ["COMMENT"]
 
 
 def test_publish_approves_when_allowed_and_clean(monkeypatch):

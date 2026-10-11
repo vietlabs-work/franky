@@ -2,10 +2,15 @@
 
 import json
 
+import pytest
+
 from franky.reviewpr import (
+    SIGNOFF_FILE,
+    SIGNOFF_LINE,
     MAX_BODY_CHARS,
     MAX_INLINE,
     anchor_ok,
+    human_signoff_required,
     build_body_only_payload,
     build_review_findings,
     build_review_payload,
@@ -14,6 +19,7 @@ from franky.reviewpr import (
     parse_review_findings,
     render_review_body,
     review_event,
+    signoff_match,
 )
 
 
@@ -738,3 +744,76 @@ def test_suggestion_cannot_close_its_fence_and_is_not_escaped():
     body = _inline(_ev(suggestion=sug))
     fence = "````"
     assert body.endswith(f"{fence}suggestion\n{sug}\n{fence}") and "<T>" in body
+
+
+@pytest.mark.parametrize(
+    ("glob", "path", "expected"),
+    [
+        ("**/refund/**", "a/refund/X.java", True),
+        ("**/refund/**", "refund/X.java", True),
+        ("refund/", "a/refund/X.java", True),
+        ("refund/", "a/refund", False),
+        ("*Refund*.java", "x/PartialRefundService.java", True),
+        ("/top.txt", "top.txt", True),
+        ("/top.txt", "a/top.txt", False),
+        ("src/*.py", "src/a/b.py", False),
+        ("src/*.py", "src/b.py", True),
+        ("src/**/*.py", "src/b.py", True),
+        ("src/**/*.py", "src/a/b.py", True),
+        ("docs", "docs/x.md", True),
+        ("docs", "other/docs/x.md", True),
+        ("a?c.txt", "abc.txt", True),
+        ("a?c.txt", "a/c.txt", False),
+        ("a.b", "aXb", False),
+    ],
+)
+def test_signoff_match_glob_semantics(glob, path, expected):
+    assert signoff_match([glob], [path]) is expected
+
+
+def test_signoff_match_negation_last_match_wins():
+    globs = ["**/refund/**", "!**/test/**"]
+    assert signoff_match(globs, ["a/refund/X.java"]) is True
+    assert signoff_match(globs, ["a/refund/test/XTest.java"]) is False
+    assert signoff_match(["!**/test/**", "**/refund/**"], ["a/refund/test/XTest.java"]) is True
+    assert signoff_match(["!x"], ["x"]) is False
+
+
+def _no_read():
+    raise AssertionError("the globs must not be read")
+
+
+def _pf(name, previous=None):
+    return {"filename": name, **({"previous_filename": previous} if previous else {})}
+
+
+def test_human_signoff_floor_branches():
+    read = lambda: ["**/pay/**"]  # noqa: E731
+    assert human_signoff_required([_pf("a/pay/X.java")], read) is True
+    assert human_signoff_required([_pf("a/ok/X.java")], read) is False
+    # a rename counts under both names
+    assert human_signoff_required([_pf("a/ok/X.java", "a/pay/X.java")], read) is True
+    assert human_signoff_required([_pf("a/pay/X.java", "a/ok/X.java")], read) is True
+    # absent list: no floor; any other read failure: floor
+    assert human_signoff_required([_pf("a/pay/X.java")], lambda: []) is False
+    assert human_signoff_required([_pf("a/pay/X.java")], lambda: None) is True
+    # unreadable, full-size or malformed file lists fail closed
+    assert human_signoff_required(None, _no_read) is True
+    assert human_signoff_required([_pf("a")] * 3000, _no_read) is True
+    assert human_signoff_required([_pf("a"), "oops"], _no_read) is True
+    assert human_signoff_required([{"filename": 3}], _no_read) is True
+    assert human_signoff_required([{"filename": "x", "status": "renamed"}], _no_read) is True
+
+
+def test_human_signoff_floor_skips_the_read_when_it_cannot_matter():
+    assert human_signoff_required([], _no_read) is False
+    # a PR that edits, renames or deletes the list itself always needs sign-off, unread
+    assert human_signoff_required([_pf(SIGNOFF_FILE)], _no_read) is True
+    assert human_signoff_required([_pf("x", SIGNOFF_FILE)], _no_read) is True
+
+
+def test_body_carries_the_signoff_line_only_when_flagged():
+    shaped = _shaped()
+    assert SIGNOFF_LINE not in render_review_body(shaped)
+    body = render_review_body({**shaped, "signoff_required": True})
+    assert "code-clean, human sign-off required" in body

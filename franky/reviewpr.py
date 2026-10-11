@@ -10,6 +10,11 @@ This module owns the pure halves of consuming that:
 - `render_review_body` / `review_event` turn that shape into the actual GitHub review the CLI
   posts host-side.
 
+`review_event` with `allow_approve` is only the findings half of the APPROVE decision. The CLI
+also applies a human sign-off floor (`human_signoff_required`): a PR that changes a path listed in
+the reviewed repo's `.github/human-signoff-paths` (read at the PR base commit), changes that file,
+or cannot be checked is posted as a COMMENT that says so. That costs one extra GitHub read.
+
 The prompt tells the agent to emit findings JSON without writing to GitHub. Franky's host process
 publishes that result. `review_event` returns COMMENT or REQUEST_CHANGES unless the caller passes
 `allow_approve=True` (`review-pr --allow-approve`), the only way APPROVE is reachable. The
@@ -30,10 +35,14 @@ Page one omits `-F after`; later pages (at most MAX_THREAD_PAGES) add it. The re
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 from .config import redact
 from .sentinel import scan_sentinel_json
+
+SIGNOFF_FILE = ".github/human-signoff-paths"
+SIGNOFF_LINE = "code-clean, human sign-off required (`.github/human-signoff-paths`)."
+_FILES_API_CAP = 3000  # the PR files API never lists more than this many files
 
 _VALID_SEVERITIES = frozenset({"blocking", "normal", "question", "nit"})
 _VALID_OUTCOMES = frozenset({"pass", "fail", "skipped"})
@@ -368,6 +377,8 @@ def _body(
     parts = [_headline(shaped, sha)]
     if prior_url and REVIEW_URL_RE.match(prior_url):
         parts.append(f"Follows [the previous review]({prior_url}).")
+    if shaped.get("signoff_required"):
+        parts.append(SIGNOFF_LINE)
     room = REVIEW_BODY_BUDGET - _TAIL_RESERVE - sum(len(p) + 2 for p in parts)
     rows = [
         "\n\n".join([f"**{_label(f)}: {_esc(f['title'])}**{_loc(f)}", *_detail(f)])
@@ -476,6 +487,80 @@ def _redacted(payload: dict, secrets: Iterable[str]) -> dict:
 def render_review_body(shaped: dict, sha: str = "", prior_url: str | None = None) -> str:
     """Review body for `--no-publish`: same layout as the posted one, no inline split."""
     return _body(shaped, _new(shaped), sha, prior_url)
+
+
+def _signoff_regex(pattern: str) -> re.Pattern:
+    """One gitignore-style glob as a regex over a repo-root-relative path.
+
+    shortcut: no [...] classes, no \\# or \\! escapes, no parent-exclusion rule; upgrade if a repo
+    needs them.
+    """
+    dir_only = pattern.endswith("/")
+    pattern = pattern.rstrip("/")
+    anchored = "/" in pattern
+    pattern = pattern.lstrip("/")
+    out, i = [], 0
+    while i < len(pattern):
+        if pattern.startswith("**/", i):
+            out.append("(?:.*/)?")
+            i += 3
+        elif pattern.startswith("**", i):
+            out.append(".*")
+            i += 2
+        elif pattern[i] == "*":
+            out.append("[^/]*")
+            i += 1
+        elif pattern[i] == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(pattern[i]))
+            i += 1
+    # A match on a directory covers every file under it.
+    return re.compile(
+        ("" if anchored else "(?:.*/)?") + "".join(out) + ("/.+" if dir_only else "(?:/.+)?")
+    )
+
+
+def signoff_match(globs: Iterable[str], paths: Iterable[str]) -> bool:
+    """True when any path ends up matched: a leading `!` negates, the last matching rule wins."""
+    rules = [(g.startswith("!"), _signoff_regex(g.removeprefix("!"))) for g in globs]
+    for path in paths:
+        matched = False
+        for negated, regex in rules:
+            if regex.fullmatch(path):
+                matched = not negated
+        if matched:
+            return True
+    return False
+
+
+def human_signoff_required(files: list | None, read_globs: Callable[[], list[str] | None]) -> bool:
+    """True when a review that would be an APPROVE must stay a COMMENT.
+
+    `files` is the PR files list (None when it could not be read). Fails closed: an unreadable
+    or full-size list, a malformed entry, a PR that changes the sign-off file itself (it cannot
+    remove its own floor), or an unreadable globs file all give True. A renamed file counts under
+    both names. `read_globs` runs only when needed and returns [] for an absent file.
+    """
+    if files is None or len(files) >= _FILES_API_CAP:
+        return True
+    paths: list[str] = []
+    for entry in files:
+        name = entry.get("filename") if isinstance(entry, dict) else None
+        if not isinstance(name, str):
+            return True
+        paths.append(name)
+        if isinstance(entry.get("previous_filename"), str):
+            paths.append(entry["previous_filename"])
+        elif entry.get("status") == "renamed":
+            return True  # a rename that hides its old path cannot be checked
+    if not paths:
+        return False
+    if SIGNOFF_FILE in paths:
+        return True
+    globs = read_globs()
+    return globs is None or signoff_match(globs, paths)
 
 
 def review_event(shaped: dict, allow_approve: bool = False) -> str:

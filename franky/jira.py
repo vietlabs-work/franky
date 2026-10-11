@@ -146,34 +146,47 @@ def jira_configured(env: Mapping[str, str]) -> bool:
     )
 
 
-def fetch_jira_issue(
-    key: str,
-    env: Mapping[str, str],
-    *,
-    opener: Callable | None = None,
-    timeout: float = 10.0,
-    refuse_restricted: bool = False,
-) -> str:
-    """Fetch a JIRA issue by key and return a plain-text task body.
+_SCOPE_SECTIONS = frozenset({"scope", "out of scope", "acceptance criteria"})
+_MAX_COMMENT_CHARS = 800
 
-    Args:
-        key: A JIRA issue key (e.g. "FOO-123"). Must already be validated by parse_task.
-        env: Environment mapping to read creds from (never reads os.environ directly).
-        opener: Injectable urllib.request.urlopen-compatible callable for tests.
-        timeout: Seconds before the HTTP request times out.
-        refuse_restricted: Also request `security` and accept only an explicit
-            `"security": null`; a security level, or a response that does not say, raises.
-            Also refuses redirects (the Authorization header must not follow one). Used where
-            the text goes to a model (review-pr), never by build/plan.
 
-    Returns:
-        A string of the form "[FOO-123] Summary\\n\\nDescription text" (or summary-only
-        if there is no description).
+def _heading_level(node: dict) -> int:
+    level = (node.get("attrs") or {}).get("level")
+    return level if isinstance(level, int) else 1
 
-    Raises:
-        ValueError: (FrankyError, with `.reason` and `.stop` attributes) On missing/blank creds, bad JIRA_BASE_URL scheme, HTTP errors,
-            network errors, or unparseable JSON. No raised message contains the token
-            or email value.
+
+def _scope_first(doc: object) -> object:
+    """Move the Scope, Out of Scope and Acceptance criteria sections of an ADF doc to the front.
+
+    A section is a heading plus the nodes up to the next heading of the same or a higher level.
+    Headings match by casefolded text, never by markdown syntax. Order inside each group is kept.
+    """
+    nodes = doc.get("content") if isinstance(doc, dict) else None
+    if not isinstance(nodes, list):
+        return doc
+    lifted: list = []
+    rest: list = []
+    keep = False
+    level = 0
+    for node in nodes:
+        if isinstance(node, dict) and node.get("type") == "heading":
+            title = _flatten_adf(node).strip().rstrip(":").strip().casefold()
+            if keep and _heading_level(node) > level:
+                pass  # a deeper sub-heading stays inside the lifted section
+            else:
+                keep = title in _SCOPE_SECTIONS
+                level = _heading_level(node)
+        (lifted if keep else rest).append(node)
+    return {**doc, "content": lifted + rest}
+
+
+def _jira_get(
+    path: str, key: str, env: Mapping[str, str], opener: Callable | None, timeout: float
+) -> object:
+    """GET `<JIRA_BASE_URL><path>` host-side and return the parsed JSON.
+
+    Owns the creds check, the https guard, the Basic header, the HTTP error mapping, the response
+    size cap and the JSON parse. No raised message contains the token or email value.
     """
     base = (env.get(JIRA_BASE_URL_VAR) or "").strip()
     email = (env.get(JIRA_EMAIL_VAR) or "").strip()
@@ -204,18 +217,9 @@ def fetch_jira_issue(
             stop=True,
         )
 
-    # Two-layer path-injection defense: JIRA_KEY_RE in task.py is the first gate (anchored,
-    # rejects `/.?#`), quote(safe='') is the second (percent-encodes anything that slips past
-    # a future caller). The key is interpolated into the REST URL path here.
-    url = (
-        f"{base.rstrip('/')}/rest/api/3/issue"
-        f"/{urllib.parse.quote(key, safe='')}?fields=summary,description"
-        f"{',security' if refuse_restricted else ''}"
-    )
-
     credentials = base64.b64encode(f"{email}:{token}".encode()).decode()
     req = urllib.request.Request(
-        url,
+        f"{base.rstrip('/')}{path}",
         headers={
             "Authorization": f"Basic {credentials}",
             "Accept": "application/json",
@@ -223,11 +227,6 @@ def fetch_jira_issue(
     )
 
     host = parsed.netloc
-    # urlopen follows redirects and re-sends the Authorization header on a same-host hop.
-    # JIRA_BASE_URL is operator-supplied out-of-band (a trusted Atlassian instance), so a
-    # downgrade redirect is not an attacker-controlled surface; we accept the default handler.
-    if opener is None:
-        opener = _no_redirect_open if refuse_restricted else urllib.request.urlopen
     try:
         with opener(req, timeout=timeout) as resp:
             payload = resp.read(_MAX_RESPONSE_BYTES + 1)
@@ -254,9 +253,59 @@ def fetch_jira_issue(
         raise NetworkError(f"JIRA response for {key} is too large")
 
     try:
-        data = json.loads(payload.decode("utf-8"))
+        return json.loads(payload.decode("utf-8"))
     except ValueError as exc:
         raise NetworkError(f"JIRA returned unparseable JSON for {key}") from exc
+
+
+def fetch_jira_issue(
+    key: str,
+    env: Mapping[str, str],
+    *,
+    opener: Callable | None = None,
+    timeout: float = 10.0,
+    refuse_restricted: bool = False,
+    scope_first: bool = False,
+) -> str:
+    """Fetch a JIRA issue by key and return a plain-text task body.
+
+    Args:
+        key: A JIRA issue key (e.g. "FOO-123"). Must already be validated by parse_task.
+        env: Environment mapping to read creds from (never reads os.environ directly).
+        opener: Injectable urllib.request.urlopen-compatible callable for tests.
+        timeout: Seconds before the HTTP request times out.
+        refuse_restricted: Also request `security` and accept only an explicit
+            `"security": null`; a security level, or a response that does not say, raises.
+            Also refuses redirects (the Authorization header must not follow one). Used where
+            the text goes to a model (review-pr), never by build/plan.
+        scope_first: Put the Scope, Out of Scope and Acceptance criteria sections of an ADF
+            description first, so a later length cut keeps them.
+
+    Returns:
+        A string of the form "[FOO-123] Summary\n\nDescription text" (or summary-only
+        if there is no description).
+
+    Raises:
+        ValueError: (FrankyError, with `.reason` and `.stop` attributes) On missing/blank creds, bad JIRA_BASE_URL scheme, HTTP errors,
+            network errors, or unparseable JSON. No raised message contains the token
+            or email value.
+    """
+    # Two-layer path-injection defense: JIRA_KEY_RE in task.py is the first gate (anchored,
+    # rejects `/.?#`), quote(safe='') is the second (percent-encodes anything that slips past
+    # a future caller). The key is interpolated into the REST URL path here.
+    # urlopen follows redirects and re-sends the Authorization header on a same-host hop.
+    # JIRA_BASE_URL is operator-supplied out-of-band (a trusted Atlassian instance), so a
+    # downgrade redirect is not an attacker-controlled surface; we accept the default handler.
+    if opener is None:
+        opener = _no_redirect_open if refuse_restricted else urllib.request.urlopen
+    data = _jira_get(
+        f"/rest/api/3/issue/{urllib.parse.quote(key, safe='')}?fields=summary,description"
+        f"{',security' if refuse_restricted else ''}",
+        key,
+        env,
+        opener,
+        timeout,
+    )
 
     # A valid-JSON response can still lack the expected shape (a restricted issue, an API
     # change). Guard so it surfaces as a ValueError (clean ClickException) rather than a
@@ -277,9 +326,52 @@ def fetch_jira_issue(
     elif isinstance(description, str):
         text = description
     else:
-        text = _clean_text(_flatten_adf(description))
+        text = _clean_text(_flatten_adf(_scope_first(description) if scope_first else description))
 
     body = f"[{key}] {summary}"
     if text:
         body = f"{body}\n\n{text}"
     return body.strip()
+
+
+def fetch_jira_comments(
+    key: str,
+    env: Mapping[str, str],
+    *,
+    opener: Callable | None = None,
+    timeout: float = 10.0,
+    limit: int = 5,
+) -> str:
+    """The newest `limit` public comments of a JIRA issue as bounded plain text, or "".
+
+    One line per comment: `- YYYY-MM-DD: text`, each cut at 800 characters. No author names.
+    Comments restricted to a group or role are skipped. Never follows a redirect. Raises the same
+    tagged errors as `fetch_jira_issue`; a payload without a comment list raises reason "network".
+    """
+    data = _jira_get(
+        f"/rest/api/3/issue/{urllib.parse.quote(key, safe='')}/comment"
+        f"?orderBy=-created&maxResults={limit}",
+        key,
+        env,
+        opener or _no_redirect_open,
+        timeout,
+    )
+    comments = data.get("comments") if isinstance(data, dict) else None
+    if not isinstance(comments, list):
+        raise _tag(NetworkError(f"JIRA returned no comment list for {key}"), "network")
+    lines = []
+    for comment in comments[:limit]:
+        if not isinstance(comment, dict) or comment.get("visibility"):
+            continue
+        raw = comment.get("body")
+        text = _clean_text(raw if isinstance(raw, str) else _flatten_adf(raw))
+        if not text:
+            continue
+        if len(text) > _MAX_COMMENT_CHARS:
+            text = text[:_MAX_COMMENT_CHARS] + " [truncated]"
+        lines.append(f"- {str(comment.get('created') or '')[:10]}: {text}")
+    if not lines:
+        return ""
+    total = data.get("total")
+    of = f" of {total}" if isinstance(total, int) else ""
+    return f"Latest ticket comments, newest first ({len(lines)} shown{of}):\n" + "\n".join(lines)

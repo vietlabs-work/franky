@@ -106,6 +106,10 @@ def _no_idempotency_network(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli.baseref, "resolve_base_sha", lambda *a, **k: None)
     # The Atlassian privacy gate is one more GitHub GET; default it to "not private" (tools off).
     monkeypatch.setattr(cli, "repo_is_private", lambda *a, **k: False)
+    # review-pr ticket comments are one more host-side JIRA GET; default to "none".
+    monkeypatch.setattr(cli, "fetch_jira_comments", lambda *a, **k: "")
+    # The human sign-off list is one more GitHub GET; default it to "no list" (no floor).
+    monkeypatch.setattr(cli, "fetch_signoff_globs", lambda *a, **k: [])
 
 
 @pytest.fixture(autouse=True)
