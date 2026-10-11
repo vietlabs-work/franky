@@ -32,8 +32,8 @@ jobs:
   guard:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Check version consistency
@@ -54,15 +54,15 @@ jobs:
   wheel:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Build wheel
         run: |
           python -m pip install --upgrade pip build
           python -m build
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/*
@@ -79,14 +79,14 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist
       # Pinned to a commit SHA (v1.14.0): a floating ref on an OIDC job holding id-token:write
       # is a supply-chain risk. skip-existing makes a re-run idempotent if a later job failed
       # after PyPI already published this version (PyPI forbids re-upload).
-      - uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
         with:
           skip-existing: true
 
@@ -109,7 +109,7 @@ jobs:
           - { name: franky, context: ., dockerfile: Dockerfile, engine: opencode, suffix: -opencode }
           - { name: franky-proxy, context: proxy, dockerfile: proxy/Dockerfile, engine: all, suffix: "" }
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
         with:
@@ -133,7 +133,7 @@ jobs:
         run: |
           mkdir -p /tmp/digests
           touch "/tmp/digests/${DIGEST#sha256:}"
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         if: github.event_name == 'push'
         with:
           # arch first, so `digests-*-franky` never also matches `digests-*-franky-pi`.
@@ -160,7 +160,7 @@ jobs:
           - { name: franky, suffix: -opencode }
           - { name: franky-proxy, suffix: "" }
     steps:
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           pattern: digests-*-${{ matrix.name }}${{ matrix.suffix }}
           merge-multiple: true
@@ -190,12 +190,12 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v7
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: Generate release notes
