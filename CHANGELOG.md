@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.18] - 2026-10-11
+
 ### Added
 
 - `review-pr` gives the reviewer each linked JIRA ticket's 5 newest comments (800 characters each, no author names, restricted comments skipped) and moves the ticket's Scope, Out of Scope and Acceptance criteria sections to the top before the length cut. A comment fetch failure never drops the ticket.
