@@ -15,7 +15,11 @@ fake and never touch the network.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
+import re
+import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
 
@@ -89,7 +93,8 @@ def fetch_pr_head_sha(
     the caller's policy, not this function's - it always just degrades to None on any error.
 
     `meta_sink` (review-pr) is filled from the SAME response with {"title", "body", "head_ref",
-    "private"} (non-string text becomes ""; `private` is True only for a literal `true`) - only on the valid-sha return path, so no extra GitHub call
+    "base_sha", "private"} (non-string text becomes ""; `private` is True only for a literal
+    `true`) - only on the valid-sha return path, so no extra GitHub call
     shape exists and a failed pin leaves the sink untouched. The sha stays fail-closed.
     """
     url = f"https://api.github.com/repos/{repo}/pulls/{number}"
@@ -129,6 +134,7 @@ def fetch_pr_head_sha(
             title=_text(data.get("title")),
             body=_text(data.get("body")),
             head_ref=_text(head.get("ref")),
+            base_sha=_text(base.get("sha") if isinstance(base, dict) else None),
             private=isinstance(base_repo, dict) and base_repo.get("private") is True,
         )
     return sha
@@ -156,3 +162,55 @@ def repo_is_private(
     except Exception:
         return False
     return isinstance(data, dict) and data.get("private") is True
+
+
+_SIGNOFF_PATH = ".github/human-signoff-paths"
+_SIGNOFF_MAX_BYTES = 64 * 1024
+
+
+def fetch_signoff_globs(
+    repo: str,
+    sha: str,
+    env: Mapping[str, str],
+    *,
+    opener: Callable = urllib.request.urlopen,
+    timeout: float = _FETCH_TIMEOUT,
+) -> list[str] | None:
+    """The glob lines of `.github/human-signoff-paths` at commit `sha` of `repo`.
+
+    `review-pr` passes the PR BASE commit, never the head: the PR author controls the head.
+    Returns [] when the file does not exist (HTTP 404: no floor) and None on ANY other failure
+    (fail closed: the caller must not approve). Blank lines and `#` comments are dropped.
+
+    GitHub REST: GET /repos/{repo}/contents/{path}?ref={sha}. Same urllib + GH_TOKEN style as
+    fetch_pr_head_sha.
+    """
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", sha or ""):
+        return None
+    url = f"https://api.github.com/repos/{repo}/contents/{_SIGNOFF_PATH}?ref={sha}"
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "franky-idempotency"}
+    token = env.get("GH_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        with opener(urllib.request.Request(url, headers=headers), timeout=timeout) as resp:
+            if getattr(resp, "status", None) != 200:
+                return None
+            data = json.load(resp)
+    except urllib.error.HTTPError as exc:
+        return [] if exc.code == 404 else None
+    except Exception:
+        return None
+    if not isinstance(data, dict) or data.get("type") != "file":
+        return None
+    size, content = data.get("size"), data.get("content")
+    if data.get("encoding") != "base64" or not isinstance(content, str):
+        return None
+    if not isinstance(size, int) or size > _SIGNOFF_MAX_BYTES:
+        return None
+    try:
+        text = base64.b64decode(content, validate=False).decode("utf-8")
+    except (binascii.Error, ValueError):
+        return None
+    lines = (line.strip() for line in text.splitlines())
+    return [line for line in lines if line and not line.startswith("#")]

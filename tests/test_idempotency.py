@@ -1,9 +1,13 @@
 """Unit tests for the best-effort idempotency pre-check (network-free via an injected opener)."""
 
+import base64
 import io
 import json
+import urllib.error
 
-from franky.idempotency import find_open_pr
+import pytest
+
+from franky.idempotency import fetch_signoff_globs, find_open_pr
 
 
 class _FakeResp:
@@ -87,6 +91,7 @@ def test_meta_sink_filled_from_one_response():
         "title": "ABC-1 fix",
         "body": "see OPS-9",
         "head": {"sha": _SHA, "ref": "abc-1-fix"},
+        "base": {"sha": "b" * 40},
     }
     sha = fetch_pr_head_sha("me/repo", 7, {}, opener=_pr_opener(payload, calls), meta_sink=sink)
     assert sha == _SHA
@@ -94,6 +99,7 @@ def test_meta_sink_filled_from_one_response():
         "title": "ABC-1 fix",
         "body": "see OPS-9",
         "head_ref": "abc-1-fix",
+        "base_sha": "b" * 40,
         "private": False,
     }
     assert len(calls) == 1
@@ -103,7 +109,7 @@ def test_meta_sink_null_body_becomes_empty_string():
     sink = {}
     payload = {"title": None, "body": None, "head": {"sha": _SHA, "ref": 5}}
     fetch_pr_head_sha("me/repo", 7, {}, opener=_pr_opener(payload, []), meta_sink=sink)
-    assert sink == {"title": "", "body": "", "head_ref": "", "private": False}
+    assert sink == {"title": "", "body": "", "head_ref": "", "base_sha": "", "private": False}
 
 
 def test_meta_sink_private_only_for_literal_true():
@@ -139,3 +145,82 @@ def test_meta_sink_untouched_on_invalid_or_missing_sha():
 def test_fetch_pr_head_sha_without_sink_unchanged():
     payload = {"head": {"sha": _SHA}}
     assert fetch_pr_head_sha("me/repo", 7, {}, opener=_pr_opener(payload, [])) == _SHA
+
+
+BASE = "b" * 40
+
+
+def _file_payload(text, **over):
+    raw = text.encode()
+    return {
+        "type": "file",
+        "encoding": "base64",
+        "size": len(raw),
+        "content": base64.b64encode(raw).decode(),
+        **over,
+    }
+
+
+def test_signoff_globs_returns_lines_without_comments_and_blanks():
+    seen = []
+
+    def opener(req, timeout=None):
+        seen.append((req.full_url, req.get_header("Authorization")))
+        return _FakeResp(_file_payload("# header\n\n**/pay/**\n  /top.txt  \n"))
+
+    assert fetch_signoff_globs("me/repo", BASE, {"GH_TOKEN": "ghp_x"}, opener=opener) == [
+        "**/pay/**",
+        "/top.txt",
+    ]
+    assert seen == [
+        (
+            f"https://api.github.com/repos/me/repo/contents/.github/human-signoff-paths?ref={BASE}",
+            "Bearer ghp_x",
+        )
+    ]
+
+
+def _http_error(code):
+    def opener(req, timeout=None):
+        raise urllib.error.HTTPError(req.full_url, code, "x", None, None)  # type: ignore[arg-type]
+
+    return opener
+
+
+def test_signoff_globs_404_means_no_list_and_other_errors_fail_closed():
+    assert fetch_signoff_globs("me/repo", BASE, {}, opener=_http_error(404)) == []
+    assert fetch_signoff_globs("me/repo", BASE, {}, opener=_http_error(500)) is None
+    assert fetch_signoff_globs("me/repo", BASE, {}, opener=_http_error(403)) is None
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _file_payload("a", type="dir"),
+        _file_payload("a", size=64 * 1024 + 1),
+        _file_payload("a", encoding="none"),
+        _file_payload("a", content="!!not base64!!"),
+        _file_payload("a", content=base64.b64encode(b"\xff\xfe").decode()),
+        ["not", "a", "dict"],
+    ],
+)
+def test_signoff_globs_bad_payload_fails_closed(payload):
+    assert (
+        fetch_signoff_globs("me/repo", BASE, {}, opener=lambda r, timeout=None: _FakeResp(payload))
+        is None
+    )
+
+
+def test_signoff_globs_non_200_and_bad_sha_fail_closed():
+    assert (
+        fetch_signoff_globs(
+            "me/repo", BASE, {}, opener=lambda r, timeout=None: _FakeResp(_file_payload("a"), 204)
+        )
+        is None
+    )
+
+    def never(req, timeout=None):
+        raise AssertionError("a bad sha must not reach the network")
+
+    assert fetch_signoff_globs("me/repo", "main", {}, opener=never) is None
+    assert fetch_signoff_globs("me/repo", "", {}, opener=never) is None

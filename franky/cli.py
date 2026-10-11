@@ -64,7 +64,7 @@ from .engine import (
 )
 from . import atlassian
 from .github import run_gh
-from .idempotency import fetch_pr_head_sha, find_open_pr, repo_is_private
+from .idempotency import fetch_pr_head_sha, fetch_signoff_globs, find_open_pr, repo_is_private
 from .jira import (
     extract_jira_keys,
     fetch_jira_comments,
@@ -112,9 +112,11 @@ from .reviewpr import (
     build_review_findings,
     build_review_payload,
     commentable_lines,
+    human_signoff_required,
     match_resolved_threads,
     parse_review_findings,
     render_review_body,
+    review_event,
 )
 from .result import (
     EXIT_AGENT,
@@ -1218,6 +1220,7 @@ def _publish_review(
     allow_approve: bool = False,
     resolve_fixed: bool = False,
     prior_url: str | None = None,
+    base_sha: str | None = None,
 ) -> tuple[str, str, int, str | None, int | None, str | None, int | None]:
     """Post the review as inline comments on the pinned commit; returns the result fields
     (status, reason, exit code, review url, review id, event posted, threads resolved).
@@ -1235,6 +1238,9 @@ def _publish_review(
       published with its own state. Absent: nothing was written, post COMMENT. Unknown (a read
       failed), or the head moved while an APPROVE may be on the PR: never repost, end with status
       `publish_uncertain` so the caller looks at the PR before acting.
+    With `allow_approve`, an APPROVE also needs no human sign-off floor: when a changed path is
+    listed in the repo's `.github/human-signoff-paths` (read at `base_sha`, the PR base commit),
+    the PR changes that file, or the file or the PR file list cannot be read, the event is COMMENT.
     With `resolve_fixed`, after a successful post and an unmoved head, resolve the publishing
     bot's matching threads for findings marked resolved (login from the POST response).
     """
@@ -1285,6 +1291,18 @@ def _publish_review(
     if stale():
         return stale_result
 
+    notes: list[str] = []
+    if (
+        allow_approve
+        and review_event(shaped, True) == "APPROVE"
+        and human_signoff_required(
+            files, lambda: fetch_signoff_globs(repo, base_sha or "", os.environ)
+        )
+    ):
+        allow_approve = False
+        shaped = {**shaped, "signoff_required": True}
+        notes.append(" (human sign-off required)")
+
     commentable = commentable_lines(files or [])
     post = ["api", "-X", "POST", f"repos/{repo}/pulls/{pr_number}/reviews", "--input", "-"]
     marker = f"<!-- {APPROVE_MARKER}:{uuid.uuid4().hex} -->"
@@ -1334,7 +1352,6 @@ def _publish_review(
             return "ok", json.dumps(review), event
         return ("unwritten" if kind == "absent" else "unknown"), gerr, None
 
-    notes: list[str] = []
     payload = build(allow_approve)
     if payload["event"] == "APPROVE":
         kind, gout, event = approve(payload)
@@ -1988,6 +2005,7 @@ def review_pr(
                             allow_approve=allow_approve,
                             resolve_fixed=resolve_fixed,
                             prior_url=(prior_handoff or {}).get("review_url"),
+                            base_sha=pr_meta.get("base_sha"),
                         )
 
         thread_result = handoff = None
