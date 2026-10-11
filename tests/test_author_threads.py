@@ -48,7 +48,7 @@ def env(monkeypatch, tmp_path):
     OPEN.clear()
     monkeypatch.setattr(cli, "find_open_pr", lambda *a, **k: OPEN.get("url"))
     # Never auto-discover the developer's real ~/.franky/profile.toml.
-    monkeypatch.setattr(cli, "_load_profile_bundle", lambda *a, **k: (None, ""))
+    monkeypatch.setattr(cli, "_load_profile_bundle", lambda *a, **k: (None, "", ""))
     monkeypatch.setattr(cli, "profile_path", lambda *a, **k: None)
     return env
 
