@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.17] - 2026-10-11
+
 ### Fixed
 
 - `review-pr`, `plan`, and the planning pass of `build --plan-first` now tell the agent about the injected operator setup, with read-only wording (no PR to open, read-only rules stay in force). Before, the profile files were injected but the prompt never named them.
