@@ -90,6 +90,7 @@ _NON_SECRET_SETTABLE_KEYS: frozenset[str] = frozenset(
         _OLLAMA_HOST,
         "JIRA_BASE_URL",
         "JIRA_EMAIL",
+        "JIRA_CLI",
         "FRANKY_IMAGE",
         "FRANKY_PROXY_IMAGE",
         "FRANKY_GHCR_REPO",

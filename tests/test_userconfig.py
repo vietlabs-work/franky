@@ -363,5 +363,5 @@ def test_settable_keys_includes_secret_keys() -> None:
 
 
 def test_settable_keys_includes_non_secret_keys() -> None:
-    for key in ("FRANKY_ENGINE", "FRANKY_ALLOWED_REPOS", "JIRA_EMAIL"):
+    for key in ("FRANKY_ENGINE", "FRANKY_ALLOWED_REPOS", "JIRA_EMAIL", "JIRA_CLI"):
         assert key in SETTABLE_KEYS

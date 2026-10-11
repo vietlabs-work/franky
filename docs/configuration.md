@@ -67,7 +67,14 @@ A well-formed id that does not exist still fails inside the engine.
 
 ## JIRA tickets
 
-`franky build jira KEY` needs `JIRA_BASE_URL`, `JIRA_EMAIL`, and `JIRA_API_TOKEN`. They stay on the host for the ticket fetch.
+`franky build jira KEY` and `review-pr` read tickets on the host, in one of two ways:
+
+| Mode | Settings | Notes |
+|------|----------|-------|
+| `acli` | `JIRA_CLI` (absolute path to `acli`) | Uses the `acli` login already on the host. Wins when both modes are set. |
+| REST | `JIRA_BASE_URL`, `JIRA_EMAIL`, `JIRA_API_TOKEN` | The token stays on the host. |
+
+`JIRA_CLI` is not a secret: `franky config set JIRA_CLI /path/to/acli`. `acli` runs as the host user with only `HOME`, `PATH`, `LANG`, `TMPDIR` and `USER`, never inside a container. It reads every ticket that login can read, so use a login scoped to what Franky may see. Needs `acli jira workitem comment list`; an `acli` that lacks it only loses ticket comments.
 
 ## Atlassian tools
 

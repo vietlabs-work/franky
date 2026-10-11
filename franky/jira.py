@@ -11,7 +11,11 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
+import subprocess
+import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -22,6 +26,11 @@ from .result import AuthError, NetworkError
 JIRA_BASE_URL_VAR = "JIRA_BASE_URL"
 JIRA_EMAIL_VAR = "JIRA_EMAIL"
 JIRA_API_TOKEN_VAR = "JIRA_API_TOKEN"
+# Absolute path to the host's `acli`. When set it wins over the three vars above: the CLI runs on
+# the HOST as the operator, with its own stored login, so no Jira secret passes through Franky.
+JIRA_CLI_VAR = "JIRA_CLI"
+_CLI_CHILD_ENV = ("HOME", "PATH", "LANG", "TMPDIR", "USER")
+_CLI_MIN_TIMEOUT = 15.0  # acli starts slower than one REST call
 
 # Keys scanned out of free text (PR title, branch, body). Not anchored like task.py's
 # JIRA_KEY_RE: a key may sit mid-sentence or inside a /browse/ URL, but not glued to a
@@ -138,9 +147,14 @@ def jira_secret_strings(env: Mapping[str, str]) -> list[str]:
     return [v for v in out if v]
 
 
+def jira_cli(env: Mapping[str, str]) -> str:
+    """The configured `acli` path, or "" when the CLI transport is off."""
+    return (env.get(JIRA_CLI_VAR) or "").strip()
+
+
 def jira_configured(env: Mapping[str, str]) -> bool:
-    """True when all three JIRA vars are set and non-blank."""
-    return all(
+    """True when `JIRA_CLI` is set, or all three JIRA vars are set and non-blank."""
+    return bool(jira_cli(env)) or all(
         (env.get(var) or "").strip()
         for var in (JIRA_BASE_URL_VAR, JIRA_EMAIL_VAR, JIRA_API_TOKEN_VAR)
     )
@@ -258,6 +272,73 @@ def _jira_get(
         raise NetworkError(f"JIRA returned unparseable JSON for {key}") from exc
 
 
+def _run_bounded(
+    argv: list[str], env: dict[str, str], timeout: float, cap: int
+) -> tuple[int, bytes, bytes]:
+    """Run argv (no shell), returning (exit code, stdout, stderr), each at most `cap + 1` bytes.
+
+    Output goes to unlinked temp files polled for size, so a runaway child is killed and reaped as
+    soon as either stream passes the cap, never buffered whole. Raises TimeoutExpired / OSError.
+    """
+    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=err, env=env)
+        deadline = time.monotonic() + timeout
+        try:
+            while proc.poll() is None:
+                if os.fstat(out.fileno()).st_size > cap or os.fstat(err.fileno()).st_size > cap:
+                    break
+                if time.monotonic() >= deadline:
+                    raise subprocess.TimeoutExpired(argv, timeout)
+                time.sleep(0.05)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+        out.seek(0)
+        err.seek(0)
+        return proc.returncode, out.read(cap + 1), err.read(cap + 1)
+
+
+def _cli_json(
+    args: list[str], key: str, env: Mapping[str, str], runner: Callable | None, timeout: float
+) -> object:
+    """Run `<JIRA_CLI> jira workitem <args> --json` on the host and return the parsed JSON.
+
+    argv only, never a shell; the child gets HOME/PATH/LANG/TMPDIR/USER and nothing else (no
+    GH_TOKEN, no JIRA_* vars). stdout is capped and stderr is never relayed: it is only matched
+    against fixed phrases to pick a reason.
+    """
+    binary = jira_cli(env)
+    if not os.path.isabs(binary):
+        raise _tag(
+            NetworkError(f"{JIRA_CLI_VAR} must be an absolute path"), "unavailable", stop=True
+        )
+    child_env = {k: env[k] for k in _CLI_CHILD_ENV if env.get(k)}
+    try:
+        rc, out, err_bytes = (runner or _run_bounded)(
+            [binary, "jira", "workitem", *args, "--json"], child_env, timeout, _MAX_RESPONSE_BYTES
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise _tag(NetworkError(f"JIRA CLI timed out for {key}"), "timeout", stop=True) from exc
+    except OSError as exc:
+        raise _tag(NetworkError("JIRA CLI is not runnable"), "unavailable", stop=True) from exc
+    if len(out) > _MAX_RESPONSE_BYTES:
+        raise _tag(NetworkError(f"JIRA response for {key} is too large"), "network")
+    if rc != 0:
+        err = err_bytes.decode("utf-8", "replace").lower()
+        if "does not exist or you do not have permission" in err:
+            raise _tag(NetworkError(f"JIRA issue {key} not found"), "not_found")
+        if any(w in err for w in ("unauthoriz", "authenticat", "login", "401", "403")):
+            raise _tag(AuthError("JIRA CLI is not logged in"), "auth", stop=True)
+        raise _tag(NetworkError(f"JIRA CLI failed for {key}"), "network")
+    try:
+        return json.loads(out.decode("utf-8"))
+    except ValueError as exc:
+        raise _tag(
+            NetworkError(f"JIRA CLI returned unparseable JSON for {key}"), "network"
+        ) from exc
+
+
 def fetch_jira_issue(
     key: str,
     env: Mapping[str, str],
@@ -266,6 +347,7 @@ def fetch_jira_issue(
     timeout: float = 10.0,
     refuse_restricted: bool = False,
     scope_first: bool = False,
+    runner: Callable | None = None,
 ) -> str:
     """Fetch a JIRA issue by key and return a plain-text task body.
 
@@ -273,6 +355,7 @@ def fetch_jira_issue(
         key: A JIRA issue key (e.g. "FOO-123"). Must already be validated by parse_task.
         env: Environment mapping to read creds from (never reads os.environ directly).
         opener: Injectable urllib.request.urlopen-compatible callable for tests.
+        runner: Injectable subprocess.run-compatible callable for the `JIRA_CLI` transport.
         timeout: Seconds before the HTTP request times out.
         refuse_restricted: Also request `security` and accept only an explicit
             `"security": null`; a security level, or a response that does not say, raises.
@@ -296,16 +379,26 @@ def fetch_jira_issue(
     # urlopen follows redirects and re-sends the Authorization header on a same-host hop.
     # JIRA_BASE_URL is operator-supplied out-of-band (a trusted Atlassian instance), so a
     # downgrade redirect is not an attacker-controlled surface; we accept the default handler.
-    if opener is None:
-        opener = _no_redirect_open if refuse_restricted else urllib.request.urlopen
-    data = _jira_get(
-        f"/rest/api/3/issue/{urllib.parse.quote(key, safe='')}?fields=summary,description"
-        f"{',security' if refuse_restricted else ''}",
-        key,
-        env,
-        opener,
-        timeout,
-    )
+    if jira_cli(env):
+        # `security` is always requested here: a build ticket still reads the same shape.
+        data = _cli_json(
+            ["view", key, "--fields", "summary,description,security"],
+            key,
+            env,
+            runner,
+            max(timeout, _CLI_MIN_TIMEOUT),
+        )
+    else:
+        if opener is None:
+            opener = _no_redirect_open if refuse_restricted else urllib.request.urlopen
+        data = _jira_get(
+            f"/rest/api/3/issue/{urllib.parse.quote(key, safe='')}?fields=summary,description"
+            f"{',security' if refuse_restricted else ''}",
+            key,
+            env,
+            opener,
+            timeout,
+        )
 
     # A valid-JSON response can still lack the expected shape (a restricted issue, an API
     # change). Guard so it surfaces as a ValueError (clean ClickException) rather than a
@@ -341,6 +434,7 @@ def fetch_jira_comments(
     opener: Callable | None = None,
     timeout: float = 10.0,
     limit: int = 5,
+    runner: Callable | None = None,
 ) -> str:
     """The newest `limit` public comments of a JIRA issue as bounded plain text, or "".
 
@@ -348,14 +442,26 @@ def fetch_jira_comments(
     Comments restricted to a group or role are skipped. Never follows a redirect. Raises the same
     tagged errors as `fetch_jira_issue`; a payload without a comment list raises reason "network".
     """
-    data = _jira_get(
-        f"/rest/api/3/issue/{urllib.parse.quote(key, safe='')}/comment"
-        f"?orderBy=-created&maxResults={limit}",
-        key,
-        env,
-        opener or _no_redirect_open,
-        timeout,
-    )
+    if jira_cli(env):
+        # Newest-first and bounded by acli itself, so a long thread never yields a stale page.
+        data = _cli_json(
+            ["comment", "list", "--key", key, "--order", "-created", "--limit", str(limit)],
+            key,
+            env,
+            runner,
+            max(timeout, _CLI_MIN_TIMEOUT),
+        )
+        if isinstance(data, list):
+            data = {"comments": data}
+    else:
+        data = _jira_get(
+            f"/rest/api/3/issue/{urllib.parse.quote(key, safe='')}/comment"
+            f"?orderBy=-created&maxResults={limit}",
+            key,
+            env,
+            opener or _no_redirect_open,
+            timeout,
+        )
     comments = data.get("comments") if isinstance(data, dict) else None
     if not isinstance(comments, list):
         raise _tag(NetworkError(f"JIRA returned no comment list for {key}"), "network")
