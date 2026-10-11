@@ -67,6 +67,7 @@ from .github import run_gh
 from .idempotency import fetch_pr_head_sha, find_open_pr, repo_is_private
 from .jira import (
     extract_jira_keys,
+    fetch_jira_comments,
     fetch_jira_issue,
     jira_configured,
     jira_secret_strings,
@@ -1459,7 +1460,11 @@ def _review_ticket_context(
             try:
                 text = redact(
                     fetch_jira_issue(
-                        key, env, refuse_restricted=True, timeout=_REVIEW_JIRA_TIMEOUT
+                        key,
+                        env,
+                        refuse_restricted=True,
+                        scope_first=True,
+                        timeout=_REVIEW_JIRA_TIMEOUT,
                     ),
                     secrets,
                 ).strip()
@@ -1472,6 +1477,15 @@ def _review_ticket_context(
                 status = "included"
                 if len(text) > PROSE_MAX_CHARS:
                     text, status = text[:PROSE_MAX_CHARS] + "\n[truncated]", "partial"
+                # Comments are extra context: a failure here never changes the ticket's status.
+                try:
+                    notes = redact(
+                        fetch_jira_comments(key, env, timeout=_REVIEW_JIRA_TIMEOUT), secrets
+                    ).strip()
+                except Exception:
+                    notes = "(ticket comments unavailable)"
+                if notes:
+                    text = f"{text}\n\n{notes}"
                 tickets.append(text)
         sources.append(
             {"kind": "jira", "ref": key, "status": status, **({"reason": reason} if reason else {})}

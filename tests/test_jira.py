@@ -15,6 +15,8 @@ from franky.jira import (
     JIRA_BASE_URL_VAR,
     JIRA_EMAIL_VAR,
     _flatten_adf,
+    _scope_first,
+    fetch_jira_comments,
     extract_jira_keys,
     fetch_jira_issue,
     jira_configured,
@@ -476,4 +478,138 @@ def test_refuse_restricted_default_opener_does_not_follow_redirects(monkeypatch)
 
     monkeypatch.setattr(jira, "_no_redirect_open", fake)
     assert fetch_jira_issue("FOO-1", _GOOD_ENV, refuse_restricted=True, timeout=5) == "[FOO-1] S"
+    assert calls == [5]
+
+
+# --- scope_first / fetch_jira_comments --------------------------------------------------------
+
+
+def _h(text: str, level: int = 2) -> dict:
+    return {
+        "type": "heading",
+        "attrs": {"level": level},
+        "content": [{"type": "text", "text": text}],
+    }
+
+
+def _p(text: str) -> dict:
+    return {"type": "paragraph", "content": [{"type": "text", "text": text}]}
+
+
+def _doc(*nodes: dict) -> dict:
+    return {"type": "doc", "version": 1, "content": list(nodes)}
+
+
+def test_scope_first_lifts_the_three_sections_in_their_original_order():
+    doc = _doc(
+        _h("Context"),
+        _p("c"),
+        _h("Scope"),
+        _p("s"),
+        _h("Out of Scope"),
+        _p("o"),
+        _h("Anchors"),
+        _p("a"),
+        _h("Acceptance criteria"),
+        _p("ac"),
+        _h("Verification"),
+        _p("v"),
+    )
+    assert _flatten_adf(_scope_first(doc)).split() == [
+        *["Scope", "s", "Out", "of", "Scope", "o", "Acceptance", "criteria", "ac"],
+        *["Context", "c", "Anchors", "a", "Verification", "v"],
+    ]
+
+
+def test_scope_first_keeps_a_deeper_heading_inside_its_section_and_matches_loosely():
+    doc = _doc(_h("Intro"), _p("i"), _h("OUT OF SCOPE:"), _h("Detail", 3), _p("d"), _h("Tail"))
+    assert _flatten_adf(_scope_first(doc)).split() == [
+        "OUT",
+        "OF",
+        "SCOPE:",
+        "Detail",
+        "d",
+        "Intro",
+        "i",
+        "Tail",
+    ]
+
+
+def test_scope_first_leaves_a_doc_without_sections_alone():
+    doc = _doc(_h("Context"), _p("c"))
+    assert _scope_first(doc) == doc
+    assert _scope_first("plain") == "plain"
+
+
+def test_fetch_jira_issue_scope_first_is_opt_in():
+    doc = _doc(_h("Context"), _p("c"), _h("Scope"), _p("s"))
+    opener = _make_opener(_issue(description=doc))
+    assert fetch_jira_issue("FOO-1", _GOOD_ENV, opener=opener).endswith("Context\nc\nScope\ns")
+    opener = _make_opener(_issue(description=doc))
+    assert fetch_jira_issue("FOO-1", _GOOD_ENV, opener=opener, scope_first=True).endswith(
+        "Scope\ns\nContext\nc"
+    )
+
+
+def _comments(*items: dict, total: int | None = None) -> bytes:
+    return json.dumps({"comments": list(items), "total": total or len(items)}).encode()
+
+
+def test_fetch_jira_comments_url_format_and_no_author_names():
+    seen = []
+    body = _comments(
+        {
+            "author": {"displayName": "Some Person"},
+            "created": "2026-03-04T10:00:00.000+0000",
+            "body": _doc(_p("Do not touch the cap.")),
+        },
+        {"created": "2026-03-01T10:00:00.000+0000", "body": "plain text"},
+        total=7,
+    )
+    inner = _make_opener(body)
+
+    def opener(req, *, timeout=None):
+        seen.append(req.full_url)
+        return inner(req, timeout=timeout)
+
+    out = fetch_jira_comments("FOO-1", _GOOD_ENV, opener=opener)
+    assert seen == [f"{FAKE_BASE}/rest/api/3/issue/FOO-1/comment?orderBy=-created&maxResults=5"]
+    assert out == (
+        "Latest ticket comments, newest first (2 shown of 7):\n"
+        "- 2026-03-04: Do not touch the cap.\n- 2026-03-01: plain text"
+    )
+    assert "Some Person" not in out
+
+
+def test_fetch_jira_comments_skips_restricted_and_truncates():
+    body = _comments(
+        {"created": "2026-03-04", "body": "secret", "visibility": {"type": "role"}},
+        {"created": "2026-03-03", "body": "x" * 900},
+    )
+    out = fetch_jira_comments("FOO-1", _GOOD_ENV, opener=_make_opener(body))
+    assert "secret" not in out
+    assert out.endswith("- 2026-03-03: " + "x" * 800 + " [truncated]")
+
+
+def test_fetch_jira_comments_empty_list_is_empty_string():
+    assert fetch_jira_comments("FOO-1", _GOOD_ENV, opener=_make_opener(_comments())) == ""
+
+
+def test_fetch_jira_comments_malformed_payload_raises_network():
+    with pytest.raises(NetworkError) as info:
+        fetch_jira_comments("FOO-1", _GOOD_ENV, opener=_make_opener(b'{"comments": "no"}'))
+    assert info.value.reason == "network"
+
+
+def test_fetch_jira_comments_default_opener_does_not_follow_redirects(monkeypatch):
+    from franky import jira
+
+    calls = []
+
+    def fake(req, timeout=None):
+        calls.append(timeout)
+        return _make_opener(_comments())(req, timeout=timeout)
+
+    monkeypatch.setattr(jira, "_no_redirect_open", fake)
+    assert fetch_jira_comments("FOO-1", _GOOD_ENV, timeout=5) == ""
     assert calls == [5]

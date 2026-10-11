@@ -5102,6 +5102,7 @@ def test_review_pr_frozen_mode_never_fetches_tickets(monkeypatch):
         raise AssertionError("frozen mode must not fetch tickets")
 
     monkeypatch.setattr(cli, "fetch_jira_issue", no_fetch)
+    monkeypatch.setattr(cli, "fetch_jira_comments", no_fetch)
     res = _run_frozen(FROZEN)
     assert res.exit_code == 0, res.output
     assert json.loads(res.stdout)["context_sources"] == []
@@ -5351,11 +5352,52 @@ def test_review_pr_fences_jira_tickets_and_reports_context_sources(monkeypatch, 
         {"kind": "jira", "ref": "ABC-123", "status": "included"},
         {"kind": "jira", "ref": "OPS-9", "status": "unavailable", "reason": "not_found"},
     ]
-    assert all(k["refuse_restricted"] is True and k["timeout"] == 5.0 for _, k in fetched)
+    assert all(
+        k["refuse_restricted"] is True and k["scope_first"] is True and k["timeout"] == 5.0
+        for _, k in fetched
+    )
     fence = f"FRANKY_TICKET_{REVIEW_NONCE}_BEGIN\n{_TICKET_TEXT}\nFRANKY_TICKET_{REVIEW_NONCE}_END"
     assert fence in prompts[0]
     assert "Acceptance: cap at 5." not in res.stdout
     assert "jira-tok-s3cret" not in prompts[0]
+
+
+def test_review_pr_appends_comments_after_the_truncated_description(monkeypatch, tmp_path):
+    notes = "Latest ticket comments, newest first (1 shown of 1):\n- 2026-01-02: use the cap"
+    monkeypatch.setattr(cli, "PROSE_MAX_CHARS", 20)
+    prompts, _ = _jira_review_setup(
+        monkeypatch, tmp_path, meta={"title": "ABC-123", "body": "", "head_ref": ""}
+    )
+    monkeypatch.setattr(cli, "fetch_jira_comments", lambda *a, **k: notes)
+    res = _review(["--engine", "claude", "--no-publish"])
+    assert res.exit_code == 0, res.output
+    assert json.loads(res.stdout)["context_sources"][0]["status"] == "partial"
+    assert "[truncated]\n\n" + notes in prompts[0]
+
+
+def test_review_pr_comment_failure_keeps_the_ticket_included(monkeypatch, tmp_path):
+    def boom(*a, **k):
+        raise _jira_tag(NetworkError("down"), "network", stop=True)
+
+    prompts, _ = _jira_review_setup(
+        monkeypatch, tmp_path, meta={"title": "ABC-123", "body": "", "head_ref": ""}
+    )
+    monkeypatch.setattr(cli, "fetch_jira_comments", boom)
+    res = _review(["--engine", "claude", "--no-publish"])
+    assert res.exit_code == 0, res.output
+    assert _reasons(res) == [("ABC-123", "included", None)]
+    assert _TICKET_TEXT + "\n\n(ticket comments unavailable)" in prompts[0]
+
+
+def test_review_pr_redacts_a_token_inside_a_ticket_comment(monkeypatch, tmp_path):
+    prompts, _ = _jira_review_setup(
+        monkeypatch, tmp_path, meta={"title": "ABC-123", "body": "", "head_ref": ""}
+    )
+    monkeypatch.setattr(cli, "fetch_jira_comments", lambda *a, **k: "- 2026-01-02: jira-tok-s3cret")
+    res = _review(["--engine", "claude", "--no-publish"])
+    assert res.exit_code == 0, res.output
+    assert "jira-tok-s3cret" not in prompts[0]
+    assert "- 2026-01-02: ***REDACTED***" in prompts[0]
 
 
 def test_review_pr_without_jira_env_reports_unconfigured_and_never_fetches(monkeypatch, tmp_path):
