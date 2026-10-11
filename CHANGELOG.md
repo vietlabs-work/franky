@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `review-pr` gives the reviewer each linked JIRA ticket's 5 newest comments (800 characters each, no author names, restricted comments skipped) and moves the ticket's Scope, Out of Scope and Acceptance criteria sections to the top before the length cut. A comment fetch failure never drops the ticket.
+- The `review-pr` method reads the `AI Review Context` block in the PR body as the scope anchor when no ticket text is present (the ticket wins when both exist). A suggestion outside that scope is rated `nit` with a `Follow-up:` title and never blocks.
 - The `--json` `started` event always carries `profile_files`: the number of profile files injected into that pass's container (0 when none).
 
 ## [0.3.16] - 2026-10-09

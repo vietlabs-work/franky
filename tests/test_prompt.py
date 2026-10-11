@@ -697,6 +697,14 @@ def test_review_prompt_rule_3_ticket_exception_in_threaded_prompt():
     )
 
 
+def test_review_method_uses_the_scope_anchor_and_marks_out_of_scope_as_nit():
+    prompt = build_review_pr_prompt("me/repo", "u", "", "n0")
+    assert "summary is exactly `AI Review Context`" in prompt
+    assert "`[TODO] no boundaries stated`" in prompt
+    assert "start its title with `Follow-up:`" in prompt
+    assert "even outside the scope anchor" in prompt
+
+
 def test_review_prompt_sets_severity_from_the_method_scale():
     prompt = build_review_pr_prompt("me/repo", "u", "", "n0")
     assert 'Set "severity" by the scale in method step 5' in prompt
