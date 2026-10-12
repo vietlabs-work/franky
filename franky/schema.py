@@ -147,10 +147,11 @@ _RESULT_SCHEMA: dict = {
                 "severity": "string: blocking | normal | question | nit",
                 "status": "string: new | open | accepted (resolved findings are dropped; at most 40)",
                 "accepted_by": "string; present only when status is accepted: the GitHub login "
-                "of the human whose APPROVED review on the PR head accepted the risk (verified "
-                "by the host every run)",
-                "raised_at": "string; UTC ISO-8601 time the finding was first raised; absent in "
-                "a handoff an older version wrote (an acceptance then fails closed)",
+                "of the OWNER, MEMBER or COLLABORATOR whose APPROVED review on the PR head accepted "
+                "the risk (verified by the host every run)",
+                "raised_at": "string; the submitted_at GitHub returned for the review that posted the finding; "
+                "absent for an unpublished run or a handoff an older version wrote (an "
+                "acceptance then fails closed)",
             }
         ],
     },

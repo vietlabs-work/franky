@@ -1465,6 +1465,9 @@ def _publish_review(
         )
     resp = parsed(gout)
     event = payload["event"]
+    posted_at = resp.get("submitted_at")
+    # The posted review's own timestamp is when its findings were raised (see build_handoff).
+    shaped["posted_at"] = posted_at if isinstance(posted_at, str) else None
     replied = resolved = None
     if (
         (resolve_fixed and any(f["status"] == "resolved" for f in shaped["findings"]))

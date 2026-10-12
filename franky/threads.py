@@ -561,21 +561,22 @@ def build_handoff(
     sha: str,
     secrets,
     review_url: str | None = None,
-    now: datetime | None = None,
     prior_handoff: dict | None = None,
 ) -> dict:
     """The bounded, redacted summary a later run is seeded with: no finding bodies, resolved
     findings dropped (an accepted one is kept, with `accepted_by`, and verified again each run),
     blocking first, at most HANDOFF_MAX_FINDINGS entries, text on one line.
     `review_url` (a GitHub PR review permalink, else ignored) lets the next run link back.
-    Every finding carries `raised_at` (UTC ISO-8601): `now` for a new one, the prior handoff's
-    value for an open or accepted one (missing when the prior had none), so an acceptance can be
-    tied to an approval that came after the finding was raised.
+    A finding carries `raised_at`: for a new one, `shaped["posted_at"]` (the `submitted_at` GitHub
+    returned for the review that posted it; absent when nothing was published, so it cannot be
+    accepted yet); for an open or accepted one, the prior handoff's value, matched by exact file
+    and title key (missing when the prior had none or only a title-only match exists). An
+    acceptance must come from an approval submitted after it.
     `overflow` is set when the cap cut a finding above nit, and it stays set for the thread:
     a cut finding can no longer be tracked, so the thread never auto-approves again."""
     findings = shaped.get("findings", [])
     carried = _raised_at(findings, prior_handoff, secrets)
-    stamp = now.astimezone(timezone.utc).isoformat(timespec="seconds") if now else None
+    stamp = shaped.get("posted_at") if isinstance(shaped.get("posted_at"), str) else None
     kept = [
         {**f, "raised_at": stamp if f.get("status", "new") == "new" else carried.get(i)}
         for i, f in enumerate(findings)
@@ -678,9 +679,7 @@ def finish_run(
                 )
                 if why in ("too_large", "verify_failed"):
                     _drop_session(thread, record)
-        record["handoff"] = build_handoff(
-            shaped, sha, secrets, review_url, now, record.get("handoff")
-        )
+        record["handoff"] = build_handoff(shaped, sha, secrets, review_url, record.get("handoff"))
         record["last_sha"] = sha
         record["updated_at"] = now.isoformat(timespec="seconds")
     if incoming is not None:

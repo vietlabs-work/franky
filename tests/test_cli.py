@@ -4572,7 +4572,13 @@ def _accept_rerun(
 ):
     """Run 1 raises a Major; run 2 reports it accepted by owner-x. Returns the gh calls."""
     _fix_review_nonce(monkeypatch)
-    calls = _mc_review_setup(monkeypatch, env=_thread_env(tmp_path), author=author, reviews=reviews)
+    calls = _mc_review_setup(
+        monkeypatch,
+        env=_thread_env(tmp_path),
+        author=author,
+        reviews=reviews,
+        gh=(0, json.dumps({"html_url": REVIEW_URL, "id": 555, "submitted_at": POSTED_AT})),
+    )
     major = {
         "summary": "one tradeoff",
         "findings": [
@@ -4602,8 +4608,13 @@ def _accept_rerun(
     return calls
 
 
-def _approval(at="2099-01-01T00:00:00Z"):
+POSTED_AT = "2026-01-01T00:00:00Z"
+
+
+def _approval(at="2099-01-01T00:00:00Z", assoc="MEMBER"):
     review = {
+        "id": 7,
+        "author_association": assoc,
         "user": {"login": "owner-x", "type": "User"},
         "state": "APPROVED",
         "commit_id": LIVE_SHA,
@@ -4630,7 +4641,7 @@ def test_review_pr_thread_accepted_risk_approves_when_a_human_approved_the_head(
     assert [(f["status"], f["accepted_by"]) for f in handoff["findings"]] == [
         ("accepted", "owner-x")
     ]
-    assert handoff["findings"][0]["raised_at"]  # carried from the first run
+    assert handoff["findings"][0]["raised_at"] == POSTED_AT  # the first POSTed review's time
 
 
 def test_review_pr_thread_accepted_risk_without_a_readable_review_list_stays_blocking(
@@ -4643,6 +4654,21 @@ def test_review_pr_thread_accepted_risk_without_a_readable_review_list_stays_blo
     handoff = threads_mod.read_record(_thread_dir(tmp_path))["handoff"]
     assert handoff["findings"][0]["status"] == "open"
     assert "accepted_by" not in handoff["findings"][0]
+
+
+def test_review_pr_thread_accepted_risk_needs_an_authorized_association(monkeypatch, tmp_path):
+    calls = _accept_rerun(monkeypatch, tmp_path, _approval(assoc="CONTRIBUTOR"))
+    assert _review(["--thread", "--allow-approve", "--engine", "claude"]).exit_code == 0
+    assert json.loads(calls.inputs[-1])["event"] == "REQUEST_CHANGES"
+
+
+def test_review_pr_thread_unpublished_run_stamps_no_raised_at(monkeypatch, tmp_path):
+    _fix_review_nonce(monkeypatch)
+    _mc_review_setup(monkeypatch, env=_thread_env(tmp_path))
+    _fake_thread_run(monkeypatch, tmp_path)
+    assert _review(["--thread", "--engine", "claude", "--no-publish"]).exit_code == 0
+    handoff = threads_mod.read_record(_thread_dir(tmp_path))["handoff"]
+    assert handoff["findings"] and all("raised_at" not in f for f in handoff["findings"])
 
 
 def test_review_pr_thread_accepted_risk_by_the_pr_author_stays_blocking(monkeypatch, tmp_path):

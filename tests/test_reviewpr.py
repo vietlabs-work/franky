@@ -961,8 +961,19 @@ def _accepted(**kw):
     return _f(title="tradeoff", status="accepted", accepted_by="owner-x", **kw)
 
 
-def _review(state="APPROVED", login="owner-x", sha=HEAD, at=LATER, kind="User", body=""):
+def _review(
+    state="APPROVED",
+    login="owner-x",
+    sha=HEAD,
+    at=LATER,
+    kind="User",
+    body="",
+    assoc="MEMBER",
+    id=1,
+):
     return {
+        "id": id,
+        "author_association": assoc,
         "user": {"login": login, "type": kind},
         "state": state,
         "commit_id": sha,
@@ -1004,6 +1015,21 @@ def test_accepted_blocking_finding_no_longer_blocks_once_verified():
         [_review(at="2025-12-31T00:00:00Z")],  # before the finding was raised
         [_review(at=RAISED)],  # not strictly after
         [_review(at="not a date")],
+        [_review(at=None)],
+        [_review(), _review("CHANGES_REQUESTED", at="garbage", id=2)],  # any bad timestamp
+        [_review(assoc="CONTRIBUTOR")],
+        [_review(assoc="NONE")],
+        [_review(assoc=None)],
+        [_review(assoc=5)],
+        [
+            _review(at="2026-01-02T00:00:00Z"),
+            _review("CHANGES_REQUESTED", at=LATER, id=1),
+        ],  # tie, equal ids
+        [_review(at=LATER, id=None), _review("CHANGES_REQUESTED", at=LATER, id=2)],  # tie, no id
+        [
+            _review(at=LATER, id=3),
+            _review("CHANGES_REQUESTED", at=LATER, id=7),
+        ],  # tie, higher id wins
         [_review("COMMENTED")],
         [_review("PENDING")],
         [_review(login="someone-else")],
@@ -1117,3 +1143,61 @@ def test_accepted_finding_never_gets_an_inline_comment_or_blocking_heading():
     assert not any(b.startswith(("**Blocking:", "**Major: tradeoff")) for b in bodies)
     assert "**Blocking:" not in payload["body"]
     assert "Accepted risk (by @owner-x): tradeoff" in payload["body"]
+
+
+@pytest.mark.parametrize("assoc", ["OWNER", "MEMBER", "COLLABORATOR"])
+def test_an_owner_member_or_collaborator_approval_counts(assoc):
+    assert _verify([_review(assoc=assoc)])["findings"][0]["status"] == "accepted"
+
+
+def test_a_same_time_tie_is_broken_by_the_larger_review_id():
+    reviews = [_review(id=9), _review("CHANGES_REQUESTED", id=3)]
+    assert _verify(reviews)["findings"][0]["status"] == "accepted"
+
+
+def test_acceptance_compares_full_precision_and_needs_strictly_after():
+    raised = [{**PRIOR[0], "raised_at": "2026-01-01T00:00:00.500Z"}]
+    early = _verify([_review(at="2026-01-01T00:00:00.250Z")], prior=raised)
+    assert early["findings"][0]["status"] == "open"  # same second, earlier subsecond
+    equal = _verify([_review(at="2026-01-01T00:00:00.500Z")], prior=raised)
+    assert equal["findings"][0]["status"] == "open"
+    late = _verify([_review(at="2026-01-01T00:00:00.750Z")], prior=raised)
+    assert late["findings"][0]["status"] == "accepted"
+
+
+def test_two_prior_entries_with_the_same_key_make_the_acceptance_ambiguous():
+    shaped = _verify([_review()], prior=[*PRIOR, {**PRIOR[0], "title": "tradeoff"}])
+    assert shaped["findings"][0]["status"] == "open"
+
+
+def test_a_demoted_question_counts_against_the_question_cap_again():
+    shaped = _shaped(
+        _f(title="q1", severity="question", status="accepted", accepted_by="owner-x"),
+        _f(title="q2", severity="question", status="open"),
+        _f(title="q3", severity="question", status="open"),
+    )
+    assert shaped["dropped_malformed"] == 0
+    verify_accepted(shaped, None, HEAD, "author-y", [])
+    assert [f["title"] for f in shaped["findings"]] == ["q1", "q2"]
+    assert shaped["dropped_malformed"] == 1
+    assert review_event(shaped, allow_approve=True) == "COMMENT"
+
+
+def test_body_has_one_fixed_line_for_verified_accepted_risks_above_nit():
+    shaped = _shaped(
+        _f(title="a", severity="blocking", status="accepted", accepted_by="owner-x"),
+        _f(title="b", severity="normal", status="accepted", accepted_by="owner-x"),
+        _f(title="c", severity="normal", status="accepted", accepted_by="Other-y"),
+        _f(title="d", severity="nit", status="accepted", accepted_by="nit-z"),
+        _f(title="q", severity="question", status="accepted", accepted_by="q-w"),
+    )
+    body = render_review_body(shaped)
+    line = (
+        "Accepted risk: 3 finding(s) above nit accepted by @owner-x, @Other-y "
+        "(approval on this commit)."
+    )
+    assert body.count(line) == 1
+    assert body.index(line) < body.index("<details>")
+    assert "Accepted risk:" not in render_review_body(_shaped(_f(severity="nit")))
+    only_nit = _shaped(_f(severity="nit", status="accepted", accepted_by="nit-z"))
+    assert "Accepted risk:" not in render_review_body(only_nit)

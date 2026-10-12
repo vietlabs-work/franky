@@ -396,6 +396,17 @@ def _body(
     """Summary line visible, everything else collapsed under <details>. The whole body stays
     under REVIEW_BODY_BUDGET (room is left for the footer and the APPROVE marker)."""
     parts = [_headline(shaped, sha)]
+    big = [
+        f
+        for f in shaped["findings"]
+        if f["status"] == "accepted" and f["severity"] in ("blocking", "normal")
+    ]
+    if big:
+        who = ", ".join(dict.fromkeys(f"@{_esc(f['accepted_by'])}" for f in big))
+        parts.append(
+            f"Accepted risk: {len(big)} finding(s) above nit accepted by {who} "
+            "(approval on this commit)."
+        )
     if prior_url and REVIEW_URL_RE.match(prior_url):
         parts.append(f"Follows [the previous review]({prior_url}).")
     if shaped.get("signoff_required"):
@@ -633,9 +644,14 @@ def _utc(value: object) -> datetime | None:
     return t if t.tzinfo is not None else None
 
 
+_AUTHORITY = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})  # review author_association
+
+
 def _approval_ok(reviews: list, login: str, head_sha: str, raised_at: object) -> bool:
     """True when `login`'s latest effective review is a human APPROVED on `head_sha`, submitted
-    after `raised_at`. COMMENTED and PENDING reviews do not count either way."""
+    after `raised_at`, by an owner, member or collaborator. COMMENTED and PENDING reviews do not
+    count either way. Any effective review of the login with an unreadable `submitted_at`, or a
+    newest-time tie that review ids cannot break, fails closed."""
     raised = _utc(raised_at)
     mine = []
     for r in map(_dict, reviews):
@@ -643,16 +659,29 @@ def _approval_ok(reviews: list, login: str, head_sha: str, raised_at: object) ->
         if (
             str(user.get("login", "")).lower() == login.lower()
             and r.get("state") in _EFFECTIVE_REVIEW_STATES
-            and (at := _utc(r.get("submitted_at"))) is not None
         ):
+            at = _utc(r.get("submitted_at"))
+            if at is None:
+                return False
             mine.append((at, r, user))
     if raised is None or not mine:
         return False
-    at, review, user = max(mine, key=lambda m: m[0])
+    newest = max(m[0] for m in mine)
+    last = [m for m in mine if m[0] == newest]
+    if len(last) > 1:
+        ids = [m[1].get("id") for m in last]
+        if not all(isinstance(i, int) and not isinstance(i, bool) for i in ids):
+            return False
+        top = max(ids)
+        if ids.count(top) > 1:
+            return False
+        last = [m for m in last if m[1]["id"] == top]
+    at, review, user = last[0]
     return (
         review["state"] == "APPROVED"
         and str(review.get("commit_id", "")).lower() == head_sha.lower()
         and at > raised
+        and review.get("author_association") in _AUTHORITY
         and user.get("type") != "Bot"
         and not str(user.get("login", "")).lower().endswith("[bot]")
         and APPROVE_MARKER not in str(review.get("body") or "")
@@ -669,13 +698,15 @@ def verify_accepted(
     """Keep an "accepted" finding only when GitHub itself shows the named person accepted it.
 
     The engine claims `accepted_by`; PR text is untrusted, so the host checks the claim. In place,
-    every accepted finding that fails any check becomes "open" (accepted_by None), and
-    `has_blocking` is recomputed. A finding stays accepted only when ALL hold:
+    every accepted finding that fails any check becomes "open" (accepted_by None), the question
+    cap is applied again, and `has_blocking` is recomputed. A finding stays accepted only when
+    ALL hold:
     - `reviews` was read and `pr_author` is known, and the accepter is not the PR author;
-    - it matches ONE prior handoff finding (same file, same title key) that no other accepted
-      finding already used;
+    - it matches exactly ONE prior handoff finding (same file, same title key) that no other
+      accepted finding already used;
     - the accepter's latest effective review (APPROVED, CHANGES_REQUESTED or DISMISSED) is an
-      APPROVED on `head_sha`, submitted strictly after the prior finding's `raised_at`;
+      APPROVED on `head_sha`, submitted strictly after the prior finding's `raised_at`, and its
+      `author_association` is OWNER, MEMBER or COLLABORATOR;
     - the accepter is not a bot and the review is not one of Franky's own (APPROVE marker).
     Never raises on malformed input.
     """
@@ -685,28 +716,35 @@ def verify_accepted(
         else []
     )
     used: set[int] = set()
+    demoted = False
     for f in shaped["findings"]:
         if f["status"] != "accepted":
             continue
         ok = isinstance(reviews, list) and isinstance(pr_author, str) and bool(pr_author)
         ok = ok and f["accepted_by"].lower() != pr_author.lower()
-        hit = next(
-            (
-                i
-                for i, p in enumerate(prior)
-                if i not in used
-                and p.get("file") == f["file"]
-                and _title_key(p.get("title")) == _title_key(f["title"])
-            ),
-            None,
-        )
-        if ok and hit is not None:
-            used.add(hit)
-            ok = _approval_ok(reviews, f["accepted_by"], head_sha, prior[hit].get("raised_at"))
+        hits = [
+            i
+            for i, p in enumerate(prior)
+            if p.get("file") == f["file"] and _title_key(p.get("title")) == _title_key(f["title"])
+        ]
+        if ok and len(hits) == 1 and hits[0] not in used:
+            used.add(hits[0])
+            ok = _approval_ok(reviews, f["accepted_by"], head_sha, prior[hits[0]].get("raised_at"))
         else:
             ok = False
         if not ok:
             f["status"], f["accepted_by"] = "open", None
+            demoted = True
+    if demoted:  # a demoted question counts against the open-question cap again
+        kept, questions = [], 0
+        for f in shaped["findings"]:
+            if f["severity"] == "question" and f["status"] not in _CLEARED:
+                questions += 1
+                if questions > MAX_QUESTIONS:
+                    shaped["dropped_malformed"] += 1
+                    continue
+            kept.append(f)
+        shaped["findings"] = kept
     shaped["has_blocking"] = _has_blocking(shaped["findings"])
 
 
