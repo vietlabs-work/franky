@@ -6379,6 +6379,59 @@ def test_review_pr_engine_login_refused_is_auth_error_and_never_publishes(monkey
     assert _only_record()["status"] == "agent_error"
 
 
+CLAUDE_LIMITED = (
+    json.dumps({"type": "result", "is_error": True, "result": "You've hit your limit"}) + "\n"
+)
+
+
+def test_review_pr_usage_limit_envelope_after_tool_use(monkeypatch):
+    calls = _mc_review_setup(
+        monkeypatch,
+        env=_claude_env(FRANKY_MODEL="claude-opus-4-1"),
+        container=(1, CLAUDE_TOOL + "\n" + CLAUDE_LIMITED),
+    )
+    published = []
+    monkeypatch.setattr(cli, "_publish_review", lambda *a, **k: published.append(1))
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["review-pr", PR_URL, "--json"])
+    assert res.exit_code == 7, res.output
+    err = json.loads(res.stdout.strip())["error"]
+    assert set(err) == {"code", "kind", "message", "hint"}
+    assert err["kind"] == "usage_limit" and err["code"] == 7
+    assert "engine 'claude'" in err["message"] and "usage or rate limit" in err["message"]
+    assert "FRANKY_MODEL" in err["hint"]
+    assert not published and len(calls) == 0
+    assert _only_record()["status"] == "agent_error"
+
+
+def test_build_usage_limit_is_usage_limit_kind(monkeypatch):
+    _mc_setup(monkeypatch, env=_claude_env(), container=(1, CLAUDE_LIMITED))
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo", "--json"])
+    assert json.loads(res.stdout)["error"]["kind"] == "usage_limit"
+    assert _only_record()["status"] == "agent_error"
+
+
+@pytest.mark.parametrize(
+    "abort",
+    [
+        "franky: could not inspect Docker security options - refusing to run",
+        "franky: Docker has less than 1 GiB free disk - refusing to run",
+    ],
+)
+def test_build_docker_abort_is_docker_error(monkeypatch, abort):
+    _mc_setup(monkeypatch, env=_claude_env(), container=(1, abort))
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["build", "do it", "--repo", "me/repo", "--json"])
+    assert res.exit_code == 6, res.output
+    err = json.loads(res.stdout)["error"]
+    assert err["kind"] == "docker_error" and abort.removeprefix("franky: ") == err["message"]
+    assert _only_record()["status"] == "agent_error"
+
+
 def test_plan_engine_login_refused_is_auth_error(monkeypatch):
     _mc_setup(monkeypatch, env=_claude_env(), container=(1, CLAUDE_REFUSED))
     runner = CliRunner()

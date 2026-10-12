@@ -280,6 +280,9 @@ _CODEX_AUTH_RE = re.compile(
     r"|refresh token (?:was already used|has expired|is invalid|was revoked)"
     r"|invalid_grant|invalid api key|incorrect api key|sign in again|log ?out and sign in"
 )
+_USAGE_LIMIT_RE = re.compile(
+    r"(?i)usage limit|rate[ _]limit|quota|\b429\b|too many requests|hit your limit|limit reached"
+)
 _CODEX_ABORT = "franky: Codex subscription login is missing or invalid"
 
 
@@ -339,6 +342,14 @@ class Engine:
 
         Base: False (the engine keeps today's agent_error handling). Conservative by design:
         a refusal only counts when the stream shows no tool call, so a rerun is side-effect free.
+        """
+        return False
+
+    def usage_limited(self, tail: str) -> bool:
+        """True when the engine's own error events report a usage or rate limit.
+
+        Base: False. Reads only the engine's error events, never assistant text or tool output.
+        Unlike auth_refused it does not require "no tool call": a limit can hit mid-run.
         """
         return False
 
@@ -492,6 +503,17 @@ class ClaudeEngine(Engine):
             return False
         return refused
 
+    def usage_limited(self, tail: str) -> bool:
+        try:
+            return any(
+                event.get("type") == "result"
+                and event.get("is_error") is True
+                and _USAGE_LIMIT_RE.search(str(event.get("result") or ""))
+                for _, event in _events(tail)
+            )
+        except ValueError:
+            return False
+
     def distill_line(self, line: str) -> str | None:
         line = line.strip()
         if not line.startswith("{"):
@@ -538,6 +560,21 @@ class CodexEngine(Engine):
             if etype in ("error", "turn.failed") and "mcp" not in msg.lower():
                 refused = refused or bool(_CODEX_AUTH_RE.search(msg))
         return refused
+
+    def usage_limited(self, tail: str) -> bool:
+        # Only the LAST error event counts: earlier ones can be transient retries that recovered.
+        last = ""
+        try:
+            for _, event in _events(tail):
+                err = event.get("error")
+                msg = err.get("message") if isinstance(err, dict) else None
+                msg = str(event.get("message") or msg or "")
+                if event.get("type") in ("error", "turn.failed"):
+                    last = msg
+        except ValueError:
+            return False
+        # An MCP server's own limit is not the model's: the last event decides either way.
+        return "mcp" not in last.lower() and bool(_USAGE_LIMIT_RE.search(last))
 
     def inner_argv(
         self, prompt: str, model: str | None, *, session_id: str | None = None, resume: bool = False

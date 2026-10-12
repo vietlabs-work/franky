@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- An engine usage or rate limit now fails with error kind `usage_limit` (exit 7) naming the engine and model, with a hint to switch `FRANKY_MODEL`, instead of the generic `agent_error`.
+- A pre-run Docker abort (`franky: ... - refusing to run`, such as unreadable security options or low free disk) now fails with error kind `docker_error` (exit 6) instead of `agent_error`.
+
 ## [0.3.20] - 2026-10-12
 
 ### Added
