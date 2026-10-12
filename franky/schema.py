@@ -89,6 +89,8 @@ _RESULT_SCHEMA: dict = {
     "is reported as COMMENT)",
     "threads_resolved": "integer; present ONLY when `review-pr --resolve-fixed` ran: the number "
     "of review threads it resolved",
+    "threads_replied": "integer; present ONLY when `review-pr --reply-prior` ran: the number "
+    "of review threads it replied on",
     # Present on every `review-pr` result; [] when no JIRA key was found or in frozen
     # (--at-sha/--diff-base) mode, which never fetches tickets. Never ticket text.
     "context_sources": [

@@ -224,8 +224,12 @@ def test_result_schemas_document_review_outputs():
         "checks",
         "review_url",
         "review_id",
+        "threads_resolved",
+        "threads_replied",
     ):
         assert field in schema["result_schema"]
+    flags = {f["name"] for f in schema["commands"]["review-pr"]["flags"]}
+    assert {"resolve_fixed", "reply_prior"} <= flags
     checks = schema["result_schema"]["checks"]
     assert "review_body" in schema["result_schema"]
     assert isinstance(checks, list)

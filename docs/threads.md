@@ -12,7 +12,7 @@
 - A second run for the same PR while one is active exits 4 (`thread_busy`).
 - Thread ids are lowercase, so `Me/Repo` and `me/repo` share one thread.
 - Without `--thread`, Franky ignores any finding `status` the agent reports.
-- Re-reviews should report each prior finding under its exact prior title; `--resolve-fixed` matches threads by it.
+- Re-reviews should report each prior finding under its exact prior title; `--resolve-fixed` and `--reply-prior` match threads by it.
 - `--rubric-version` pins a rubric label. Changing it, the engine, or the model starts a new session.
 
 Sessions move by stream-in (tar over `docker exec`) and copy-out (a `docker cp ... -` tar stream, capped at 64 MiB) only. No volume or mount is added. Only the session file and its side directory move. Claude's project memory never moves between runs. Stored sessions contain regular files only, are scrubbed of known secret values and token patterns, and are refused on any finding. They stay host-only (0700/0600) and are never exported. The stored findings are redacted the same way. `threads prune` and `threads purge` delete them.
