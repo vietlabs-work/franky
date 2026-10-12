@@ -20,6 +20,7 @@ from franky.reviewpr import (
     reply_body,
     thread_reply_target,
     parse_review_findings,
+    verify_accepted,
     render_review_body,
     review_event,
     signoff_match,
@@ -946,3 +947,173 @@ def test_body_carries_the_signoff_line_only_when_flagged():
     assert SIGNOFF_LINE not in render_review_body(shaped)
     body = render_review_body({**shaped, "signoff_required": True})
     assert "code-clean, human sign-off required" in body
+
+
+# --- accepted risk ---------------------------------------------------------------------------
+
+HEAD = "a" * 40
+RAISED = "2026-01-01T00:00:00Z"
+LATER = "2026-01-02T00:00:00Z"
+PRIOR = [{"title": "Tradeoff.", "file": "a.py", "severity": "normal", "raised_at": RAISED}]
+
+
+def _accepted(**kw):
+    return _f(title="tradeoff", status="accepted", accepted_by="owner-x", **kw)
+
+
+def _review(state="APPROVED", login="owner-x", sha=HEAD, at=LATER, kind="User", body=""):
+    return {
+        "user": {"login": login, "type": kind},
+        "state": state,
+        "commit_id": sha,
+        "submitted_at": at,
+        "body": body,
+    }
+
+
+def _verify(reviews, finding=None, prior=PRIOR, author="author-y", **kw):
+    shaped = _shaped(finding or _accepted(), **kw)
+    verify_accepted(shaped, reviews, HEAD, author, prior)
+    return shaped
+
+
+def test_accepted_by_a_human_approval_on_head_clears_the_finding_and_can_approve():
+    shaped = _verify([_review()])
+    assert shaped["findings"][0]["status"] == "accepted"
+    assert shaped["findings"][0]["accepted_by"] == "owner-x"
+    assert shaped["has_blocking"] is False
+    assert review_event(shaped) == "COMMENT"
+    assert review_event(shaped, allow_approve=True) == "APPROVE"
+
+
+def test_accepted_blocking_finding_no_longer_blocks_once_verified():
+    shaped = _verify([_review()], _accepted(severity="blocking"))
+    assert shaped["has_blocking"] is False
+    assert review_event(shaped, allow_approve=True) == "APPROVE"
+    refused = _verify([], _accepted(severity="blocking"))
+    assert refused["has_blocking"] is True
+    assert review_event(refused, allow_approve=True) == "REQUEST_CHANGES"
+
+
+@pytest.mark.parametrize(
+    "reviews",
+    [
+        [_review(sha="b" * 40)],  # approval on an older commit
+        [_review(), _review("CHANGES_REQUESTED", at="2026-01-03T00:00:00Z")],  # latest wins
+        [_review("DISMISSED", at="2026-01-03T00:00:00Z"), _review()],
+        [_review(at="2025-12-31T00:00:00Z")],  # before the finding was raised
+        [_review(at=RAISED)],  # not strictly after
+        [_review(at="not a date")],
+        [_review("COMMENTED")],
+        [_review("PENDING")],
+        [_review(login="someone-else")],
+        [_review(kind="Bot")],
+        [_review(login="owner-x[bot]")],
+        [_review(body="ok <!-- franky-review:abc -->")],
+        [],
+        None,
+        "nope",
+    ],
+)
+def test_unverified_acceptance_falls_back_to_open(reviews):
+    shaped = _verify(reviews, _accepted(severity="blocking"))
+    f = shaped["findings"][0]
+    assert f["status"] == "open" and f["accepted_by"] is None
+    assert shaped["has_blocking"] is True
+
+
+def test_a_later_comment_review_does_not_hide_the_approval_and_login_case_is_ignored():
+    reviews = [_review(login="Owner-X"), _review("COMMENTED", at="2026-01-05T00:00:00Z")]
+    assert _verify(reviews)["findings"][0]["status"] == "accepted"
+    assert _verify([_review(sha=HEAD.upper())])["findings"][0]["status"] == "accepted"
+
+
+def test_author_cannot_accept_their_own_pr_case_insensitively():
+    shaped = _verify([_review()], author="OWNER-X")
+    assert shaped["findings"][0]["status"] == "open"
+
+
+@pytest.mark.parametrize("author", [None, "", 5])
+def test_unknown_pr_author_fails_closed(author):
+    assert _verify([_review()], author=author)["findings"][0]["status"] == "open"
+
+
+@pytest.mark.parametrize(
+    "prior",
+    [
+        None,
+        "x",
+        [],
+        [{"title": "other", "file": "a.py", "raised_at": RAISED}],
+        [{"title": "tradeoff", "file": "b.py", "raised_at": RAISED}],
+        [{"title": "tradeoff", "file": "a.py"}],  # no raised_at
+        [{"title": "tradeoff", "file": "a.py", "raised_at": "garbage"}],
+        ["junk"],
+    ],
+)
+def test_acceptance_needs_one_matching_prior_with_a_raised_at(prior):
+    assert _verify([_review()], prior=prior)["findings"][0]["status"] == "open"
+
+
+def test_one_prior_entry_serves_one_accepted_finding_only():
+    shaped = _shaped(_accepted(), _accepted())
+    verify_accepted(shaped, [_review()], HEAD, "author-y", PRIOR)
+    assert [f["status"] for f in shaped["findings"]] == ["accepted", "open"]
+
+
+def test_verify_accepted_leaves_other_statuses_alone_and_never_raises():
+    shaped = _shaped(_f(title="a", status="open"), _f(title="b", status="resolved"), _f(title="c"))
+    verify_accepted(shaped, None, HEAD, None, None)
+    assert [f["status"] for f in shaped["findings"]] == ["open", "resolved", "new"]
+    junk = _shaped(_accepted())
+    verify_accepted(junk, [None, 3, {"user": 5, "state": "APPROVED"}], HEAD, "a", PRIOR)
+    assert junk["findings"][0]["status"] == "open"
+
+
+def test_accepted_needs_a_valid_login_and_a_thread():
+    bad = ["", None, "a b", "-x", "x" * 40, "o/x", 5]
+    for login in bad:
+        f = _shaped(_f(status="accepted", accepted_by=login))["findings"][0]
+        assert f["status"] == "open" and f["accepted_by"] is None
+    f = _shaped(_f(status="accepted", accepted_by=" @owner-x "))["findings"][0]
+    assert f["status"] == "accepted" and f["accepted_by"] == "owner-x"
+    plain = _shaped(_f(status="accepted", accepted_by="owner-x"), threaded=False)["findings"][0]
+    assert plain["status"] == "new" and plain["accepted_by"] is None
+
+
+def test_accepted_finding_is_not_live_in_headline_questions_or_blocking():
+    shaped = _shaped(
+        _f(title="q1", severity="question", status="accepted", accepted_by="owner-x"),
+        _f(title="q2", severity="question", status="open"),
+        _f(title="q3", severity="question", status="open"),
+        _f(title="q4", severity="question", status="resolved"),
+        _f(title="b", severity="blocking", status="accepted", accepted_by="owner-x"),
+    )
+    assert shaped["dropped_malformed"] == 0  # accepted questions do not use the cap
+    assert shaped["has_blocking"] is False
+    assert "no findings above nit" not in render_review_body(shaped)  # q2, q3 still live
+    body = render_review_body(_shaped(_f(severity="blocking", status="accepted", accepted_by="o")))
+    assert "no findings above nit." in body
+
+
+def test_body_lists_accepted_risk_with_escaped_login_and_title():
+    shaped = _shaped(_f(title="a <b>", status="accepted", accepted_by="owner-x"))
+    body = render_review_body(shaped)
+    assert "- Accepted risk (by @owner-x): a &lt;b&gt; (a.py:11)" in body
+    nit = _shaped(_f(severity="nit", status="accepted", accepted_by="owner-x"))
+    payload = build_review_payload(nit, commentable_lines(FILES), HEAD, [])
+    assert "Accepted risk" not in payload["body"]  # prior nits stay out of a posted body
+
+
+def test_accepted_finding_never_gets_an_inline_comment_or_blocking_heading():
+    shaped = _shaped(
+        _f(title="fresh", severity="normal"),
+        _f(title="tradeoff", severity="blocking", status="accepted", accepted_by="owner-x"),
+        _f(title="old", severity="blocking", status="resolved"),
+    )
+    payload = build_review_payload(shaped, commentable_lines(FILES), HEAD, [], allow_approve=True)
+    bodies = [c["body"] for c in payload["comments"]]
+    assert len(bodies) == 1 and bodies[0].startswith("**Major: fresh**")
+    assert not any(b.startswith(("**Blocking:", "**Major: tradeoff")) for b in bodies)
+    assert "**Blocking:" not in payload["body"]
+    assert "Accepted risk (by @owner-x): tradeoff" in payload["body"]

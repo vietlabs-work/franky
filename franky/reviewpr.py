@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Iterable
+from datetime import datetime
 
 from .config import redact
 from .sentinel import scan_sentinel_json
@@ -50,7 +51,9 @@ _FILES_API_CAP = 3000  # the PR files API never lists more than this many files
 _VALID_SEVERITIES = frozenset({"blocking", "normal", "question", "nit"})
 _VALID_OUTCOMES = frozenset({"pass", "fail", "skipped"})
 # Per-finding status on a `--thread` re-review: new, still open, or fixed since the last review.
-_VALID_STATUSES = frozenset({"new", "open", "resolved"})
+_VALID_STATUSES = frozenset({"new", "open", "resolved", "accepted"})
+_CLEARED = frozenset({"resolved", "accepted"})  # statuses that no longer block or stay live
+_LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")  # a GitHub login
 
 # Fixed GraphQL documents (see the module docstring); never built from input.
 THREADS_QUERY = (
@@ -68,6 +71,7 @@ MAX_REPLY_EVIDENCE_CHARS = 600
 MAX_REPLY_CHARS = 2000  # the host gh wrapper refuses a longer reply body
 APPROVE_MARKER = "franky-review"  # `<!-- franky-review:<nonce> -->` ends an APPROVE body
 
+_EFFECTIVE_REVIEW_STATES = frozenset({"APPROVED", "CHANGES_REQUESTED", "DISMISSED"})
 MAX_INLINE = 8  # inline comments per review
 MAX_QUESTIONS = 2  # question findings kept per review
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
@@ -136,7 +140,9 @@ def _shape_finding(raw: object, threaded: bool = False) -> dict | None:
     engine is autonomous, so we never trust the shape). An unrecognized severity defaults to
     "normal" rather than being dropped, so a slightly-off label doesn't silently lose a finding.
     A missing or unrecognized status defaults to "new", and so does every status when the run is
-    not `--thread`: only a threaded re-review may mark a finding open or resolved.
+    not `--thread`: only a threaded re-review may mark a finding open, resolved or accepted.
+    "accepted" needs an `accepted_by` GitHub login; without one it is "open". Franky's host
+    still verifies the acceptance (`verify_accepted`), this only shapes the claim.
     """
     if not isinstance(raw, dict):
         return None
@@ -154,6 +160,11 @@ def _shape_finding(raw: object, threaded: bool = False) -> dict | None:
     line = _pos_int(raw.get("line"))
     start = _pos_int(raw.get("start_line"))
     suggestion = raw.get("suggestion")
+    status = raw["status"] if threaded and _in(raw.get("status"), _VALID_STATUSES) else "new"
+    accepted_by = raw.get("accepted_by")
+    accepted_by = accepted_by.strip().lstrip("@") if isinstance(accepted_by, str) else ""
+    if status == "accepted" and not _LOGIN_RE.match(accepted_by):
+        status = "open"
     return {
         "title": title.strip()[:MAX_TITLE_CHARS],
         "body": body,
@@ -166,7 +177,8 @@ def _shape_finding(raw: object, threaded: bool = False) -> dict | None:
         "start_line": start if start is not None and line is not None and start < line else None,
         # An empty string is a valid suggestion: it deletes the anchored lines.
         "suggestion": suggestion[:MAX_SUGGESTION_CHARS] if isinstance(suggestion, str) else None,
-        "status": raw["status"] if threaded and _in(raw.get("status"), _VALID_STATUSES) else "new",
+        "status": status,
+        "accepted_by": accepted_by if status == "accepted" else None,
     }
 
 
@@ -195,7 +207,8 @@ def build_review_findings(parsed: dict, threaded: bool = False) -> dict:
 
     `has_blocking` is derived (never trusted from the agent directly) so `review_event` has a
     single, grounded signal for whether REQUEST_CHANGES is warranted. A resolved finding never
-    blocks. `threaded` (`review-pr --thread`) is the only way a status other than "new" is kept.
+    blocks, and neither does an accepted one. `threaded` (`review-pr --thread`) is the only way a
+    status other than "new" is kept.
     """
     raw_findings = parsed.get("findings")
     findings: list[dict] = []
@@ -207,7 +220,7 @@ def build_review_findings(parsed: dict, threaded: bool = False) -> dict:
             if shaped is None:
                 dropped += 1
                 continue
-            if shaped["severity"] == "question" and shaped["status"] != "resolved":
+            if shaped["severity"] == "question" and shaped["status"] not in _CLEARED:
                 questions += 1
                 if questions > MAX_QUESTIONS:  # the method allows at most 2 open
                     dropped += 1  # an unshown open question must still block APPROVE
@@ -238,10 +251,12 @@ def build_review_findings(parsed: dict, threaded: bool = False) -> dict:
         "findings": findings,
         "checks": checks,
         "dropped_malformed": dropped,
-        "has_blocking": any(
-            f["severity"] == "blocking" and f["status"] != "resolved" for f in findings
-        ),
+        "has_blocking": _has_blocking(findings),
     }
+
+
+def _has_blocking(findings: list[dict]) -> bool:
+    return any(f["severity"] == "blocking" and f["status"] not in _CLEARED for f in findings)
 
 
 def commentable_lines(files: list[dict]) -> dict[str, list[tuple[int, int]]]:
@@ -359,7 +374,7 @@ def _block(title: str, items: list[str], sep: str, room: int) -> str:
 
 
 def _headline(shaped: dict, sha: str) -> str:
-    live = [f for f in shaped["findings"] if f["status"] != "resolved" and f["severity"] != "nit"]
+    live = [f for f in shaped["findings"] if f["status"] not in _CLEARED and f["severity"] != "nit"]
     live += shaped.get("omitted_prior") or []
     blocking = sum(f["severity"] == "blocking" for f in live)
     what = (
@@ -395,9 +410,15 @@ def _body(
         + (f" ({_esc(f['file'])})" if f.get("file") else "")
         for f in shaped.get("omitted_prior") or []
     ] + [
-        f"- {'Still open' if f['status'] == 'open' else 'Fixed'}: {_esc(f['title'])}{_loc(f)}"
+        (
+            f"- Accepted risk (by @{_esc(f['accepted_by'])}): {_esc(f['title'])}{_loc(f)}"
+            if f["status"] == "accepted"
+            else f"- {'Still open' if f['status'] == 'open' else 'Fixed'}: "
+            f"{_esc(f['title'])}{_loc(f)}"
+        )
         for f in shaped["findings"]
-        if f["status"] in ("open", "resolved") and (prior_nits or f["severity"] != "nit")
+        if f["status"] in ("open", "resolved", "accepted")
+        and (prior_nits or f["severity"] != "nit")
     ]
     failed = [
         f"- Failed check: {_esc(c['name'])}" + (f" - {_esc(c['detail'])}" if c["detail"] else "")
@@ -573,7 +594,8 @@ def review_event(shaped: dict, allow_approve: bool = False) -> str:
     """COMMENT, REQUEST_CHANGES or (only with `allow_approve`) APPROVE.
 
     The default can never return APPROVE. With `allow_approve`, APPROVE needs every finding above
-    nit (blocking, Major, or an open question, whose deciding fact is still unknown) to be resolved,
+    nit (blocking, Major, or an open question, whose deciding fact is still unknown) to be resolved
+    or accepted (an acceptance `verify_accepted` confirmed),
     no finding dropped as malformed, no prior finding left out of a threaded re-review
     (`omitted_prior`; an omitted blocking one gives REQUEST_CHANGES), no thread handoff that
     overflowed (`prior_overflow`), and no failed check. The decision reads the full structured
@@ -589,11 +611,103 @@ def review_event(shaped: dict, allow_approve: bool = False) -> str:
         and not shaped.get("prior_overflow")
         and not any(c["outcome"] == "fail" for c in shaped["checks"])
         and not any(
-            f["severity"] != "nit" and f["status"] != "resolved" for f in shaped["findings"]
+            f["severity"] != "nit" and f["status"] not in _CLEARED for f in shaped["findings"]
         )
     ):
         return "APPROVE"
     return "COMMENT"
+
+
+def _title_key(title: object) -> str:
+    return title.casefold().rstrip(".:;!? ") if isinstance(title, str) else ""
+
+
+def _utc(value: object) -> datetime | None:
+    """An ISO-8601 UTC timestamp as an aware datetime, or None when it is not one."""
+    if not isinstance(value, str):
+        return None
+    try:
+        t = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return t if t.tzinfo is not None else None
+
+
+def _approval_ok(reviews: list, login: str, head_sha: str, raised_at: object) -> bool:
+    """True when `login`'s latest effective review is a human APPROVED on `head_sha`, submitted
+    after `raised_at`. COMMENTED and PENDING reviews do not count either way."""
+    raised = _utc(raised_at)
+    mine = []
+    for r in map(_dict, reviews):
+        user = _dict(r.get("user"))
+        if (
+            str(user.get("login", "")).lower() == login.lower()
+            and r.get("state") in _EFFECTIVE_REVIEW_STATES
+            and (at := _utc(r.get("submitted_at"))) is not None
+        ):
+            mine.append((at, r, user))
+    if raised is None or not mine:
+        return False
+    at, review, user = max(mine, key=lambda m: m[0])
+    return (
+        review["state"] == "APPROVED"
+        and str(review.get("commit_id", "")).lower() == head_sha.lower()
+        and at > raised
+        and user.get("type") != "Bot"
+        and not str(user.get("login", "")).lower().endswith("[bot]")
+        and APPROVE_MARKER not in str(review.get("body") or "")
+    )
+
+
+def verify_accepted(
+    shaped: dict,
+    reviews: list | None,
+    head_sha: str,
+    pr_author: str | None,
+    prior_findings: object,
+) -> None:
+    """Keep an "accepted" finding only when GitHub itself shows the named person accepted it.
+
+    The engine claims `accepted_by`; PR text is untrusted, so the host checks the claim. In place,
+    every accepted finding that fails any check becomes "open" (accepted_by None), and
+    `has_blocking` is recomputed. A finding stays accepted only when ALL hold:
+    - `reviews` was read and `pr_author` is known, and the accepter is not the PR author;
+    - it matches ONE prior handoff finding (same file, same title key) that no other accepted
+      finding already used;
+    - the accepter's latest effective review (APPROVED, CHANGES_REQUESTED or DISMISSED) is an
+      APPROVED on `head_sha`, submitted strictly after the prior finding's `raised_at`;
+    - the accepter is not a bot and the review is not one of Franky's own (APPROVE marker).
+    Never raises on malformed input.
+    """
+    prior = (
+        [p for p in prior_findings if isinstance(p, dict)]
+        if isinstance(prior_findings, list)
+        else []
+    )
+    used: set[int] = set()
+    for f in shaped["findings"]:
+        if f["status"] != "accepted":
+            continue
+        ok = isinstance(reviews, list) and isinstance(pr_author, str) and bool(pr_author)
+        ok = ok and f["accepted_by"].lower() != pr_author.lower()
+        hit = next(
+            (
+                i
+                for i, p in enumerate(prior)
+                if i not in used
+                and p.get("file") == f["file"]
+                and _title_key(p.get("title")) == _title_key(f["title"])
+            ),
+            None,
+        )
+        if ok and hit is not None:
+            used.add(hit)
+            ok = _approval_ok(reviews, f["accepted_by"], head_sha, prior[hit].get("raised_at"))
+        else:
+            ok = False
+        if not ok:
+            f["status"], f["accepted_by"] = "open", None
+    shaped["has_blocking"] = _has_blocking(shaped["findings"])
 
 
 def _dict(v: object) -> dict:

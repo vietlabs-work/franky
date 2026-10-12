@@ -34,6 +34,58 @@ def _write(path, text="x"):
     return path
 
 
+def _acc(**kw):
+    return {
+        "title": "tradeoff",
+        "file": "a.py",
+        "line": 3,
+        "severity": "normal",
+        "status": "accepted",
+        "accepted_by": "owner-x",
+        **kw,
+    }
+
+
+def test_build_handoff_carries_accepted_with_login_and_stamps_raised_at():
+    prior = {
+        "findings": [
+            {"title": "Tradeoff.", "file": "a.py", "raised_at": "2026-01-01T00:00:00+00:00"}
+        ]
+    }
+    shaped = _shaped(
+        [
+            _acc(accepted_by="owner-x\nsecond line"),
+            {"title": "fresh", "file": "b.py", "severity": "normal", "status": "new"},
+            {"title": "gone", "file": "c.py", "severity": "normal", "status": "resolved"},
+        ]
+    )
+    handoff = threads.build_handoff(shaped, "s", [], now=NOW, prior_handoff=prior)
+    by_title = {f["title"]: f for f in handoff["findings"]}
+    assert set(by_title) == {"tradeoff", "fresh"}  # resolved dropped, accepted kept
+    assert by_title["tradeoff"]["status"] == "accepted"
+    assert by_title["tradeoff"]["accepted_by"] == "owner-x second line"
+    assert by_title["tradeoff"]["raised_at"] == "2026-01-01T00:00:00+00:00"  # copied, not reset
+    assert by_title["fresh"]["raised_at"] == NOW.isoformat(timespec="seconds")
+    assert "accepted_by" not in by_title["fresh"]
+
+
+def test_build_handoff_leaves_raised_at_missing_when_the_prior_had_none():
+    prior = {"findings": [{"title": "tradeoff", "file": "a.py"}]}
+    handoff = threads.build_handoff(_shaped([_acc()]), "s", [], now=NOW, prior_handoff=prior)
+    assert "raised_at" not in handoff["findings"][0]
+
+
+def test_omitted_accepted_prior_comes_back_open_and_keeps_raised_at():
+    prior = {"findings": [_acc(raised_at="2026-01-01T00:00:00+00:00")]}
+    omitted = threads.omitted_prior(_shaped([]), prior, [])
+    assert omitted[0]["status"] == "open" and omitted[0]["accepted_by"] is None
+    assert omitted[0]["raised_at"] == "2026-01-01T00:00:00+00:00"
+    handoff = threads.build_handoff({"findings": [], "omitted_prior": omitted}, "s", [], now=NOW)
+    assert handoff["findings"][0]["status"] == "open"
+    assert "accepted_by" not in handoff["findings"][0]
+    assert handoff["findings"][0]["raised_at"] == "2026-01-01T00:00:00+00:00"
+
+
 def _record(**overrides):
     record = {
         "schema": 1,

@@ -585,10 +585,35 @@ def test_review_prompt_handoff_block_is_fenced_and_scoped():
     assert f"- Last reviewed commit: {'c' * 40}" in prompt
     assert f"2. Review the delta {'c' * 40}..HEAD fully." in prompt
     assert "only at blocking severity" in prompt and "force-push or rebase" in prompt
-    assert '"suggestion": "text-or-null", "status": "<new|open|resolved>"}], "checks"' in prompt
+    assert (
+        '"suggestion": "text-or-null", "status": "<new|open|resolved|accepted>", '
+        '"accepted_by": "<login-or-null>"}], "checks"' in prompt
+    )
+    assert 'or "accepted". Use "accepted" only for a prior finding' in prompt
+    assert "Franky's host verifies that person's approval itself" in prompt
     # The block sits after the task block and before the review conventions.
     assert prompt.index("Task: independently review") < prompt.index(begin)
     assert prompt.index(end) < prompt.index("REVIEW MODE")
+
+
+def test_review_prompt_shows_accepted_by_on_an_accepted_prior_finding():
+    handoff = {
+        "schema": 1,
+        "sha": "b" * 40,
+        "summary": "s",
+        "findings": [
+            {
+                "title": "tradeoff",
+                "file": "a.py",
+                "line": 3,
+                "severity": "normal",
+                "status": "accepted",
+                "accepted_by": "owner-x",
+            }
+        ],
+    }
+    prompt = build_review_pr_prompt("me/repo", "u", "", "n0", handoff=handoff, last_sha="c" * 40)
+    assert "- [normal] tradeoff (a.py:3) status=accepted accepted_by=owner-x\n" in prompt
 
 
 def test_review_prompt_carries_method_trust_boundary_and_readonly_rules():

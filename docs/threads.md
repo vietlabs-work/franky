@@ -8,10 +8,11 @@
 - Other engines, and a session that is stale, changed, or rejected, start a new session seeded with the stored findings. A thread never blocks the review.
 - If a resumed session fails, Franky drops it and retries once in the same run with a seeded session. The result reports `session: seeded` with `session_reason: resume_failed`.
 - A new session is stored only after a clean run with parsed findings. A failed run keeps the previous session and findings.
-- The prompt tells the agent to verify each prior finding (`open` or `resolved`), review the delta since the last reviewed head, and report new findings on unchanged code only at blocking severity.
+- The prompt tells the agent to verify each prior finding (`open`, `resolved`, or `accepted` with the accepting human's login), review the delta since the last reviewed head, and report new findings on unchanged code only at blocking severity.
 - A second run for the same PR while one is active exits 4 (`thread_busy`).
 - Thread ids are lowercase, so `Me/Repo` and `me/repo` share one thread.
 - Without `--thread`, Franky ignores any finding `status` the agent reports.
+- A third status, `accepted`, records a risk or tradeoff a named human accepted. The handoff carries it with `accepted_by` and `raised_at`, and the host verifies it again on every run against the PR's reviews (see `--allow-approve` in [review.md](review.md)). An unverified one counts as `open`; a handoff from an older version has no `raised_at`, so it cannot be accepted until the finding is raised again.
 - Re-reviews should report each prior finding under its exact prior title; `--resolve-fixed` and `--reply-prior` match threads by it.
 - `--rubric-version` pins a rubric label. Changing it, the engine, or the model starts a new session.
 

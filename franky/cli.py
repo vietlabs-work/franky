@@ -120,6 +120,7 @@ from .reviewpr import (
     reply_body,
     review_event,
     thread_reply_target,
+    verify_accepted,
 )
 from .result import (
     EXIT_AGENT,
@@ -1121,6 +1122,32 @@ def _paged_list(out: str) -> list | None:
     return items
 
 
+def _read_pr_reviews(repo: str, pr_number: int, secrets: list[str]) -> list | None:
+    """Every review of the PR, or None when the read failed (already logged).
+
+    The exact `gh api` shape is what the host wrapper allows: do not add flags."""
+    try:
+        code, out, err = run_gh(
+            [
+                "api",
+                f"repos/{repo}/pulls/{pr_number}/reviews?per_page=100",
+                "--paginate",
+                "--slurp",
+            ],
+            os.environ,
+            timeout=_resolve_gh_timeout(os.environ),
+        )
+        reviews = _paged_list(out) if code == 0 else None
+        if reviews is None:
+            raise ValueError(err.strip() or "unparsable reviews")
+    except (FrankyError, DockerError, OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        click.echo(
+            f"franky: could not read PR reviews: {redact(str(exc), secrets)[:200]}", err=True
+        )
+        return None
+    return reviews
+
+
 def _find_marked_review(gh, repo: str, pr_number: int, sha: str, marker: str):
     """Reconcile an uncertain APPROVE POST. Returns ("found", review), ("absent", None) or
     ("unknown", None). Absent needs two clean reads, a short sleep apart; any failed, refused,
@@ -2012,6 +2039,14 @@ def review_pr(
             else:
                 shaped = build_review_findings(parsed, threaded=thread is not None)
                 if thread is not None:
+                    if any(f["status"] == "accepted" for f in shaped["findings"]):
+                        verify_accepted(
+                            shaped,
+                            _read_pr_reviews(repo, pr_number, secrets),
+                            pinned_sha,
+                            pr_meta.get("author"),
+                            (prior_handoff or {}).get("findings"),
+                        )
                     shaped["omitted_prior"] = threads.omitted_prior(shaped, prior_handoff, secrets)
                     shaped["prior_overflow"] = bool((prior_handoff or {}).get("overflow"))
                 findings_summary = shaped["summary"]
