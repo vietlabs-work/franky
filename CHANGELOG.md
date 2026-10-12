@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.21] - 2026-10-12
+
 ### Fixed
 
 - An engine usage or rate limit now fails with error kind `usage_limit` (exit 7) naming the engine and model, with a hint to switch `FRANKY_MODEL`, instead of the generic `agent_error`.
