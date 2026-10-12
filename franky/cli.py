@@ -69,6 +69,7 @@ from .jira import (
     extract_jira_keys,
     fetch_jira_comments,
     fetch_jira_issue,
+    jira_cli,
     jira_configured,
     jira_secret_strings,
 )
@@ -3243,7 +3244,7 @@ def _enable_atlassian(
 
     if not atlassian.stored_secrets(os.environ):
         verdict("not_connected")
-        if jira_configured(os.environ):
+        if jira_configured(os.environ) and not jira_cli(os.environ):
             say("franky: Atlassian tools off - run `franky connect jira`")
         return
     if private is None:

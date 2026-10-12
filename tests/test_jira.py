@@ -24,7 +24,7 @@ from franky.jira import (
 
 import urllib.error
 
-from franky.result import NetworkError
+from franky.result import AuthError, NetworkError
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -619,3 +619,131 @@ def test_fetch_jira_comments_default_opener_does_not_follow_redirects(monkeypatc
     monkeypatch.setattr(jira, "_no_redirect_open", fake)
     assert fetch_jira_comments("FOO-1", _GOOD_ENV, timeout=5) == ""
     assert calls == [5]
+
+
+# --- JIRA_CLI transport -----------------------------------------------------------------------
+
+import subprocess  # noqa: E402
+
+from franky.jira import JIRA_CLI_VAR, jira_cli  # noqa: E402
+
+_CLI_ENV = {JIRA_CLI_VAR: "/opt/test/acli", "HOME": "/h", "PATH": "/bin", "GH_TOKEN": "ghp_fake"}
+
+
+def _fake_run(stdout=b"", stderr=b"", rc=0, exc=None, seen=None):
+    def run(argv, env, timeout, cap):
+        if seen is not None:
+            seen.append((argv, env))
+        if exc:
+            raise exc
+        return rc, stdout, stderr
+
+    return run
+
+
+def _issue_json(**fields) -> bytes:
+    base = {"summary": "Cap it", "description": None, "security": None}
+    return json.dumps({"key": "FOO-1", "fields": {**base, **fields}}).encode()
+
+
+def test_jira_cli_set_counts_as_configured_and_wins_over_rest():
+    assert jira_configured({JIRA_CLI_VAR: "/opt/test/acli"})
+    assert not jira_configured({JIRA_CLI_VAR: "  "})
+    opener_calls = []
+    seen: list = []
+    out = fetch_jira_issue(
+        "FOO-1",
+        {**_GOOD_ENV, **_CLI_ENV},
+        opener=lambda *a, **k: opener_calls.append(1),
+        runner=_fake_run(_issue_json(), seen=seen),
+    )
+    assert out == "[FOO-1] Cap it" and not opener_calls
+    argv, child_env = seen[0]
+    assert argv == [
+        "/opt/test/acli", "jira", "workitem", "view", "FOO-1",
+        "--fields", "summary,description,security", "--json",
+    ]  # fmt: skip
+    assert child_env == {"HOME": "/h", "PATH": "/bin"}  # no GH_TOKEN, no JIRA_* vars
+    assert jira_cli(_CLI_ENV) == "/opt/test/acli"
+
+
+def test_jira_cli_refuses_restricted_issue():
+    with pytest.raises(NetworkError) as ei:
+        fetch_jira_issue(
+            "FOO-1",
+            _CLI_ENV,
+            refuse_restricted=True,
+            runner=_fake_run(_issue_json(security={"name": "Secret"})),
+        )
+    assert ei.value.reason == "restricted"
+
+
+@pytest.mark.parametrize(
+    ("run", "reason", "stop"),
+    [
+        (_fake_run(rc=1, stderr=b"Issue does not exist or you do not have permission."), "not_found", False),
+        (_fake_run(rc=1, stderr=b"Error: unauthorized, please login"), "auth", True),
+        (_fake_run(exc=subprocess.TimeoutExpired("acli", 1)), "timeout", True),
+        (_fake_run(exc=FileNotFoundError("nope")), "unavailable", True),
+        (_fake_run(rc=2, stderr=b"boom jira-secret-text"), "network", False),
+        (_fake_run(stdout=b"not json"), "network", False),
+        (_fake_run(stdout=b"x" * (256 * 1024 + 1)), "network", False),
+    ],
+)  # fmt: skip
+def test_jira_cli_failures_map_to_reasons_without_relaying_stderr(run, reason, stop):
+    with pytest.raises((NetworkError, AuthError)) as ei:
+        fetch_jira_issue("FOO-1", _CLI_ENV, runner=run)
+    assert ei.value.reason == reason and ei.value.stop is stop
+    assert "jira-secret-text" not in str(ei.value)
+
+
+def test_jira_cli_relative_path_is_unavailable_and_never_runs():
+    ran = []
+    with pytest.raises(NetworkError) as ei:
+        fetch_jira_issue("FOO-1", {JIRA_CLI_VAR: "acli"}, runner=_fake_run(seen=ran))
+    assert ei.value.reason == "unavailable" and not ran
+
+
+def test_jira_cli_comments_use_newest_first_listing_and_keep_only_public():
+    seen: list = []
+    payload = json.dumps(
+        {
+            "comments": [
+                {"author": "Zed", "body": "newest", "id": "3", "visibility": "public"},
+                {"author": "Y", "body": "hidden", "id": "2", "visibility": "role:x"},
+                {"author": "Y", "body": "unmarked", "id": "4"},
+                {"author": "Y", "body": "older", "id": "1", "visibility": "public"},
+            ],
+            "total": 9,
+            "isLast": False,
+        }
+    ).encode()  # fmt: skip
+    out = fetch_jira_comments("FOO-1", _CLI_ENV, runner=_fake_run(payload, seen=seen))
+    assert seen[0][0][3:] == [
+        "comment", "list", "--key", "FOO-1", "--order", "-created", "--limit", "5", "--json",
+    ]  # fmt: skip
+    assert out == ("Latest ticket comments, newest first (2 shown of 9):\n- newest\n- older")
+    assert "Zed" not in out
+
+
+def test_jira_cli_comments_accept_a_bare_list():
+    payload = json.dumps([{"body": "hi", "visibility": "public"}]).encode()
+    out = fetch_jira_comments("FOO-1", _CLI_ENV, runner=_fake_run(payload))
+    assert out == "Latest ticket comments, newest first (1 shown):\n- hi"
+
+
+def test_jira_cli_comments_unparseable_shape_raises_network():
+    with pytest.raises(NetworkError) as ei:
+        fetch_jira_comments("FOO-1", _CLI_ENV, runner=_fake_run(b'"oops"'))
+    assert ei.value.reason == "network"
+
+
+def test_run_bounded_kills_a_runaway_child_and_times_out_a_hung_one():
+    from franky.jira import _run_bounded
+
+    rc, out, _ = _run_bounded(["/bin/sh", "-c", "echo ok; echo bad >&2; exit 3"], {}, 5, 100)
+    assert (rc, out.strip()) == (3, b"ok")
+    _, big, _ = _run_bounded(["/bin/sh", "-c", "yes"], {}, 5, 1000)
+    assert 1000 < len(big) <= 1001
+    with pytest.raises(subprocess.TimeoutExpired):
+        _run_bounded(["/bin/sh", "-c", "sleep 5"], {}, 0.2, 100)

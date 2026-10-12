@@ -5414,6 +5414,16 @@ def test_review_pr_publish_passes_the_pr_base_sha_to_the_signoff_floor(monkeypat
     assert seen[0]["base_sha"] == "b" * 40 and seen[0]["allow_approve"] is True
 
 
+def test_review_pr_with_only_jira_cli_fetches_and_reports_included(monkeypatch, tmp_path):
+    _, fetched = _jira_review_setup(
+        monkeypatch, tmp_path, jira=False, extra_env={"JIRA_CLI": "/opt/test/acli"}
+    )
+    res = _review(["--engine", "claude", "--no-publish"])
+    assert res.exit_code == 0, res.output
+    assert [s["status"] for s in json.loads(res.stdout)["context_sources"]][0] == "included"
+    assert fetched
+
+
 def test_review_pr_without_jira_env_reports_unconfigured_and_never_fetches(monkeypatch, tmp_path):
     prompts, fetched = _jira_review_setup(monkeypatch, tmp_path, jira=False)
     res = _review(["--engine", "claude", "--no-publish"])
