@@ -877,3 +877,75 @@ def test_codex_auth_refused_ignores_non_auth_errors(msg):
 @pytest.mark.parametrize("text", ["took 401 ms", "port 401 closed", "HTTP 500 error"])
 def test_claude_auth_refused_ignores_bare_401(text):
     assert ClaudeEngine().auth_refused(_claude_result(text)) is False
+
+
+# --- usage_limited: only the engine's own error events count ---
+
+
+def test_claude_usage_limited_on_result_error_even_after_tool_use():
+    work = json.dumps(
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {}}]},
+        }
+    )
+    limit = _claude_result("You've hit your limit - resets 5pm")
+    assert ClaudeEngine().usage_limited(limit) is True
+    assert ClaudeEngine().usage_limited(work + "\n" + limit) is True
+
+
+def test_claude_usage_limited_negative_and_ignores_assistant_text():
+    assert ClaudeEngine().usage_limited(_claude_result("max turns reached")) is False
+    assert ClaudeEngine().usage_limited(_claude_result("rate limit", is_error=False)) is False
+    text = json.dumps(
+        {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "API Error: 429 rate limit"}]},
+        }
+    )
+    assert ClaudeEngine().usage_limited(text + "\n" + _claude_result("boom")) is False
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        {
+            "type": "turn.failed",
+            "error": {"message": "You've hit your usage limit for gpt-6.1-sol"},
+        },
+        {"type": "error", "message": "unexpected status 429 Too Many Requests"},
+    ],
+)
+def test_codex_usage_limited_on_error_events(line):
+    work = json.dumps({"type": "item.completed"})
+    assert CodexEngine().usage_limited(json.dumps(line) + "\n") is True
+    assert CodexEngine().usage_limited(work + "\n" + json.dumps(line)) is True
+
+
+def test_codex_usage_limited_negative():
+    assert CodexEngine().usage_limited(json.dumps({"type": "error", "message": "boom"})) is False
+    mcp = {"type": "error", "message": "mcp server rate limit"}
+    assert CodexEngine().usage_limited(json.dumps(mcp)) is False
+    text = {"type": "item.completed", "item": {"type": "agent_message", "text": "rate limit"}}
+    assert CodexEngine().usage_limited(json.dumps(text)) is False
+    assert CodexEngine().usage_limited('{"broken\n') is False
+
+
+def test_pi_and_opencode_never_report_usage_limited():
+    out = _claude_result("rate limit")
+    assert PiEngine().usage_limited(out) is False
+    assert OpenCodeEngine().usage_limited(out) is False
+
+
+def test_codex_usage_limited_judges_only_the_last_error_event():
+    early = json.dumps({"type": "error", "message": "Reconnecting... 429 Too Many Requests"})
+    other = json.dumps({"type": "turn.failed", "error": {"message": "boom"}})
+    limit = json.dumps({"type": "turn.failed", "error": {"message": "You've hit your usage limit"}})
+    assert CodexEngine().usage_limited(early + "\n" + other) is False
+    assert CodexEngine().usage_limited(other + "\n" + limit) is True
+
+
+def test_codex_usage_limited_a_last_mcp_error_wins_over_an_earlier_limit():
+    early = json.dumps({"type": "error", "message": "429 Too Many Requests"})
+    mcp = json.dumps({"type": "error", "message": "mcp server jira: rate limit exceeded"})
+    assert CodexEngine().usage_limited(early + "\n" + mcp) is False

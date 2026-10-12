@@ -134,6 +134,7 @@ from .result import (
     DockerError,
     FrankyError,
     ImagePullTimeout,
+    UsageLimit,
     NetworkError,
     TaskRejected,
     build_error,
@@ -641,7 +642,7 @@ def build(
                     kind="timeout",
                 )
             if code != 0:
-                raise _engine_auth_error(cfg, code, output) or FrankyError(
+                raise _engine_error(cfg, code, output) or FrankyError(
                     f"planning pass exited non-zero ({code}) - see the redacted log "
                     f"({plan_log_path})",
                     code=EXIT_AGENT,
@@ -1040,7 +1041,7 @@ def iterate(
             log_path=log_path,
             diagnostics=diagnostics,
         )
-        if auth_error := _engine_auth_error(cfg, code, output, clean=work_sink["clean"]):
+        if auth_error := _engine_error(cfg, code, output, clean=work_sink["clean"]):
             raise auth_error
         result = build_result(
             status=status,
@@ -2118,7 +2119,7 @@ def review_pr(
             },
         )
         # Reached only when the agent failed (code != 0), so _publish_review never ran.
-        if auth_error := _engine_auth_error(cfg, code, output, clean=work_sink["clean"]):
+        if auth_error := _engine_error(cfg, code, output, clean=work_sink["clean"]):
             raise auth_error
         result = build_result(
             status=status,
@@ -2274,7 +2275,7 @@ def plan(
                 kind="timeout",
             )
         if code != 0:
-            raise _engine_auth_error(cfg, code, output) or FrankyError(
+            raise _engine_error(cfg, code, output) or FrankyError(
                 f"plan pass exited {code} - see the redacted log ({decompose_log_path})",
                 code=EXIT_AGENT,
                 kind="agent_error",
@@ -2417,6 +2418,42 @@ def _engine_auth_error(cfg, code, output, *, clean=True) -> AuthError | None:
         f"engine '{cfg.engine.name}' login was refused (expired, revoked or invalid) "
         "before any tool call - safe to rerun",
         hint=f"renew the engine login: {cfg.engine.cred_hint()}",
+    )
+
+
+def _engine_usage_limit(cfg, code, output) -> UsageLimit | None:
+    """A UsageLimit when the engine's own error events report a usage or rate limit, else None.
+
+    No short-output or clean-attempt condition: a limit can hit after tool calls, and the run
+    record is already written when callers raise it."""
+    if code in (0, CONTAINER_TIMEOUT_CODE) or not cfg.engine.usage_limited(_output_tail(output)):
+        return None
+    model = getattr(cfg, "model", None)
+    return UsageLimit(
+        f"engine '{cfg.engine.name}'{f' model {model!r}' if model else ''} hit its usage or "
+        "rate limit - switch the model or wait for the limit to reset",
+        hint="set another model: franky config set FRANKY_MODEL <model>",
+    )
+
+
+def _docker_abort_error(code, output) -> DockerError | None:
+    """A DockerError when the whole output is container.py's single pre-run abort line."""
+    if code in (0, CONTAINER_TIMEOUT_CODE):
+        return None
+    tail = _output_tail(output).strip()
+    first = tail.splitlines()[0] if tail else ""
+    if first.startswith("franky: ") and "refusing to run" in first and "{" not in tail:
+        return DockerError(first.removeprefix("franky: "), hint="fix the Docker host, then rerun")
+    return None
+
+
+def _engine_error(cfg, code, output, *, clean=True) -> FrankyError | None:
+    """The host-fixable engine failure for a finished pass, else None: auth first, then usage
+    limit, then a pre-run Docker abort. Callers raise it AFTER the run record is written."""
+    return (
+        _engine_auth_error(cfg, code, output, clean=clean)
+        or _engine_usage_limit(cfg, code, output)
+        or _docker_abort_error(code, output)
     )
 
 
@@ -3742,7 +3779,7 @@ def _build_once(
                 env=env,
             )
         # Only the FIRST attempt: an earlier attempt of a --retry loop may already have pushed.
-        if first_attempt and (auth_error := _engine_auth_error(cfg, code, output)):
+        if auth_error := _engine_error(cfg, code, output, clean=first_attempt):
             raise auth_error
         keep_bundle = status == "branch_ready"  # fully established only now
         return outcome
@@ -4932,7 +4969,7 @@ def job_replay(
             env=os.environ,
         )
 
-        if auth_error := _engine_auth_error(cfg, code, output):
+        if auth_error := _engine_error(cfg, code, output):
             raise auth_error
         result = build_result(
             status=status,

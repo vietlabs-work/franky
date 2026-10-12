@@ -438,7 +438,9 @@ _ERROR_SCHEMA: dict = {
         "code": "the process exit code (see exit_codes)",
         "kind": (
             "a stable machine slug for the failure class (e.g. config_error). "
-            "image_pull_timeout: the image pull hit its cap, nothing ran, retry is safe (exit 6)"
+            "image_pull_timeout: the image pull hit its cap, nothing ran, retry is safe (exit 6). "
+            "usage_limit: the engine model hit its usage or rate limit, switch the model "
+            "or wait (exit 7)"
         ),
         "message": "a redacted, human-readable message",
         "hint": "an optional operator-facing remediation hint (may be empty)",

@@ -407,3 +407,8 @@ def test_started_event_schema_documents_profile_files_and_diagnose():
     started = build_schema(cli.main)["started_event_schema"]
     assert "profile_files" in started and "always present" in started["profile_files"]
     assert "diagnose" in started["command"]
+
+
+def test_error_schema_lists_usage_limit():
+    kind = build_schema(cli.main)["error_schema"]["error"]["kind"]
+    assert "usage_limit" in kind

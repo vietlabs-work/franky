@@ -65,6 +65,13 @@ With `--json`, every run prints one `{"event":"started","job_id":...,"status_com
 
 If the engine's own login is missing, expired, revoked, or refused, the command ends with the `auth_error` envelope (exit 5) and a `message` that starts with `no creds present for engine '<e>'`, `engine '<e>' requires `, or `engine '<e>' login was refused`. The last form appears only for `build`, `iterate`, `review-pr`, `plan`, and `job replay`, and only when no attempt of the run made an engine tool call, so rerunning the same request with another engine is safe. It proves no engine tool call, not that operator hooks or profile MCP servers did nothing. `job resume` and the build pass of `build --plan-first` keep `agent_error`, and so does a `build --retry` attempt after the first. The job record stays `agent_error`.
 
+Two more host-fixable failures get their own kind instead of `agent_error`. The job record still stays `agent_error`, and they apply at the same call sites as `auth_error` (without its no-tool-call and single-attempt conditions).
+
+| `kind` | Exit | Meaning |
+|--------|-----:|---------|
+| `usage_limit` | `7` | The engine's own error event reports a usage or rate limit. The message names the engine and model. Set another model with `franky config set FRANKY_MODEL <model>` or wait for the reset. |
+| `docker_error` | `6` | A pre-run check refused to start the task (for example Docker security options, free disk, or the egress proxy). Nothing ran. |
+
 `state` is `active` (output in the last 120 s), `quiet` (alive, silent), `orphaned` (the owning process is gone), `unknown` (liveness cannot be confirmed), or `finished`. `next` gives one `action` (`wait`, `check`, `kill`, `resume`, `rerun`, `inspect`, `done`), its `command`, `retry_safe`, and `check_after`. Do not rerun unless `retry_safe` is true. `unknown` is never proof of death.
 
 A run also keeps `<job_id>.progress.json` beside its record: phase, attempt, last tool name (never arguments), and last output time. It is host-only, never exported, and pruned with the record.

@@ -105,6 +105,13 @@ class ImagePullTimeout(DockerError):
     kind = "image_pull_timeout"
 
 
+class UsageLimit(FrankyError):
+    """The engine's model hit its usage or rate limit. Exit 7 (agent failure)."""
+
+    code = EXIT_AGENT
+    kind = "usage_limit"
+
+
 class NetworkError(FrankyError):
     """Network/timeout reaching JIRA, HTTP error, or unparseable response. Exit 8."""
 
