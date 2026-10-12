@@ -1365,6 +1365,7 @@ def _publish_review(
         return stale_result
 
     notes: list[str] = []
+    caller_shaped = shaped
     if (
         allow_approve
         and review_event(shaped, True) == "APPROVE"
@@ -1468,6 +1469,8 @@ def _publish_review(
     posted_at = resp.get("submitted_at")
     # The posted review's own timestamp is when its findings were raised (see build_handoff).
     shaped["posted_at"] = posted_at if isinstance(posted_at, str) else None
+    if caller_shaped is not shaped:  # the sign-off copy must not hide the stamp from the handoff
+        caller_shaped["posted_at"] = shaped["posted_at"]
     replied = resolved = None
     if (
         (resolve_fixed and any(f["status"] == "resolved" for f in shaped["findings"]))

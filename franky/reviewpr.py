@@ -396,11 +396,7 @@ def _body(
     """Summary line visible, everything else collapsed under <details>. The whole body stays
     under REVIEW_BODY_BUDGET (room is left for the footer and the APPROVE marker)."""
     parts = [_headline(shaped, sha)]
-    big = [
-        f
-        for f in shaped["findings"]
-        if f["status"] == "accepted" and f["severity"] in ("blocking", "normal")
-    ]
+    big = [f for f in shaped["findings"] if f["status"] == "accepted" and f["severity"] != "nit"]
     if big:
         who = ", ".join(dict.fromkeys(f"@{_esc(f['accepted_by'])}" for f in big))
         parts.append(
@@ -681,7 +677,8 @@ def _approval_ok(reviews: list, login: str, head_sha: str, raised_at: object) ->
         review["state"] == "APPROVED"
         and str(review.get("commit_id", "")).lower() == head_sha.lower()
         and at > raised
-        and review.get("author_association") in _AUTHORITY
+        and isinstance(review.get("author_association"), str)
+        and review["author_association"] in _AUTHORITY
         and user.get("type") != "Bot"
         and not str(user.get("login", "")).lower().endswith("[bot]")
         and APPROVE_MARKER not in str(review.get("body") or "")

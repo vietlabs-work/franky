@@ -1021,6 +1021,8 @@ def test_accepted_blocking_finding_no_longer_blocks_once_verified():
         [_review(assoc="NONE")],
         [_review(assoc=None)],
         [_review(assoc=5)],
+        [_review(assoc=["MEMBER"])],
+        [_review(assoc={"MEMBER": 1})],
         [
             _review(at="2026-01-02T00:00:00Z"),
             _review("CHANGES_REQUESTED", at=LATER, id=1),
@@ -1193,7 +1195,7 @@ def test_body_has_one_fixed_line_for_verified_accepted_risks_above_nit():
     )
     body = render_review_body(shaped)
     line = (
-        "Accepted risk: 3 finding(s) above nit accepted by @owner-x, @Other-y "
+        "Accepted risk: 4 finding(s) above nit accepted by @owner-x, @Other-y, @q-w "
         "(approval on this commit)."
     )
     assert body.count(line) == 1

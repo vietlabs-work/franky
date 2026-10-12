@@ -5747,6 +5747,21 @@ def test_publish_matching_signoff_glob_posts_comment_not_approve(monkeypatch):
     assert reads == [("me/repo", BASE_SHA40)]
 
 
+def test_publish_signoff_copy_still_stamps_posted_at_on_the_callers_shape(monkeypatch):
+    shaped = _clean()
+    post = (
+        0,
+        json.dumps({"html_url": REVIEW_URL, "id": 555, "submitted_at": "2026-01-02T03:04:05Z"}),
+        "",
+    )
+    monkeypatch.setattr(cli, "fetch_signoff_globs", lambda *a, **k: ["**/pay/**"])
+    _Gh(monkeypatch, posts=[post], files=_signoff_files("a/pay/X.java"))
+    out = _pub(shaped, allow_approve=True, base_sha=BASE_SHA40)
+    assert out[5] == "COMMENT"
+    assert shaped["posted_at"] == "2026-01-02T03:04:05Z"
+    assert "signoff_required" not in shaped
+
+
 def test_publish_no_matching_signoff_glob_still_approves(monkeypatch):
     gh, out, _ = _floor_pub(monkeypatch, ["**/pay/**"], _signoff_files("a/ok/X.java"))
     assert out[5] == "APPROVE" and gh.post_events() == ["APPROVE"]
