@@ -114,10 +114,12 @@ from .reviewpr import (
     build_review_payload,
     commentable_lines,
     human_signoff_required,
-    match_resolved_threads,
+    match_prior_threads,
     parse_review_findings,
     render_review_body,
+    reply_body,
     review_event,
+    thread_reply_target,
 )
 from .result import (
     EXIT_AGENT,
@@ -1149,16 +1151,8 @@ def _find_marked_review(gh, repo: str, pr_number: int, sha: str, marker: str):
     return "absent", None
 
 
-def _resolve_fixed_threads(
-    gh, repo: str, pr_number: int, shaped: dict, login: str | None, secrets: list[str]
-) -> int:
-    """Resolve the publishing bot's matching threads for resolved findings; returns the count.
-
-    Best effort: any read, parse or mutation failure is logged (redacted) and skipped. Nothing is
-    resolved when the poster login is unknown or the thread list could not be read in full.
-    """
-    if not login:
-        return 0
+def _read_review_threads(gh, repo: str, pr_number: int, secrets: list[str]) -> list | None:
+    """Every review thread node of the PR, or None when the read failed (already logged)."""
     owner, name = repo.split("/", 1)
     base = [
         "api", "graphql", "-f", f"query={THREADS_QUERY}",
@@ -1182,23 +1176,70 @@ def _resolve_fixed_threads(
         click.echo(
             f"franky: could not read review threads: {redact(str(exc), secrets)[:200]}", err=True
         )
-        return 0
-    done = 0
-    for thread_id in match_resolved_threads(shaped, nodes, login):
+        return None
+    return nodes
+
+
+def _update_prior_threads(
+    gh,
+    repo: str,
+    pr_number: int,
+    shaped: dict,
+    login: str | None,
+    sha: str,
+    secrets: list[str],
+    stale,
+    *,
+    reply: bool,
+    resolve: bool,
+) -> tuple[int | None, int | None]:
+    """Reply on the bot's still-open threads and resolve its fixed ones: (replied, resolved).
+
+    A pass that is off gives None. Best effort: any read, parse, reply or mutation failure is
+    logged (redacted) and skipped. Nothing happens when the poster login is unknown or the
+    thread list could not be read in full. `stale()` is checked before every write; a moved head
+    stops all further writes.
+    """
+    replied = 0 if reply else None
+    resolved = 0 if resolve else None
+    if not login:
+        return replied, resolved
+    nodes = _read_review_threads(gh, repo, pr_number, secrets)
+    if nodes is None:
+        return replied, resolved
+    for decision, node, _findings, reply_finding in match_prior_threads(shaped, nodes, login):
+        if decision == "open" and reply and reply_finding is not None:
+            cid = thread_reply_target(node)
+            if cid is None:
+                continue
+            finding = reply_finding
+            argv = [
+                "api", "-X", "POST", f"repos/{repo}/pulls/{pr_number}/comments/{cid}/replies",
+                "-f", f"body={reply_body(finding, sha, secrets)}",
+            ]  # fmt: skip
+            what = "reply to"
+        elif decision == "resolve" and resolve:
+            argv = ["api", "graphql", "-f", f"query={RESOLVE_MUTATION}", "-F", f"id={node['id']}"]
+            what = "resolve"
+        else:
+            continue
+        if stale():
+            break
         try:
-            code, _out, err = gh(
-                ["api", "graphql", "-f", f"query={RESOLVE_MUTATION}", "-F", f"id={thread_id}"]
-            )
+            code, _out, err = gh(argv)
         except (FrankyError, DockerError) as exc:
             code, err = 1, str(exc)
         if code == 0:
-            done += 1
+            if what == "resolve":
+                resolved += 1
+            else:
+                replied += 1
         else:
             click.echo(
-                f"franky: could not resolve a thread: {redact(err.strip(), secrets)[:200]}",
+                f"franky: could not {what} a thread: {redact(err.strip(), secrets)[:200]}",
                 err=True,
             )
-    return done
+    return replied, resolved
 
 
 def _poster_login(resp: dict) -> str | None:
@@ -1220,11 +1261,13 @@ def _publish_review(
     secrets: list[str],
     allow_approve: bool = False,
     resolve_fixed: bool = False,
+    reply_prior: bool = False,
     prior_url: str | None = None,
     base_sha: str | None = None,
-) -> tuple[str, str, int, str | None, int | None, str | None, int | None]:
+) -> tuple[str, str, int, str | None, int | None, str | None, int | None, int | None]:
     """Post the review as inline comments on the pinned commit; returns the result fields
-    (status, reason, exit code, review url, review id, event posted, threads resolved).
+    (status, reason, exit code, review url, review id, event posted, threads resolved,
+    threads replied).
 
     Fetches the PR files to learn which lines are commentable, re-checks the head, then POSTs.
     If GitHub rejects the anchors (422), retries ONCE with every finding in the body.
@@ -1243,7 +1286,8 @@ def _publish_review(
     listed in the repo's `.github/human-signoff-paths` (read at `base_sha`, the PR base commit),
     the PR changes that file, or the file or the PR file list cannot be read, the event is COMMENT.
     With `resolve_fixed`, after a successful post and an unmoved head, resolve the publishing
-    bot's matching threads for findings marked resolved (login from the POST response).
+    bot's matching threads for findings marked resolved (login from the POST response). With
+    `reply_prior`, the same pass replies once on its threads whose finding is still open.
     """
     timeout = _resolve_gh_timeout(os.environ)
 
@@ -1267,7 +1311,7 @@ def _publish_review(
         return live is None or live.lower() != pinned_sha.lower()
 
     def fail(status: str, reason: str, code: int):
-        return (status, reason, code, None, None, None, None)
+        return (status, reason, code, None, None, None, None, None)
 
     stale_result = fail(
         "publish_blocked_stale_head",
@@ -1393,9 +1437,15 @@ def _publish_review(
         )
     resp = parsed(gout)
     event = payload["event"]
-    resolved = None
-    if resolve_fixed and any(f["status"] == "resolved" for f in shaped["findings"]) and not stale():
-        resolved = _resolve_fixed_threads(gh, repo, pr_number, shaped, _poster_login(resp), secrets)
+    replied = resolved = None
+    if (
+        (resolve_fixed and any(f["status"] == "resolved" for f in shaped["findings"]))
+        or (reply_prior and any(f["status"] == "open" for f in shaped["findings"]))
+    ) and not stale():
+        replied, resolved = _update_prior_threads(
+            gh, repo, pr_number, shaped, _poster_login(resp), pinned_sha, secrets, stale,
+            reply=reply_prior, resolve=resolve_fixed,
+        )  # fmt: skip
     return (
         "review_published",
         f"published a {event} review" + "".join(notes),
@@ -1404,6 +1454,7 @@ def _publish_review(
         resp.get("id"),
         event,
         resolved,
+        replied,
     )
 
 
@@ -1566,6 +1617,14 @@ def _review_ticket_context(
     "marked resolved (unambiguous matches only). Requires --thread; refused with --no-publish.",
 )
 @click.option(
+    "--reply-prior",
+    "reply_prior",
+    is_flag=True,
+    default=False,
+    help="After publishing, reply once on this bot's own review threads whose finding the "
+    "re-review kept open (never twice in a row). Requires --thread; refused with --no-publish.",
+)
+@click.option(
     "--thread",
     "use_thread",
     is_flag=True,
@@ -1624,6 +1683,7 @@ def review_pr(
     no_publish: bool,
     allow_approve: bool,
     resolve_fixed: bool,
+    reply_prior: bool,
     use_thread: bool,
     rubric_version: str,
     engine: str | None,
@@ -1701,16 +1761,16 @@ def review_pr(
                     kind="usage_error",
                 )
 
-        if (allow_approve or resolve_fixed) and no_publish:
+        if (allow_approve or resolve_fixed or reply_prior) and no_publish:
             raise FrankyError(
-                "--allow-approve/--resolve-fixed publish to GitHub and cannot be combined "
+                "--allow-approve/--resolve-fixed/--reply-prior publish to GitHub and cannot be combined "
                 "with --no-publish",
                 code=EXIT_USAGE,
                 kind="usage_error",
             )
-        if resolve_fixed and not use_thread:
+        if (resolve_fixed or reply_prior) and not use_thread:
             raise FrankyError(
-                "--resolve-fixed requires --thread (it needs the prior findings)",
+                "--resolve-fixed/--reply-prior require --thread (they need the prior findings)",
                 code=EXIT_USAGE,
                 kind="usage_error",
             )
@@ -1914,6 +1974,7 @@ def review_pr(
         review_id: int | None = None
         review_event_out: str | None = None
         threads_resolved: int | None = None
+        threads_replied: int | None = None
         findings_summary: str | None = None
         review_body: str | None = None
         checks: list | None = None
@@ -1996,6 +2057,7 @@ def review_pr(
                             review_id,
                             review_event_out,
                             threads_resolved,
+                            threads_replied,
                         ) = _publish_review(
                             repo,
                             pr_number,
@@ -2005,6 +2067,7 @@ def review_pr(
                             secrets,
                             allow_approve=allow_approve,
                             resolve_fixed=resolve_fixed,
+                            reply_prior=reply_prior,
                             prior_url=(prior_handoff or {}).get("review_url"),
                             base_sha=pr_meta.get("base_sha"),
                         )
@@ -2078,6 +2141,7 @@ def review_pr(
             review_id=review_id,
             review_event=review_event_out,
             threads_resolved=threads_resolved,
+            threads_replied=threads_replied,
             thread=thread_result,
             handoff=handoff,
             context_sources=context_sources,

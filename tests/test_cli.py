@@ -5406,7 +5406,7 @@ def test_review_pr_publish_passes_the_pr_base_sha_to_the_signoff_floor(monkeypat
 
     def fake_publish(*a, **k):
         seen.append(k)
-        return ("review_published", "ok", 0, None, None, "COMMENT", None)
+        return ("review_published", "ok", 0, None, None, "COMMENT", None, None)
 
     monkeypatch.setattr(cli, "_publish_review", fake_publish)
     res = _review(["--engine", "claude", "--allow-approve"])
@@ -5509,8 +5509,15 @@ THREAD_NODE = {
     "path": "a.py",
     "comments": {
         "nodes": [
-            {"author": {"login": "franky-bot", "__typename": "Bot"}, "body": "**Major: race**\n\nb"}
+            {
+                "databaseId": 101,
+                "author": {"login": "franky-bot", "__typename": "Bot"},
+                "body": "**Major: race**\n\nb",
+            }
         ]
+    },
+    "last": {
+        "nodes": [{"databaseId": 101, "author": {"login": "franky-bot", "__typename": "Bot"}}]
     },
 }
 CLEAN = {"summary": "ok", "findings": [], "checks": []}
@@ -5520,11 +5527,12 @@ class _Gh:
     """Scripted `gh` for _publish_review: `posts` and `reviews`/`graphql` replies are queues."""
 
     def __init__(
-        self, monkeypatch, *, heads=None, posts=(), reviews=None, graphql=(), files="[[]]"
-    ):
+        self, monkeypatch, *, heads=None, posts=(), reviews=None, graphql=(), files="[[]]",
+        replies=(),
+    ):  # fmt: skip
         self.files = files
         self.calls, self.inputs = [], []
-        self.posts, self.graphql = list(posts), list(graphql)
+        self.posts, self.graphql, self.replies = list(posts), list(graphql), list(replies)
         self.reviews = reviews if reviews is not None else (0, "[]", "")
         self.heads = list(heads) if heads is not None else []
         self.sleeps = []
@@ -5548,7 +5556,7 @@ class _Gh:
             if isinstance(reply, Exception):
                 raise reply
             return reply
-        reply = self.posts.pop(0)
+        reply = (self.replies if args[3].endswith("/replies") else self.posts).pop(0)
         if isinstance(reply, Exception):
             raise reply
         return reply
@@ -5828,7 +5836,12 @@ def test_resolve_fixed_skipped_when_off_open_or_head_moved(monkeypatch):
     _Gh(monkeypatch, posts=[OK_POST])
     assert _pub(RESOLVED_SHAPED())[6] is None  # flag off
     _Gh(monkeypatch, posts=[OK_POST])
+    gh = _Gh(monkeypatch, posts=[OK_POST])
     assert _pub(RESOLVED_SHAPED(status="open"), resolve_fixed=True)[6] is None
+    assert not [c for c in gh.calls if c[1] == "graphql"]  # resolve-only needs a resolved finding
+    gh = _Gh(monkeypatch, posts=[OK_POST])
+    assert _pub(RESOLVED_SHAPED(), reply_prior=True)[7] is None  # reply-only needs an open one
+    assert not [c for c in gh.calls if c[1] == "graphql"]
     gh = _Gh(monkeypatch, heads=[LIVE_SHA, LIVE_SHA, "b" * 40], posts=[OK_POST])
     out = _pub(RESOLVED_SHAPED(), resolve_fixed=True)
     assert out[0] == "review_published" and out[6] is None
@@ -5861,6 +5874,8 @@ def test_resolve_fixed_not_run_when_post_fails(monkeypatch):
         ["--allow-approve", "--no-publish"],
         ["--resolve-fixed", "--no-publish", "--thread"],
         ["--resolve-fixed"],
+        ["--reply-prior", "--no-publish", "--thread"],
+        ["--reply-prior"],
     ],
 )
 def test_review_pr_flag_validation_refusals(monkeypatch, flags):
@@ -5888,7 +5903,105 @@ def test_review_pr_default_reports_comment_event(monkeypatch):
 
 def test_review_pr_flags_visible_in_help():
     out = CliRunner().invoke(cli.main, ["review-pr", "--help"]).output
-    assert "--allow-approve" in out and "--resolve-fixed" in out
+    assert "--allow-approve" in out and "--resolve-fixed" in out and "--reply-prior" in out
+
+
+def _reply_argv(cid=101, body="Still open at `%s`: why" % LIVE_SHA[:7]):
+    return ["api", "-X", "POST", f"repos/me/repo/pulls/11/comments/{cid}/replies",
+            "-f", f"body={body}"]  # fmt: skip
+
+
+def _open_shaped(**kw):
+    return RESOLVED_SHAPED(status="open", evidence="why", **kw)
+
+
+REPLY_OK = (0, json.dumps({"id": 9}), "")
+
+
+def test_both_flags_resolved_finding_resolves_without_reply(monkeypatch):
+    gh = _Gh(
+        monkeypatch, posts=[OK_POST], graphql=[(0, THREADS_PAGE([THREAD_NODE]), ""), MUTATION_OK]
+    )
+    out = _pub(RESOLVED_SHAPED(), resolve_fixed=True, reply_prior=True)
+    assert out[6] == 1 and out[7] == 0
+    assert [c for c in gh.calls if c[1] == "graphql"] == [GQL_BASE, RESOLVE_ARGV]  # one read
+    assert not [c for c in gh.calls if c[3:4] and c[3].endswith("/replies")]
+
+
+def test_reply_prior_posts_exact_argv_and_never_resolves(monkeypatch):
+    gh = _Gh(
+        monkeypatch, posts=[OK_POST], graphql=[(0, THREADS_PAGE([THREAD_NODE]), "")],
+        replies=[REPLY_OK],
+    )  # fmt: skip
+    out = _pub(_open_shaped(), resolve_fixed=True, reply_prior=True)
+    assert out[0] == "review_published" and out[6] == 0 and out[7] == 1
+    assert _reply_argv() in gh.calls
+    assert not [c for c in gh.calls if f"query={RESOLVE_MUTATION}" in c]
+
+
+def test_reply_prior_skips_when_a_bot_already_replied(monkeypatch):
+    replied = {
+        **THREAD_NODE,
+        "last": {"nodes": [{"databaseId": 102, "author": {"login": "x", "__typename": "Bot"}}]},
+    }
+    gh = _Gh(monkeypatch, posts=[OK_POST], graphql=[(0, THREADS_PAGE([replied]), "")])
+    out = _pub(_open_shaped(), reply_prior=True)
+    assert out[7] == 0 and out[6] is None
+    assert not [c for c in gh.calls if c[3:4] and c[3].endswith("/replies")]
+
+
+def test_reply_failure_never_fails_run_and_resolve_still_runs(monkeypatch, capsys):
+    gone = {**THREAD_NODE, "id": "PRRT_2", "path": "z.py"}
+    gone["comments"] = {
+        "nodes": [{**THREAD_NODE["comments"]["nodes"][0], "body": "**Major: other**\n\nb"}]
+    }
+    shaped = build_review_findings(
+        {
+            "summary": "s",
+            "findings": [
+                {"title": "race", "severity": "normal", "file": "a.py", "line": 3,
+                 "status": "open", "evidence": "why"},
+                {"title": "other", "severity": "normal", "file": "z.py", "line": 3,
+                 "status": "resolved", "evidence": "fixed"},
+            ],
+            "checks": [],
+        },
+        threaded=True,
+    )  # fmt: skip
+    _Gh(
+        monkeypatch, posts=[OK_POST],
+        graphql=[(0, THREADS_PAGE([THREAD_NODE, gone]), ""), MUTATION_OK],
+        replies=[(1, "", REFUSED)],
+    )  # fmt: skip
+    out = _pub(shaped, resolve_fixed=True, reply_prior=True)
+    assert out[0] == "review_published" and out[6] == 1 and out[7] == 0
+    assert "could not reply to a thread" in capsys.readouterr().err
+
+
+def test_head_moving_after_the_read_stops_every_write(monkeypatch):
+    # heads: publish stale checks (3) pass; the pre-write check sees a new head.
+    gh = _Gh(
+        monkeypatch, heads=[LIVE_SHA] * 3 + ["b" * 40], posts=[OK_POST],
+        graphql=[(0, THREADS_PAGE([THREAD_NODE]), "")], replies=[REPLY_OK],
+    )  # fmt: skip
+    out = _pub(_open_shaped(), reply_prior=True)
+    assert out[0] == "review_published" and out[7] == 0
+    assert not [c for c in gh.calls if c[3:4] and c[3].endswith("/replies")]
+
+
+def test_reply_prior_off_reports_none_and_head_moved_does_nothing(monkeypatch):
+    _Gh(monkeypatch, posts=[OK_POST], graphql=[(0, THREADS_PAGE([THREAD_NODE]), "")])
+    assert _pub(_open_shaped(), resolve_fixed=True)[7] is None
+    gh = _Gh(monkeypatch, heads=[LIVE_SHA, LIVE_SHA, "b" * 40], posts=[OK_POST])
+    out = _pub(_open_shaped(), reply_prior=True)
+    assert out[0] == "review_published" and out[7] is None
+    assert not [c for c in gh.calls if c[1] == "graphql"]
+
+
+def test_review_pr_threads_replied_absent_when_off(monkeypatch):
+    _fix_review_nonce(monkeypatch)
+    _mc_review_setup(monkeypatch)
+    assert "threads_replied" not in json.loads(_review([]).stdout)
 
 
 def test_graphql_read_never_passes_dash_x(monkeypatch):

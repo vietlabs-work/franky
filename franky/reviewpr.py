@@ -20,16 +20,19 @@ publishes that result. `review_event` returns COMMENT or REQUEST_CHANGES unless 
 `allow_approve=True` (`review-pr --allow-approve`), the only way APPROVE is reachable. The
 container is autonomous, so GitHub token permissions remain the hard external-write boundary.
 
-`review-pr --resolve-fixed` resolves the bot's own fixed threads with two fixed GraphQL calls. A
-trusted wrapper may allowlist these exact argv shapes byte for byte (`<o>`, `<n>`, `<N>`, `<id>`,
-`<cursor>` are values; `THREADS_QUERY` and `RESOLVE_MUTATION` are the constants below):
+`review-pr --resolve-fixed` resolves the bot's own fixed threads and `--reply-prior` replies once
+on its still-open ones. A trusted wrapper may allowlist these exact argv shapes byte for byte
+(`<o>`, `<n>`, `<N>`, `<id>`, `<cursor>`, `<repo>`, `<cid>`, `<body>` are values; `THREADS_QUERY` and
+`RESOLVE_MUTATION` are the constants below; `<cid>` is the thread's first comment databaseId):
 
     gh api graphql -f query=<THREADS_QUERY> -F owner=<o> -F name=<n> -F number=<N>
     gh api graphql -f query=<THREADS_QUERY> -F owner=<o> -F name=<n> -F number=<N> -F after=<cursor>
     gh api graphql -f query=<RESOLVE_MUTATION> -F id=<id>
+    gh api -X POST repos/<repo>/pulls/<N>/comments/<cid>/replies -f body=<body>
 
 Page one omits `-F after`; later pages (at most MAX_THREAD_PAGES) add it. The read must NOT pass
-`-X GET`: GitHub then ignores the query and returns the schema.
+`-X GET`: GitHub then ignores the query and returns the schema. It returns each thread's first
+comment (with its databaseId) and its last comment, which `thread_reply_target` reads.
 """
 
 from __future__ import annotations
@@ -54,12 +57,15 @@ THREADS_QUERY = (
     "query($owner:String!,$name:String!,$number:Int!,$after:String){"
     "repository(owner:$owner,name:$name){pullRequest(number:$number){"
     "reviewThreads(first:100,after:$after){pageInfo{hasNextPage endCursor} "
-    "nodes{id isResolved path comments(first:1){nodes{author{login __typename} body}}}}}}}"
+    "nodes{id isResolved path comments(first:1){nodes{databaseId author{login __typename} body}} "
+    "last:comments(last:1){nodes{databaseId author{login __typename}}}}}}}}"
 )
 RESOLVE_MUTATION = (
     "mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{isResolved}}}"
 )
 MAX_THREAD_PAGES = 5
+MAX_REPLY_EVIDENCE_CHARS = 600
+MAX_REPLY_CHARS = 2000  # the host gh wrapper refuses a longer reply body
 APPROVE_MARKER = "franky-review"  # `<!-- franky-review:<nonce> -->` ends an APPROVE body
 
 MAX_INLINE = 8  # inline comments per review
@@ -590,22 +596,56 @@ def review_event(shaped: dict, allow_approve: bool = False) -> str:
     return "COMMENT"
 
 
-def match_resolved_threads(shaped: dict, nodes: list, login: str | None) -> list[str]:
-    """Ids of the publishing bot's own unresolved threads for findings now marked resolved.
+def _dict(v: object) -> dict:
+    return v if isinstance(v, dict) else {}
 
-    A finding matches a thread when the thread is open, its first comment is by a Bot whose login
-    is `login` (case-insensitive; no login resolves nothing), its path is the finding's file and
-    its body starts with `**{Label}: {title}**` for any severity label (the severity may have
-    changed since the comment). Zero or 2+ candidates skip that finding. A finding never matches
-    when a new/open finding has the same file and title, and new/open findings never match.
+
+def _first_node(conn: object) -> dict:
+    """The first comment node of a `comments`-shaped value, or {} when malformed."""
+    nodes = _dict(conn).get("nodes")
+    return _dict(nodes[0]) if isinstance(nodes, list) and nodes else {}
+
+
+def match_prior_threads(
+    shaped: dict, nodes: list, login: str | None
+) -> list[tuple[str, dict, list[dict], dict | None]]:
+    """The publishing bot's own unresolved threads matched to open/resolved findings.
+
+    Returns `(decision, node, findings, reply_finding)` per thread: decision is "resolve" when
+    every matched finding is resolved, "open" when any is open (it is never resolved).
+    `reply_finding` is the first open finding matched by path, or None: an open finding that
+    matched only through the title fallback blocks a resolve but never earns a reply.
+    A thread is a candidate when it is open, its first comment is by a Bot whose login is `login`
+    (case-insensitive; no login matches nothing) and its body starts with `**{Label}: {title}**`
+    for any severity label (the severity may have changed since the comment). A finding picks the
+    candidates on its own file; if none, any candidate by title (the model may report a prior
+    finding under another file). Zero or 2+ candidates skip that finding. A resolved finding is
+    skipped when a new/open finding has the same file and title (same title in the fallback).
+    Malformed nodes are skipped, never raised on.
     """
-    if not login:
+    if not login or not isinstance(nodes, list):
         return []
     login = login.lower()
+    own = []
+    for n in nodes:
+        if not isinstance(n, dict) or n.get("isResolved") is not False:
+            continue
+        if not isinstance(n.get("id"), str):
+            continue
+        first = _first_node(n.get("comments"))
+        author = _dict(first.get("author"))
+        body = first.get("body")
+        if (
+            author.get("__typename") == "Bot"
+            and str(author.get("login", "")).lower() == login
+            and isinstance(body, str)
+        ):
+            own.append((n, body))
     live = {(f["file"], f["title"]) for f in shaped["findings"] if f["status"] != "resolved"}
-    ids: list[str] = []
+    live_titles = {t for _f, t in live}
+    grouped: dict[str, tuple[dict, list[dict], list[dict]]] = {}
     for f in shaped["findings"]:
-        if f["status"] != "resolved" or not f["file"] or (f["file"], f["title"]) in live:
+        if f["status"] not in ("open", "resolved"):
             continue
         # GitHub stores the escaped title; older comments carry the raw one.
         heads = tuple(
@@ -613,24 +653,62 @@ def match_resolved_threads(shaped: dict, nodes: list, login: str | None) -> list
             for label in _LABELS.values()
             for t in {_esc(f["title"]), f["title"]}
         )
-        found = []
-        for n in nodes:
-            if not isinstance(n, dict) or n.get("isResolved") is not False:
-                continue
-            if n.get("path") != f["file"] or not isinstance(n.get("id"), str):
-                continue
-            first = ((n.get("comments") or {}).get("nodes") or [None])[0]
-            if not isinstance(first, dict):
-                continue
-            author = first.get("author") or {}
-            body = first.get("body")
-            if (
-                author.get("__typename") == "Bot"
-                and str(author.get("login", "")).lower() == login
-                and isinstance(body, str)
-                and body.startswith(heads)
-            ):
-                found.append(n["id"])
-        if len(found) == 1 and found[0] not in ids:
-            ids.append(found[0])
-    return ids
+        titled = [n for n, body in own if body.startswith(heads)]
+        by_path = [n for n in titled if f["file"] and n.get("path") == f["file"]]
+        found = by_path or titled
+        if len(found) != 1:
+            continue
+        if f["status"] == "resolved" and (
+            (f["file"], f["title"]) in live if by_path else f["title"] in live_titles
+        ):
+            continue
+        entry = grouped.setdefault(found[0]["id"], (found[0], [], []))
+        entry[1].append(f)
+        if f["status"] == "open" and by_path:
+            entry[2].append(f)
+    return [
+        ("open" if any(f["status"] == "open" for f in fs) else "resolve", n, fs, (rs or [None])[0])
+        for n, fs, rs in grouped.values()
+    ]
+
+
+def match_resolved_threads(shaped: dict, nodes: list, login: str | None) -> list[str]:
+    """Ids of the matched threads whose findings are all resolved (see `match_prior_threads`)."""
+    matched = match_prior_threads(shaped, nodes, login)
+    return [n["id"] for d, n, _fs, _rf in matched if d == "resolve"]
+
+
+def thread_reply_target(node: dict) -> int | None:
+    """The databaseId of the thread's first comment when a reply is due, else None.
+
+    Due when nobody replied yet (last is first) or the last comment is by a non-Bot author (a
+    human posted after). A Bot last, ours or another, means no reply. Anything malformed, an
+    author without a string `__typename` included, fails closed.
+    """
+    node = _dict(node)
+    first, last = _first_node(node.get("comments")), _first_node(node.get("last"))
+    fid, lid = _pos_int(first.get("databaseId")), _pos_int(last.get("databaseId"))
+    if fid is None or lid is None:
+        return None
+    if lid == fid:
+        return fid
+    typename = _dict(last.get("author")).get("__typename")
+    return fid if isinstance(typename, str) and typename != "Bot" else None
+
+
+def reply_body(finding: dict, sha: str, secrets: list[str]) -> str:
+    """One short reply for a thread whose finding is still open at `sha`.
+
+    Redact first (so a secret crossing the cut cannot leak a prefix), then cut, then escape, and
+    finally keep the whole body under MAX_REPLY_CHARS without splitting an `&...;` entity.
+    """
+    head = f"Still open at `{sha[:7]}`"
+    evidence = redact((finding.get("evidence") or "").strip(), secrets)
+    evidence = _esc(evidence.strip()[:MAX_REPLY_EVIDENCE_CHARS])
+    body = f"{head}: {evidence}" if evidence else f"{head}."
+    if len(body) >= MAX_REPLY_CHARS:
+        body = body[: MAX_REPLY_CHARS - 1]
+        amp = body.rfind("&")
+        if amp != -1 and ";" not in body[amp:]:
+            body = body[:amp]
+    return body

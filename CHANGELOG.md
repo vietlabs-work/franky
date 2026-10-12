@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `review-pr --reply-prior` (with `--thread`) replies once, `Still open at SHA7: evidence`, on the publishing bot's own review threads whose finding the re-review kept open. It never replies after a bot's reply and never fails the run. The `--json` result adds `threads_replied` when the flag ran. A host `gh` wrapper that allowlists argv must also allow `api -X POST repos/OWNER/REPO/pulls/N/comments/ID/replies -f body=TEXT`.
+
+### Changed
+
+- `review-pr --resolve-fixed` matches a thread by file first, then by title across the bot's open threads (the model can report a resolved finding under another file), and never resolves a thread that still has an open finding. The thread read query text changed (`THREADS_QUERY` adds `databaseId` and the last comment): a host wrapper that allowlists the query must take the new text.
+
 ## [0.3.19] - 2026-10-12
 
 ### Added

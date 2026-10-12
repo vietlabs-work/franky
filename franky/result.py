@@ -138,6 +138,7 @@ def build_result(
     review_id: int | None = None,
     review_event: str | None = None,
     threads_resolved: int | None = None,
+    threads_replied: int | None = None,
     thread: dict | None = None,
     handoff: dict | None = None,
     context_sources: list | None = None,
@@ -184,8 +185,8 @@ def build_result(
     GitHub - see the `review-pr` command).
 
     `review_event` (COMMENT | REQUEST_CHANGES | APPROVE) is the event the posted review really
-    has, and `threads_resolved` the number of threads `--resolve-fixed` resolved; both are
-    `review-pr`-only and absent otherwise.
+    has, `threads_resolved` the number of threads `--resolve-fixed` resolved and `threads_replied`
+    the number `--reply-prior` replied on; all are `review-pr`-only and absent otherwise.
 
     `context_sources` is `review-pr`-only (absent, not null, elsewhere): one
     {kind, ref, status} entry per linked JIRA key Franky looked for, `[]` when none. It never
@@ -245,6 +246,8 @@ def build_result(
         result["review_event"] = review_event
     if threads_resolved is not None:
         result["threads_resolved"] = threads_resolved
+    if threads_replied is not None:
+        result["threads_replied"] = threads_replied
     if context_sources is not None:
         result["context_sources"] = context_sources
     if base_sha is not None:

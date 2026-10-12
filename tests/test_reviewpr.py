@@ -15,7 +15,10 @@ from franky.reviewpr import (
     build_review_findings,
     build_review_payload,
     commentable_lines,
+    match_prior_threads,
     match_resolved_threads,
+    reply_body,
+    thread_reply_target,
     parse_review_findings,
     render_review_body,
     review_event,
@@ -365,19 +368,27 @@ def test_nit_never_displaces_a_major_from_inline():
     assert "nit7" not in json.dumps(p)  # cut nit is dropped, not moved to the body
 
 
-def _node(id_, title="t", label="Major", path="a.py", resolved=False, typename="Bot"):
+def _node(
+    id_,
+    title="t",
+    label="Major",
+    path="a.py",
+    resolved=False,
+    typename="Bot",
+    database_id=1,
+    last=None,
+):
+    first = {
+        "databaseId": database_id,
+        "author": {"login": "franky-bot", "__typename": typename},
+        "body": f"**{label}: {title}**\n\nwhy",
+    }
     return {
         "id": id_,
         "isResolved": resolved,
         "path": path,
-        "comments": {
-            "nodes": [
-                {
-                    "author": {"login": "franky-bot", "__typename": typename},
-                    "body": f"**{label}: {title}**\n\nwhy",
-                }
-            ]
-        },
+        "comments": {"nodes": [first]},
+        "last": {"nodes": [first if last is None else last]},
     }
 
 
@@ -391,7 +402,6 @@ def test_match_resolved_threads_matches_only_unambiguous_own_threads():
     for bad in (
         _node("T1", typename="User"),
         _node("T1", resolved=True),
-        _node("T1", path="b.py"),
         _node("T1", title="other"),
     ):
         assert match_resolved_threads(shaped, [bad], "franky-bot") == []
@@ -401,6 +411,48 @@ def test_match_resolved_threads_matches_only_unambiguous_own_threads():
     assert match_resolved_threads(
         shaped, [_node("T1"), _node("T2", resolved=True)], "franky-bot"
     ) == ["T1"]
+
+
+def test_match_resolved_threads_falls_back_to_a_single_title_match_elsewhere():
+    shaped = _resolved({"title": "t", "severity": "normal"})  # finding reported on a.py
+    assert match_resolved_threads(shaped, [_node("T1", path="b.py")], "franky-bot") == ["T1"]
+    two = [_node("T1", path="b.py"), _node("T2", path="c.py")]
+    assert match_resolved_threads(shaped, two, "franky-bot") == []  # ambiguous
+    # the thread on the finding's own file wins over a title match on another file
+    both = [_node("T1", path="b.py"), _node("T2", path="a.py")]
+    assert match_resolved_threads(shaped, both, "franky-bot") == ["T2"]
+
+
+def test_match_prior_threads_finding_without_a_file_matches_by_title():
+    shaped = _shaped({"title": "t", "severity": "normal", "status": "resolved", "file": None})
+    assert match_resolved_threads(shaped, [_node("T1")], "franky-bot") == ["T1"]
+
+
+def _two_findings(first, second):
+    a = {"title": "t", "severity": "normal", "line": 3, "file": "a.py"}
+    b = {"title": "t", "severity": "normal", "line": 3, "file": "b.py"}
+    return _shaped({**a, "status": first}, {**b, "status": second})
+
+
+@pytest.mark.parametrize("order", [("resolved", "open"), ("open", "resolved")])
+def test_match_prior_threads_open_finding_blocks_resolving_a_shared_thread(order):
+    shaped = _two_findings(*order)
+    nodes = [_node("T1", path="a.py")]  # b.py has no thread: it falls back to A's by title
+    assert match_resolved_threads(shaped, nodes, "franky-bot") == []
+    [(decision, node, findings, _rf)] = match_prior_threads(shaped, nodes, "franky-bot")
+    assert decision == "open" and node["id"] == "T1"
+    assert "open" in {f["status"] for f in findings}
+
+
+def test_match_prior_threads_never_returns_new_findings():
+    shaped = _shaped({"title": "t", "severity": "normal", "status": "new", "file": "a.py"})
+    assert match_prior_threads(shaped, [_node("T1")], "franky-bot") == []
+
+
+def test_match_prior_threads_open_finding_gets_open_decision():
+    shaped = _shaped({"title": "t", "severity": "normal", "status": "open", "file": "a.py"})
+    [(decision, _n, findings, rf)] = match_prior_threads(shaped, [_node("T1")], "franky-bot")
+    assert decision == "open" and findings[0]["status"] == "open" and rf is findings[0]
 
 
 def test_match_resolved_threads_needs_the_posting_login():
@@ -435,6 +487,83 @@ def test_match_resolved_threads_ignores_open_and_new_findings():
 def test_match_resolved_threads_dedupes_ids():
     shaped = _resolved({"title": "t", "severity": "normal"}, {"title": "t", "severity": "normal"})
     assert match_resolved_threads(shaped, [_node("T1")], "Franky-Bot") == ["T1"]
+
+
+def _bot(i):
+    return {"databaseId": i, "author": {"login": "x", "__typename": "Bot"}}
+
+
+def test_thread_reply_target():
+    assert thread_reply_target(_node("T", database_id=7)) == 7  # never replied
+    assert thread_reply_target(_node("T", database_id=7, last=_bot(8))) is None  # a bot last
+    human = {"databaseId": 8, "author": {"login": "me", "__typename": "User"}}
+    assert thread_reply_target(_node("T", database_id=7, last=human)) == 7
+    for bad in (
+        {**_node("T"), "last": None},
+        {k: v for k, v in _node("T").items() if k != "last"},
+        _node("T", database_id=True),
+        _node("T", database_id=0),
+        _node("T", database_id=7, last={"author": {"__typename": "User"}}),
+        _node("T", database_id=7, last={"databaseId": 0, "author": {"__typename": "User"}}),
+    ):
+        assert thread_reply_target(bad) is None
+
+
+def test_reply_body():
+    sha = "abcdef1234"
+    assert reply_body({"evidence": " a.py:3 still races "}, sha, []) == (
+        "Still open at `abcdef1`: a.py:3 still races"
+    )
+    assert reply_body({"evidence": ""}, sha, []) == "Still open at `abcdef1`."
+    assert reply_body({"evidence": "x" * 900}, sha, []) == "Still open at `abcdef1`: " + "x" * 600
+    assert "s3cret" not in reply_body({"evidence": "key s3cret"}, sha, ["s3cret"])
+    assert "</details>" not in reply_body({"evidence": "</details>"}, sha, [])
+    assert len(reply_body({"evidence": "y" * 1000}, sha, [])) < 2000
+
+
+def test_open_finding_matched_only_by_title_never_replies_or_resolves():
+    shaped = _shaped({"title": "t", "severity": "normal", "status": "open", "file": "b.py"})
+    nodes = [_node("T1", path="a.py")]
+    assert match_resolved_threads(shaped, nodes, "franky-bot") == []
+    [(decision, _n, _fs, reply_finding)] = match_prior_threads(shaped, nodes, "franky-bot")
+    assert decision == "open" and reply_finding is None
+
+
+def test_match_prior_threads_survives_malformed_nodes():
+    shaped = _shaped({"title": "t", "severity": "normal", "status": "open", "file": "a.py"})
+    bad = [
+        {"id": "T", "isResolved": False, "comments": [1]},
+        {"id": "T", "isResolved": False, "comments": {"nodes": None}},
+        {"id": "T", "isResolved": False, "comments": {"nodes": [1]}},
+        {"id": "T", "isResolved": False, "comments": {"nodes": [{"author": "x", "body": "b"}]}},
+        "junk",
+        None,
+    ]
+    assert match_prior_threads(shaped, bad, "franky-bot") == []
+    assert match_prior_threads(shaped, None, "franky-bot") == []
+    for node in ({"comments": [1], "last": 3}, {"comments": {"nodes": None}}, {}, None, "x"):
+        assert thread_reply_target(node) is None
+
+
+def test_thread_reply_target_needs_a_typed_last_author():
+    for last in (
+        {"databaseId": 8},
+        {"databaseId": 8, "author": None},
+        {"databaseId": 8, "author": "x"},
+        {"databaseId": 8, "author": {"login": "me"}},
+        {"databaseId": 8, "author": {"__typename": 5}},
+    ):
+        assert thread_reply_target(_node("T", database_id=7, last=last)) is None
+
+
+def test_reply_body_stays_short_and_redacts_before_cutting():
+    sha = "abcdef1234"
+    body = reply_body({"evidence": "&" * 600}, sha, [])
+    assert len(body) < 2000 and not body.endswith("&") and not body.endswith("&a")
+    assert "a&b" not in reply_body({"evidence": "key a&b"}, sha, ["a&b"])
+    secret = "Z" * 20
+    crossing = "x" * 590 + secret  # the secret straddles the 600 cut
+    assert "Z" not in reply_body({"evidence": crossing}, sha, [secret])
 
 
 def test_empty_suggestion_renders_a_deletion_block():
