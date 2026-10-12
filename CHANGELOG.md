@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.19] - 2026-10-12
+
 ### Added
 
 - `JIRA_CLI` (an absolute path to the host's `acli`) lets `build jira KEY`, `plan jira KEY` and `review-pr` read tickets and comments through the operator's existing `acli` login instead of `JIRA_BASE_URL`, `JIRA_EMAIL` and `JIRA_API_TOKEN`. It wins when both are set, runs on the host only, and needs no `franky connect jira`. Set it with `franky config set JIRA_CLI /path/to/acli`. Older Franky versions ignore it.
