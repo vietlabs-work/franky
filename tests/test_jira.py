@@ -704,33 +704,32 @@ def test_jira_cli_relative_path_is_unavailable_and_never_runs():
     assert ei.value.reason == "unavailable" and not ran
 
 
-def test_jira_cli_comments_use_newest_first_listing_and_skip_restricted():
+def test_jira_cli_comments_use_newest_first_listing_and_keep_only_public():
     seen: list = []
     payload = json.dumps(
         {
             "comments": [
-                {"created": "2026-02-02T10:00:00.000+0000", "body": "newest", "author": "Zed"},
-                {"created": "2026-02-01T10:00:00.000+0000", "body": "hidden", "visibility": {"type": "role"}},
-                {"created": "2026-01-01T10:00:00.000+0000", "body": "older"},
+                {"author": "Zed", "body": "newest", "id": "3", "visibility": "public"},
+                {"author": "Y", "body": "hidden", "id": "2", "visibility": "role:x"},
+                {"author": "Y", "body": "unmarked", "id": "4"},
+                {"author": "Y", "body": "older", "id": "1", "visibility": "public"},
             ],
             "total": 9,
+            "isLast": False,
         }
     ).encode()  # fmt: skip
     out = fetch_jira_comments("FOO-1", _CLI_ENV, runner=_fake_run(payload, seen=seen))
     assert seen[0][0][3:] == [
         "comment", "list", "--key", "FOO-1", "--order", "-created", "--limit", "5", "--json",
     ]  # fmt: skip
-    assert out == (
-        "Latest ticket comments, newest first (2 shown of 9):\n"
-        "- 2026-02-02: newest\n- 2026-01-01: older"
-    )
+    assert out == ("Latest ticket comments, newest first (2 shown of 9):\n- newest\n- older")
     assert "Zed" not in out
 
 
 def test_jira_cli_comments_accept_a_bare_list():
-    payload = json.dumps([{"created": "2026-02-02T10:00:00Z", "body": "hi"}]).encode()
+    payload = json.dumps([{"body": "hi", "visibility": "public"}]).encode()
     out = fetch_jira_comments("FOO-1", _CLI_ENV, runner=_fake_run(payload))
-    assert out == "Latest ticket comments, newest first (1 shown):\n- 2026-02-02: hi"
+    assert out == "Latest ticket comments, newest first (1 shown):\n- hi"
 
 
 def test_jira_cli_comments_unparseable_shape_raises_network():

@@ -442,7 +442,8 @@ def fetch_jira_comments(
     Comments restricted to a group or role are skipped. Never follows a redirect. Raises the same
     tagged errors as `fetch_jira_issue`; a payload without a comment list raises reason "network".
     """
-    if jira_cli(env):
+    cli = bool(jira_cli(env))
+    if cli:
         # Newest-first and bounded by acli itself, so a long thread never yields a stale page.
         data = _cli_json(
             ["comment", "list", "--key", key, "--order", "-created", "--limit", str(limit)],
@@ -467,7 +468,10 @@ def fetch_jira_comments(
         raise _tag(NetworkError(f"JIRA returned no comment list for {key}"), "network")
     lines = []
     for comment in comments[:limit]:
-        if not isinstance(comment, dict) or comment.get("visibility"):
+        if not isinstance(comment, dict):
+            continue
+        # acli marks a normal comment visibility "public"; anything else or missing is dropped.
+        if (comment.get("visibility") != "public") if cli else comment.get("visibility"):
             continue
         raw = comment.get("body")
         text = _clean_text(raw if isinstance(raw, str) else _flatten_adf(raw))
@@ -475,7 +479,8 @@ def fetch_jira_comments(
             continue
         if len(text) > _MAX_COMMENT_CHARS:
             text = text[:_MAX_COMMENT_CHARS] + " [truncated]"
-        lines.append(f"- {str(comment.get('created') or '')[:10]}: {text}")
+        day = str(comment.get("created") or "")[:10]
+        lines.append(f"- {day}: {text}" if day or not cli else f"- {text}")
     if not lines:
         return ""
     total = data.get("total")
