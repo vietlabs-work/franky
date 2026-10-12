@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.20] - 2026-10-12
+
 ### Added
 
 - `review-pr --reply-prior` (with `--thread`) replies once, `Still open at SHA7: evidence`, on the publishing bot's own review threads whose finding the re-review kept open. It never replies after a bot's reply and never fails the run. The `--json` result adds `threads_replied` when the flag ran. A host `gh` wrapper that allowlists argv must also allow `api -X POST repos/OWNER/REPO/pulls/N/comments/ID/replies -f body=TEXT`.
