@@ -570,7 +570,8 @@ def build_handoff(
     A finding carries `raised_at`: for a new one, `shaped["posted_at"]` (the `submitted_at` GitHub
     returned for the review that posted it; absent when nothing was published, so it cannot be
     accepted yet); for an open or accepted one, the prior handoff's value, matched by exact file
-    and title key (missing when the prior had none or only a title-only match exists). An
+    and title key; one the prior had none for (an older handoff, an unpublished first run, or a
+    title-only match) gets this run's `posted_at`, which only moves it later. An
     acceptance must come from an approval submitted after it.
     `overflow` is set when the cap cut a finding above nit, and it stays set for the thread:
     a cut finding can no longer be tracked, so the thread never auto-approves again."""
@@ -578,7 +579,7 @@ def build_handoff(
     carried = _raised_at(findings, prior_handoff, secrets)
     stamp = shaped.get("posted_at") if isinstance(shaped.get("posted_at"), str) else None
     kept = [
-        {**f, "raised_at": stamp if f.get("status", "new") == "new" else carried.get(i)}
+        {**f, "raised_at": stamp if f.get("status", "new") == "new" else carried.get(i) or stamp}
         for i, f in enumerate(findings)
         if f.get("status") != "resolved"
     ]

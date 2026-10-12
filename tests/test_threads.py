@@ -76,6 +76,28 @@ def test_build_handoff_stamps_no_raised_at_when_nothing_was_published():
     assert "raised_at" not in threads.build_handoff(shaped, "s", [])["findings"][0]
 
 
+def _open_prior(**kw):
+    return {"findings": [{"title": "tradeoff", "file": "a.py", **kw}]}
+
+
+def test_published_run_stamps_a_reported_prior_that_has_no_raised_at():
+    shaped = {"posted_at": "2026-03-01T00:00:00Z"} | _shaped([_acc(status="open")])
+    handoff = threads.build_handoff(shaped, "s", [], prior_handoff=_open_prior())
+    assert handoff["findings"][0]["raised_at"] == "2026-03-01T00:00:00Z"
+
+
+def test_published_run_never_overwrites_an_existing_raised_at():
+    shaped = {"posted_at": "2026-03-01T00:00:00Z"} | _shaped([_acc()])
+    prior = _open_prior(raised_at="2026-01-01T00:00:00Z")
+    handoff = threads.build_handoff(shaped, "s", [], prior_handoff=prior)
+    assert handoff["findings"][0]["raised_at"] == "2026-01-01T00:00:00Z"
+
+
+def test_unpublished_run_stamps_no_prior_without_raised_at():
+    handoff = threads.build_handoff(_shaped([_acc()]), "s", [], prior_handoff=_open_prior())
+    assert "raised_at" not in handoff["findings"][0]
+
+
 def test_raised_at_carries_only_on_an_exact_file_and_title_match():
     prior = {
         "findings": [{"title": "tradeoff", "file": "other.py", "raised_at": "2026-01-01T00:00:00Z"}]
