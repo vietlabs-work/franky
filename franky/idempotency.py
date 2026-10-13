@@ -93,8 +93,8 @@ def fetch_pr_head_sha(
     the caller's policy, not this function's - it always just degrades to None on any error.
 
     `meta_sink` (review-pr) is filled from the SAME response with {"title", "body", "head_ref",
-    "base_sha", "private"} (non-string text becomes ""; `private` is True only for a literal
-    `true`) - only on the valid-sha return path, so no extra GitHub call
+    "base_sha", "private", "author"} (non-string text becomes ""; `private` is True only for a literal
+    `true`; `author` is the PR opener's login or None) - only on the valid-sha return path, so no extra GitHub call
     shape exists and a failed pin leaves the sink untouched. The sha stays fail-closed.
     """
     url = f"https://api.github.com/repos/{repo}/pulls/{number}"
@@ -126,6 +126,8 @@ def fetch_pr_head_sha(
     if meta_sink is not None:
         base = data.get("base")
         base_repo = base.get("repo") if isinstance(base, dict) else None
+        user = data.get("user")
+        login = user.get("login") if isinstance(user, dict) else None
 
         def _text(value: object) -> str:
             return value if isinstance(value, str) else ""
@@ -136,6 +138,7 @@ def fetch_pr_head_sha(
             head_ref=_text(head.get("ref")),
             base_sha=_text(base.get("sha") if isinstance(base, dict) else None),
             private=isinstance(base_repo, dict) and base_repo.get("private") is True,
+            author=login if isinstance(login, str) else None,
         )
     return sha
 

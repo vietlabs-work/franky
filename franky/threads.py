@@ -512,35 +512,84 @@ def omitted_prior(shaped: dict, handoff: dict | None, secrets) -> list[dict]:
     for f, title in unmatched:  # pass 2: same title, another or no file
         hit = next((p for p in pool if p[0] == title), None)
         if hit is None:
-            omitted.append({**f, "status": "open"})
+            omitted.append({**f, "status": "open", "accepted_by": None})
         else:
             pool.remove(hit)
     return omitted
 
 
-def build_handoff(shaped: dict, sha: str, secrets, review_url: str | None = None) -> dict:
+def _raised_at(shaped_findings: list, prior_handoff: dict | None, secrets) -> dict[int, str]:
+    """The prior `raised_at` of each reported (open or accepted) finding, by list index.
+
+    Same file and title key as the prior entry; each prior entry serves one finding. A prior
+    without a `raised_at` (an older handoff) gives none, so a later acceptance fails closed."""
+    prior = (prior_handoff or {}).get("findings")
+    prior = [p for p in (prior if isinstance(prior, list) else []) if isinstance(p, dict)]
+    keyed = [
+        (_title_key(p.get("title"), secrets), p.get("file"), p.get("raised_at")) for p in prior
+    ]
+    out: dict[int, str] = {}
+    for i, f in enumerate(shaped_findings):
+        if f.get("status") not in ("open", "accepted"):
+            continue
+        key, file_ = _title_key(f.get("title"), secrets), _clean_text(f.get("file"), 200, secrets)
+        hit = next((k for k in keyed if k[0] == key and k[1] == file_), None)
+        if hit is not None:
+            keyed.remove(hit)
+            if isinstance(hit[2], str):
+                out[i] = hit[2]
+    return out
+
+
+def _handoff_entry(f: dict, secrets) -> dict:
+    entry = {
+        "title": _clean_text(f.get("title"), 200, secrets),
+        "file": _clean_text(f.get("file"), 200, secrets),
+        "line": f.get("line"),
+        "severity": f.get("severity"),
+        "status": f.get("status", "new"),
+    }
+    if entry["status"] == "accepted":
+        entry["accepted_by"] = _clean_text(f.get("accepted_by"), 39, secrets)
+    if f.get("raised_at"):
+        entry["raised_at"] = f["raised_at"]
+    return entry
+
+
+def build_handoff(
+    shaped: dict,
+    sha: str,
+    secrets,
+    review_url: str | None = None,
+    prior_handoff: dict | None = None,
+) -> dict:
     """The bounded, redacted summary a later run is seeded with: no finding bodies, resolved
-    findings dropped, blocking first, at most HANDOFF_MAX_FINDINGS entries, text on one line.
+    findings dropped (an accepted one is kept, with `accepted_by`, and verified again each run),
+    blocking first, at most HANDOFF_MAX_FINDINGS entries, text on one line.
     `review_url` (a GitHub PR review permalink, else ignored) lets the next run link back.
+    A finding carries `raised_at`: for a new one, `shaped["posted_at"]` (the `submitted_at` GitHub
+    returned for the review that posted it; absent when nothing was published, so it cannot be
+    accepted yet); for an open or accepted one, the prior handoff's value, matched by exact file
+    and title key; one the prior had none for (an older handoff, an unpublished first run, or a
+    title-only match) gets this run's `posted_at`, which only moves it later. An
+    acceptance must come from an approval submitted after it.
     `overflow` is set when the cap cut a finding above nit, and it stays set for the thread:
     a cut finding can no longer be tracked, so the thread never auto-approves again."""
-    kept = [f for f in shaped.get("findings", []) if f.get("status") != "resolved"]
+    findings = shaped.get("findings", [])
+    carried = _raised_at(findings, prior_handoff, secrets)
+    stamp = shaped.get("posted_at") if isinstance(shaped.get("posted_at"), str) else None
+    kept = [
+        {**f, "raised_at": stamp if f.get("status", "new") == "new" else carried.get(i) or stamp}
+        for i, f in enumerate(findings)
+        if f.get("status") != "resolved"
+    ]
     kept += shaped.get("omitted_prior") or []  # still open: the re-review never reported them
     kept.sort(key=lambda f: _SEVERITY_ORDER.get(f.get("severity"), 2))  # stable
     handoff = {
         "schema": SCHEMA,
         "sha": sha,
         "summary": _clean_text(shaped.get("summary") or "", 500, secrets),
-        "findings": [
-            {
-                "title": _clean_text(f.get("title"), 200, secrets),
-                "file": _clean_text(f.get("file"), 200, secrets),
-                "line": f.get("line"),
-                "severity": f.get("severity"),
-                "status": f.get("status", "new"),
-            }
-            for f in kept[:HANDOFF_MAX_FINDINGS]
-        ],
+        "findings": [_handoff_entry(f, secrets) for f in kept[:HANDOFF_MAX_FINDINGS]],
     }
     cut = kept[HANDOFF_MAX_FINDINGS:]
     if shaped.get("prior_overflow") or any(f.get("severity") != "nit" for f in cut):
@@ -631,7 +680,7 @@ def finish_run(
                 )
                 if why in ("too_large", "verify_failed"):
                     _drop_session(thread, record)
-        record["handoff"] = build_handoff(shaped, sha, secrets, review_url)
+        record["handoff"] = build_handoff(shaped, sha, secrets, review_url, record.get("handoff"))
         record["last_sha"] = sha
         record["updated_at"] = now.isoformat(timespec="seconds")
     if incoming is not None:

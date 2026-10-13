@@ -3809,6 +3809,7 @@ class _GhCalls(list):
         super().__init__()
         self.files = []
         self.inputs = []
+        self.reads = []
 
 
 def _mc_review_setup(
@@ -3821,6 +3822,8 @@ def _mc_review_setup(
     gh=(0, None),
     review_files=None,
     later_sha=None,
+    author=None,
+    reviews=None,
 ):
     """Wire a hermetic review-pr: env, images present, live-head fetch + container + gh api all
     mocked. `recheck_sha` defaults to `live_sha` (head unchanged); pass a different value to
@@ -3835,6 +3838,8 @@ def _mc_review_setup(
     seen_gh_calls = _GhCalls()
 
     def fake_fetch(repo, number, e, **k):
+        if author is not None and k.get("meta_sink") is not None:
+            k["meta_sink"]["author"] = author
         if later_sha is not None and seen_gh_calls.files:
             return later_sha
         return shas.pop(0) if shas else (recheck_sha if recheck_sha is not None else live_sha)
@@ -3854,6 +3859,9 @@ def _mc_review_setup(
         if "/files" in args[1]:
             seen_gh_calls.files.append(list(args))
             return 0, json.dumps([review_files or []]), ""
+        if args[1].endswith("/reviews?per_page=100"):
+            seen_gh_calls.reads.append(list(args))
+            return reviews if reviews is not None else (0, "[[]]", "")
         seen_gh_calls.append(list(args))
         seen_gh_calls.inputs.append(k.get("input"))
         return gcode, gout, ""
@@ -4557,6 +4565,132 @@ def test_review_pr_thread_re_review_that_omits_a_prior_finding_never_approves(
     assert json.loads(calls.inputs[-1])["event"] == "COMMENT"  # "race" was never reported
     handoff = threads_mod.read_record(_thread_dir(tmp_path))["handoff"]
     assert [(f["title"], f["status"]) for f in handoff["findings"]] == [("race", "open")]
+
+
+def _accept_rerun(
+    monkeypatch, tmp_path, reviews, *, author="author-y", approve_at="2099-01-01T00:00:00Z"
+):
+    """Run 1 raises a Major; run 2 reports it accepted by owner-x. Returns the gh calls."""
+    _fix_review_nonce(monkeypatch)
+    calls = _mc_review_setup(
+        monkeypatch,
+        env=_thread_env(tmp_path),
+        author=author,
+        reviews=reviews,
+        gh=(0, json.dumps({"html_url": REVIEW_URL, "id": 555, "submitted_at": POSTED_AT})),
+    )
+    major = {
+        "summary": "one tradeoff",
+        "findings": [
+            {"title": "race", "body": "b", "severity": "blocking", "file": "a.py", "line": 3}
+        ],
+        "checks": [],
+    }
+    accepted = {
+        "summary": "accepted by the approver",
+        "findings": [
+            {
+                "title": "race",
+                "body": "b",
+                "severity": "blocking",
+                "file": "a.py",
+                "line": 3,
+                "status": "accepted",
+                "accepted_by": "owner-x",
+            }
+        ],
+        "checks": [],
+    }
+    _fake_thread_run(
+        monkeypatch, tmp_path, results=[(0, _review_block(major)), (0, _review_block(accepted))]
+    )
+    assert _review(["--thread", "--engine", "claude"]).exit_code == 0
+    return calls
+
+
+POSTED_AT = "2026-01-01T00:00:00Z"
+
+
+def _approval(at="2099-01-01T00:00:00Z", assoc="MEMBER"):
+    review = {
+        "id": 7,
+        "author_association": assoc,
+        "user": {"login": "owner-x", "type": "User"},
+        "state": "APPROVED",
+        "commit_id": LIVE_SHA,
+        "submitted_at": at,
+        "body": "",
+    }
+    return (0, json.dumps([[review]]), "")
+
+
+def test_review_pr_thread_accepted_risk_approves_when_a_human_approved_the_head(
+    monkeypatch, tmp_path
+):
+    calls = _accept_rerun(monkeypatch, tmp_path, _approval())
+    second = _review(["--thread", "--allow-approve", "--engine", "claude"])
+    assert second.exit_code == 0, second.output
+    posted = json.loads(calls.inputs[-1])
+    assert posted["event"] == "APPROVE"
+    assert all(not c["body"].startswith(("**Blocking:", "**Major:")) for c in posted["comments"])
+    assert "Accepted risk (by @owner-x): race" in posted["body"]
+    assert calls.reads == [
+        ["api", "repos/me/repo/pulls/11/reviews?per_page=100", "--paginate", "--slurp"]
+    ]
+    handoff = threads_mod.read_record(_thread_dir(tmp_path))["handoff"]
+    assert [(f["status"], f["accepted_by"]) for f in handoff["findings"]] == [
+        ("accepted", "owner-x")
+    ]
+    assert handoff["findings"][0]["raised_at"] == POSTED_AT  # the first POSTed review's time
+
+
+def test_review_pr_thread_accepted_risk_without_a_readable_review_list_stays_blocking(
+    monkeypatch, tmp_path
+):
+    calls = _accept_rerun(monkeypatch, tmp_path, (1, "", "boom"))
+    second = _review(["--thread", "--allow-approve", "--engine", "claude"])
+    assert second.exit_code == 0, second.output
+    assert json.loads(calls.inputs[-1])["event"] == "REQUEST_CHANGES"
+    handoff = threads_mod.read_record(_thread_dir(tmp_path))["handoff"]
+    assert handoff["findings"][0]["status"] == "open"
+    assert "accepted_by" not in handoff["findings"][0]
+
+
+def test_review_pr_thread_accepted_risk_needs_an_authorized_association(monkeypatch, tmp_path):
+    calls = _accept_rerun(monkeypatch, tmp_path, _approval(assoc="CONTRIBUTOR"))
+    assert _review(["--thread", "--allow-approve", "--engine", "claude"]).exit_code == 0
+    assert json.loads(calls.inputs[-1])["event"] == "REQUEST_CHANGES"
+
+
+def test_review_pr_thread_unpublished_run_stamps_no_raised_at(monkeypatch, tmp_path):
+    _fix_review_nonce(monkeypatch)
+    _mc_review_setup(monkeypatch, env=_thread_env(tmp_path))
+    _fake_thread_run(monkeypatch, tmp_path)
+    assert _review(["--thread", "--engine", "claude", "--no-publish"]).exit_code == 0
+    handoff = threads_mod.read_record(_thread_dir(tmp_path))["handoff"]
+    assert handoff["findings"] and all("raised_at" not in f for f in handoff["findings"])
+
+
+def test_review_pr_thread_accepted_risk_by_the_pr_author_stays_blocking(monkeypatch, tmp_path):
+    calls = _accept_rerun(monkeypatch, tmp_path, _approval(), author="Owner-X")
+    assert _review(["--thread", "--allow-approve", "--engine", "claude"]).exit_code == 0
+    assert json.loads(calls.inputs[-1])["event"] == "REQUEST_CHANGES"
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [(1, "", "denied"), (0, "not json", ""), (0, '{"a": 1}', ""), OSError("no gh"),
+     subprocess.TimeoutExpired("gh", 5), cli.DockerError("x")],
+)  # fmt: skip
+def test_read_pr_reviews_gives_none_on_any_failure(monkeypatch, capsys, reply):
+    def fake(args, env, **k):
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    monkeypatch.setattr(cli, "run_gh", fake)
+    assert cli._read_pr_reviews("me/repo", 11, ["sekret"]) is None
+    assert "could not read PR reviews" in capsys.readouterr().err
 
 
 def test_review_pr_thread_first_run_pins_session_before_launch(monkeypatch, tmp_path):
@@ -5611,6 +5745,21 @@ def test_publish_matching_signoff_glob_posts_comment_not_approve(monkeypatch):
     assert gh.post_events() == ["COMMENT"]
     assert "code-clean, human sign-off required" in json.loads(gh.inputs[-1])["body"]
     assert reads == [("me/repo", BASE_SHA40)]
+
+
+def test_publish_signoff_copy_still_stamps_posted_at_on_the_callers_shape(monkeypatch):
+    shaped = _clean()
+    post = (
+        0,
+        json.dumps({"html_url": REVIEW_URL, "id": 555, "submitted_at": "2026-01-02T03:04:05Z"}),
+        "",
+    )
+    monkeypatch.setattr(cli, "fetch_signoff_globs", lambda *a, **k: ["**/pay/**"])
+    _Gh(monkeypatch, posts=[post], files=_signoff_files("a/pay/X.java"))
+    out = _pub(shaped, allow_approve=True, base_sha=BASE_SHA40)
+    assert out[5] == "COMMENT"
+    assert shaped["posted_at"] == "2026-01-02T03:04:05Z"
+    assert "signoff_required" not in shaped
 
 
 def test_publish_no_matching_signoff_glob_still_approves(monkeypatch):

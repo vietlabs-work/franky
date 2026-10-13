@@ -92,6 +92,7 @@ def test_meta_sink_filled_from_one_response():
         "body": "see OPS-9",
         "head": {"sha": _SHA, "ref": "abc-1-fix"},
         "base": {"sha": "b" * 40},
+        "user": {"login": "owner-x"},
     }
     sha = fetch_pr_head_sha("me/repo", 7, {}, opener=_pr_opener(payload, calls), meta_sink=sink)
     assert sha == _SHA
@@ -101,6 +102,7 @@ def test_meta_sink_filled_from_one_response():
         "head_ref": "abc-1-fix",
         "base_sha": "b" * 40,
         "private": False,
+        "author": "owner-x",
     }
     assert len(calls) == 1
 
@@ -109,7 +111,14 @@ def test_meta_sink_null_body_becomes_empty_string():
     sink = {}
     payload = {"title": None, "body": None, "head": {"sha": _SHA, "ref": 5}}
     fetch_pr_head_sha("me/repo", 7, {}, opener=_pr_opener(payload, []), meta_sink=sink)
-    assert sink == {"title": "", "body": "", "head_ref": "", "base_sha": "", "private": False}
+    assert sink == {
+        "title": "",
+        "body": "",
+        "head_ref": "",
+        "base_sha": "",
+        "private": False,
+        "author": None,
+    }
 
 
 def test_meta_sink_private_only_for_literal_true():
