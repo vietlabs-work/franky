@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.22] - 2026-10-13
+
 ### Added
 
 - A threaded `review-pr` re-review can mark a prior finding `accepted` with `accepted_by` (a GitHub login) when its remaining concern is a risk tradeoff that a named human accepted. Franky keeps it only when it reads that person's latest review as an `APPROVED` on the reviewed head by an `OWNER`, `MEMBER` or `COLLABORATOR` (`author_association`), submitted after the review that posted the finding, and the person is neither the PR author nor a bot. A verified accepted finding above nit adds an `Accepted risk:` line to the review body. Otherwise the finding stays `open`. A verified accepted risk no longer blocks `--allow-approve`. The handoff stores `accepted_by` and `raised_at` (the posted review's `submitted_at`) per finding. A host `gh` wrapper that allowlists argv must allow `api repos/OWNER/REPO/pulls/N/reviews?per_page=100 --paginate --slurp` (already used to reconcile an APPROVE).
