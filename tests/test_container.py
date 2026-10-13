@@ -6,6 +6,11 @@ import pytest
 from franky import franky_version, snapshot
 from franky.config import Config, load_config
 from franky.container import (
+    fallback_image,
+    list_local_images,
+    local_engines,
+    pick_fallback,
+    pull_in_background,
     CODEX_AUTH_HOME,
     FRANKY_PROXY_IMAGE_VAR,
     GHCR_REPO_VAR,
@@ -2914,3 +2919,99 @@ def test_workspace_and_session_sinks_share_one_hold(tmp_path):
         )
     assert wsink["status"] == "ok" and ssink["status"] == "ok"
     assert sum(1 for c in calls if c == _MARKER) == 1
+
+
+_G = "ghcr.io/acme"
+_V = franky_version().rsplit(".", 1)[0]  # major.minor of the running version
+
+
+def test_pick_fallback_newest_lower_patch_same_minor_and_engine():
+    refs = [
+        f"{_G}/franky:1.4.1-codex",
+        f"{_G}/franky:1.4.3-codex",
+        f"{_G}/franky:1.4.7-codex",  # not lower
+        f"{_G}/franky:1.4.9-codex",  # higher
+        f"{_G}/franky:1.3.9-codex",  # other minor
+        f"{_G}/franky:1.5.0-codex",  # other minor
+        f"{_G}/franky:1.4.2-claude",  # other engine
+        f"{_G}/franky:1.4.2-codex-dev",  # dev tag
+        f"{_G}/franky:latest",
+        f"{_G}/franky:1.4.2",  # no engine suffix
+        "ghcr.io/other/franky:1.4.4-codex",  # other repo
+        f"{_G}/franky-proxy:1.4.4",  # other image
+    ]
+    assert pick_fallback(f"{_G}/franky:1.4.5-codex", refs) == f"{_G}/franky:1.4.3-codex"
+    assert pick_fallback(f"{_G}/franky:1.4.0-codex", refs) is None
+
+
+def test_pick_fallback_proxy_and_unparseable():
+    refs = [f"{_G}/franky-proxy:1.4.1", f"{_G}/franky-proxy:1.4.2", f"{_G}/franky:1.4.3-pi"]
+    assert pick_fallback(f"{_G}/franky-proxy:1.4.3", refs) == f"{_G}/franky-proxy:1.4.2"
+    assert pick_fallback("franky", refs) is None
+    assert pick_fallback(f"{_G}/franky:dev", refs) is None
+
+
+def test_local_engines_any_version_this_prefix_only():
+    refs = [
+        f"{_G}/franky:1.0.0-claude",
+        f"{_G}/franky:1.4.0-codex",
+        f"{_G}/franky:1.4.0-bogus",  # not an engine
+        f"{_G}/franky:1.4.0",
+        "ghcr.io/other/franky:1.4.0-pi",
+    ]
+    assert local_engines(refs, _G) == {"claude", "codex"}
+
+
+def _ls_runner(stdout, returncode=0):
+    return lambda argv, **kw: subprocess.CompletedProcess(
+        argv, returncode, stdout=stdout, stderr=""
+    )
+
+
+def test_list_local_images_and_failures():
+    assert list_local_images(_ls_runner("a:1\nb:2\n")) == ["a:1", "b:2"]
+    assert list_local_images(_ls_runner("a:1", returncode=1)) == []
+
+    def boom(argv, **kw):
+        raise OSError("no docker")
+
+    assert list_local_images(boom) == []
+
+
+def test_fallback_image_none_when_image_is_local():
+    img = f"{_G}/franky:1.4.5-pi"
+    assert fallback_image(img, _ls_runner(f"{img}\n{_G}/franky:1.4.4-pi\n")) is None
+    assert fallback_image(img, _ls_runner(f"{_G}/franky:1.4.4-pi\n")) == f"{_G}/franky:1.4.4-pi"
+
+
+def test_pull_in_background_detaches_and_logs(tmp_path):
+    calls = []
+    pull_in_background(
+        "img:1", tmp_path / "home", popen=lambda argv, **kw: calls.append((argv, kw))
+    )
+    argv, kw = calls[0]
+    assert argv == ["docker", "pull", "img:1"]
+    assert kw["start_new_session"] is True
+    assert kw["stdin"] == subprocess.DEVNULL and kw["stderr"] == subprocess.STDOUT
+    log = tmp_path / "home" / "image-pull.log"
+    assert log.exists() and oct(log.stat().st_mode & 0o777) == "0o600"
+    assert oct((tmp_path / "home").stat().st_mode & 0o777) == "0o700"
+
+
+def test_pull_in_background_tightens_an_existing_log(tmp_path):
+    log = tmp_path / "image-pull.log"
+    log.write_text("old\n")
+    log.chmod(0o644)
+    pull_in_background("img:1", tmp_path, popen=lambda argv, **kw: None)
+    assert oct(log.stat().st_mode & 0o777) == "0o600"
+
+
+def test_pull_in_background_oserror_never_raises(tmp_path):
+    def boom(argv, **kw):
+        raise OSError("no docker")
+
+    pull_in_background("img:1", tmp_path, popen=boom)
+    # An unwritable log dir is skipped too.
+    blocker = tmp_path / "file"
+    blocker.write_text("x")
+    pull_in_background("img:1", blocker / "sub", popen=lambda *a, **k: pytest.fail("no pull"))

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `franky update` pre-pulls the task image of every engine this host uses: the configured one, any engine with a local released image, and those named in the new `FRANKY_PULL_ENGINES` setting (comma-separated). One failed pull no longer skips the others.
+- A run whose versioned image is not pulled yet uses the newest older patch of the same minor (and engine) that is local, and pulls the missing image in the background (log: `~/.franky/image-pull.log`). With no such image it pulls as before. `FRANKY_IMAGE` and `FRANKY_PROXY_IMAGE` overrides never fall back.
+
+### Fixed
+
+- `franky update` on the latest release now pre-pulls images too, so it repairs a missing image.
+
 ## [0.3.23] - 2026-10-13
 
 ### Changed

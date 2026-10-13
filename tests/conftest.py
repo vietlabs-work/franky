@@ -147,3 +147,12 @@ def connect_atlassian():
         return rec
 
     return make
+
+
+@pytest.fixture(autouse=True)
+def _no_local_docker_images(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Unit tests never list real docker images: no run-time fallback, no engines in use."""
+    from franky import cli
+
+    monkeypatch.setattr(cli, "fallback_image", lambda image: None)
+    monkeypatch.setattr(cli, "list_local_images", lambda: [])

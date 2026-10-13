@@ -12,7 +12,7 @@ import franky.cli as cli
 import franky.jobs as jobs
 from click.testing import CliRunner
 
-from franky import __version__
+from franky import __version__, franky_version
 from franky.reviewpr import RESOLVE_MUTATION, THREADS_QUERY, build_review_findings
 from franky.schema import build_schema
 from franky._install import Install
@@ -1100,6 +1100,138 @@ def test_pull_images_uses_the_engine_from_the_config_file(monkeypatch, tmp_path)
     assert res.exit_code == 0, res.output
     assert pulled[0] == f"ghcr.io/vietlabs-work/franky:{__version__}-claude"
     assert "FRANKY_ENGINE" not in cli.os.environ  # the copy was loaded, not the process env
+
+
+def _pull_recorder(monkeypatch, fail=()):
+    pulled = []
+
+    def fake(image):
+        pulled.append(image)
+        return (False, "pull-failed") if any(f in image for f in fail) else (True, "")
+
+    monkeypatch.setattr(cli, "ensure_image_available", fake)
+    return pulled
+
+
+def test_pull_images_covers_configured_local_and_listed_engines(monkeypatch, tmp_path):
+    g = "ghcr.io/vietlabs-work"
+    env = {
+        "FRANKY_ENGINE": "claude",
+        "FRANKY_PULL_ENGINES": " opencode , codex ",
+        **_cfg_env(tmp_path),
+    }
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(
+        cli, "list_local_images", lambda: [f"{g}/franky:0.1.0-pi", f"{g}/franky:0.1.0"]
+    )
+    pulled = _pull_recorder(monkeypatch)
+    res = CliRunner().invoke(cli.main, ["pull-images"])
+    assert res.exit_code == 0, res.output
+    tasks = [p for p in pulled if "franky-proxy" not in p]
+    assert tasks == [
+        f"{g}/franky:{franky_version()}-{e}" for e in ("claude", "opencode", "codex", "pi")
+    ]
+    assert res.output.count("image ready") == 5  # four engines + proxy
+
+
+def test_pull_images_unknown_pull_engine_is_a_config_error(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        cli.os, "environ", {"FRANKY_PULL_ENGINES": "codex,nope", **_cfg_env(tmp_path)}
+    )
+    pulled = _pull_recorder(monkeypatch)
+    res = CliRunner().invoke(cli.main, ["pull-images"])
+    assert res.exit_code == cli.EXIT_CONFIG
+    assert "unknown engine 'nope'" in res.output
+    assert pulled == []
+
+
+def test_pull_images_override_pulls_one_image(monkeypatch, tmp_path):
+    env = {"FRANKY_IMAGE": "local/franky:dev", "FRANKY_PULL_ENGINES": "codex", **_cfg_env(tmp_path)}
+    monkeypatch.setattr(cli.os, "environ", env)
+    monkeypatch.setattr(cli, "list_local_images", lambda: ["ghcr.io/vietlabs-work/franky:0.1.0-pi"])
+    pulled = _pull_recorder(monkeypatch)
+    res = CliRunner().invoke(cli.main, ["pull-images"])
+    assert res.exit_code == 0, res.output
+    assert pulled[0] == "local/franky:dev"
+    assert len([p for p in pulled if "franky-proxy" not in p]) == 1
+
+
+def test_pull_images_one_engine_failing_does_not_skip_the_rest(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        cli.os,
+        "environ",
+        {"FRANKY_ENGINE": "claude", "FRANKY_PULL_ENGINES": "codex,pi", **_cfg_env(tmp_path)},
+    )
+    pulled = _pull_recorder(monkeypatch, fail=("-codex",))
+    res = CliRunner().invoke(cli.main, ["pull-images"])
+    assert res.exit_code == 6
+    assert any(p.endswith("-pi") for p in pulled) and any(p.endswith("-claude") for p in pulled)
+    assert "image pull failed" in res.output and "-codex" in res.output
+    assert res.output.count("image ready") == 3  # claude, pi, proxy
+
+
+def test_pull_images_pulls_the_proxy_when_every_task_image_fails(monkeypatch, tmp_path):
+    monkeypatch.setattr(cli.os, "environ", {"FRANKY_ENGINE": "codex", **_cfg_env(tmp_path)})
+    pulled = _pull_recorder(monkeypatch, fail=("/franky:",))
+    res = CliRunner().invoke(cli.main, ["pull-images"])
+    assert res.exit_code == 6
+    assert pulled[-1] == f"ghcr.io/vietlabs-work/franky-proxy:{franky_version()}"
+    assert res.output.count("image ready") == 1
+
+
+def test_pull_images_unknown_pull_engine_fails_even_with_an_override(monkeypatch, tmp_path):
+    env = {"FRANKY_IMAGE": "local/franky:dev", "FRANKY_PULL_ENGINES": "nope", **_cfg_env(tmp_path)}
+    monkeypatch.setattr(cli.os, "environ", env)
+    pulled = _pull_recorder(monkeypatch)
+    res = CliRunner().invoke(cli.main, ["pull-images"])
+    assert res.exit_code == cli.EXIT_CONFIG
+    assert pulled == []
+
+
+def _fallback_env(monkeypatch, old="ghcr.io/vietlabs-work/franky:0.0.1-pi"):
+    bg = []
+    monkeypatch.setattr(cli, "fallback_image", lambda image: old if "proxy" not in image else None)
+    monkeypatch.setattr(cli, "pull_in_background", lambda image: bg.append(image))
+    return bg
+
+
+def test_ensure_images_missing_uses_fallback_and_pulls_in_background(monkeypatch, capsys):
+    bg = _fallback_env(monkeypatch)
+    blocking = []
+    monkeypatch.setattr(
+        cli, "ensure_image_available", lambda image: blocking.append(image) or (True, "")
+    )
+    franky_img, proxy_img = cli._ensure_images({}, "pi")
+    new = f"ghcr.io/vietlabs-work/franky:{franky_version()}-pi"
+    assert franky_img == "ghcr.io/vietlabs-work/franky:0.0.1-pi"
+    assert bg == [new]
+    assert blocking == [proxy_img]  # no fallback for the proxy here: normal blocking path
+    err = capsys.readouterr().err
+    assert err.count("not pulled yet") == 1 and new in err
+
+
+def test_ensure_images_no_fallback_blocks_as_before(monkeypatch):
+    monkeypatch.setattr(cli, "pull_in_background", lambda image: pytest.fail("no bg pull"))
+    blocking = []
+    monkeypatch.setattr(
+        cli, "ensure_image_available", lambda image: blocking.append(image) or (True, "")
+    )
+    cli._ensure_images({}, "pi")
+    assert len(blocking) == 2
+
+
+def test_ensure_images_override_and_disabled_never_fall_back(monkeypatch):
+    _fallback_env(monkeypatch)
+    monkeypatch.setattr(cli, "pull_in_background", lambda image: pytest.fail("no bg pull"))
+    blocking = []
+    monkeypatch.setattr(
+        cli, "ensure_image_available", lambda image: blocking.append(image) or (True, "")
+    )
+    cli._ensure_images({"FRANKY_IMAGE": "local/franky:dev"}, "pi")
+    assert blocking[0] == "local/franky:dev"
+    blocking.clear()
+    cli._ensure_images({}, "pi", allow_fallback=False)
+    assert blocking[0].endswith(f"{franky_version()}-pi")
 
 
 def test_pull_images_is_hidden_from_help_but_in_schema():

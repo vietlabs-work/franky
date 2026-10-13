@@ -99,3 +99,8 @@ Release runs use an engine-specific image. The unsuffixed image contains all eng
 | `FRANKY_IMAGE` | Override the task image. |
 | `FRANKY_PROXY_IMAGE` | Override the proxy image. |
 | `FRANKY_GHCR_REPO` | Override the GHCR namespace. |
+| `FRANKY_PULL_ENGINES` | Comma-separated engines that `franky update` also pre-pulls. |
+
+`franky update` pulls the task image of the configured engine, of every engine with a local released image, and of each engine in `FRANKY_PULL_ENGINES`, then the proxy image. A failed pull does not skip the others, and the command exits nonzero.
+
+When a run finds its versioned image missing, it uses the newest older patch of the same minor version and engine that is local, and pulls the missing image in the background (log: `~/.franky/image-pull.log`). It never crosses a minor version. With no such image, or with `FRANKY_IMAGE` or `FRANKY_PROXY_IMAGE` set, it pulls and waits as before.
