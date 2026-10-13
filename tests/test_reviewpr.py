@@ -180,7 +180,7 @@ def test_payload_splits_inline_and_body():
     assert "Off diff" not in p["body"]  # a nit is inline or nothing
     assert "**Major: No line**\n\nwhy" in p["body"]
     assert "Persist tax id" not in p["body"]
-    assert p["body"].startswith("Review of sha1: 2 findings (1 blocking). sum\n\n") and p[
+    assert p["body"].startswith("Review of sha1: 2 findings (1 blocking, 1 major). sum\n\n") and p[
         "body"
     ].endswith("<sub>Automated review by Franky</sub>")
 
@@ -605,7 +605,7 @@ def test_prior_finding_left_out_of_a_re_review_blocks_approve():
     assert review_event(shaped, allow_approve=True) == "COMMENT"
     body = render_review_body(shaped, "a" * 40)
     assert "Not re-reported, still open: Guard the null list" in body
-    assert "1 finding (0 blocking)" in body
+    assert "1 finding (0 blocking, 1 major)" in body
     shaped["omitted_prior"] = [{"title": "Race", "severity": "blocking", "file": "a.py"}]
     assert review_event(shaped) == "REQUEST_CHANGES"
     over = _shape(threaded=True)
@@ -719,6 +719,12 @@ def test_heading_still_matches_resolve_threads():
     assert match_resolved_threads(shaped, [node], "bot") == ["T1"]
 
 
+def test_headline_names_major_and_question_counts_beside_blocking():
+    shaped = _shaped(_ev("a"), _ev("b"), _ev("c", severity="question"), _ev("d", severity="nit"))
+    body = build_body_only_payload(shaped, "abcdef1234", [])["body"]
+    assert body.startswith("Review of abcdef1: 3 findings (0 blocking, 2 major, 1 question). s")
+
+
 def test_body_headline_counts_and_collapsed_blocks_only_when_non_empty():
     quiet = build_review_payload(_shaped(_ev(severity="nit")), {}, "abcdef1234", [])["body"]
     assert quiet == (
@@ -726,7 +732,7 @@ def test_body_headline_counts_and_collapsed_blocks_only_when_non_empty():
     )
     shaped = _shaped(_ev("a", severity="blocking", file=None, line=None), _ev("b", line=11))
     body = build_review_payload(shaped, commentable_lines(FILES), "abcdef1234", [])["body"]
-    assert body.startswith("Review of abcdef1: 2 findings (1 blocking). s\n\n")
+    assert body.startswith("Review of abcdef1: 2 findings (1 blocking, 1 major). s\n\n")
     assert body.count("<details>") == 1 and "Since the last" not in body
     assert (
         "<details><summary>Findings with no line (1)</summary>\n\n**Blocking: a**\n\n"

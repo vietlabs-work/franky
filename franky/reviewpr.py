@@ -376,9 +376,14 @@ def _block(title: str, items: list[str], sep: str, room: int) -> str:
 def _headline(shaped: dict, sha: str) -> str:
     live = [f for f in shaped["findings"] if f["status"] not in _CLEARED and f["severity"] != "nit"]
     live += shaped.get("omitted_prior") or []
-    blocking = sum(f["severity"] == "blocking" for f in live)
+    # Name every live severity, so "0 blocking" never reads as a clean pass.
+    counts = [f"{sum(f.get('severity') == 'blocking' for f in live)} blocking"] + [
+        f"{n} {_LABELS[s].lower()}"
+        for s in ("normal", "question")
+        if (n := sum(f.get("severity") == s for f in live))
+    ]
     what = (
-        f"{len(live)} finding{'' if len(live) == 1 else 's'} ({blocking} blocking)."
+        f"{len(live)} finding{'' if len(live) == 1 else 's'} ({', '.join(counts)})."
         if live
         else "no findings above nit."
     )
