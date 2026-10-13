@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.23] - 2026-10-13
+
 ### Changed
 
 - The `review-pr` headline now counts Major findings and open questions beside the blocking count (`3 findings (0 blocking, 2 major, 1 question).`), so a review with no blocking finding no longer reads as a clean pass.
