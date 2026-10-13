@@ -25,8 +25,9 @@ hooks, MCP files, env files, keys, credentials, non-UTF-8 files, anything outsid
 and, inside a skill directory, `*.yaml`, `*.yml`, `*.toml`, `*.json` files and `agents/` dirs.
 Caps: 500 files, 4 MiB in total (both fail the run), 256 KiB per file (the file is skipped,
 also at fetch time: a larger blob is never downloaded), 16 KiB for the index.
-Repository text is neutralized where it joins the instruction file: `@` import lines are
-wrapped in backticks (anywhere in a line) and headings are demoted, so it cannot import a file or fake a heading.
+Repository text joins the instruction file inside one fenced code block (a fence longer than any
+backtick run in it), so it can neither import a file with `@path` nor fake a heading.
+
 
 Any fetch or mapping error exits nonzero with one short message and no secret in it: the host
 then fails the run before the engine starts. A repository with no setup is normal.
@@ -371,27 +372,17 @@ def clean_line(value: str, limit: int) -> str:
     return flat if len(flat) <= limit else flat[: limit - 3].rstrip() + "..."
 
 
-# An `@path` import counts anywhere in a line, so every `@token` not glued to a word or a backtick.
-_IMPORT_RE = re.compile(r"(?<![\w`])(@\S+)")
-_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}(\s|$)")
-_SETEXT_RE = re.compile(r"^\s{0,3}(=+|-+)\s*$")
+def fence_text(text: str) -> str:
+    """Wrap repository text in ONE fenced code block so it is inert in the instruction file.
 
-
-def neutralize(text: str) -> str:
-    """Make repository text inert where it joins the instruction file.
-
-    An `@path` token is an import in Claude Code wherever it sits in a line: it is wrapped in backticks.
-    A Markdown heading is demoted below the `###` file headings (a `#####` prefix), and a setext
-    underline is escaped, so repository text cannot fake the "Team rules" or any other heading.
+    Claude Code resolves no `@path` import and no heading inside a fenced code block, and
+    CommonMark never closes a backtick fence on a shorter backtick run, so the fence is longer
+    than the longest backtick run in the text (3 at least). CR and CRLF become LF, NUL goes.
     """
-    out = []
-    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-        if _HEADING_RE.match(line):
-            line = "##### " + line.lstrip().lstrip("#").strip()
-        elif _SETEXT_RE.match(line):
-            line = "\\" + line.lstrip()
-        out.append(_IMPORT_RE.sub(lambda m: f"`{m.group(1)}`", line))
-    return "\n".join(out)
+    text = text.replace("\0", "").replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+    longest = max((len(m) for m in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}text\n{text}\n{fence}"
 
 
 def _write(path: Path, text: str) -> None:
@@ -484,11 +475,11 @@ def map_setup(
         text = texts.get(rel)
         if text and text.strip() and text.strip() not in seen:
             seen.add(text.strip())
-            sections.append((rel, neutralize(text.strip())))
+            sections.append((rel, fence_text(text.strip())))
     rules = sorted(r for r in texts if r.endswith(".md") and any(_under(r, p) for p in RULE_ROOTS))
     for rel in rules:
         if texts[rel].strip():
-            sections.append((rel, neutralize(texts[rel].strip())))
+            sections.append((rel, fence_text(texts[rel].strip())))
     if sections:
         target = home / instruction
         existing = target.read_text(encoding="utf-8") if target.is_file() else ""
