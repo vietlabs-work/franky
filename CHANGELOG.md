@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.25] - 2026-10-13
+
 ### Added
 
 - A `team` setup kind: `[setups] team = "<dir>"` declares an engine-neutral team setup (`AGENTS.md`, `rules/`, `skills/<name>/SKILL.md`, `knowledge/`, `commands/pr.md`, `MANIFEST.json`). Franky maps it onto the selected engine's native locations when it packs the bundle (verified for `claude` and `codex`; `opencode` and `pi` keep a prompt pointer), merges the team rules into the one instruction file after the operator's text, and prefers the team PR-description spec. It ships Markdown and plain-text documents only, under the same deny rules, limits, and secret scan. `franky profile check` prints a `team:` line from `MANIFEST.json`.
