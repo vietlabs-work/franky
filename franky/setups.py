@@ -29,6 +29,7 @@ from __future__ import annotations
 import fnmatch
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -432,6 +433,53 @@ def expand_setup(kind: str, root: Path, budget: ReadBudget | None = None) -> Set
 
 
 TEAM_TEXT_SUFFIXES = (".md", ".markdown", ".txt", ".rst")
+SKILL_FRONTMATTER_KEYS = ("name", "description")
+AGENT_FRONTMATTER_KEYS = ("name", "description", "tools", "model")
+
+_FM_KEY_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*):")
+
+
+def sanitize_frontmatter(text: str, allowed) -> str | None:
+    """Keep only the `allowed` top-level keys of a Markdown YAML header; None if it cannot be read.
+
+    Claude Code and similar engines honor header keys such as `hooks`, `mcpServers` and
+    `permissionMode` in a skill or agent file, so a copied file must never carry them. A key's
+    indented, list, or blank continuation lines go with it. A text with no header is returned
+    as is. An unclosed header, or a line that is neither a bare `key:` line, a continuation, nor
+    a comment (a quoted key, say), makes the whole file unreadable: the caller skips it.
+    """
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.split("\n")
+    if lines[0].strip() != "---":
+        return text
+    try:
+        end = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
+    except StopIteration:
+        return None
+    kept: list[str] = []
+    current = None
+    keep = False
+    for line in lines[1:end]:
+        if not line.strip():
+            if keep:
+                kept.append(line)
+            continue
+        if line.lstrip().startswith("#"):
+            continue
+        if line[0] in " \t-":
+            if current is None:
+                return None
+            if keep:
+                kept.append(line)
+            continue
+        match = _FM_KEY_RE.match(line)
+        if not match:
+            return None
+        current = match.group(1).lower()
+        keep = current in allowed
+        if keep:
+            kept.append(line)
+    return "\n".join(["---", *kept, "---", *lines[end + 1 :]])
 
 
 def _team_admits(path: Path, root: Path) -> bool:

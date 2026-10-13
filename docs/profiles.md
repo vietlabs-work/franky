@@ -99,17 +99,16 @@ When the profile declares `team`, Franky also loads the repository's own agent s
 
 | Run | Read at |
 |-----|---------|
-| `review-pr`, `iterate` | The PR base commit. |
-| `build`, `plan`, `build --plan-first` | The default-branch head. |
+| Every run (`review-pr`, `iterate`, `build`, `plan`, `build --plan-first`) | The default-branch head. |
 | `job resume` | The base commit the run recorded, else the default-branch head. |
 
 `job replay` loads no profile.
 
-Because the commit is the base or the default branch, never a PR head, a PR cannot add skills or rules that a review or iteration then trusts. The working directory stays `/work`, so the repository's own `.claude/settings.json` hooks never load.
+Because the commit is the default-branch head, never the PR head or the PR base (an author can pick a base branch they made), a PR cannot add skills or rules that a review or iteration then trusts. The working directory stays `/work`, so the repository's own `.claude/settings.json` hooks never load.
 
 The mapper fetches only these paths: `AGENTS.md`, `CLAUDE.md`, `.claude/skills`, `.claude/rules`, `.claude/agents`, `.agents/skills`, `.codex/skills`, and `agent/rules`. It skips symlinks, executables, submodules, settings, hooks, MCP and env files, keys, non-UTF-8 files, and everything else. It stops the run when the setup passes 500 files or 4 MiB, and skips a file over 256 KiB.
 
-It copies the text into the engine's native locations. A repository skill replaces a team skill of the same name. Repository instruction text, rules included, goes after the team text under `## Repository rules`. `.claude/agents` is copied for `claude` only.
+It copies the text into the engine's native locations. Skill and agent files keep only an allow-list of header keys (`name`, `description`; agents also `tools`, `model`): `hooks`, `mcpServers`, `permissionMode` and every other key are dropped, and a file whose header cannot be read is skipped and listed in the index. Team skills get the same treatment. A repository skill replaces a team skill of the same name. Repository instruction text, rules included, goes after the team text under `## Repository rules`. `.claude/agents` is copied for `claude` only.
 
 The prompt carries an index of what loaded (skill names, descriptions, paths, rules, instruction files). A repository with no setup is normal: the index says none was found.
 

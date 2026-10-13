@@ -338,6 +338,63 @@ def test_a_team_skill_replaces_the_operator_skill_directory_as_a_whole(tmp_path,
     assert cook == [".claude/skills/cook/SKILL.md", ".claude/skills/cook/references/steps.md"]
 
 
+HOOKED_SKILL = (
+    "---\nname: cook\ndescription: Cook it\nhooks:\n  PreToolUse:\n    - command: evil\n"
+    "mcpServers:\n  x: {command: y}\nallowed-tools: Bash\n---\nbody\n"
+)
+
+
+def test_team_skill_headers_are_rewritten_to_the_allow_list(tmp_path, monkeypatch):
+    team = _team(tmp_path / "team")
+    (team / "skills/cook/SKILL.md").write_text(HOOKED_SKILL)
+    spec = _load(tmp_path, monkeypatch, team=team)
+
+    members = _members(profile.build_bundle(spec, engine="claude"))
+
+    cook = members[".claude/skills/cook/SKILL.md"]
+    assert cook == "---\nname: cook\ndescription: Cook it\n---\nbody\n"
+    for key in ("hooks", "mcpServers", "allowed-tools", "evil"):
+        assert key not in cook
+
+
+def test_a_team_skill_with_an_unreadable_header_is_not_installed_natively(tmp_path, monkeypatch):
+    team = _team(tmp_path / "team")
+    (team / "skills/cook/SKILL.md").write_text('---\n"hooks": x\nname: cook\n---\n')
+    spec = _load(tmp_path, monkeypatch, team=team)
+
+    members = _members(profile.build_bundle(spec, engine="claude"))
+
+    assert not [n for n in members if n.startswith(".claude/skills/cook/")]
+    assert ".claude/skills/lint/SKILL.md" in members
+
+
+@pytest.mark.parametrize(
+    "text,expected",
+    [
+        ("no header\n", "no header\n"),
+        ("---\nname: a\n---\nbody", "---\nname: a\n---\nbody"),
+        ("---\nname: a\nhooks:\n  - x\n---\nb", "---\nname: a\n---\nb"),
+        ("---\nname: a\n# note\nPermissionMode: bypass\n---\nb", "---\nname: a\n---\nb"),
+        ("---\nname: a\n", None),
+        ("---\n- orphan\n---\n", None),
+        ('---\n"hooks": 1\n---\n', None),
+        ("---\nname: a\r\nmodel: m\r\n---\r\nb", "---\nname: a\n---\nb"),
+    ],
+)
+def test_sanitize_frontmatter_cases_match_the_image_mapper(text, expected):
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("mapper", ROOT / "franky-repo-setup.py")
+    mapper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mapper)
+    keys = setups.SKILL_FRONTMATTER_KEYS
+
+    assert setups.sanitize_frontmatter(text, keys) == expected
+    assert mapper.sanitize_frontmatter(text, keys) == expected
+    assert mapper.SKILL_FRONTMATTER_KEYS == keys
+    assert mapper.AGENT_FRONTMATTER_KEYS == setups.AGENT_FRONTMATTER_KEYS
+
+
 def test_a_profile_without_team_packs_the_same_with_or_without_an_engine(tmp_path, monkeypatch):
     claude = tmp_path / ".claude"
     (claude / "skills" / "cook").mkdir(parents=True)
@@ -648,7 +705,9 @@ def test_plan_reads_the_repo_setup_at_the_default_branch_head(tmp_path, monkeypa
     _assert_wrapped(seen[0], DEFAULT_SHA)
 
 
-def test_iterate_reads_the_repo_setup_at_the_pr_base_not_the_head(tmp_path, monkeypatch):
+def test_iterate_reads_the_repo_setup_at_the_default_branch_head_not_the_pr_base_or_head(
+    tmp_path, monkeypatch
+):
     monkeypatch.setattr(cli.os, "environ", _iterate_env())
     _common(monkeypatch)
     prof, _ = _team_stub(monkeypatch, tmp_path)
@@ -666,14 +725,34 @@ def test_iterate_reads_the_repo_setup_at_the_pr_base_not_the_head(tmp_path, monk
         res = runner.invoke(cli.main, ["iterate", PR_URL])
 
     assert res.exit_code == 0, res.output
-    _assert_wrapped(seen[0], BASE_SHA)
-    assert HEAD_SHA not in seen[0].kwargs["repo_setup"].values()
+    # The PR base is author-chosen, so it is not trusted either.
+    _assert_wrapped(seen[0], DEFAULT_SHA)
+    assert not {HEAD_SHA, BASE_SHA} & set(seen[0].kwargs["repo_setup"].values())
 
 
-def test_review_pr_reads_the_repo_setup_at_the_pr_base_not_the_head(tmp_path, monkeypatch):
+def test_iterate_fails_closed_when_the_default_branch_head_cannot_be_resolved(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(cli.os, "environ", _iterate_env())
+    _common(monkeypatch)
+    monkeypatch.setattr(cli.baseref, "resolve_base_sha", lambda repo, env: None)
+    prof, _ = _team_stub(monkeypatch, tmp_path)
+    seen = _capture_runs(monkeypatch, [(0, "pushed")])
+    runner = CliRunner()
+
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["iterate", PR_URL])
+
+    assert res.exit_code != 0 and not seen
+
+
+def test_review_pr_reads_the_repo_setup_at_the_default_branch_head_not_the_pr_base_or_head(
+    tmp_path, monkeypatch
+):
     _fix_review_nonce(monkeypatch)
     _mc_review_setup(monkeypatch)
     prof, _ = _team_stub(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli.baseref, "resolve_base_sha", lambda repo, env: DEFAULT_SHA)
     live_fetch = cli.fetch_pr_head_sha
 
     def fetch(repo, number, env, **kwargs):
@@ -688,8 +767,22 @@ def test_review_pr_reads_the_repo_setup_at_the_pr_base_not_the_head(tmp_path, mo
     res = CliRunner().invoke(cli.main, ["review-pr", "--no-publish", "--", PR_URL])
 
     assert res.exit_code == 0, res.output
-    _assert_wrapped(seen[0], BASE_SHA)
+    _assert_wrapped(seen[0], DEFAULT_SHA)
     assert profile.REPO_SETUP_MARKER in " ".join(seen[0].argv)
+
+
+def test_review_pr_fails_closed_when_the_default_branch_head_cannot_be_resolved(
+    tmp_path, monkeypatch
+):
+    _fix_review_nonce(monkeypatch)
+    _mc_review_setup(monkeypatch)
+    prof, _ = _team_stub(monkeypatch, tmp_path)
+    monkeypatch.setattr(cli.baseref, "resolve_base_sha", lambda repo, env: None)
+    seen = _capture_runs(monkeypatch, [(0, _review_block({"summary": "ok", "findings": []}))])
+
+    res = CliRunner().invoke(cli.main, ["review-pr", "--no-publish", "--", PR_URL])
+
+    assert res.exit_code != 0 and not seen
 
 
 def test_resume_loads_the_bundle_and_reads_the_repo_setup_at_the_recorded_base(

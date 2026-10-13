@@ -75,6 +75,8 @@ SKILL_ROOTS = {
 RULE_ROOTS = (".claude/rules", "agent/rules")
 AGENT_ROOT = ".claude/agents"
 INSTRUCTION_FILES = ("AGENTS.md", "CLAUDE.md")
+SKILL_FRONTMATTER_KEYS = ("name", "description")
+AGENT_FRONTMATTER_KEYS = ("name", "description", "tools", "model")
 _ALL_ROOTS = (*RULE_ROOTS, AGENT_ROOT, *sorted({r for rs in SKILL_ROOTS.values() for r in rs}))
 
 _DENY_NAMES = (
@@ -257,6 +259,50 @@ def frontmatter(text: str) -> dict[str, str]:
     return out
 
 
+_FM_KEY_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*):")
+
+
+def sanitize_frontmatter(text: str, allowed) -> str | None:
+    """Keep only the `allowed` top-level keys of a Markdown YAML header; None if unreadable.
+
+    Claude Code and similar engines honor header keys such as `hooks`, `mcpServers` and
+    `permissionMode` in a skill or agent file, so a copied file must never carry them. (Same
+    rules as franky/setups.py `sanitize_frontmatter`; a test pins the two together.)
+    """
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.split("\n")
+    if lines[0].strip() != "---":
+        return text
+    try:
+        end = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
+    except StopIteration:
+        return None
+    kept: list[str] = []
+    current = None
+    keep = False
+    for line in lines[1:end]:
+        if not line.strip():
+            if keep:
+                kept.append(line)
+            continue
+        if line.lstrip().startswith("#"):
+            continue
+        if line[0] in " \t-":
+            if current is None:
+                return None
+            if keep:
+                kept.append(line)
+            continue
+        match = _FM_KEY_RE.match(line)
+        if not match:
+            return None
+        current = match.group(1).lower()
+        keep = current in allowed
+        if keep:
+            kept.append(line)
+    return "\n".join(["---", *kept, "---", *lines[end + 1 :]])
+
+
 def clean_line(value: str, limit: int) -> str:
     flat = re.sub(r"[\x00-\x1f\x7f]+", " ", value)
     flat = re.sub(r"\s+", " ", flat).strip()
@@ -283,6 +329,32 @@ def map_setup(work: Path, paths: list[str], engine: str, home: Path, repo: str, 
         if total > MAX_TOTAL_BYTES:
             raise SetupError(f"repository setup is over the size limit {MAX_TOTAL_BYTES} bytes")
         texts[rel] = text
+
+    # Skill and agent headers are rewritten to an allow-list; an unreadable one is skipped.
+    unsafe: set[str] = set()
+    for rel in sorted(texts):
+        parts = rel.split("/")
+        is_skill = parts[-1] == "SKILL.md" and any(
+            rel.startswith(r + "/") and len(parts) == len(r.split("/")) + 2
+            for r in SKILL_ROOTS[engine]
+        )
+        is_agent = _under(rel, AGENT_ROOT) and rel.endswith(".md")
+        if not (is_skill or is_agent):
+            continue
+        keys = SKILL_FRONTMATTER_KEYS if is_skill else AGENT_FRONTMATTER_KEYS
+        clean = sanitize_frontmatter(texts[rel], keys)
+        if clean is None:
+            unsafe.add(rel)
+        else:
+            texts[rel] = clean
+    for rel in unsafe:
+        skipped.append(rel)
+        if rel.endswith("/SKILL.md"):
+            base = rel[: -len("SKILL.md")]
+            for other in [r for r in texts if r.startswith(base)]:
+                del texts[other]
+        else:
+            texts.pop(rel, None)
 
     # Skills: a directory with a SKILL.md directly under one root. First root in order wins.
     skills: dict[str, tuple[str, str, str]] = {}  # name -> (root, description, path)
@@ -331,9 +403,10 @@ def map_setup(work: Path, paths: list[str], engine: str, home: Path, repo: str, 
         _write(target, f"{head}## Repository rules (from {repo} at {ref[:12]})\n\n{body}\n")
 
     instruction_files = [rel for rel, _ in sections if rel in INSTRUCTION_FILES]
-    _write(
-        home / INDEX_DIR / "index.txt", render_index(repo, ref, skills, rules, instruction_files)
-    )
+    index = render_index(repo, ref, skills, rules, instruction_files)
+    if unsafe:
+        index += "\n- Skipped (unreadable header): " + ", ".join(sorted(unsafe))
+    _write(home / INDEX_DIR / "index.txt", index)
     return {
         "skills": len(skills),
         "rules": len(rules),
@@ -345,7 +418,7 @@ def map_setup(work: Path, paths: list[str], engine: str, home: Path, repo: str, 
 
 
 def render_index(repo, ref, skills, rules, instruction_files) -> str:
-    head = f"Repository setup (read from {repo} at {ref[:12]}, the base commit, never the PR head):"
+    head = f"Repository setup (read from {repo} at {ref[:12]}, the default-branch commit, never the PR head or base):"
     if not skills and not rules and not instruction_files:
         return head + " none found."
     lines = [head]

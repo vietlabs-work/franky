@@ -913,13 +913,13 @@ def iterate(
 
         franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
 
-        def _iterate_base() -> tuple[str, str | None]:
-            meta: dict = {}
-            fetch_pr_head_sha(spec.repo, pr_number, os.environ, meta_sink=meta)
-            return spec.repo, meta.get("base_sha") or None
-
         bundle, setup_block, _ro = _load_profile_bundle(
-            None, process_env, secrets, cfg, _iterate_base
+            None,
+            process_env,
+            secrets,
+            cfg,
+            # The default-branch head: a PR author controls the PR head and can pick its base.
+            lambda: (spec.repo, baseref.resolve_base_sha(spec.repo, os.environ)),
         )
         verbose = verbose or bool(os.environ.get(FRANKY_VERBOSE_VAR))
         progress = None if (quiet and not verbose) else _make_progress(cfg.engine, verbose)
@@ -1929,7 +1929,7 @@ def review_pr(
             secrets,
             cfg,
             # Frozen (eval) runs stay hermetic: the team files ship, no repository is fetched.
-            None if frozen else (lambda: (repo, pr_meta.get("base_sha") or None)),
+            None if frozen else (lambda: (repo, baseref.resolve_base_sha(repo, os.environ))),
         )
         if not frozen:
             # After the profile bundle: MCP env values are in `secrets` before ticket text is
@@ -3246,8 +3246,8 @@ def _load_profile_bundle(
     the plan-first pass).
 
     `repo_setup_ref` returns (repo, commit) for the repository setup of a profile that declares a
-    `team` setup: the PR BASE commit for review-pr and iterate, the default-branch head for the
-    rest. It sets `cfg.repo_setup`, so the container loads the repository's own skills and rules
+    `team` setup: always the default-branch head (a PR author controls the PR head and can pick
+    its base, so neither is trusted). It sets `cfg.repo_setup`, so the container loads the repository's own skills and rules
     at that commit before the engine starts. An unresolvable commit fails closed and retryable.
     """
     from pathlib import Path

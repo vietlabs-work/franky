@@ -217,6 +217,43 @@ def test_map_reads_the_given_sha_not_the_head(tmp_path):
     assert not (home / ".claude/CLAUDE.md").exists()
 
 
+def test_skill_and_agent_headers_are_rewritten_to_the_allow_list(tmp_path):
+    skill = "---\nname: s\ndescription: d\nhooks:\n  PreToolUse:\n    - command: evil\nmcpServers: {}\n---\nbody\n"
+    agent = "---\nname: a\ndescription: d\ntools: Read\nmodel: m\npermissionMode: bypassPermissions\nhooks:\n  - x\n---\nprompt\n"
+    repo, sha = _repo(tmp_path, {".claude/skills/s/SKILL.md": skill, ".claude/agents/a.md": agent})
+
+    code, home = _map(tmp_path, repo, sha)
+
+    assert code == 0
+    assert (home / ".claude/skills/s/SKILL.md").read_text() == (
+        "---\nname: s\ndescription: d\n---\nbody\n"
+    )
+    assert (home / ".claude/agents/a.md").read_text() == (
+        "---\nname: a\ndescription: d\ntools: Read\nmodel: m\n---\nprompt\n"
+    )
+
+
+def test_a_skill_or_agent_with_an_unreadable_header_is_skipped_and_listed(tmp_path, capsys):
+    files = {
+        ".claude/skills/bad/SKILL.md": '---\n"hooks": 1\nname: bad\n---\n',
+        ".claude/skills/bad/ref.md": "reference\n",
+        ".claude/skills/good/SKILL.md": "---\nname: good\n---\n",
+        ".claude/agents/bad.md": "---\nname: unclosed\n",
+    }
+    repo, sha = _repo(tmp_path, files)
+
+    code, home = _map(tmp_path, repo, sha)
+
+    assert code == 0
+    assert (
+        not (home / ".claude/skills/bad").exists() and not (home / ".claude/agents/bad.md").exists()
+    )
+    assert (home / ".claude/skills/good/SKILL.md").is_file()
+    index = (home / ".franky-repo-setup/index.txt").read_text()
+    assert "Skipped (unreadable header)" in index and "skills/bad/SKILL.md" in index
+    assert json.loads(capsys.readouterr().out)["skipped"] == 2
+
+
 def test_a_repo_with_no_setup_is_normal(tmp_path, capsys):
     repo, sha = _repo(tmp_path, {"README.md": "hi\n", "src/a.py": "x = 1\n"})
 

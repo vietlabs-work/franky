@@ -163,22 +163,26 @@ docker exec "$TASK_REPO" sh -c "test -f $CHOME/.claude/skills/repo-skill/SKILL.m
 echo "   OK (mapper ran in the image as uid 1001; repo skill overrides team skill; base commit only)"
 
 echo "== 5a. codex lists the team skill and the repo skill at session start (offline) =="
-docker exec -e CODEX_HOME="$CHOME/.codex" "$TASK_REPO" sh -c 'cd /work && codex debug prompt-input hi' > "$WORKDIR/codex-prompt.json" \
-  || fail "codex debug prompt-input failed in the image"
-grep -q 'team-skill' "$WORKDIR/codex-prompt.json" || fail "codex does not list the team skill"
-grep -q 'repo-skill' "$WORKDIR/codex-prompt.json" || fail "codex does not list the repo skill"
-grep -q 'REPO-RULE-MARKER' "$WORKDIR/codex-prompt.json" || fail "codex does not carry the repository rules"
-echo "   OK (codex sees both skills and the merged instructions)"
+if docker exec "$TASK_REPO" sh -c 'command -v codex' >/dev/null 2>&1; then
+  docker exec -e CODEX_HOME="$CHOME/.codex" "$TASK_REPO" sh -c 'cd /work && codex debug prompt-input hi' > "$WORKDIR/codex-prompt.json" \
+    || fail "codex debug prompt-input failed in the image"
+  grep -q 'team-skill' "$WORKDIR/codex-prompt.json" || fail "codex does not list the team skill"
+  grep -q 'repo-skill' "$WORKDIR/codex-prompt.json" || fail "codex does not list the repo skill"
+  grep -q 'REPO-RULE-MARKER' "$WORKDIR/codex-prompt.json" || fail "codex does not carry the repository rules"
+  echo "   OK (codex sees both skills and the merged instructions)"
+else
+  echo "   SKIPPED (this image variant has no codex; the native dirs were checked in step 5)"
+fi
 
 echo "== 5b. claude lists them too (needs CLAUDE_CODE_OAUTH_TOKEN; skipped without) =="
-if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] && docker exec "$TASK_REPO" sh -c 'command -v claude' >/dev/null 2>&1; then
   docker exec -e CLAUDE_CODE_OAUTH_TOKEN "$TASK_REPO" sh -c "cd /work && claude -p 'List the names of your available skills, one per line, nothing else.' --dangerously-skip-permissions" \
     > "$WORKDIR/claude-skills.txt" || fail "claude -p failed"
   grep -q 'team-skill' "$WORKDIR/claude-skills.txt" && grep -q 'repo-skill' "$WORKDIR/claude-skills.txt" \
     || fail "claude does not list both skills"
   echo "   OK (claude lists both skills)"
 else
-  echo "   SKIPPED (no CLAUDE_CODE_OAUTH_TOKEN; claude's native skills dir was checked in step 5)"
+  echo "   SKIPPED (no CLAUDE_CODE_OAUTH_TOKEN or no claude in this image; the native skills dir was checked in step 5)"
 fi
 
 echo "== 5c. a bad commit fails closed with one short line =="

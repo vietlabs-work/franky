@@ -999,6 +999,7 @@ def _team_members(
     root = team.root.resolve()
     rules: list[tuple[str, str]] = []
     owned: set[str] = set()
+    bad: set[str] = set()
     agents_text = ""
     for path in sorted(team.files):
         try:
@@ -1010,12 +1011,24 @@ def _team_members(
             continue
         top = rel.parts[0]
         if top == "skills" and len(rel.parts) >= 3:
+            if rel.name == "SKILL.md" and len(rel.parts) == 3:
+                clean = setups.sanitize_frontmatter(text, setups.SKILL_FRONTMATTER_KEYS)
+                if clean is None:
+                    bad.add(rel.parts[1])
+                    continue
+                text = clean
             members[f"{skills_dir}/{'/'.join(rel.parts[1:])}"] = text
             owned.add(f"{skills_dir}/{rel.parts[1]}/")
         elif top == "rules" and rel.suffix.lower() == ".md":
             rules.append((rel.as_posix(), text))
         elif rel.as_posix() == "AGENTS.md":
             agents_text = text
+    # A skill whose header cannot be read is not installed natively at all.
+    for name in bad:
+        prefix = f"{skills_dir}/{name}/"
+        for key in [k for k in members if k.startswith(prefix)]:
+            del members[key]
+        owned.discard(prefix)
     sections = []
     if agents_text.strip():
         sections.append(agents_text.strip())

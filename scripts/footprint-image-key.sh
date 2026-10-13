@@ -4,5 +4,8 @@
 # sha256sum carries a file name, so content cannot shift between files unnoticed.
 set -euo pipefail
 cd "${1:-.}"
-sha256sum Dockerfile install-codex-native-launcher.sh franky-dind-entrypoint.sh \
-  franky-repo-setup.py proxy/Dockerfile proxy/entrypoint.sh | sha256sum | cut -c1-16
+files=(Dockerfile install-codex-native-launcher.sh franky-dind-entrypoint.sh)
+# A base commit that predates the mapper has no such file; every other input must exist.
+[ ! -e franky-repo-setup.py ] || files+=(franky-repo-setup.py)
+files+=(proxy/Dockerfile proxy/entrypoint.sh)
+sha256sum "${files[@]}" | sha256sum | cut -c1-16
