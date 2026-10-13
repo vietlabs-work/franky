@@ -7,6 +7,8 @@ from franky import franky_version, snapshot
 from franky.config import Config, load_config
 from franky.container import (
     CODEX_AUTH_HOME,
+    CODEX_RUN_AUTH_MOUNT,
+    CODEX_RUN_HOME,
     FRANKY_PROXY_IMAGE_VAR,
     GHCR_REPO_VAR,
     PULL_TIMEOUT_SECS,
@@ -171,7 +173,12 @@ def test_codex_subscription_mounts_only_fixed_named_volume():
     named_mounts = [
         argv[i + 1] for i, t in enumerate(argv) if t == "--mount" and "src=" in argv[i + 1]
     ]
-    assert named_mounts == [f"type=volume,src={CODEX_AUTH_VOLUME},dst={CODEX_AUTH_HOME}"]
+    # The persistent volume sits BESIDE the per-run CODEX_HOME, never over it: only auth.json is
+    # linked in (entrypoint), so skills, rules and sessions never reach the shared volume.
+    assert named_mounts == [f"type=volume,src={CODEX_AUTH_VOLUME},dst={CODEX_RUN_AUTH_MOUNT}"]
+    assert CODEX_RUN_AUTH_MOUNT != CODEX_AUTH_HOME
+    assert not any(m.endswith(f"dst={CODEX_AUTH_HOME}") for m in named_mounts)
+    assert argv[argv.index(f"CODEX_HOME={CODEX_RUN_HOME}") - 1] == "-e"
     assert "type=bind" not in " ".join(argv)
     assert "docker.sock" not in " ".join(argv)
 
@@ -2914,3 +2921,133 @@ def test_workspace_and_session_sinks_share_one_hold(tmp_path):
         )
     assert wsink["status"] == "ok" and ssink["status"] == "ok"
     assert sum(1 for c in calls if c == _MARKER) == 1
+
+
+# --- repository setup: the mapper runs between the untar and the marker -----------------------
+
+REPO_REF = "a" * 40
+
+
+def _mapper_runner(*, map_rc=0, map_err="", summary='{"skills": 2}'):
+    base, _ = _orchestration_runner(
+        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, stdout="ok", stderr="")
+    )
+    calls = []
+
+    def runner(argv, **kwargs):
+        calls.append((argv, kwargs))
+        if argv[:3] == ["docker", "inspect", "-f"] and "{{.State.Running}}" in argv:
+            return subprocess.CompletedProcess(argv, 0, stdout="true", stderr="")
+        if container_mod.REPO_SETUP_BIN in argv:
+            return subprocess.CompletedProcess(argv, map_rc, stdout=summary, stderr=map_err)
+        return base(argv, **kwargs)
+
+    return runner, calls
+
+
+def test_deliver_profile_runs_the_repo_mapper_after_the_untar_and_before_the_marker():
+    runner, calls = _mapper_runner()
+    sink = {}
+    assert container_mod.deliver_profile(
+        "t1",
+        b"profile-bytes",
+        runner,
+        sleeper=NOOP_SLEEP,
+        repo_setup={"repo": "acme/service", "ref": REPO_REF, "engine": "claude"},
+        repo_setup_sink=sink,
+    )
+    execs = [argv for argv, _kw in calls if argv[:2] == ["docker", "exec"]]
+    kinds = [
+        "untar"
+        if "-xzf" in a
+        else "map"
+        if container_mod.REPO_SETUP_BIN in a
+        else "marker"
+        if "touch" in a
+        else "other"
+        for a in execs
+    ]
+    assert kinds == ["untar", "map", "marker"]
+    mapper = execs[1]
+    assert mapper[mapper.index("--repo") + 1] == "acme/service"
+    assert mapper[mapper.index("--ref") + 1] == REPO_REF
+    assert mapper[mapper.index("--engine") + 1] == "claude"
+    assert sink == {"summary": '{"skills": 2}'}
+
+
+def test_deliver_profile_mapper_failure_leaves_the_marker_untouched():
+    runner, calls = _mapper_runner(map_rc=1, map_err="franky-repo-setup: git fetch failed: nope")
+    sink = {}
+    assert not container_mod.deliver_profile(
+        "t1",
+        None,
+        runner,
+        sleeper=NOOP_SLEEP,
+        repo_setup={"repo": "acme/service", "ref": REPO_REF, "engine": "codex"},
+        repo_setup_sink=sink,
+    )
+    assert not any("touch" in argv for argv, _kw in calls)
+    assert "git fetch failed" in sink["error"]
+
+
+def test_deliver_profile_mapper_timeout_is_a_repo_setup_error():
+    runner, calls = _mapper_runner()
+
+    def timing_out(argv, **kwargs):
+        if container_mod.REPO_SETUP_BIN in argv:
+            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        return runner(argv, **kwargs)
+
+    sink = {}
+    assert not container_mod.deliver_profile(
+        "t1",
+        None,
+        timing_out,
+        sleeper=NOOP_SLEEP,
+        repo_setup={"repo": "acme/service", "ref": REPO_REF, "engine": "pi"},
+        repo_setup_sink=sink,
+    )
+    assert sink["error"] == "timed out after 100s"
+    assert not any("touch" in argv for argv, _kw in calls)
+
+
+def test_run_in_container_repo_setup_failure_fails_the_run_before_the_engine():
+    runner, calls = _mapper_runner(map_rc=1, map_err="franky-repo-setup: git fetch failed: nope")
+    code, out = run_in_container(
+        _cfg(),
+        ["pi"],
+        runner=runner,
+        env={},
+        sleeper=NOOP_SLEEP,
+        popen=_fake_popen_factory([]),
+        profile_bundle=b"fake-gzip-tar",
+        repo_setup={"repo": "acme/service", "ref": REPO_REF, "engine": "pi"},
+    )
+    assert code == container_mod.REPO_SETUP_FAILED_CODE
+    assert "repository setup failed (retryable" in out
+    assert "git fetch failed" in out
+    assert not any("touch" in argv for argv, _kw in calls)
+
+
+def test_run_in_container_repo_setup_alone_uses_injection_mode():
+    runner, calls = _mapper_runner()
+    seen = {}
+
+    def popen(argv, **kwargs):
+        seen["argv"] = argv
+        return _FakePopen(lines=["ok\n"])
+
+    code, out = run_in_container(
+        _cfg(),
+        ["pi"],
+        runner=runner,
+        env={},
+        sleeper=NOOP_SLEEP,
+        popen=popen,
+        repo_setup={"repo": "acme/service", "ref": REPO_REF, "engine": "pi"},
+    )
+    assert code == 0
+    assert 'repository setup loaded {"skills": 2}' in out
+    assert "FRANKY_PROFILE_WAIT=1" in seen["argv"]
+    assert any(container_mod.REPO_SETUP_BIN in argv for argv, _kw in calls)
+    assert any("touch" in argv for argv, _kw in calls)

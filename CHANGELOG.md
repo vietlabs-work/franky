@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A `team` setup kind: `[setups] team = "<dir>"` declares an engine-neutral team setup (`AGENTS.md`, `rules/`, `skills/<name>/SKILL.md`, `knowledge/`, `commands/pr.md`, `MANIFEST.json`). Franky maps it onto the selected engine's native locations when it packs the bundle (verified for `claude` and `codex`; `opencode` and `pi` keep a prompt pointer), merges the team rules into the one instruction file after the operator's text, and prefers the team PR-description spec. It ships Markdown and plain-text documents only, under the same deny rules, limits, and secret scan. `franky profile check` prints a `team:` line from `MANIFEST.json`.
+- Repository setup: with a `team` profile, `franky-repo-setup` loads the repository's own `AGENTS.md`, `CLAUDE.md`, `.claude/{skills,rules,agents}`, `.agents/skills`, `.codex/skills`, and `agent/rules` before the engine starts, and puts an index of them in the prompt. It reads the PR base commit for `review-pr` and `iterate`, and the default-branch head for `build` and `plan`, so a PR head never injects trusted instructions. Symlinks, executables, settings, hooks, MCP and env files, and non-UTF-8 files are skipped. A fetch error fails the run before the engine starts (`agent_error`, retryable).
+- `job resume` now loads the operator profile like `build`. `job replay` stays profile-less.
+
+### Changed
+
+- Codex subscription runs use a per-run `CODEX_HOME`. The persistent auth volume mounts beside it and only `auth.json` is linked in, so skills, rules, and session files never reach the shared volume.
+
 ## [0.3.23] - 2026-10-13
 
 ### Changed

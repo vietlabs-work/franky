@@ -152,6 +152,7 @@ _SHIPPED = (
     "proxy/",
     "Dockerfile",
     "franky-dind-entrypoint.sh",
+    "franky-repo-setup.py",
     "install-codex-native-launcher.sh",
     "pyproject.toml",
 )

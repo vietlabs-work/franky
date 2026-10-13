@@ -18,6 +18,15 @@ export DOCKER_HOST="unix://${XDG_RUNTIME_DIR}/docker.sock"
 # rootless dockerd wants the runtime dir private (0700). We own it (tmpfs uid=1001).
 chmod 700 "${XDG_RUNTIME_DIR}" 2>/dev/null || true
 
+# Codex subscription runs: CODEX_HOME is a per-run directory in this container's own HOME
+# volume, so team and repository skills, rules and session files never touch the shared auth
+# volume. That volume is mounted beside it, and only auth.json is linked in, so a token refresh
+# written through the link still lands in the persistent volume.
+if [ -f "${HOME}/.codex-auth/auth.json" ]; then
+    mkdir -p "${HOME}/.codex"
+    ln -sfn "${HOME}/.codex-auth/auth.json" "${HOME}/.codex/auth.json"
+fi
+
 # Make INNER containers inherit the egress proxy (proxy URLs ONLY - never creds). With no proxy
 # env set (e.g. local dev), write nothing so docker keeps its defaults.
 mkdir -p "${HOME}/.docker"
@@ -75,18 +84,21 @@ fi
 # WHY safe: the bundle is assembled host-side from a bounded allowlist and refused (fail-closed)
 # if any credential pattern is detected (see franky/profile.py and franky/setups.py).
 if [ -n "${FRANKY_PROFILE_WAIT:-}" ]; then
+    # 120 s, or the host's longer bound when it also loads a repository setup before the marker.
+    wait_secs="${FRANKY_PROFILE_WAIT_SECS:-120}"
+    case "${wait_secs}" in ''|*[!0-9]*) wait_secs=120 ;; esac
     ready=0
-    for _ in $(seq 1 120); do
+    for _ in $(seq 1 "${wait_secs}"); do
         if [ -f "${HOME}/.franky-profile-ready" ]; then ready=1; break; fi
         sleep 1
     done
     if [ "${ready}" != 1 ]; then
-        echo "franky: operator profile was never injected (marker absent after 120s) -" \
+        echo "franky: operator profile was never injected (marker absent after ${wait_secs}s) -" \
              "refusing to run without it" >&2
         exit 78
     fi
     rm -f "${HOME}/.franky-profile-ready" 2>/dev/null || true
-    unset FRANKY_PROFILE_WAIT
+    unset FRANKY_PROFILE_WAIT FRANKY_PROFILE_WAIT_SECS
 fi
 
 # Resume mode (issue #71): the host docker-cp's the prior workspace into this started

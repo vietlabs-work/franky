@@ -90,7 +90,7 @@ CLI -> config and task policy -> prompt -> engine command -> container runtime -
 | Atlassian | `atlassian.py` | Host-side Atlassian OAuth connection and MCP wiring |
 | Agent instructions | `prompt.py`, `persona.md`, `decompose.py`, `diagnosis.py`, `reviewpr.py`, `sentinel.py` | Prompts and bounded structured output |
 | Runtime | `container.py`, `security.py`, `egress.py`, `franky-dind-entrypoint.sh`, `proxy/` | Docker lifecycle, isolation, policies, proxy |
-| Transfer | `profile.py`, `setups.py`, `snapshot.py` | Bounded, secret-scanned profile and workspace bundles |
+| Transfer | `profile.py`, `setups.py`, `snapshot.py`, `franky-repo-setup.py` | Bounded, secret-scanned profile and workspace bundles; the in-image repository-setup mapper |
 | Runs | `jobs.py`, `transcript.py`, `economics.py` | Records, redacted logs, diagnostics, usage |
 | Threads | `threads.py` | Per-PR reviewer and author sessions, handoffs, locks, prune and purge |
 | Host helpers | `github.py`, `update_check.py`, `_install.py` | `gh` passthrough, updates, install detection |
@@ -127,7 +127,7 @@ Do not weaken these rules.
 - Send only policy data, such as `FRANKY_ALLOWED_DOMAINS`, by value to the proxy.
 - Redact autonomous output, stored transcripts, diagnostics, and JSON errors before release.
 - `config list --reveal` is explicit operator output. Do not claim that Franky redacts it.
-- Codex subscription auth is the only persistent task volume. Scrub it to `auth.json` before each run.
+- Codex subscription auth is the only persistent task volume. Scrub it to `auth.json` before each run. Never mount it over `CODEX_HOME`: `CODEX_HOME` is a per-run directory and the entrypoint links only `auth.json` in from the volume mounted beside it.
 - Never mount the subscription volume into helpers, proxies, or non-subscription tasks.
 
 ### Private terms
@@ -188,6 +188,8 @@ Any policy delta must pass pinned-policy tests, `make smoke-security`, and `make
 - Bind a session to an author thread only after the host confirms that the open PR on the run's branch is the PR the agent reported. Agent output alone never picks the thread.
 - Secret-scan every injected profile file. Resolve symlinks before deny checks.
 - Skip unscannable setup files. Never inject setup MCP configuration automatically.
+- A `team` setup ships Markdown and plain-text documents only (plus its `MANIFEST.json`): no hooks, MCP, settings, scripts, or executables, under the same deny rules, limits, and secret scan as any setup.
+- Load the repository's own setup (`franky-repo-setup`) before the engine starts, at the PR base commit for review-pr and iterate and at the default-branch head otherwise, never at a PR head. Fetch only the setup paths, skip symlinks, executables, settings, hooks, MCP and env files, and keep the working directory `/work`, so repository hooks never run. A fetch or mapping error fails the run before the engine starts. Setup text never relaxes a read-only pass. Precedence: prompt, repository setup, team setup, operator setup.
 - Keep Codex `--ignore-user-config`. Pass validated MCP servers as explicit overrides.
 - Franky requests read and search scopes only and denies the Atlassian write tools in the engine config (Claude deny patterns, a Codex read-tool allowlist), plus the prompt. If Atlassian grants broader scopes, read-only is not enforced by Atlassian; `--status` shows the granted scopes. Only claude and codex get the tools. A missing, expired or revoked connection turns the tools off with one stderr line and never fails a task.
 - Tell review agents to stay read-only. The host publisher uses COMMENT or REQUEST_CHANGES. It uses APPROVE only behind `--allow-approve`, when no finding above nit is open (an `accepted` one counts only after the host verifies a non-author `OWNER`, `MEMBER` or `COLLABORATOR` `APPROVED` on the head, submitted after the review that posted the finding), nothing was dropped as malformed, no check failed, and no changed file needs human sign-off under the reviewed repo's `.github/human-signoff-paths` (a PR touching that file always does; a failed read never approves); the caller must enforce branch protection that dismisses stale approvals on push. An APPROVE with an uncertain outcome is reconciled, never blindly reposted (`publish_uncertain`). `--resolve-fixed` resolves, and `--reply-prior` replies once on, only the publishing bot's own unambiguous matching threads.

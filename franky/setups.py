@@ -27,6 +27,7 @@ Three properties are load-bearing:
 from __future__ import annotations
 
 import fnmatch
+import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -151,7 +152,19 @@ SETUP_MANIFESTS: dict[str, SetupManifest] = {
         files=("AGENTS.md", "CLAUDE.md"),
         dirs=("skills", "commands", "prompts", "agents", "rules"),
     ),
+    # A team-owned, engine-neutral setup: `AGENTS.md`, `skills/<name>/SKILL.md` (+ text
+    # references), `rules/*.md`, `knowledge/**.md`, `commands/pr.md` (the PR-description spec) and
+    # `MANIFEST.json`. No hooks, MCP, settings or executables ever ship from it. `profile.py`
+    # maps it onto each engine's native locations at pack time.
+    "team": SetupManifest(
+        default_root="~/.franky/team",
+        files=("AGENTS.md", "MANIFEST.json"),
+        dirs=("skills", "rules", "knowledge", "commands"),
+    ),
 }
+
+TEAM_KIND = "team"
+TEAM_MANIFEST_NAME = "MANIFEST.json"
 
 SETUP_KINDS = tuple(SETUP_MANIFESTS)
 
@@ -239,6 +252,9 @@ class SetupScan:
     root: Path
     files: list[Path] = field(default_factory=list)
     skipped_binary: list[Path] = field(default_factory=list)
+    # Team setup only: files the text-only policy refuses (scripts, executables, MCP or other
+    # structured config), reported by `profile check`.
+    skipped_policy: list[Path] = field(default_factory=list)
     mcp_hints: list[Path] = field(default_factory=list)
 
     @property
@@ -381,6 +397,10 @@ def expand_setup(kind: str, root: Path, budget: ReadBudget | None = None) -> Set
     visited: set[str] = set()
 
     def add(path: Path) -> None:
+        # A team setup ships text documents only (see `_team_admits`).
+        if kind == TEAM_KIND and not _team_admits(path, root):
+            scan.skipped_policy.append(path)
+            return
         try:
             raw = read_bounded(path, budget)
         except OSError:
@@ -409,6 +429,56 @@ def expand_setup(kind: str, root: Path, budget: ReadBudget | None = None) -> Set
             scan.mcp_hints.append(hint)
 
     return scan
+
+
+TEAM_TEXT_SUFFIXES = (".md", ".markdown", ".txt", ".rst")
+
+
+def _team_admits(path: Path, root: Path) -> bool:
+    """A team setup ships Markdown or plain-text documents, plus its own MANIFEST.json.
+
+    Everything else under the layout is refused, whatever its name: scripts (with or without an
+    execute bit), MCP or other structured config (`.mcp.json`, `.yaml`), settings, and archives.
+    The check runs on the declared name and on the symlink-resolved target.
+    """
+    if path.name == TEAM_MANIFEST_NAME and path.parent == root:
+        return True
+    try:
+        if path.stat().st_mode & 0o111:
+            return False
+        resolved = path.resolve()
+    except OSError:
+        return False
+    return all(p.suffix.lower() in TEAM_TEXT_SUFFIXES for p in (path, resolved))
+
+
+def read_team_manifest(root: Path) -> dict | None:
+    """Parse and validate `<root>/MANIFEST.json` of a team setup; None when it has none.
+
+    Fail-closed on malformed JSON or a wrong shape (`{schema: 1, source, commit, plugins[],
+    skills[{name, plugin, path}]}`): the manifest describes what the team setup contains, so a
+    broken one must not be reported as healthy. A team dir without a manifest is valid.
+    """
+    path = root / TEAM_MANIFEST_NAME
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(read_bounded(path, profile_budget()).decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise ValueError(f"team manifest {path} is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict) or data.get("schema") != 1:
+        raise ValueError(f"team manifest {path} must be an object with schema 1")
+    for key in ("source", "commit"):
+        if not isinstance(data.get(key), str):
+            raise ValueError(f"team manifest {path}: {key} must be a string")
+    plugins, skills = data.get("plugins", []), data.get("skills", [])
+    if not isinstance(plugins, list) or not all(isinstance(p, str) for p in plugins):
+        raise ValueError(f"team manifest {path}: plugins must be a list of strings")
+    if not isinstance(skills, list) or not all(
+        isinstance(s, dict) and isinstance(s.get("name"), str) for s in skills
+    ):
+        raise ValueError(f"team manifest {path}: skills must be a list of objects with a name")
+    return data
 
 
 def _declares_mcp(path: Path) -> bool:

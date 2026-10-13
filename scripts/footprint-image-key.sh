@@ -5,4 +5,4 @@
 set -euo pipefail
 cd "${1:-.}"
 sha256sum Dockerfile install-codex-native-launcher.sh franky-dind-entrypoint.sh \
-  proxy/Dockerfile proxy/entrypoint.sh | sha256sum | cut -c1-16
+  franky-repo-setup.py proxy/Dockerfile proxy/entrypoint.sh | sha256sum | cut -c1-16

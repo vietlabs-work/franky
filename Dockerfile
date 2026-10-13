@@ -146,7 +146,10 @@ RUN useradd --uid 1001 --create-home --shell /bin/bash franky \
 # The DinD entrypoint starts rootless dockerd then execs the engine argv (supplied as CMD by
 # franky/container.py).
 COPY franky-dind-entrypoint.sh /usr/local/bin/franky-dind-entrypoint.sh
-RUN chmod +x /usr/local/bin/franky-dind-entrypoint.sh
+# The repository-setup mapper (stdlib python3 + git): the host runs it with `docker exec` during
+# the profile wait, before the engine starts.
+COPY franky-repo-setup.py /usr/local/bin/franky-repo-setup
+RUN chmod +x /usr/local/bin/franky-dind-entrypoint.sh /usr/local/bin/franky-repo-setup
 
 # ---- stage 5: selected engine ---------------------------------------------------------------
 FROM runtime-base

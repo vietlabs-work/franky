@@ -6974,7 +6974,7 @@ def stub_profile(monkeypatch, tmp_path, files=3):
     monkeypatch.setattr(cli, "validate_mcp_engine", lambda *a: None)
     monkeypatch.setattr(cli, "resolve_mcp_credentials", lambda *a: {})
     monkeypatch.setattr(cli, "claude_mcp_config_path", lambda spec: None)
-    monkeypatch.setattr(cli, "build_bundle", lambda spec: b"bundle")
+    monkeypatch.setattr(cli, "build_bundle", lambda spec, engine=None: b"bundle")
     prof = tmp_path / "p.toml"
     prof.write_text("")
     return str(prof)

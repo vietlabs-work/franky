@@ -21,6 +21,12 @@
 #   - a realistically sized bundle survives the stdin channel
 #   - touching the marker releases the profile-wait entrypoint and the engine runs
 #   - WITHOUT the marker the entrypoint refuses (exit 78) instead of running a profile-less build
+#   - team setup + repository setup (franky-repo-setup): a team skill and a repo skill, loaded
+#     before the engine starts, are both visible to codex at session start (`codex debug
+#     prompt-input`, offline) and sit in claude's native skills dir; the repo copy of a same-named
+#     skill wins; the mapper reads only the given commit; a bad commit fails closed
+#     (set CLAUDE_CODE_OAUTH_TOKEN to also have `claude -p` list them; it is the only step that
+#     needs a credential, and is skipped without one)
 #
 # Usage: scripts/smoke-profile.sh   (needs Docker running + the `franky` image built)
 set -uo pipefail
@@ -28,13 +34,14 @@ set -uo pipefail
 FRANKY_IMG="${FRANKY_IMG:-franky}"
 TASK="smoke-profile-task-$$"
 TASK_REFUSE="smoke-profile-refuse-$$"
+TASK_REPO="smoke-profile-repo-$$"
 WORKDIR="$(mktemp -d)"
 BUNDLE="$WORKDIR/profile.tar.gz"
 MARKER="$(python3 -c 'from franky.container import PROFILE_READY_MARKER; print(PROFILE_READY_MARKER)')"
 CHOME="$(python3 -c 'from franky.profile import CONTAINER_HOME; print(CONTAINER_HOME)')"
 
 cleanup() {
-  docker rm -f -v "$TASK" "$TASK_REFUSE" >/dev/null 2>&1 || true
+  docker rm -f -v "$TASK" "$TASK_REFUSE" "$TASK_REPO" >/dev/null 2>&1 || true
   rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
@@ -108,5 +115,78 @@ docker exec "$TASK_REFUSE" test -f /tmp/profile-engine-ran \
 docker inspect -f '{{.State.Running}}' "$TASK_REFUSE" | grep -q true \
   || fail "container exited early for some other reason (expected: still waiting)"
 echo "   OK (still blocked on the marker, engine not started)"
+
+echo "== 5. team + repository setup: both skills are loaded before the engine starts =="
+docker rm -f "$TASK_REPO" >/dev/null 2>&1 || true
+start_task "$TASK_REPO" 'touch /tmp/profile-engine-ran; sleep 120' || fail "repo-setup container did not start"
+sleep 3
+# The team part rides the bundle, exactly as profile.build_bundle packs it (codex native dirs here,
+# claude's below); the repository part is a throwaway local git repo the mapper fetches over file://.
+TEAM="$WORKDIR/team"
+mkdir -p "$TEAM/.codex/skills/team-skill" "$TEAM/.codex/skills/shared" "$TEAM/.claude/skills/team-skill"
+printf -- '---\nname: team-skill\ndescription: The team skill\n---\nbody\n' > "$TEAM/.codex/skills/team-skill/SKILL.md"
+printf -- '---\nname: team-skill\ndescription: The team skill\n---\nbody\n' > "$TEAM/.claude/skills/team-skill/SKILL.md"
+printf -- '---\nname: shared\ndescription: TEAM COPY\n---\n' > "$TEAM/.codex/skills/shared/SKILL.md"
+printf '## Team rules (always on)\n\nTEAM-RULE-MARKER\n' > "$TEAM/.codex/AGENTS.md"
+tar -czf "$WORKDIR/team.tar.gz" -C "$TEAM" .
+docker exec -i "$TASK_REPO" tar --no-same-owner -xzf - -C "$CHOME" < "$WORKDIR/team.tar.gz" \
+  2> >(grep -v 'LIBARCHIVE.xattr' >&2) || fail "team untar failed"
+docker exec "$TASK_REPO" sh -c '
+  set -e
+  r=/tmp/smoke-src; mkdir -p $r/.claude/skills/repo-skill $r/.claude/skills/shared $r/.claude/hooks; cd $r
+  git init -q
+  git config uploadpack.allowFilter true; git config uploadpack.allowAnySHA1InWant true
+  printf -- "---\nname: repo-skill\ndescription: The repo skill\n---\n" > .claude/skills/repo-skill/SKILL.md
+  printf -- "---\nname: shared\ndescription: REPO COPY\n---\n" > .claude/skills/shared/SKILL.md
+  echo "REPO-RULE-MARKER" > AGENTS.md; echo "hook" > .claude/hooks/pre.md
+  echo "{}" > .claude/settings.json
+  git add -A; git -c user.name=t -c user.email=t@example.com commit -qm base
+  git rev-parse HEAD > /tmp/base-sha
+  echo "PR-HEAD-ONLY" > AGENTS.md; mkdir -p .claude/skills/pr-only; echo x > .claude/skills/pr-only/SKILL.md
+  git add -A; git -c user.name=t -c user.email=t@example.com commit -qm head
+' || fail "could not build the throwaway repository in the container"
+BASE_SHA="$(docker exec "$TASK_REPO" cat /tmp/base-sha)"
+docker exec "$TASK_REPO" franky-repo-setup map --repo acme/service --ref "$BASE_SHA" --engine codex \
+  --remote file:///tmp/smoke-src || fail "franky-repo-setup map failed in the real image"
+docker exec "$TASK_REPO" franky-repo-setup map --repo acme/service --ref "$BASE_SHA" --engine claude \
+  --remote file:///tmp/smoke-src >/dev/null || fail "franky-repo-setup map (claude) failed"
+docker exec "$TASK_REPO" sh -c "test -f $CHOME/.codex/skills/repo-skill/SKILL.md && test ! -e $CHOME/.codex/skills/pr-only" \
+  || fail "repo skill missing, or a skill from the PR head leaked in"
+docker exec "$TASK_REPO" sh -c "grep -q 'REPO COPY' $CHOME/.codex/skills/shared/SKILL.md" \
+  || fail "the repo copy of a same-named skill did not win over the team copy"
+docker exec "$TASK_REPO" sh -c "grep -q TEAM-RULE-MARKER $CHOME/.codex/AGENTS.md && grep -q REPO-RULE-MARKER $CHOME/.codex/AGENTS.md && ! grep -q PR-HEAD-ONLY $CHOME/.codex/AGENTS.md" \
+  || fail "instruction file is not team text then repository text from the base commit"
+docker exec "$TASK_REPO" sh -c "test ! -e $CHOME/.codex/settings.json && test ! -e $CHOME/.claude/settings.json && test ! -e $CHOME/.claude/hooks" \
+  || fail "a repository settings file or hook was copied"
+docker exec "$TASK_REPO" sh -c "test -f $CHOME/.claude/skills/repo-skill/SKILL.md && test -f $CHOME/.claude/skills/team-skill/SKILL.md" \
+  || fail "claude native skills dir does not hold both skills"
+echo "   OK (mapper ran in the image as uid 1001; repo skill overrides team skill; base commit only)"
+
+echo "== 5a. codex lists the team skill and the repo skill at session start (offline) =="
+docker exec -e CODEX_HOME="$CHOME/.codex" "$TASK_REPO" sh -c 'cd /work && codex debug prompt-input hi' > "$WORKDIR/codex-prompt.json" \
+  || fail "codex debug prompt-input failed in the image"
+grep -q 'team-skill' "$WORKDIR/codex-prompt.json" || fail "codex does not list the team skill"
+grep -q 'repo-skill' "$WORKDIR/codex-prompt.json" || fail "codex does not list the repo skill"
+grep -q 'REPO-RULE-MARKER' "$WORKDIR/codex-prompt.json" || fail "codex does not carry the repository rules"
+echo "   OK (codex sees both skills and the merged instructions)"
+
+echo "== 5b. claude lists them too (needs CLAUDE_CODE_OAUTH_TOKEN; skipped without) =="
+if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+  docker exec -e CLAUDE_CODE_OAUTH_TOKEN "$TASK_REPO" sh -c "cd /work && claude -p 'List the names of your available skills, one per line, nothing else.' --dangerously-skip-permissions" \
+    > "$WORKDIR/claude-skills.txt" || fail "claude -p failed"
+  grep -q 'team-skill' "$WORKDIR/claude-skills.txt" && grep -q 'repo-skill' "$WORKDIR/claude-skills.txt" \
+    || fail "claude does not list both skills"
+  echo "   OK (claude lists both skills)"
+else
+  echo "   SKIPPED (no CLAUDE_CODE_OAUTH_TOKEN; claude's native skills dir was checked in step 5)"
+fi
+
+echo "== 5c. a bad commit fails closed with one short line =="
+if docker exec "$TASK_REPO" franky-repo-setup map --repo acme/service --ref "$(printf 'b%.0s' $(seq 1 40))" \
+  --engine codex --remote file:///tmp/smoke-src 2> "$WORKDIR/map-err.txt"; then
+  fail "a bad commit did not fail"
+fi
+[ "$(wc -l < "$WORKDIR/map-err.txt")" -eq 1 ] || fail "failure was not one short line"
+echo "   OK"
 
 echo "SMOKE PASS: profile injection works into the real hardened container (stdin untar into HOME)."

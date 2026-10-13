@@ -51,6 +51,15 @@ _RUN_UID = 1001
 _RUN_GID = 1001
 _HOME = "/home/franky"
 CODEX_AUTH_HOME = f"{_HOME}/.codex"
+# How long the entrypoint waits for the profile ready marker, and the variable that extends it.
+PROFILE_WAIT_SECS = 120
+PROFILE_WAIT_VAR_SECS = "FRANKY_PROFILE_WAIT_SECS"
+# A task never mounts the persistent Codex auth volume over its CODEX_HOME. CODEX_HOME is a
+# per-run directory in the task's own HOME volume; the auth volume sits beside it and only
+# `auth.json` is linked in (franky-dind-entrypoint.sh), so team and repository skills, rules and
+# session files never touch the shared volume and two runs never share them.
+CODEX_RUN_HOME = CODEX_AUTH_HOME
+CODEX_RUN_AUTH_MOUNT = f"{_HOME}/.codex-auth"
 _CODEX_AUTH_MAX_BYTES = 64 * 1024
 # XDG_RUNTIME_DIR for the always-on rootless Docker daemon: it puts docker.sock + runtime state
 # here (dockerd-rootless.sh defaults to /run/user/<uid>).
@@ -179,6 +188,7 @@ def build_docker_argv(
     disk_mb: int = DEFAULT_DISK_MB,
     apparmor_profile: str | None = None,
     session_hold: str = "",
+    profile_wait_secs: int = PROFILE_WAIT_SECS,
 ) -> list[str]:
     """Build the full `docker run` argv. Pure - no docker invoked.
 
@@ -206,7 +216,8 @@ def build_docker_argv(
     are unchanged - resume uses only host-side docker cp/exec + this env flag, no bind mount.
 
     `auth_volume` is the fixed Codex subscription named volume selected by fail-closed config.
-    It is never a caller-supplied path or bind mount.
+    It is never a caller-supplied path or bind mount. It mounts beside, not over, the per-run
+    CODEX_HOME (see CODEX_RUN_AUTH_MOUNT).
 
     When `session_hold` (a per-run nonce) is set the container starts with
     `-e FRANKY_SESSION_HOLD=<nonce>` (by-value, non-secret): after a clean engine exit the
@@ -231,7 +242,9 @@ def build_docker_argv(
     if auth_volume:
         argv += [
             "--mount",
-            f"type=volume,src={auth_volume},dst={CODEX_AUTH_HOME}",
+            f"type=volume,src={auth_volume},dst={CODEX_RUN_AUTH_MOUNT}",
+            "-e",
+            f"CODEX_HOME={CODEX_RUN_HOME}",
         ]
     if network:
         argv += ["--network", network]
@@ -259,6 +272,8 @@ def build_docker_argv(
         # By-value (non-secret): puts the entrypoint into profile-wait mode. The content
         # arrives later over `docker exec -i` stdin; see deliver_profile + the entrypoint.
         argv += ["-e", f"{PROFILE_WAIT_VAR}=1"]
+        if profile_wait_secs != PROFILE_WAIT_SECS:
+            argv += ["-e", f"{PROFILE_WAIT_VAR_SECS}={profile_wait_secs}"]
     if resume_wait:
         # By-value (non-secret): puts the entrypoint into resume-wait mode (issue #71).
         argv += ["-e", f"{snapshot.RESUME_WAIT_ENV}=1"]
@@ -565,6 +580,15 @@ def deliver_steer(
 # The file the host touches (last, after a clean untar) to release the entrypoint's wait.
 PROFILE_READY_MARKER = f"{CONTAINER_HOME}/.franky-profile-ready"
 
+# The in-image repository-setup mapper (franky-repo-setup.py): its own deadline is 90 s and this
+# host cap 100 s. The entrypoint's marker wait (120 s) grows by that cap for a run that loads a
+# repository setup, so a slow but valid setup never loses the race (FRANKY_PROFILE_WAIT_SECS).
+REPO_SETUP_BIN = "/usr/local/bin/franky-repo-setup"
+REPO_SETUP_TIMEOUT = 100.0
+
+# The exit code of a run whose repository setup failed (the entrypoint's own profile code).
+REPO_SETUP_FAILED_CODE = 78
+
 
 def deliver_profile(
     task: str,
@@ -578,6 +602,8 @@ def deliver_profile(
     session_tar: str | None = None,
     session_timeout: float = 20.0,
     private_prompt_tar: bytes | None = None,
+    repo_setup: dict[str, str] | None = None,
+    repo_setup_sink: dict | None = None,
 ) -> bool:
     """Stream the operator profile tar into a freshly launched container, then signal it.
 
@@ -596,6 +622,12 @@ def deliver_profile(
     `session_tar` (a host tar path, `review-pr --thread`) is streamed from the file into HOME on
     the same channel AFTER the profile. Its failure still touches the marker: the review runs,
     the engine's resume fails, and the thread store drops that session for the next run.
+
+    `repo_setup` ({"repo", "ref", "engine"}) runs the in-image `franky-repo-setup map` between
+    the untar and the marker, so the engine starts with the repository's own skills and rules in
+    place. A failure leaves the marker untouched, puts a short redacted reason in
+    `repo_setup_sink["error"]`, and returns False: the caller then fails the run before the
+    engine starts. On success the sink gets `"summary"`.
     """
     from . import snapshot
 
@@ -634,6 +666,37 @@ def deliver_profile(
             )
             if getattr(untar, "returncode", 1) != 0:
                 return False
+        if repo_setup is not None:
+            try:
+                mapped = runner(
+                    [
+                        "docker",
+                        "exec",
+                        task,
+                        REPO_SETUP_BIN,
+                        "map",
+                        "--repo",
+                        repo_setup["repo"],
+                        "--ref",
+                        repo_setup["ref"],
+                        "--engine",
+                        repo_setup["engine"],
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=REPO_SETUP_TIMEOUT,
+                )
+            except subprocess.TimeoutExpired:
+                if repo_setup_sink is not None:
+                    repo_setup_sink["error"] = f"timed out after {int(REPO_SETUP_TIMEOUT)}s"
+                return False
+            if getattr(mapped, "returncode", 1) != 0:
+                if repo_setup_sink is not None:
+                    detail = (getattr(mapped, "stderr", "") or "").strip().splitlines()
+                    repo_setup_sink["error"] = (detail[-1] if detail else "no detail")[:300]
+                return False
+            if repo_setup_sink is not None:
+                repo_setup_sink["summary"] = (getattr(mapped, "stdout", "") or "").strip()[:300]
         marker = runner(
             snapshot.build_marker_argv(task, marker=PROFILE_READY_MARKER),
             capture_output=True,
@@ -1565,6 +1628,7 @@ def run_in_container(
     workspace_sink: dict | None = None,
     private_prompt_tar: bytes | None = None,
     extra_secrets: Iterable[str] = (),
+    repo_setup: dict[str, str] | None = None,
 ) -> tuple[int, str | Transcript]:
     """Run the inner engine in a hardened, egress-controlled container; return
     (returncode, redacted_output).
@@ -1601,6 +1665,10 @@ def run_in_container(
 
     `extra_secrets` are host-only values (the JIRA token and email) added to the redaction set
     for the streamed and stored output. They are never passed into the container.
+
+    `repo_setup` ({"repo", "ref", "engine"}) loads the repository's own agent setup, read at
+    `ref`, before the engine starts (see `deliver_profile`). A mapper failure fails the run with
+    exit code 78 and a one-line retryable message; the engine never starts.
 
     Topology: an --internal network (no internet route) hosts a Squid proxy (default-deny
     allowlist) and the task container. The task's HTTP(S)_PROXY points at the proxy and its
@@ -1649,6 +1717,8 @@ def run_in_container(
     hold_nonce = _hold_nonce() if holding else ""
     hold_want = f"{snapshot.SESSION_HOLD_LINE} {hold_nonce}"
     hold_buf, hold_at_line_start = "", True
+    repo_setup_sink: dict = {}
+    setup_failed = False
 
     try:
         try:
@@ -1701,7 +1771,10 @@ def run_in_container(
         # their injected capture boundary; profile/restore and injected Popen use streaming.
         resuming = resume_workspace is not None
         injecting = (
-            profile_bundle is not None or session_tar is not None or private_prompt_tar is not None
+            profile_bundle is not None
+            or session_tar is not None
+            or private_prompt_tar is not None
+            or repo_setup is not None
         )
         effective_progress = progress
         if (
@@ -1722,6 +1795,8 @@ def run_in_container(
             disk_mb=cfg.disk_mb,
             apparmor_profile=apparmor_profile,
             session_hold=hold_nonce,
+            profile_wait_secs=PROFILE_WAIT_SECS
+            + (int(REPO_SETUP_TIMEOUT) if repo_setup is not None else 0),
         )
         if effective_progress is not None:
             # Redact before disk and callbacks, retaining only bounded unfinished fragments.
@@ -1754,6 +1829,7 @@ def run_in_container(
                     # Setup precedes the task timeout. Current bounded profile and restore
                     # calls need at most 245 + 145 seconds, including readiness inspections.
                     setup_grace = 400 if injecting or resuming else 0
+                    setup_grace += int(REPO_SETUP_TIMEOUT) if repo_setup is not None else 0
                     storage_thread = threading.Thread(
                         target=_watch_storage,
                         args=(
@@ -1780,7 +1856,20 @@ def run_in_container(
                         sleeper=sleeper,
                         session_tar=session_tar,
                         private_prompt_tar=private_prompt_tar,
+                        repo_setup=repo_setup,
+                        repo_setup_sink=repo_setup_sink,
                     )
+                    if "error" in repo_setup_sink:
+                        # Fail closed and fast: no marker was touched, so the engine would only
+                        # exit after the entrypoint's own wait. Say why, then stop the container.
+                        setup_failed = True
+                        emit(
+                            "franky: repository setup failed (retryable, nothing was changed): "
+                            f"{repo_setup_sink['error']}\n"
+                        )
+                        proc.kill()
+                    elif repo_setup_sink.get("summary"):
+                        emit(f"franky: repository setup loaded {repo_setup_sink['summary']}\n")
                 # Restore the prior workspace into the just-launched container (issue #71) BEFORE
                 # draining stdout: the container is waiting on the ready marker in resume-wait
                 # mode. A False result is fine to proceed on - the entrypoint will exit 75 quickly
@@ -1878,6 +1967,8 @@ def run_in_container(
                 if timed_out or watchdog_hit.is_set():
                     code = CONTAINER_TIMEOUT_CODE
                     output.write("\n" + CONTAINER_TIMEOUT_MSG.format(timeout=timeout))
+                elif setup_failed:
+                    code = REPO_SETUP_FAILED_CODE
                 else:
                     code = proc.returncode
             except OSError as exc:
