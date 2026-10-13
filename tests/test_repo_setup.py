@@ -453,7 +453,7 @@ def test_repo_text_cannot_import_files_or_fake_headings(tmp_path):
     assert code == 0
     assert not [ln for ln in lines if ln.lstrip().startswith("@")]
     assert "`@~/.ssh/config`" in text and "  `@../secret.md` rest" in text
-    assert "keep @inline" in text and "`@etc/passwd`" in text
+    assert "keep `@inline`" in text and "`@etc/passwd`" in text
     assert [ln for ln in lines if ln.startswith("#")] == [
         ln for ln in lines if ln.startswith(("## Repository rules", "### ", "##### "))
     ]
@@ -544,3 +544,21 @@ def test_the_image_wording_does_not_claim_the_pr_head_never_loads():
     doc = mapper.__doc__
     assert "default-branch head" in doc and "Residual" in doc
     assert "can never inject" not in doc
+
+
+@pytest.mark.parametrize(
+    "line,expected",
+    [
+        ("see @~/.codex-auth/auth.json for details", "see `@~/.codex-auth/auth.json` for details"),
+        ("a @x.md and @y.md", "a `@x.md` and `@y.md`"),
+        ("- @a.md", "- `@a.md`"),
+        ("1. read @a.md", "1. read `@a.md`"),
+        ("> quote @a.md", "> quote `@a.md`"),
+        ('say "@a.md" now', 'say "`@a.md"` now'),
+        ("(@a.md)", "(`@a.md)`"),
+        ("mail me a@b.com", "mail me a@b.com"),
+        ("already `@a.md` here", "already `@a.md` here"),
+    ],
+)
+def test_neutralize_wraps_every_import_token_anywhere_in_a_line(line, expected):
+    assert mapper.neutralize(line) == expected

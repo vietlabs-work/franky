@@ -26,7 +26,7 @@ and, inside a skill directory, `*.yaml`, `*.yml`, `*.toml`, `*.json` files and `
 Caps: 500 files, 4 MiB in total (both fail the run), 256 KiB per file (the file is skipped,
 also at fetch time: a larger blob is never downloaded), 16 KiB for the index.
 Repository text is neutralized where it joins the instruction file: `@` import lines are
-wrapped in backticks and headings are demoted, so it cannot import a file or fake a heading.
+wrapped in backticks (anywhere in a line) and headings are demoted, so it cannot import a file or fake a heading.
 
 Any fetch or mapping error exits nonzero with one short message and no secret in it: the host
 then fails the run before the engine starts. A repository with no setup is normal.
@@ -371,7 +371,8 @@ def clean_line(value: str, limit: int) -> str:
     return flat if len(flat) <= limit else flat[: limit - 3].rstrip() + "..."
 
 
-_IMPORT_RE = re.compile(r"^(\s*)(@\S*)")
+# An `@path` import counts anywhere in a line, so every `@token` not glued to a word or a backtick.
+_IMPORT_RE = re.compile(r"(?<![\w`])(@\S+)")
 _HEADING_RE = re.compile(r"^\s{0,3}#{1,6}(\s|$)")
 _SETEXT_RE = re.compile(r"^\s{0,3}(=+|-+)\s*$")
 
@@ -379,7 +380,7 @@ _SETEXT_RE = re.compile(r"^\s{0,3}(=+|-+)\s*$")
 def neutralize(text: str) -> str:
     """Make repository text inert where it joins the instruction file.
 
-    A line that starts with `@` is an import in Claude Code: its token is wrapped in backticks.
+    An `@path` token is an import in Claude Code wherever it sits in a line: it is wrapped in backticks.
     A Markdown heading is demoted below the `###` file headings (a `#####` prefix), and a setext
     underline is escaped, so repository text cannot fake the "Team rules" or any other heading.
     """
@@ -389,9 +390,7 @@ def neutralize(text: str) -> str:
             line = "##### " + line.lstrip().lstrip("#").strip()
         elif _SETEXT_RE.match(line):
             line = "\\" + line.lstrip()
-        else:
-            line = _IMPORT_RE.sub(lambda m: f"{m.group(1)}`{m.group(2)}`", line)
-        out.append(line)
+        out.append(_IMPORT_RE.sub(lambda m: f"`{m.group(1)}`", line))
     return "\n".join(out)
 
 
