@@ -44,10 +44,16 @@ from .container import (
     codex_auth_status,
     FRANKY_IMAGE_VAR,
     FRANKY_PROXY_IMAGE_VAR,
+    DEFAULT_GHCR_REPO,
+    GHCR_REPO_VAR,
     PULL_TIMEOUT_SECS,
     REPO_SETUP_BIN,
     capture_diagnostics,
     ensure_image_available,
+    fallback_image,
+    list_local_images,
+    local_engines,
+    pull_in_background,
     resolve_image,
     run_in_container,
 )
@@ -364,24 +370,41 @@ def main() -> None:
 
 @main.command("pull-images", hidden=True)
 def pull_images() -> None:
-    """Pull the task and proxy images for this version (run by `franky update`)."""
+    """Pull the task image of every engine this host uses, and the proxy image (run by
+    `franky update`)."""
     # Resolve the engine and image the way a real run does, config file included, on a
     # copy so a pull never changes this process's environment.
     env = dict(os.environ)
     try:
         load_config_file(env)
-        engine = resolve_engine(None, env).name
+        engines = [resolve_engine(None, env).name]
+        extra = [e.strip() for e in env.get("FRANKY_PULL_ENGINES", "").split(",") if e.strip()]
+        for name in extra:
+            resolve_engine(name, env)  # unknown name -> ValueError, even with an override
+        if not env.get(FRANKY_IMAGE_VAR):  # an override names one image: pull only that
+            prefix = (env.get(GHCR_REPO_VAR) or DEFAULT_GHCR_REPO).rstrip("/")
+            # Old images of other engines show which ones this host runs; prune runs after.
+            used = sorted(local_engines(list_local_images(), prefix))
+            engines += [e for e in [*extra, *used] if e not in engines]
     except ValueError as exc:
         click.echo(f"franky: {exc}", err=True)
         sys.exit(EXIT_CONFIG)
-    try:
-        click.echo("franky: pulling images ...", err=True)
-        franky_img, proxy_img = _ensure_images(env, engine)
-    except FrankyError as exc:
-        hint = f" ({exc.hint})" if exc.hint else ""
-        click.echo(f"franky: image pull failed: {exc}{hint}", err=True)
-        sys.exit(exc.code)
-    click.echo(f"franky: images ready: {franky_img}, {proxy_img}", err=True)
+    click.echo("franky: pulling images ...", err=True)
+    # Each image is pulled on its own: one failure (a task image or the proxy) skips nothing.
+    images = [_image_spec(env, "franky", engine) for engine in engines]
+    images.append(_image_spec(env, "franky-proxy"))
+    failed = 0
+    for spec in images:
+        try:
+            img = _ensure_image(env, *spec, allow_fallback=False)
+        except FrankyError as exc:
+            hint = f" ({exc.hint})" if exc.hint else ""
+            click.echo(f"franky: image pull failed: {exc}{hint}", err=True)
+            failed = failed or exc.code
+            continue
+        click.echo(f"franky: image ready: {img}", err=True)
+    if failed:
+        sys.exit(failed)
 
 
 @main.command("apparmor-profile")
@@ -2413,7 +2436,18 @@ def _format_plan_summary(result: dict) -> list[str]:
     return lines
 
 
-def _ensure_images(env: Mapping[str, str], engine: str) -> tuple[str, str]:
+def _image_spec(env: Mapping[str, str], label: str, engine: str | None = None) -> tuple:
+    """(label, image ref, dev build command, override var) for the task or proxy image."""
+    if label == "franky":
+        img = resolve_image(env, FRANKY_IMAGE_VAR, "franky", engine=engine)
+        return label, img, "docker build -t franky .", FRANKY_IMAGE_VAR
+    img = resolve_image(env, FRANKY_PROXY_IMAGE_VAR, "franky-proxy")
+    return label, img, "docker build -t franky-proxy proxy/", FRANKY_PROXY_IMAGE_VAR
+
+
+def _ensure_images(
+    env: Mapping[str, str], engine: str, *, allow_fallback: bool = True
+) -> tuple[str, str]:
     """Resolve + ensure the franky and franky-proxy images are available locally.
 
     Returns (franky_image, proxy_image). Raises DockerError (exit 6, a clean message, no
@@ -2421,38 +2455,61 @@ def _ensure_images(env: Mapping[str, str], engine: str) -> tuple[str, str]:
     failed - typed so the outer FrankyError handler emits the right code + JSON error too.
     Shared by every command that runs an engine container.
     """
-    franky_img = resolve_image(env, FRANKY_IMAGE_VAR, "franky", engine=engine)
-    proxy_img = resolve_image(env, FRANKY_PROXY_IMAGE_VAR, "franky-proxy")
-    for label, img, dev_build, dev_var in (
-        ("franky", franky_img, "docker build -t franky .", FRANKY_IMAGE_VAR),
-        ("franky-proxy", proxy_img, "docker build -t franky-proxy proxy/", FRANKY_PROXY_IMAGE_VAR),
-    ):
-        ok, reason = ensure_image_available(img)
-        if not ok:
-            if reason == "no-docker":
-                raise DockerError(
-                    "docker is not available - is the daemon running and `docker` on PATH?"
-                )
-            if reason == "auth":
-                raise DockerError(
-                    f"{label} image '{img}' needs auth to pull - run `docker login ghcr.io` "
-                    f"(a PAT with read:packages), or for local dev `{dev_build}` "
-                    f"and set {dev_var}=<local-tag>."
-                )
-            if reason == "pull-timeout":
-                raise ImagePullTimeout(
-                    f"{label} image '{img}' pull did not finish in {PULL_TIMEOUT_SECS}s - "
-                    f"nothing ran, so retrying is safe. Pre-pull with `docker pull {img}`.",
-                    hint=(
-                        f"Nothing ran, so retrying is safe. Pre-pull with `docker pull {img}`, "
-                        "then run the command again."
-                    ),
-                )
-            raise DockerError(
-                f"{label} image '{img}' not found locally and could not be pulled. "
-                f"For local dev: `{dev_build}` and set {dev_var}=<local-tag>."
-            )
+    franky_img = _ensure_image(
+        env, *_image_spec(env, "franky", engine), allow_fallback=allow_fallback
+    )
+    proxy_img = _ensure_image(env, *_image_spec(env, "franky-proxy"), allow_fallback=allow_fallback)
     return franky_img, proxy_img
+
+
+def _ensure_image(
+    env: Mapping[str, str],
+    label: str,
+    img: str,
+    dev_build: str,
+    dev_var: str,
+    *,
+    allow_fallback: bool = True,
+) -> str:
+    """Ensure one image is local and return the ref to run.
+
+    A missing versioned image falls back to the newest older patch of the same minor (and
+    engine) when one is local, and the missing one is pulled in the background. Overrides
+    (FRANKY_IMAGE / FRANKY_PROXY_IMAGE) and `allow_fallback=False` always pull.
+    """
+    old = fallback_image(img) if allow_fallback and not env.get(dev_var) else None
+    if old:
+        click.echo(
+            f"franky: {label} image '{img}' is not pulled yet - using '{old}' "
+            f"and pulling '{img}' in the background",
+            err=True,
+        )
+        pull_in_background(img)
+        return old
+    ok, reason = ensure_image_available(img)
+    if ok:
+        return img
+    if reason == "no-docker":
+        raise DockerError("docker is not available - is the daemon running and `docker` on PATH?")
+    if reason == "auth":
+        raise DockerError(
+            f"{label} image '{img}' needs auth to pull - run `docker login ghcr.io` "
+            f"(a PAT with read:packages), or for local dev `{dev_build}` "
+            f"and set {dev_var}=<local-tag>."
+        )
+    if reason == "pull-timeout":
+        raise ImagePullTimeout(
+            f"{label} image '{img}' pull did not finish in {PULL_TIMEOUT_SECS}s - "
+            f"nothing ran, so retrying is safe. Pre-pull with `docker pull {img}`.",
+            hint=(
+                f"Nothing ran, so retrying is safe. Pre-pull with `docker pull {img}`, "
+                "then run the command again."
+            ),
+        )
+    raise DockerError(
+        f"{label} image '{img}' not found locally and could not be pulled. "
+        f"For local dev: `{dev_build}` and set {dev_var}=<local-tag>."
+    )
 
 
 _TAIL_CHARS = 65536

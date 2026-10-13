@@ -54,6 +54,7 @@ from .container import (
     GHCR_REPO_VAR,
     PULL_TIMEOUT_SECS,
 )
+from .engine import ENGINES
 from .userconfig import load_config_file
 
 # Self-update reinstalls by the published distribution name (DIST_NAME, defined once in
@@ -197,6 +198,7 @@ def force_update(
     newer = is_newer(tag, current)
     if not newer and not force:
         out(f"franky: already on the latest release ({_vstr(current)})")
+        _prepull_images(runner, out)  # repairs a missing image; no prune, nothing was replaced
         return 0
 
     argv = _install_command(install, tag)
@@ -236,7 +238,8 @@ def _prepull_images(runner: Callable, out: Callable[[str], None]) -> None:
     # run inside a checkout still runs the newly installed code with the user's creds.
     argv = [sys.executable, "-I", "-m", "franky.cli", "pull-images"]
     try:
-        proc = runner(argv, timeout=2 * PULL_TIMEOUT_SECS + 60)
+        # Worst case: every engine's task image plus the proxy, each capped by its own pull.
+        proc = runner(argv, timeout=(len(ENGINES) + 1) * PULL_TIMEOUT_SECS + 60)
     except (OSError, subprocess.TimeoutExpired) as exc:
         proc = None
         reason = f"({exc})"

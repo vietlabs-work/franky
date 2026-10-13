@@ -2162,6 +2162,82 @@ def resolve_image(
     return f"{repo}/{name}:{tag}"
 
 
+def list_local_images(runner=subprocess.run) -> list[str]:
+    """Local image refs as `repository:tag`. Empty when docker is absent or fails."""
+    try:
+        proc = runner(
+            ["docker", "image", "ls", "--format", "{{.Repository}}:{{.Tag}}"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    return (proc.stdout or "").split() if proc.returncode == 0 else []
+
+
+# `<repo>/<name>:X.Y.Z` with an optional `-<engine>` suffix. Dev tags and `latest` never match.
+_RELEASED_REF_RE = re.compile(r"^(.+/[a-z-]+):(\d+)\.(\d+)\.(\d+)(-[a-z]+)?$")
+
+
+def local_engines(refs: Iterable[str], prefix: str) -> set[str]:
+    """Engines that have any local released task image `<prefix>/franky:X.Y.Z-<engine>`."""
+    found = set()
+    for ref in refs:
+        m = _RELEASED_REF_RE.match(ref)
+        if m and m.group(1) == f"{prefix}/franky" and m.group(5):
+            found.add(m.group(5)[1:])
+    return found & set(ENGINES)
+
+
+def pick_fallback(image: str, refs: Iterable[str]) -> str | None:
+    """The newest ref with the same repository and engine suffix, same major.minor and a
+    LOWER patch than `image`. Never crosses a minor version; dev tags and `latest` never match."""
+    want = _RELEASED_REF_RE.match(image)
+    if not want:
+        return None
+    best = None
+    for ref in refs:
+        m = _RELEASED_REF_RE.match(ref)
+        if (
+            m
+            and (m.group(1), m.group(2), m.group(3), m.group(5))
+            == (want.group(1), want.group(2), want.group(3), want.group(5))
+            and int(m.group(4)) < int(want.group(4))
+            and (best is None or int(m.group(4)) > best[0])
+        ):
+            best = (int(m.group(4)), ref)
+    return best[1] if best else None
+
+
+def fallback_image(image: str, runner=subprocess.run) -> str | None:
+    """A usable older local image when `image` is not local, else None (also None when
+    `image` exists, so the caller needs no separate existence check)."""
+    refs = list_local_images(runner)
+    return None if image in refs else pick_fallback(image, refs)
+
+
+def pull_in_background(image: str, log_dir: Path | None = None, popen=subprocess.Popen) -> None:
+    """Start a detached `docker pull` that outlives this process, logging to
+    `~/.franky/image-pull.log`. Never raises and never waits: on any OSError the caller
+    just keeps using its fallback image."""
+    log_dir = log_dir or Path.home() / ".franky"
+    try:
+        log_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(log_dir / "image-pull.log", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.fchmod(fd, 0o600)  # an existing log keeps its old mode otherwise
+        with os.fdopen(fd, "ab") as log:
+            popen(
+                ["docker", "pull", image],
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+    except OSError:
+        pass
+
+
 def ensure_image_available(
     image: str, runner=subprocess.run, timeout: float = PULL_TIMEOUT_SECS
 ) -> tuple[bool, str]:

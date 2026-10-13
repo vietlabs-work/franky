@@ -9,6 +9,8 @@ from types import SimpleNamespace
 import pytest
 
 from franky._install import Install
+from franky.container import PULL_TIMEOUT_SECS
+from franky.engine import ENGINES
 from franky.update_check import (
     _TTL_AVAILABLE,
     _TTL_CURRENT,
@@ -196,17 +198,25 @@ def test_force_update_dev_checkout_is_noop():
     assert any("dev checkout" in ln and "git" in ln for ln in lines)
 
 
-def test_force_update_already_current():
+def test_force_update_already_current_prepulls_without_install_or_prune():
     lines, out = _collect()
+    argvs = []
+
+    def runner(argv, **kw):
+        argvs.append(argv)
+        return _proc(returncode=0)
+
     code = force_update(
         install=Install("pip", "/usr/bin/python3"),
         current="0.2.0",
         fetch=lambda: "v0.2.0",
-        runner=lambda *a, **k: pytest.fail("must not install when already current"),
+        runner=runner,
         out=out,
     )
     assert code == 0
     assert any("already on the latest release" in ln for ln in lines)
+    # Only the pre-pull ran: no install, and no `docker image ls` / `rm` from the prune.
+    assert argvs == [_pull_argv()]
 
 
 def test_force_update_upgrades_and_reports_version():
@@ -568,20 +578,9 @@ def test_force_update_prepulls_after_install():
     )
     assert code == 0
     assert [a for a, _ in argvs][1] == _pull_argv()  # after the install, via the new package
-    assert argvs[1][1]["timeout"] > 0
+    # Room for every engine's task image plus the proxy, each capped by its own pull.
+    assert argvs[1][1]["timeout"] > (len(ENGINES) + 1) * PULL_TIMEOUT_SECS
     assert not any("pre-pull" in ln for ln in lines)
-
-
-def test_force_update_noop_does_not_prepull():
-    lines, out = _collect()
-    code = force_update(
-        install=Install("pip", "/usr/bin/python3"),
-        current="0.2.0",
-        fetch=lambda: "v0.2.0",
-        runner=lambda *a, **k: pytest.fail("no install and no pull when already current"),
-        out=out,
-    )
-    assert code == 0
 
 
 def test_force_update_failed_install_does_not_prepull():
