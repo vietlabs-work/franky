@@ -39,6 +39,7 @@ import io
 import json
 import math
 import re
+import secrets
 import tarfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -68,6 +69,30 @@ PROFILE_CATEGORIES = PROFILE_FILE_CATEGORIES + PROFILE_VALUE_CATEGORIES
 # The second top-level table: whole agentic-coding setups declared by directory,
 # `[setups] claude = "~/.claude"`. Expanded through setups.SETUP_MANIFESTS.
 SETUPS_TABLE = "setups"
+
+# Where a team setup lands per engine: (skills dir, instruction file), HOME-relative. claude and
+# codex are verified; opencode and pi are UNVERIFIED, so the prompt keeps its pointer to the
+# team dir for those two (see prompt.build_setup_block). Codex reads its own per-run
+# CODEX_HOME (`~/.codex`, see container.py), never the shared auth volume.
+TEAM_NATIVE = {
+    "claude": (".claude/skills", ".claude/CLAUDE.md"),
+    "codex": (".codex/skills", ".codex/AGENTS.md"),
+    "opencode": (".config/opencode/skills", ".config/opencode/AGENTS.md"),
+    "pi": (".pi/skills", ".pi/AGENTS.md"),
+}
+TEAM_NATIVE_VERIFIED = ("claude", "codex")
+TEAM_RULES_HEADING = "## Team rules (always on)"
+# Where a prompt carries the repository-setup index: franky-repo-setup (`exec`) replaces this
+# marker in the engine argv with the index it wrote, right before the engine starts. The
+# in-image script keeps its own copy of the literal; a test pins the two together. A run uses
+# `new_repo_marker()`: this literal plus random hex, so text in the prompt that quotes the plain
+# literal (a PR body, say) is never swapped.
+REPO_SETUP_MARKER = "__FRANKY_REPO_SETUP_INDEX__"
+
+
+def new_repo_marker() -> str:
+    return REPO_SETUP_MARKER + secrets.token_hex(16)
+
 
 _ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 _PLACEHOLDER_RE = re.compile(r"^\$\{([A-Z_][A-Z0-9_]*)\}$")
@@ -178,7 +203,17 @@ class ProfileSpec:
         spec is one file among the operator's commands, so it follows whatever setup they feed
         Franky instead of being configured twice.
         """
+        team = self.team_scan
+        if team is not None:
+            # Precedence: team over the operator's own setup.
+            found = setups.find_pr_spec(team.files)
+            if found is not None:
+                return found
         return setups.find_pr_spec(self.setup_files)
+
+    @property
+    def team_scan(self) -> setups.SetupScan | None:
+        return self.setup_scans.get(setups.TEAM_KIND)
 
     def all_files(self) -> list[Path]:
         """All files across all categories, in declaration order.
@@ -335,6 +370,8 @@ def _load_setups(raw, path: Path, budget: setups.ReadBudget) -> dict[str, setups
                 "bundle is unpacked relative to HOME inside the container"
             ) from exc
         scans[kind] = setups.expand_setup(kind, root, budget)
+        if kind == setups.TEAM_KIND:
+            setups.read_team_manifest(root)
     return scans
 
 
@@ -949,7 +986,71 @@ def scan_profile_files(spec: ProfileSpec) -> list[FileScanResult]:
     return results
 
 
-def build_bundle(spec: ProfileSpec) -> bytes:
+def _team_members(
+    spec: ProfileSpec, engine: str, texts: dict[Path, str], operator_text
+) -> tuple[dict[str, str], list[str]]:
+    """The engine-native members of a team setup: {arcname: text}, in a stable order.
+
+    Skills map one-to-one into the engine's skills dir. ONE instruction member carries the
+    operator's own text for that file first, then the team AGENTS.md and rules under a fixed
+    heading, so the team rules are always on without a second file the engine may not read.
+    `knowledge/` is never merged: it is read on demand through the prompt pointer.
+
+    Also returns the native skill directories the team owns (`<skills dir>/<name>/`): a team
+    skill replaces an operator skill of the same name as a whole, never file by file.
+    """
+    team = spec.team_scan
+    if team is None or engine not in TEAM_NATIVE:
+        return {}, []
+    skills_dir, instruction = TEAM_NATIVE[engine]
+    members: dict[str, str] = {}
+    root = team.root.resolve()
+    rules: list[tuple[str, str]] = []
+    owned: set[str] = set()
+    bad: set[str] = set()
+    agents_text = ""
+    for path in sorted(team.files):
+        try:
+            rel = path.resolve().relative_to(root)
+        except ValueError:
+            continue
+        text = texts.get(path)
+        if text is None:
+            continue
+        top = rel.parts[0]
+        if top == "skills" and len(rel.parts) >= 3:
+            # A SKILL.md at any depth below the skill dir carries a header an engine may honor.
+            if rel.name.lower() == "skill.md":
+                clean = setups.sanitize_frontmatter(text, setups.SKILL_FRONTMATTER_KEYS)
+                if clean is None:
+                    bad.add(rel.parts[1])
+                    continue
+                text = clean
+            members[f"{skills_dir}/{'/'.join(rel.parts[1:])}"] = text
+            owned.add(f"{skills_dir}/{rel.parts[1]}/")
+        elif top == "rules" and rel.suffix.lower() == ".md":
+            rules.append((rel.as_posix(), text))
+        elif rel.as_posix() == "AGENTS.md":
+            agents_text = text
+    # A skill whose header cannot be read is not installed natively at all. Its dir stays
+    # owned, so the caller also drops any raw copy at that native path.
+    for name in bad:
+        prefix = f"{skills_dir}/{name}/"
+        for key in [k for k in members if k.startswith(prefix)]:
+            del members[key]
+        owned.add(prefix)
+    sections = []
+    if agents_text.strip():
+        sections.append(agents_text.strip())
+    sections += [f"### {name}\n\n{text.strip()}" for name, text in rules if text.strip()]
+    if sections:
+        base = operator_text(instruction)
+        head = base.rstrip() + "\n\n" if base.strip() else ""
+        members[instruction] = head + TEAM_RULES_HEADING + "\n\n" + "\n\n".join(sections) + "\n"
+    return members, sorted(owned)
+
+
+def build_bundle(spec: ProfileSpec, engine: str | None = None) -> bytes:
     """Collect, secret-scan, and pack the profile into gzip-tar BYTES.
 
     Raw bytes, not base64: the bundle is streamed into the container over `docker exec -i`
@@ -962,6 +1063,9 @@ def build_bundle(spec: ProfileSpec) -> bytes:
 
     Files whose path cannot be made relative to HOME fall back to a flat layout
     under a top-level `profile/` directory inside HOME.
+
+    With a `team` setup and an `engine`, the team files ALSO land in that engine's native
+    locations (`_team_members`); a profile without `team` packs exactly as before.
 
     Raises ValueError (fail-closed) if:
     - Any file cannot be read.
@@ -982,37 +1086,50 @@ def build_bundle(spec: ProfileSpec) -> bytes:
     validate_mcp_configs(spec)
     home = Path.home().resolve()
     declared_home = Path.home().absolute()
-    buf = io.BytesIO()
     read_budget = setups.profile_budget()
 
-    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
-        for file_path in files:
-            try:
-                text = _read_profile_text(file_path, read_budget)
-            except (OSError, ValueError) as exc:
-                raise ValueError(f"could not read profile file {file_path}: {exc}") from exc
+    entries: dict[str, str] = {}
+    texts: dict[Path, str] = {}
+    for file_path in files:
+        try:
+            text = _read_profile_text(file_path, read_budget)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"could not read profile file {file_path}: {exc}") from exc
 
-            findings = (
-                _scan_mcp_text(text, spec.mcp_credentials)
-                if file_path in spec.mcp_configs
-                else scan_for_secrets(text)
+        findings = (
+            _scan_mcp_text(text, spec.mcp_credentials)
+            if file_path in spec.mcp_configs
+            else scan_for_secrets(text)
+        )
+        if findings:
+            raise ValueError(
+                f"profile file {file_path} contains a potential credential "
+                f"({findings[0]}) - refusing to inject (fail-closed). "
+                "Remove the credential from the file before adding it to the profile."
             )
-            if findings:
-                raise ValueError(
-                    f"profile file {file_path} contains a potential credential "
-                    f"({findings[0]}) - refusing to inject (fail-closed). "
-                    "Remove the credential from the file before adding it to the profile."
-                )
 
-            try:
-                archive_path = (
-                    file_path.absolute() if file_path in spec.mcp_configs else file_path.resolve()
-                )
-                archive_home = declared_home if file_path in spec.mcp_configs else home
-                arcname = str(archive_path.relative_to(archive_home))
-            except ValueError:
-                arcname = f"profile/{file_path.name}"
+        try:
+            archive_path = (
+                file_path.absolute() if file_path in spec.mcp_configs else file_path.resolve()
+            )
+            archive_home = declared_home if file_path in spec.mcp_configs else home
+            arcname = str(archive_path.relative_to(archive_home))
+        except ValueError:
+            arcname = f"profile/{file_path.name}"
+        entries[arcname] = text
+        texts[file_path] = text
 
+    if engine is not None:
+        # The team's native members win over an operator file at the same path; the operator's
+        # instruction text stays as the head of the merged instruction member.
+        members, owned = _team_members(spec, engine, texts, lambda name: entries.get(name, ""))
+        for name in [n for n in entries if n.startswith(tuple(owned))]:
+            del entries[name]
+        entries.update(members)
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        for arcname, text in entries.items():
             encoded = text.encode("utf-8")
             info = tarfile.TarInfo(name=arcname)
             info.size = len(encoded)

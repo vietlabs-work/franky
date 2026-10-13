@@ -18,6 +18,31 @@ export DOCKER_HOST="unix://${XDG_RUNTIME_DIR}/docker.sock"
 # rootless dockerd wants the runtime dir private (0700). We own it (tmpfs uid=1001).
 chmod 700 "${XDG_RUNTIME_DIR}" 2>/dev/null || true
 
+# Codex subscription runs: CODEX_HOME is a per-run directory in this container's own HOME
+# volume, so team and repository skills, rules and session files never touch the shared auth
+# volume. That volume is mounted beside it, and only auth.json is linked in, so a token refresh
+# written through the link still lands in the persistent volume.
+codex_link=0
+if [ -f "${HOME}/.codex-auth/auth.json" ]; then
+    mkdir -p "${HOME}/.codex"
+    ln -sfn "${HOME}/.codex-auth/auth.json" "${HOME}/.codex/auth.json"
+    codex_link=1
+fi
+
+# BEGIN check_codex_auth
+# After the engine exits: auth.json must still be the link into the auth volume. If the engine
+# (or a repository script it ran) replaced the link with a regular file, a refreshed token sits
+# in this container only and the volume keeps a stale one. Say so loudly; never copy secrets.
+check_codex_auth() {
+    [ "${codex_link}" = 1 ] || return 0
+    local link="${CODEX_HOME:-${HOME}/.codex}/auth.json"
+    [ -L "${link}" ] && [ "$(readlink "${link}")" = "${HOME}/.codex-auth/auth.json" ] && return 0
+    echo "franky: ERROR codex auth.json is no longer a link to the auth volume - refusing to" \
+         "report success (a refreshed login would be lost)" >&2
+    return 1
+}
+# END check_codex_auth
+
 # Make INNER containers inherit the egress proxy (proxy URLs ONLY - never creds). With no proxy
 # env set (e.g. local dev), write nothing so docker keeps its defaults.
 mkdir -p "${HOME}/.docker"
@@ -75,18 +100,21 @@ fi
 # WHY safe: the bundle is assembled host-side from a bounded allowlist and refused (fail-closed)
 # if any credential pattern is detected (see franky/profile.py and franky/setups.py).
 if [ -n "${FRANKY_PROFILE_WAIT:-}" ]; then
+    # 120 s, or the host's longer bound when it also loads a repository setup before the marker.
+    wait_secs="${FRANKY_PROFILE_WAIT_SECS:-120}"
+    case "${wait_secs}" in ''|*[!0-9]*) wait_secs=120 ;; esac
     ready=0
-    for _ in $(seq 1 120); do
+    for _ in $(seq 1 "${wait_secs}"); do
         if [ -f "${HOME}/.franky-profile-ready" ]; then ready=1; break; fi
         sleep 1
     done
     if [ "${ready}" != 1 ]; then
-        echo "franky: operator profile was never injected (marker absent after 120s) -" \
+        echo "franky: operator profile was never injected (marker absent after ${wait_secs}s) -" \
              "refusing to run without it" >&2
         exit 78
     fi
     rm -f "${HOME}/.franky-profile-ready" 2>/dev/null || true
-    unset FRANKY_PROFILE_WAIT
+    unset FRANKY_PROFILE_WAIT FRANKY_PROFILE_WAIT_SECS
 fi
 
 # Resume mode (issue #71): the host docker-cp's the prior workspace into this started
@@ -113,8 +141,10 @@ fi
 # per-run nonce and wait (capped) for the host to copy the session and touch the nonce marker. If
 # the host is gone, the cap runs out and --rm still removes the container, so no stopped
 # container keeps the tokens.
-if [ -n "${FRANKY_SESSION_HOLD:-}" ]; then
-    hold_nonce="${FRANKY_SESSION_HOLD}"
+if [ -n "${FRANKY_SESSION_HOLD:-}" ] || [ "${codex_link}" = 1 ]; then
+    # A Codex subscription run is supervised too (no hold without a nonce), so the link check
+    # below can run after the engine exits.
+    hold_nonce="${FRANKY_SESSION_HOLD:-}"
     unset FRANKY_SESSION_HOLD
     # Job control only for the launch: it starts the engine in its own process group with
     # default signal dispositions (a plain `&` here starts it with SIGINT/SIGQUIT ignored).
@@ -135,7 +165,9 @@ if [ -n "${FRANKY_SESSION_HOLD:-}" ]; then
         rc=$?
         kill -0 "${child}" 2>/dev/null || break
     done
-    if [ "${rc}" = 0 ] && [ "${signalled}" = 0 ]; then
+    if ! check_codex_auth; then
+        [ "${rc}" != 0 ] || rc=70
+    elif [ "${rc}" = 0 ] && [ "${signalled}" = 0 ] && [ -n "${hold_nonce}" ]; then
         # Leftover engine processes must not run on, with the tokens, through the hold.
         kill -KILL -- "-${child}" 2>/dev/null
         echo "franky: engine exited, holding for session copy ${hold_nonce}" >&2

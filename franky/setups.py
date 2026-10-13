@@ -27,7 +27,9 @@ Three properties are load-bearing:
 from __future__ import annotations
 
 import fnmatch
+import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -151,7 +153,19 @@ SETUP_MANIFESTS: dict[str, SetupManifest] = {
         files=("AGENTS.md", "CLAUDE.md"),
         dirs=("skills", "commands", "prompts", "agents", "rules"),
     ),
+    # A team-owned, engine-neutral setup: `AGENTS.md`, `skills/<name>/SKILL.md` (+ text
+    # references), `rules/*.md`, `knowledge/**.md`, `commands/pr.md` (the PR-description spec) and
+    # `MANIFEST.json`. No hooks, MCP, settings or executables ever ship from it. `profile.py`
+    # maps it onto each engine's native locations at pack time.
+    "team": SetupManifest(
+        default_root="~/.franky/team",
+        files=("AGENTS.md", "MANIFEST.json"),
+        dirs=("skills", "rules", "knowledge", "commands"),
+    ),
 }
+
+TEAM_KIND = "team"
+TEAM_MANIFEST_NAME = "MANIFEST.json"
 
 SETUP_KINDS = tuple(SETUP_MANIFESTS)
 
@@ -239,6 +253,9 @@ class SetupScan:
     root: Path
     files: list[Path] = field(default_factory=list)
     skipped_binary: list[Path] = field(default_factory=list)
+    # Team setup only: files the text-only policy refuses (scripts, executables, MCP or other
+    # structured config), reported by `profile check`.
+    skipped_policy: list[Path] = field(default_factory=list)
     mcp_hints: list[Path] = field(default_factory=list)
 
     @property
@@ -381,6 +398,10 @@ def expand_setup(kind: str, root: Path, budget: ReadBudget | None = None) -> Set
     visited: set[str] = set()
 
     def add(path: Path) -> None:
+        # A team setup ships text documents only (see `_team_admits`).
+        if kind == TEAM_KIND and not _team_admits(path, root):
+            scan.skipped_policy.append(path)
+            return
         try:
             raw = read_bounded(path, budget)
         except OSError:
@@ -409,6 +430,117 @@ def expand_setup(kind: str, root: Path, budget: ReadBudget | None = None) -> Set
             scan.mcp_hints.append(hint)
 
     return scan
+
+
+TEAM_TEXT_SUFFIXES = (".md", ".markdown", ".txt", ".rst")
+TEAM_SKILL_DENIED_SUFFIXES = (".yaml", ".yml", ".toml", ".json")
+SKILL_FRONTMATTER_KEYS = ("name", "description")
+AGENT_FRONTMATTER_KEYS = ("name", "description", "tools", "model")
+
+_FM_KEY_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*):")
+
+
+def sanitize_frontmatter(text: str, allowed) -> str | None:
+    """Keep only the `allowed` top-level keys of a Markdown YAML header; None if it cannot be read.
+
+    Claude Code and similar engines honor header keys such as `hooks`, `mcpServers` and
+    `permissionMode` in a skill or agent file, so a copied file must never carry them. A key's
+    indented, list, or blank continuation lines go with it. A text with no header is returned
+    as is. An unclosed header, or a line that is neither a bare `key:` line, a continuation, nor
+    a comment (a quoted key, say), makes the whole file unreadable: the caller skips it. A
+    leading BOM is dropped, and a first line that starts with `---` but is not exactly `---`
+    (after a strip) is unreadable too.
+    """
+    text = text.removeprefix("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+    lines = text.split("\n")
+    if lines[0].strip() != "---":
+        # `--- x` or `----` opens a header in some parsers: unreadable, never passed through.
+        return None if lines[0].startswith("---") else text
+    try:
+        end = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
+    except StopIteration:
+        return None
+    kept: list[str] = []
+    current = None
+    keep = False
+    for line in lines[1:end]:
+        if not line.strip():
+            if keep:
+                kept.append(line)
+            continue
+        if line.lstrip().startswith("#"):
+            continue
+        if line[0] in " \t-":
+            if current is None:
+                return None
+            if keep:
+                kept.append(line)
+            continue
+        match = _FM_KEY_RE.match(line)
+        if not match:
+            return None
+        current = match.group(1).lower()
+        keep = current in allowed
+        if keep:
+            kept.append(line)
+    return "\n".join(["---", *kept, "---", *lines[end + 1 :]])
+
+
+def _team_admits(path: Path, root: Path) -> bool:
+    """A team setup ships Markdown or plain-text documents, plus its own MANIFEST.json.
+
+    Everything else under the layout is refused, whatever its name: scripts (with or without an
+    execute bit), MCP or other structured config (`.mcp.json`, `.yaml`), settings, and archives.
+    The check runs on the declared name and on the symlink-resolved target.
+    """
+    if path.name == TEAM_MANIFEST_NAME and path.parent == root:
+        return True
+    try:
+        inner = path.relative_to(root).parts
+    except ValueError:
+        return False
+    # Inside a skill dir, structured config and an `agents/` subdirectory never load.
+    if inner[:1] == ("skills",) and len(inner) >= 3:
+        if "agents" in (p.lower() for p in inner[2:-1]) or inner[-1].lower().endswith(
+            TEAM_SKILL_DENIED_SUFFIXES
+        ):
+            return False
+    try:
+        if path.stat().st_mode & 0o111:
+            return False
+        resolved = path.resolve()
+    except OSError:
+        return False
+    return all(p.suffix.lower() in TEAM_TEXT_SUFFIXES for p in (path, resolved))
+
+
+def read_team_manifest(root: Path) -> dict | None:
+    """Parse and validate `<root>/MANIFEST.json` of a team setup; None when it has none.
+
+    Fail-closed on malformed JSON or a wrong shape (`{schema: 1, source, commit, plugins[],
+    skills[{name, plugin, path}]}`): the manifest describes what the team setup contains, so a
+    broken one must not be reported as healthy. A team dir without a manifest is valid.
+    """
+    path = root / TEAM_MANIFEST_NAME
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(read_bounded(path, profile_budget()).decode("utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        raise ValueError(f"team manifest {path} is not valid JSON: {exc}") from exc
+    if not isinstance(data, dict) or data.get("schema") != 1:
+        raise ValueError(f"team manifest {path} must be an object with schema 1")
+    for key in ("source", "commit"):
+        if not isinstance(data.get(key), str):
+            raise ValueError(f"team manifest {path}: {key} must be a string")
+    plugins, skills = data.get("plugins", []), data.get("skills", [])
+    if not isinstance(plugins, list) or not all(isinstance(p, str) for p in plugins):
+        raise ValueError(f"team manifest {path}: plugins must be a list of strings")
+    if not isinstance(skills, list) or not all(
+        isinstance(s, dict) and isinstance(s.get("name"), str) for s in skills
+    ):
+        raise ValueError(f"team manifest {path}: skills must be a list of objects with a name")
+    return data
 
 
 def _declares_mcp(path: Path) -> bool:

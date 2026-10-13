@@ -516,6 +516,7 @@ IMAGE_INPUTS = (
     "Dockerfile",
     "install-codex-native-launcher.sh",
     "franky-dind-entrypoint.sh",
+    "franky-repo-setup.py",
     "proxy/Dockerfile",
     "proxy/entrypoint.sh",
 )

@@ -70,6 +70,16 @@ def redact(text: str, secrets: Iterable[str]) -> str:
     return text
 
 
+@dataclass(frozen=True)
+class RepoSetup:
+    """Load the repository's own agent setup, read at `ref`, before the engine starts."""
+
+    repo: str
+    ref: str
+    # The per-run token the prompt carries in place of the index (see profile.new_repo_marker).
+    marker: str = field(default="", compare=False, repr=False)
+
+
 @dataclass
 class Config:
     engine: Engine
@@ -89,6 +99,7 @@ class Config:
     # The JIRA email is redacted like a secret but is not a credential (see `--no-publish`'s scan).
     jira_email: str = ""
     atlassian_tools: bool = False
+    repo_setup: RepoSetup | None = None
 
     def enable_atlassian(self, token: str) -> None:
         """Turn the Atlassian tools on: the short-lived access token (as a header value), the MCP

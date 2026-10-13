@@ -23,7 +23,7 @@ import tarfile
 import tempfile
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace as dc_replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,7 +33,7 @@ import click
 from . import baseref, franky_version
 from .transcript import Transcript, Redactor, chunks, open_secure
 from ._install import detect_install
-from .config import GH_TOKEN_VAR, Config, load_config, redact, repo_allowed
+from .config import GH_TOKEN_VAR, Config, RepoSetup, load_config, redact, repo_allowed
 from .decompose import build_plan_result, parse_decomposition
 from .diagnosis import build_diagnosis_result, parse_diagnosis
 from .economics import Usage, format_economics, parse_usage
@@ -47,6 +47,7 @@ from .container import (
     DEFAULT_GHCR_REPO,
     GHCR_REPO_VAR,
     PULL_TIMEOUT_SECS,
+    REPO_SETUP_BIN,
     capture_diagnostics,
     ensure_image_available,
     fallback_image,
@@ -87,6 +88,7 @@ from .profile import (
     claude_mcp_config_path,
     codex_mcp_overrides,
     load_profile,
+    new_repo_marker,
     profile_file_path,
     profile_path,
     read_profile_raw,
@@ -616,8 +618,16 @@ def build(
 
         # Build the profile bundle (optional). Auto-discovers ~/.franky/profile.toml unless
         # overridden by --profile or FRANKY_PROFILE_PATH. Fails closed on detected credentials.
+        def _setup_base() -> tuple[str, str | None]:
+            # The repository setup and the run record share ONE pin of the default-branch tip,
+            # so a plan-first pass and the build read the same commit.
+            nonlocal base_sha
+            if base_sha is None:
+                base_sha = baseref.resolve_base_sha(spec.repo, os.environ)
+            return spec.repo, base_sha
+
         bundle, setup_block, plan_setup = _load_profile_bundle(
-            profile_path_opt, process_env, secrets, cfg
+            profile_path_opt, process_env, secrets, cfg, _setup_base
         )
 
         # Verbose mode: raw passthrough of agent output to stderr. Quiet (or --json) -> no
@@ -689,7 +699,7 @@ def build(
         # still reproducing the same starting state, not a moving target. Best-effort: one extra
         # GitHub GET alongside the existing idempotency check; None (unresolved) just means a
         # later `job replay` of this run cannot pin a commit, never a build failure.
-        if not no_publish:
+        if not no_publish and base_sha is None:
             base_sha = baseref.resolve_base_sha(spec.repo, os.environ)
         task_full = redact(spec.text, secrets)[:PROSE_MAX_CHARS]
 
@@ -927,7 +937,14 @@ def iterate(
 
         franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
 
-        bundle, setup_block, _ro = _load_profile_bundle(None, process_env, secrets, cfg)
+        bundle, setup_block, _ro = _load_profile_bundle(
+            None,
+            process_env,
+            secrets,
+            cfg,
+            # The default-branch head: a PR author controls the PR head and can pick its base.
+            lambda: (spec.repo, baseref.resolve_base_sha(spec.repo, os.environ)),
+        )
         verbose = verbose or bool(os.environ.get(FRANKY_VERBOSE_VAR))
         progress = None if (quiet and not verbose) else _make_progress(cfg.engine, verbose)
         # Register the run before it starts (issue #63), same as build - iterate has no
@@ -1930,7 +1947,14 @@ def review_pr(
                 prose=not (quiet or as_json),
             )
         franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
-        bundle, _setup_block, review_setup = _load_profile_bundle(None, process_env, secrets, cfg)
+        bundle, _setup_block, review_setup = _load_profile_bundle(
+            None,
+            process_env,
+            secrets,
+            cfg,
+            # Frozen (eval) runs stay hermetic: the team files ship, no repository is fetched.
+            None if frozen else (lambda: (repo, baseref.resolve_base_sha(repo, os.environ))),
+        )
         if not frozen:
             # After the profile bundle: MCP env values are in `secrets` before ticket text is
             # redacted. Frozen (eval) mode never fetches tickets.
@@ -2305,7 +2329,11 @@ def plan(
 
         franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
         bundle, _setup_block, setup_block = _load_profile_bundle(
-            profile_path_opt, process_env, secrets, cfg
+            profile_path_opt,
+            process_env,
+            secrets,
+            cfg,
+            lambda: (spec.repo, baseref.resolve_base_sha(spec.repo, os.environ)),
         )
         _flush_notes()  # plan announces no job, so its notes may print now
         progress = None if quiet else _make_progress(cfg.engine, False)
@@ -3196,6 +3224,15 @@ def _run_pass(
     if cfg.effort:
         inner_argv += ["--effort", cfg.effort]
     extra = {} if timeout is None else {"timeout": timeout}
+    if cfg.repo_setup is not None:
+        # The mapper loads the repository setup before the engine starts and then swaps the
+        # index marker in the prompt; it runs inside the private-prompt wrapper below.
+        inner_argv = [REPO_SETUP_BIN, "exec", "--marker", cfg.repo_setup.marker, "--", *inner_argv]
+        extra["repo_setup"] = {
+            "repo": cfg.repo_setup.repo,
+            "ref": cfg.repo_setup.ref,
+            "engine": cfg.engine.name,
+        }
     if private_prompt:
         prompt_bytes = prompt.encode("utf-8")
         buffer = io.BytesIO()
@@ -3249,6 +3286,7 @@ def _load_profile_bundle(
     credential_env: dict,
     secrets: list[str],
     cfg: Config,
+    repo_setup_ref: Callable[[], tuple[str, str | None]] | None = None,
 ) -> tuple[bytes | None, str, str]:
     """Load, scan, and pack the operator profile; return (bundle_bytes, prompt_setup_block).
 
@@ -3264,6 +3302,11 @@ def _load_profile_bundle(
     Both come from the SAME resolved spec, so what the prompt names is always what shipped.
     The third element is the read-only variant for the passes that open no PR (review-pr, plan,
     the plan-first pass).
+
+    `repo_setup_ref` returns (repo, commit) for the repository setup of a profile that declares a
+    `team` setup: always the default-branch head (a PR author controls the PR head and can pick
+    its base, so neither is trusted). It sets `cfg.repo_setup`, so the container loads the repository's own skills and rules
+    at that commit before the engine starts. An unresolvable commit fails closed and retryable.
     """
     from pathlib import Path
 
@@ -3305,17 +3348,32 @@ def _load_profile_bundle(
                 "it will be injected. Run `franky profile check` to see what it expanded to."
             )
 
-    if not spec.all_files():
+    engine = cfg.engine.name
+    with_repo = False
+    if getattr(spec, "team_scan", None) is not None and repo_setup_ref is not None:
+        repo, ref = repo_setup_ref()
+        if not (ref and _FULL_SHA_RE.match(ref)):
+            raise NetworkError(
+                "could not resolve the repository base commit for the team setup - refusing "
+                "to start without it",
+                hint="check GH_TOKEN and network access to api.github.com, then retry",
+            )
+        cfg.repo_setup = RepoSetup(repo, ref.lower(), marker=new_repo_marker())
+        with_repo = True
+    marker = cfg.repo_setup.marker if cfg.repo_setup else None
+    # Declaring `team` turns repository setup on even when the team dir itself holds no files.
+    if not spec.all_files() and not with_repo:
         return None, "", ""
     pre = _pre_start()
     if pre is not None:
         pre.profile_files = len(spec.all_files())
-
     try:
         return (
-            build_bundle(spec),
-            build_setup_block(spec),
-            build_setup_block(spec, read_only=True),
+            build_bundle(spec, engine=engine) if spec.all_files() else None,
+            build_setup_block(spec, engine=engine, repo_setup=with_repo, repo_marker=marker),
+            build_setup_block(
+                spec, read_only=True, engine=engine, repo_setup=with_repo, repo_marker=marker
+            ),
         )
     except ValueError as exc:
         raise ConfigError(redact(str(exc), secrets)) from exc
@@ -5301,6 +5359,22 @@ def job_resume(
                     f"(reason={fallback}) - workspace-only (V1) resume"
                 )
 
+        # The team setup and operator profile load as in `build`; the repository setup is read at
+        # the original run's pinned base commit (a fresh default-branch head for an old record).
+        resume_base = record.get("base_sha")
+        bundle, setup_block, _ro = _load_profile_bundle(
+            None,
+            dict(os.environ),
+            secrets,
+            cfg,
+            lambda: (
+                repo,
+                resume_base
+                if baseref.is_valid_sha(resume_base) and _FULL_SHA_RE.match(resume_base)
+                else baseref.resolve_base_sha(repo, os.environ),
+            ),
+        )
+
         new_id = jobs.new_job_id()
         _record_run_start(
             new_id,
@@ -5323,8 +5397,6 @@ def job_resume(
         diagnostics: dict = {}
         # A timed-out resume is itself resumable (issue #71) - same snapshot-on-timeout sink.
         snapshot_sink: dict = {"dest": str(snapshot.snapshot_path_for(new_id, os.environ))}
-        # No profile bundle for resume (mirrors job_replay): the restored /work already carries
-        # the prior run's state, and resume is a continuation tool, not a full build re-run.
         run_kwargs = (
             _session_capture(cfg, session_id, resume=session_tar is not None, env=os.environ)
             if session_id
@@ -5336,10 +5408,10 @@ def job_resume(
         def launch(kwargs):
             return _run_pass(
                 cfg,
-                build_resume_prompt(spec, branch=branch),
+                build_resume_prompt(spec, branch=branch, operator_setup=setup_block),
                 franky_img,
                 proxy_img,
-                None,
+                bundle,
                 progress=progress,
                 timeout=max_duration,
                 run_id=new_id,
@@ -6402,6 +6474,18 @@ def profile_show() -> None:
         click.echo(f"  [setups] PR-description spec: {pr_spec}", err=True)
 
 
+def _team_summary(team) -> str:
+    """`source@commit, N plugin(s), M skill(s)` from the team MANIFEST.json, or the file count."""
+    manifest = setups.read_team_manifest(team.root)
+    if manifest is None:
+        return f"{team.root} (no MANIFEST.json), {len(team.files)} file(s)"
+    commit = str(manifest.get("commit", ""))[:12] or "unknown"
+    return (
+        f"{manifest['source']}@{commit}, {len(manifest.get('plugins', []))} plugin(s), "
+        f"{len(manifest.get('skills', []))} skill(s)"
+    )
+
+
 @profile_group.command("check")
 def profile_check() -> None:
     """Dry-run the build's profile gate: expand globs + secret-scan, report what would inject.
@@ -6443,6 +6527,15 @@ def profile_check() -> None:
                 f"           {hint} declares MCP servers - NOT injected. Enabling MCP stays "
                 "explicit (mcp_configs + mcp_credentials + mcp_domains): each server adds an "
                 "egress host and forwards a credential.",
+                err=True,
+            )
+    team = spec.team_scan
+    if team is not None:
+        click.echo(f"  team: {_team_summary(team)}", err=True)
+        if team.skipped_policy:
+            click.echo(
+                f"           skipped {len(team.skipped_policy)} non-document file(s) "
+                "(a team setup ships Markdown and plain text only)",
                 err=True,
             )
     pr_spec = spec.pr_spec()

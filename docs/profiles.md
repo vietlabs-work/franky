@@ -31,7 +31,7 @@ instructions = ["~/team/AGENTS.md"]
 knowledge = ["~/team/architecture.md"]
 ```
 
-Supported setup kinds are `claude`, `codex`, `opencode`, and `pi`. Unknown kinds and missing roots fail validation.
+Supported setup kinds are `claude`, `codex`, `opencode`, `pi`, and `team` (see [Team setup](#team-setup)). Unknown kinds and missing roots fail validation.
 
 Paths support `~` and glob patterns. Franky includes a file once when multiple declarations match it.
 
@@ -56,6 +56,65 @@ Every included file passes the same fail-closed secret scan. One detected secret
 The scan detects private keys, common provider tokens, GitHub tokens, and assignments to known credential variables.
 
 Remove the credential from the file, then run `franky profile check` again. The command names the file but never prints its contents.
+
+## Team setup
+
+`team` is an engine-neutral setup that a team keeps in one place and every engine can use. Declare its directory under HOME:
+
+```toml
+# ~/.franky/profile.toml
+[setups]
+team = "~/.franky/team"
+```
+
+The directory has a fixed layout. Franky reads nothing else from it.
+
+| Path | Use |
+|------|-----|
+| `AGENTS.md` | Team instructions, always on. |
+| `rules/*.md` | Team rules, always on. |
+| `skills/<name>/SKILL.md` and text references | Skills. |
+| `knowledge/**.md` | Reference notes, read on demand. |
+| `commands/pr.md` | The PR-description spec. It wins over the operator's own. |
+| `MANIFEST.json` | `{"schema": 1, "source", "commit", "plugins": [], "skills": [{"name", "plugin", "path"}]}`. Optional. |
+
+A team setup ships Markdown and plain-text documents only (`.md`, `.markdown`, `.txt`, `.rst`), plus `MANIFEST.json`. Scripts (with or without an execute bit), YAML, JSON, and MCP config (including a nested `.mcp.json`), hooks, settings files, credentials, and binary files never ship. `franky profile check` counts the refused files. Every shipped file passes the same secret scan and limits as the rest of the profile. A broken `MANIFEST.json` fails validation. `franky profile check` prints `team: <source>@<commit>, N plugin(s), M skill(s)`.
+
+Franky maps the team setup onto the selected engine when it packs the bundle. The files also stay at their HOME-relative path (`~/<dir>`), which the prompt names as a pointer.
+
+| Engine | Skills | Instructions | Status |
+|--------|--------|--------------|--------|
+| `claude` | `~/.claude/skills/<name>/` | `~/.claude/CLAUDE.md` | Verified. |
+| `codex` | `$CODEX_HOME/skills/<name>/` | `$CODEX_HOME/AGENTS.md` | Verified: with `CODEX_HOME` set, `codex debug prompt-input` shows its `AGENTS.md` as instructions and lists its `skills/`. |
+| `opencode` | `~/.config/opencode/skills/<name>/` | `~/.config/opencode/AGENTS.md` | Unverified. The prompt also points at the team directory. |
+| `pi` | `~/.pi/skills/<name>/` | `~/.pi/AGENTS.md` | Unverified. The prompt also points at the team directory. |
+
+The instruction file is one member. It holds the operator's own text for that file first, then the team `AGENTS.md` and `rules/` under `## Team rules (always on)`. A team skill replaces an operator skill of the same name. A profile without `team` packs exactly as before.
+
+Codex runs use a per-run `CODEX_HOME` (`~/.codex` in the task's own volume). The persistent subscription volume mounts beside it, and only `auth.json` is linked in, so a token refresh still persists but no skill or session file reaches the shared volume.
+
+## Repository setup
+
+When the profile declares `team`, Franky also loads the repository's own agent setup before the engine starts. It runs in the same profile-wait phase, through `franky-repo-setup` in the image, as the task user, with the run's GitHub token and proxy.
+
+| Run | Read at |
+|-----|---------|
+| Every run (`review-pr`, `iterate`, `build`, `plan`, `build --plan-first`) | The default-branch head. |
+| `job resume` | The base commit the run recorded, else the default-branch head. |
+
+`job replay` loads no profile.
+
+The setup Franky installs is read from the default-branch head, never the PR head or the PR base (an author can pick a base branch they made), so a PR cannot add skills or rules to what Franky installs. The working directory stays `/work`, so the repository's own `.claude/settings.json` hooks never load. Residual: `/work` holds the PR checkout, so an engine that reads instruction files from its working directory can still see PR-head files. Franky controls what it installs, not what the engine finds there.
+
+The mapper fetches only these paths: `AGENTS.md`, `CLAUDE.md`, `.claude/skills`, `.claude/rules`, `.claude/agents`, `.agents/skills`, `.codex/skills`, and `agent/rules`. It skips symlinks, executables, submodules, settings, hooks, MCP and env files, keys, non-UTF-8 files, and everything else. Inside a skill directory it also skips `*.yaml`, `*.yml`, `*.toml`, `*.json` files and any `agents/` subdirectory (team skills too). It stops the run when the setup passes 500 files or 4 MiB, and skips a file over 256 KiB (the fetch filters such a blob out, so it is never downloaded; the index lists it as too large).
+
+It copies the text into the engine's native locations. Skill and agent files keep only an allow-list of header keys (`name`, `description`; agents also `tools`, `model`): `hooks`, `mcpServers`, `permissionMode` and every other key are dropped, and a file whose header cannot be read is skipped and listed in the index (a header that does not open with exactly `---` is unreadable, and a leading BOM is dropped). Every `SKILL.md` in a skill directory, at any depth, gets this rewrite, and an unreadable one drops the whole skill. Team skills get the same treatment. A repository skill replaces a team skill of the same name. Repository instruction text, rules included, goes after the team text under `## Repository rules`. Each repository text (instruction file, rule) is placed in one fenced code block under its `###` file heading, with a fence longer than any backtick run in the text, so it cannot import a file with `@path` or fake a heading such as `Team rules`. It stays readable as text, and an engine that resolves imports or headings does not do so inside the fence.claude/agents` is copied for `claude` only.
+
+The prompt carries an index of what loaded (skill names, descriptions, paths, rules, instruction files), capped at 16 KiB. The prompt holds a random per-run token in its place; the mapper swaps the first occurrence only, so text that quotes the plain marker is never replaced. A repository with no setup is normal: the index says none was found.
+
+A fetch or mapping error fails the run before the engine starts. It ends as `agent_error` with a one-line retryable message that never carries a credential, and the run log shows a `repository setup loaded` line on success.
+
+Precedence when setups disagree: the prompt, then the repository setup, then the team setup, then the operator setup. None of them relaxes a read-only pass.
 
 ## Limits
 
@@ -134,9 +193,10 @@ Before the agent starts, Franky:
 3. Packs HOME-relative files into a gzip archive.
 4. Starts the task in profile-wait mode.
 5. Streams the archive through `docker exec -i`.
-6. Marks the profile ready only after extraction succeeds.
+6. Loads the repository setup when the profile declares `team`.
+7. Marks the profile ready only after both succeed.
 
-The archive never appears in process arguments or environment values. No ready marker within 120 seconds stops the task.
+The archive never appears in process arguments or environment values. No ready marker within 120 seconds stops the task (220 seconds when a repository setup is loaded, since the mapper has its own 90-second deadline).
 
 The prompt of `build`, `iterate`, `review-pr`, and `plan` (and the planning pass of `build --plan-first`) tells the agent where the setup exists. `build` and `iterate` also identify a discovered PR specification. The read-only passes (`review-pr`, `plan`, the planning pass) omit it, finish by reporting as their own prompt asks, and the setup files never relax their read-only rules.
 
@@ -147,5 +207,7 @@ Franky's autonomous rules take precedence. The agent must not wait for approval 
 `franky profile check` uses the same loader, limits, MCP validation, and secret scan as a real build.
 
 Run it after each profile change. It reports setup counts, skipped files, MCP policy, and the selected PR specification.
+
+`make smoke-profile` also checks that `claude` and `codex` list a team skill and a repository skill at session start (it needs Docker and engine credentials).
 
 Run `make smoke-profile` after changes to profile delivery, profile-wait startup, or task hardening.
