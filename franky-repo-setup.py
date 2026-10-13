@@ -9,17 +9,24 @@ skills and rules already in place. Two subcommands:
         Fetch ONLY the setup paths of `ref` (a blobless, depth-1, sparse fetch into a private temp
         dir), copy the text into the engine's native locations under $HOME, and write the index
         the prompt shows (`$HOME/.franky-repo-setup/index.txt`). Prints one JSON summary line.
-  exec  -- <argv...>
-        Replace the index marker in every argv element with that index, then exec the engine.
+  exec  --marker <token> -- <argv...>
+        Replace the first occurrence of the per-run index marker (a random token the host made)
+        with that index, then exec the engine. Untrusted prompt text cannot carry the token.
 
-The host chooses the ref: the PR BASE commit for review and iterate, the default-branch head for
-build and plan. So a PR head can never inject trusted skills or rules, and the working directory
-stays /work, so a repository's own `.claude/settings.json` hooks never load.
+The host chooses the ref: the default-branch head, for every command. A PR author controls the
+PR head and can pick the PR base, so neither is read as setup. The working directory stays
+/work, so a repository's own `.claude/settings.json` hooks never load. Residual: the engine's
+cwd holds the PR checkout, so an engine that also reads instruction files from its cwd can see
+PR-head files; this mapper only controls what it installs, not what the engine finds there.
 
 What it reads: AGENTS.md, CLAUDE.md, .claude/{skills,rules,agents}, .agents/skills,
 .codex/skills, agent/rules. What it never takes: symlinks, executables, submodules, settings,
-hooks, MCP files, env files, keys, credentials, non-UTF-8 files, or anything outside those roots.
-Caps: 500 files, 4 MiB in total (both fail the run), 256 KiB per file (the file is skipped).
+hooks, MCP files, env files, keys, credentials, non-UTF-8 files, anything outside those roots,
+and, inside a skill directory, `*.yaml`, `*.yml`, `*.toml`, `*.json` files and `agents/` dirs.
+Caps: 500 files, 4 MiB in total (both fail the run), 256 KiB per file (the file is skipped,
+also at fetch time: a larger blob is never downloaded), 16 KiB for the index.
+Repository text is neutralized where it joins the instruction file: `@` import lines are
+wrapped in backticks and headings are demoted, so it cannot import a file or fake a heading.
 
 Any fetch or mapping error exits nonzero with one short message and no secret in it: the host
 then fails the run before the engine starts. A repository with no setup is normal.
@@ -48,6 +55,10 @@ MAX_FILES = 500
 MAX_TOTAL_BYTES = 4 * 1024 * 1024
 MAX_FILE_BYTES = 256 * 1024
 MAX_SKILLS_LISTED = 60
+MAX_RULES_LISTED = 60
+MAX_INDEX_BYTES = 16 * 1024
+BLOB_LIMIT = MAX_FILE_BYTES + 1  # blob:limit=<n> omits blobs of n bytes or more
+SKILL_DENIED_SUFFIXES = (".yaml", ".yml", ".toml", ".json")
 DESCRIPTION_CHARS = 160
 # One deadline for the whole `map`: the host gives up at 100 s and the entrypoint at 120 s.
 DEADLINE_SECS = 90
@@ -129,6 +140,22 @@ def _under(rel: str, root: str) -> bool:
     return rel.startswith(root + "/")
 
 
+def _skill_roots() -> set[str]:
+    return {r for roots in SKILL_ROOTS.values() for r in roots}
+
+
+def skill_denied(rel: str) -> bool:
+    """True for a path inside a skill dir that must not load: structured config and `agents/`."""
+    for root in _skill_roots():
+        if not _under(rel, root):
+            continue
+        inner = rel[len(root) + 1 :].lower().split("/")
+        if len(inner) < 2:
+            return False
+        return inner[-1].endswith(SKILL_DENIED_SUFFIXES) or "agents" in inner[1:-1]
+    return False
+
+
 def _git_env(remote: str, home: Path) -> dict[str, str]:
     env = {
         "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
@@ -194,33 +221,66 @@ def select_paths(tree: bytes) -> list[str]:
             continue  # 120000 symlink, 160000 submodule, 100755 executable: never taken
         if any(ch in rel for ch in "*?[]\\\n") or rel.startswith(("!", "#")):
             continue  # would be read as a sparse-checkout pattern
-        if denied(rel):
+        if denied(rel) or skill_denied(rel):
             continue
         if rel in INSTRUCTION_FILES or any(_under(rel, root) for root in _ALL_ROOTS):
             chosen.append(rel)
     return sorted(chosen)
 
 
-def fetch_setup(remote: str, ref: str, dest: Path, home: Path) -> list[str]:
-    """Fetch only the setup paths of `ref` into `dest`; return the paths that landed."""
+def fetch_setup(
+    remote: str, ref: str, dest: Path, home: Path, too_large: list[str] | None = None
+) -> list[str]:
+    """Fetch only the setup paths of `ref` into `dest`; return the paths that landed.
+
+    A blob over the per-file cap is never downloaded; its path goes into `too_large`.
+    """
     env = _git_env(remote, home)
     _git(["init", "-q"], dest, env)
     _git(["remote", "add", "origin", remote], dest, env)
     _git(
         ["-c", "protocol.version=2", "fetch", "-q", "--depth=1", "--no-tags"]
-        + ["--filter=blob:none", "origin", ref],
+        + [f"--filter=blob:limit={BLOB_LIMIT}", "origin", ref],
         dest,
         env,
     )
-    paths = select_paths(_git(["ls-tree", "-r", "-z", "--full-tree", ref], dest, env))
+    specs = [f"{p}" for p in (*INSTRUCTION_FILES, *_ALL_ROOTS)]
+    paths = select_paths(_git(["ls-tree", "-r", "-z", "--full-tree", ref, "--", *specs], dest, env))
     if len(paths) > MAX_FILES:
         raise SetupError(f"repository setup has {len(paths)} files, over the limit {MAX_FILES}")
+    if not paths:
+        return []
+    paths, large = _split_missing_blobs(paths, ref, dest, env)
+    if too_large is not None:
+        too_large.extend(large)
     if not paths:
         return []
     patterns = "".join(f"/{p}\n" for p in paths).encode("utf-8")
     _git(["sparse-checkout", "set", "--no-cone", "--stdin"], dest, env, stdin=patterns)
     _git(["checkout", "-q", "--detach", ref], dest, env)
     return paths
+
+
+def _split_missing_blobs(
+    paths: list[str], ref: str, dest: Path, env: dict[str, str]
+) -> tuple[list[str], list[str]]:
+    """Split the paths into (blob present, blob filtered out as too large).
+
+    GIT_NO_LAZY_FETCH keeps `cat-file` from downloading the omitted blob just to look at it
+    (git 2.44 and newer; an older git ignores it, and the per-file read cap still applies).
+    """
+    stdin = "".join(f"{ref}:{p}\n" for p in paths).encode("utf-8")
+    out = _git(
+        ["cat-file", "--batch-check=%(objectsize)"],
+        dest,
+        {**env, "GIT_NO_LAZY_FETCH": "1"},
+        stdin=stdin,
+    )
+    kept: list[str] = []
+    large: list[str] = []
+    for path, line in zip(paths, out.decode("utf-8", "replace").splitlines()):
+        (large if line.endswith(" missing") else kept).append(path)
+    return kept, large
 
 
 def read_text(path: Path) -> str | None:
@@ -267,12 +327,14 @@ def sanitize_frontmatter(text: str, allowed) -> str | None:
 
     Claude Code and similar engines honor header keys such as `hooks`, `mcpServers` and
     `permissionMode` in a skill or agent file, so a copied file must never carry them. (Same
-    rules as franky/setups.py `sanitize_frontmatter`; a test pins the two together.)
+    rules as franky/setups.py `sanitize_frontmatter`; a test pins the two together.) A leading BOM
+    is dropped, and a first line that starts with `---` but is not exactly `---` is unreadable.
     """
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.removeprefix("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
     lines = text.split("\n")
     if lines[0].strip() != "---":
-        return text
+        # `--- x` or `----` opens a header in some parsers: unreadable, never passed through.
+        return None if lines[0].startswith("---") else text
     try:
         end = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
     except StopIteration:
@@ -309,17 +371,49 @@ def clean_line(value: str, limit: int) -> str:
     return flat if len(flat) <= limit else flat[: limit - 3].rstrip() + "..."
 
 
+_IMPORT_RE = re.compile(r"^(\s*)(@\S*)")
+_HEADING_RE = re.compile(r"^\s{0,3}#{1,6}(\s|$)")
+_SETEXT_RE = re.compile(r"^\s{0,3}(=+|-+)\s*$")
+
+
+def neutralize(text: str) -> str:
+    """Make repository text inert where it joins the instruction file.
+
+    A line that starts with `@` is an import in Claude Code: its token is wrapped in backticks.
+    A Markdown heading is demoted below the `###` file headings (a `#####` prefix), and a setext
+    underline is escaped, so repository text cannot fake the "Team rules" or any other heading.
+    """
+    out = []
+    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        if _HEADING_RE.match(line):
+            line = "##### " + line.lstrip().lstrip("#").strip()
+        elif _SETEXT_RE.match(line):
+            line = "\\" + line.lstrip()
+        else:
+            line = _IMPORT_RE.sub(lambda m: f"{m.group(1)}`{m.group(2)}`", line)
+        out.append(line)
+    return "\n".join(out)
+
+
 def _write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
 
 
-def map_setup(work: Path, paths: list[str], engine: str, home: Path, repo: str, ref: str) -> dict:
+def map_setup(
+    work: Path,
+    paths: list[str],
+    engine: str,
+    home: Path,
+    repo: str,
+    ref: str,
+    too_large: list[str] | None = None,
+) -> dict:
     """Copy the fetched text into the engine's native dirs and write the index."""
     skills_dir, instruction, agents_dir = ENGINES[engine]
     total = 0
     texts: dict[str, str] = {}
-    skipped: list[str] = []
+    skipped: list[str] = list(too_large or [])
     for rel in paths:
         text = read_text(work / rel)
         if text is None:
@@ -334,9 +428,8 @@ def map_setup(work: Path, paths: list[str], engine: str, home: Path, repo: str, 
     unsafe: set[str] = set()
     for rel in sorted(texts):
         parts = rel.split("/")
-        is_skill = parts[-1] == "SKILL.md" and any(
-            rel.startswith(r + "/") and len(parts) == len(r.split("/")) + 2
-            for r in SKILL_ROOTS[engine]
+        is_skill = parts[-1].lower() == "skill.md" and any(
+            _under(rel, r) and len(parts) >= len(r.split("/")) + 2 for r in _skill_roots()
         )
         is_agent = _under(rel, AGENT_ROOT) and rel.endswith(".md")
         if not (is_skill or is_agent):
@@ -349,8 +442,10 @@ def map_setup(work: Path, paths: list[str], engine: str, home: Path, repo: str, 
             texts[rel] = clean
     for rel in unsafe:
         skipped.append(rel)
-        if rel.endswith("/SKILL.md"):
-            base = rel[: -len("SKILL.md")]
+        root = next((r for r in _skill_roots() if _under(rel, r)), None)
+        if root is not None and rel.rsplit("/", 1)[-1].lower() == "skill.md":
+            # Any unreadable SKILL.md, at any depth, drops the whole skill directory.
+            base = "/".join(rel.split("/")[: len(root.split("/")) + 1]) + "/"
             for other in [r for r in texts if r.startswith(base)]:
                 del texts[other]
         else:
@@ -390,22 +485,29 @@ def map_setup(work: Path, paths: list[str], engine: str, home: Path, repo: str, 
         text = texts.get(rel)
         if text and text.strip() and text.strip() not in seen:
             seen.add(text.strip())
-            sections.append((rel, text.strip()))
+            sections.append((rel, neutralize(text.strip())))
     rules = sorted(r for r in texts if r.endswith(".md") and any(_under(r, p) for p in RULE_ROOTS))
     for rel in rules:
         if texts[rel].strip():
-            sections.append((rel, texts[rel].strip()))
+            sections.append((rel, neutralize(texts[rel].strip())))
     if sections:
         target = home / instruction
         existing = target.read_text(encoding="utf-8") if target.is_file() else ""
         head = existing.rstrip() + "\n\n" if existing.strip() else ""
-        body = "\n\n".join(f"### {rel}\n\n{text}" for rel, text in sections)
+        body = "\n\n".join(f"### {clean_line(rel, 200)}\n\n{text}" for rel, text in sections)
         _write(target, f"{head}## Repository rules (from {repo} at {ref[:12]})\n\n{body}\n")
 
     instruction_files = [rel for rel, _ in sections if rel in INSTRUCTION_FILES]
     index = render_index(repo, ref, skills, rules, instruction_files)
     if unsafe:
-        index += "\n- Skipped (unreadable header): " + ", ".join(sorted(unsafe))
+        index += "\n- Skipped (unreadable header): " + ", ".join(
+            clean_line(r, 200) for r in sorted(unsafe)[:MAX_RULES_LISTED]
+        )
+    if too_large:
+        index += "\n- Skipped (too large): " + ", ".join(
+            clean_line(r, 200) for r in sorted(too_large)[:MAX_RULES_LISTED]
+        )
+    index = cap_index(index)
     _write(home / INDEX_DIR / "index.txt", index)
     return {
         "skills": len(skills),
@@ -417,23 +519,37 @@ def map_setup(work: Path, paths: list[str], engine: str, home: Path, repo: str, 
     }
 
 
+def cap_index(index: str) -> str:
+    raw = index.encode("utf-8")
+    if len(raw) <= MAX_INDEX_BYTES:
+        return index
+    return raw[: MAX_INDEX_BYTES - 16].decode("utf-8", "ignore").rstrip() + "\n- ... (cut)"
+
+
 def render_index(repo, ref, skills, rules, instruction_files) -> str:
-    head = f"Repository setup (read from {repo} at {ref[:12]}, the default-branch commit, never the PR head or base):"
+    head = f"Repository setup Franky installed (read from {repo} at {ref[:12]}, the default-branch commit):"
     if not skills and not rules and not instruction_files:
         return head + " none found."
     lines = [head]
     if instruction_files:
         lines.append(
             "- Instruction files: "
-            + ", ".join(instruction_files)
+            + ", ".join(clean_line(f, 200) for f in instruction_files)
             + ' (appended to your instruction file under "Repository rules")'
         )
     if rules:
-        lines.append("- Rules (in that same section): " + ", ".join(rules))
+        shown = [clean_line(r, 200) for r in rules[:MAX_RULES_LISTED]]
+        more = (
+            f", ... and {len(rules) - MAX_RULES_LISTED} more"
+            if len(rules) > MAX_RULES_LISTED
+            else ""
+        )
+        lines.append("- Rules (in that same section): " + ", ".join(shown) + more)
     if skills:
         lines.append(f"- Skills ({len(skills)}), installed where your engine looks for them:")
         for name in sorted(skills)[:MAX_SKILLS_LISTED]:
             _, desc, where = skills[name]
+            where = clean_line(where, 300)
             lines.append(f"  - {name}: {desc} ({where})" if desc else f"  - {name} ({where})")
         if len(skills) > MAX_SKILLS_LISTED:
             lines.append(f"  - ... and {len(skills) - MAX_SKILLS_LISTED} more")
@@ -453,24 +569,37 @@ def cmd_map(args: argparse.Namespace) -> int:
     remote = args.remote or f"https://github.com/{args.repo}.git"
     _deadline[0] = time.monotonic() + DEADLINE_SECS
     work = Path(tempfile.mkdtemp(prefix="franky-repo-setup-"))
+    too_large: list[str] = []
     try:
-        paths = fetch_setup(remote, args.ref, work, home)
-        summary = map_setup(work, paths, args.engine, home, args.repo, args.ref)
+        paths = fetch_setup(remote, args.ref, work, home, too_large)
+        summary = map_setup(work, paths, args.engine, home, args.repo, args.ref, too_large)
     finally:
         shutil.rmtree(work, ignore_errors=True)
     print(json.dumps(summary, sort_keys=True))
     return 0
 
 
-def cmd_exec(argv: list[str]) -> int:
+def cmd_exec(marker: str, argv: list[str]) -> int:
     if not argv:
         raise SetupError("exec needs a command")
+    if not (marker.startswith(MARKER) and len(marker) >= len(MARKER) + 16):
+        raise SetupError("exec needs the per-run --marker")
     home = Path(os.environ.get("HOME", ""))
     try:
         index = (home / INDEX_DIR / "index.txt").read_text(encoding="utf-8")
     except OSError:
         index = NO_INDEX
-    os.execvp(argv[0], [a.replace(MARKER, index) for a in argv])
+    swapped = []
+    done = False
+    for arg in argv:
+        # Once only: the prompt may quote untrusted text, and the token is not in it.
+        if not done and marker in arg:
+            arg, done = arg.replace(marker, index, 1), True
+        swapped.append(arg)
+    try:
+        os.execvp(argv[0], swapped)
+    except OSError as exc:
+        raise SetupError(f"could not start the engine: {exc.__class__.__name__}") from exc
     return 1  # unreachable
 
 
@@ -483,12 +612,14 @@ def main(argv: list[str] | None = None) -> int:
     mapper.add_argument("--engine", required=True)
     mapper.add_argument("--home", default="")
     mapper.add_argument("--remote", default="", help=argparse.SUPPRESS)
-    sub.add_parser("exec", help="exec -- <argv...>: swap the index marker, then exec the engine")
+    sub.add_parser("exec", help="exec --marker M -- <argv...>: swap the index marker, then exec")
     argv = sys.argv[1:] if argv is None else argv
     try:
         if argv[:1] == ["exec"]:
             # Parsed by hand: argparse would swallow the engine's own flags.
-            return cmd_exec(argv[2:] if argv[1:2] == ["--"] else argv[1:])
+            if argv[1:2] != ["--marker"] or argv[3:4] != ["--"]:
+                raise SetupError("usage: exec --marker <token> -- <argv...>")
+            return cmd_exec(argv[2], argv[4:])
         return cmd_map(parser.parse_args(argv))
     except SetupError as exc:
         print(f"franky-repo-setup: {exc}", file=sys.stderr)

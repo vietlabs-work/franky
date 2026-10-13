@@ -379,6 +379,11 @@ def test_a_team_skill_with_an_unreadable_header_is_not_installed_natively(tmp_pa
         ("---\n- orphan\n---\n", None),
         ('---\n"hooks": 1\n---\n', None),
         ("---\nname: a\r\nmodel: m\r\n---\r\nb", "---\nname: a\n---\nb"),
+        ("\ufeff---\nname: a\nhooks: x\n---\nb", "---\nname: a\n---\nb"),
+        ("\ufeffno header\n", "no header\n"),
+        ("--- x\nname: a\n---\nb", None),
+        ("----\nhooks: x\n---\nb", None),
+        ("---  \nname: a\n---\nb", "---\nname: a\n---\nb"),
     ],
 )
 def test_sanitize_frontmatter_cases_match_the_image_mapper(text, expected):
@@ -640,12 +645,15 @@ def _capture_runs(monkeypatch, results):
 
 
 def _assert_wrapped(run, ref):
-    assert run.argv[:3] == [REPO_SETUP_BIN, "exec", "--"]
+    marker = run.cfg.repo_setup.marker
+    assert run.argv[:5] == [REPO_SETUP_BIN, "exec", "--marker", marker, "--"]
+    assert marker.startswith(profile.REPO_SETUP_MARKER) and len(marker) > 40
     assert run.kwargs["repo_setup"] == {"repo": "me/repo", "ref": ref, "engine": "pi"}
     assert run.cfg.repo_setup == RepoSetup("me/repo", ref)
     assert run.kwargs["profile_bundle"] == b"bundle"
-    prompt = " ".join(run.argv)
-    assert profile.REPO_SETUP_MARKER in prompt
+    # The prompt carries the per-run token once, and never the bare literal.
+    assert " ".join(run.argv[5:]).count(marker) == 1
+    assert " ".join(run.argv[5:]).count(profile.REPO_SETUP_MARKER) == 1
 
 
 def _common(monkeypatch):
@@ -949,3 +957,43 @@ def test_the_entrypoint_leaves_codex_home_alone_without_a_subscription(tmp_path)
     )
 
     assert not (home / ".codex").exists()
+
+
+def test_a_nested_team_skill_md_is_sanitized_and_a_bad_one_drops_the_skill(tmp_path, monkeypatch):
+    team = _team(tmp_path / "team")
+    (team / "skills/cook/sub").mkdir()
+    (team / "skills/cook/sub/SKILL.md").write_text("---\nname: n\nhooks:\n  - x\n---\nnested\n")
+    (team / "skills/lint/deep/er").mkdir(parents=True)
+    (team / "skills/lint/deep/er/skill.md").write_text('---\n"hooks": 1\n---\n')
+    spec = _load(tmp_path, monkeypatch, team=team)
+
+    members = _members(profile.build_bundle(spec, engine="claude"))
+
+    assert members[".claude/skills/cook/sub/SKILL.md"] == "---\nname: n\n---\nnested\n"
+    assert not [n for n in members if n.startswith(".claude/skills/lint/")]
+
+
+def test_team_skill_dirs_refuse_structured_config_and_an_agents_dir(tmp_path, monkeypatch):
+    team = _team(tmp_path / "team")
+    for rel in (
+        "skills/cook/a.yaml",
+        "skills/cook/b.yml",
+        "skills/cook/c.toml",
+        "skills/cook/d.json",
+        "skills/cook/agents/openai.md",
+        "skills/cook/x/Agents/y.md",
+    ):
+        (team / rel).parent.mkdir(parents=True, exist_ok=True)
+        (team / rel).write_text("x\n")
+    spec = _load(tmp_path, monkeypatch, team=team)
+
+    members = _members(profile.build_bundle(spec, engine="claude"))
+
+    cook = sorted(n for n in members if n.startswith(".claude/skills/cook/"))
+    assert cook == [".claude/skills/cook/SKILL.md", ".claude/skills/cook/references/steps.md"]
+
+
+def test_each_run_gets_a_fresh_marker_that_extends_the_literal():
+    a, b = profile.new_repo_marker(), profile.new_repo_marker()
+
+    assert a != b and a.startswith(profile.REPO_SETUP_MARKER) and len(a) >= 48

@@ -76,6 +76,8 @@ class RepoSetup:
 
     repo: str
     ref: str
+    # The per-run token the prompt carries in place of the index (see profile.new_repo_marker).
+    marker: str = field(default="", compare=False, repr=False)
 
 
 @dataclass

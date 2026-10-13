@@ -433,6 +433,7 @@ def expand_setup(kind: str, root: Path, budget: ReadBudget | None = None) -> Set
 
 
 TEAM_TEXT_SUFFIXES = (".md", ".markdown", ".txt", ".rst")
+TEAM_SKILL_DENIED_SUFFIXES = (".yaml", ".yml", ".toml", ".json")
 SKILL_FRONTMATTER_KEYS = ("name", "description")
 AGENT_FRONTMATTER_KEYS = ("name", "description", "tools", "model")
 
@@ -446,12 +447,15 @@ def sanitize_frontmatter(text: str, allowed) -> str | None:
     `permissionMode` in a skill or agent file, so a copied file must never carry them. A key's
     indented, list, or blank continuation lines go with it. A text with no header is returned
     as is. An unclosed header, or a line that is neither a bare `key:` line, a continuation, nor
-    a comment (a quoted key, say), makes the whole file unreadable: the caller skips it.
+    a comment (a quoted key, say), makes the whole file unreadable: the caller skips it. A
+    leading BOM is dropped, and a first line that starts with `---` but is not exactly `---`
+    (after a strip) is unreadable too.
     """
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.removeprefix("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
     lines = text.split("\n")
     if lines[0].strip() != "---":
-        return text
+        # `--- x` or `----` opens a header in some parsers: unreadable, never passed through.
+        return None if lines[0].startswith("---") else text
     try:
         end = next(i for i in range(1, len(lines)) if lines[i].strip() == "---")
     except StopIteration:
@@ -491,6 +495,16 @@ def _team_admits(path: Path, root: Path) -> bool:
     """
     if path.name == TEAM_MANIFEST_NAME and path.parent == root:
         return True
+    try:
+        inner = path.relative_to(root).parts
+    except ValueError:
+        return False
+    # Inside a skill dir, structured config and an `agents/` subdirectory never load.
+    if inner[:1] == ("skills",) and len(inner) >= 3:
+        if "agents" in (p.lower() for p in inner[2:-1]) or inner[-1].lower().endswith(
+            TEAM_SKILL_DENIED_SUFFIXES
+        ):
+            return False
     try:
         if path.stat().st_mode & 0o111:
             return False

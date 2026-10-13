@@ -39,6 +39,7 @@ import io
 import json
 import math
 import re
+import secrets
 import tarfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -83,8 +84,15 @@ TEAM_NATIVE_VERIFIED = ("claude", "codex")
 TEAM_RULES_HEADING = "## Team rules (always on)"
 # Where a prompt carries the repository-setup index: franky-repo-setup (`exec`) replaces this
 # marker in the engine argv with the index it wrote, right before the engine starts. The
-# in-image script keeps its own copy of the literal; a test pins the two together.
+# in-image script keeps its own copy of the literal; a test pins the two together. A run uses
+# `new_repo_marker()`: this literal plus random hex, so text in the prompt that quotes the plain
+# literal (a PR body, say) is never swapped.
 REPO_SETUP_MARKER = "__FRANKY_REPO_SETUP_INDEX__"
+
+
+def new_repo_marker() -> str:
+    return REPO_SETUP_MARKER + secrets.token_hex(16)
+
 
 _ENV_NAME_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 _PLACEHOLDER_RE = re.compile(r"^\$\{([A-Z_][A-Z0-9_]*)\}$")
@@ -1011,7 +1019,8 @@ def _team_members(
             continue
         top = rel.parts[0]
         if top == "skills" and len(rel.parts) >= 3:
-            if rel.name == "SKILL.md" and len(rel.parts) == 3:
+            # A SKILL.md at any depth below the skill dir carries a header an engine may honor.
+            if rel.name.lower() == "skill.md":
                 clean = setups.sanitize_frontmatter(text, setups.SKILL_FRONTMATTER_KEYS)
                 if clean is None:
                     bad.add(rel.parts[1])

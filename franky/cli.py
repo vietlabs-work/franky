@@ -82,6 +82,7 @@ from .profile import (
     claude_mcp_config_path,
     codex_mcp_overrides,
     load_profile,
+    new_repo_marker,
     profile_file_path,
     profile_path,
     read_profile_raw,
@@ -3169,7 +3170,7 @@ def _run_pass(
     if cfg.repo_setup is not None:
         # The mapper loads the repository setup before the engine starts and then swaps the
         # index marker in the prompt; it runs inside the private-prompt wrapper below.
-        inner_argv = [REPO_SETUP_BIN, "exec", "--", *inner_argv]
+        inner_argv = [REPO_SETUP_BIN, "exec", "--marker", cfg.repo_setup.marker, "--", *inner_argv]
         extra["repo_setup"] = {
             "repo": cfg.repo_setup.repo,
             "ref": cfg.repo_setup.ref,
@@ -3300,8 +3301,9 @@ def _load_profile_bundle(
                 "to start without it",
                 hint="check GH_TOKEN and network access to api.github.com, then retry",
             )
-        cfg.repo_setup = RepoSetup(repo, ref.lower())
+        cfg.repo_setup = RepoSetup(repo, ref.lower(), marker=new_repo_marker())
         with_repo = True
+    marker = cfg.repo_setup.marker if cfg.repo_setup else None
     # Declaring `team` turns repository setup on even when the team dir itself holds no files.
     if not spec.all_files() and not with_repo:
         return None, "", ""
@@ -3311,8 +3313,10 @@ def _load_profile_bundle(
     try:
         return (
             build_bundle(spec, engine=engine) if spec.all_files() else None,
-            build_setup_block(spec, engine=engine, repo_setup=with_repo),
-            build_setup_block(spec, read_only=True, engine=engine, repo_setup=with_repo),
+            build_setup_block(spec, engine=engine, repo_setup=with_repo, repo_marker=marker),
+            build_setup_block(
+                spec, read_only=True, engine=engine, repo_setup=with_repo, repo_marker=marker
+            ),
         )
     except ValueError as exc:
         raise ConfigError(redact(str(exc), secrets)) from exc

@@ -22,10 +22,26 @@ chmod 700 "${XDG_RUNTIME_DIR}" 2>/dev/null || true
 # volume, so team and repository skills, rules and session files never touch the shared auth
 # volume. That volume is mounted beside it, and only auth.json is linked in, so a token refresh
 # written through the link still lands in the persistent volume.
+codex_link=0
 if [ -f "${HOME}/.codex-auth/auth.json" ]; then
     mkdir -p "${HOME}/.codex"
     ln -sfn "${HOME}/.codex-auth/auth.json" "${HOME}/.codex/auth.json"
+    codex_link=1
 fi
+
+# BEGIN check_codex_auth
+# After the engine exits: auth.json must still be the link into the auth volume. If the engine
+# (or a repository script it ran) replaced the link with a regular file, a refreshed token sits
+# in this container only and the volume keeps a stale one. Say so loudly; never copy secrets.
+check_codex_auth() {
+    [ "${codex_link}" = 1 ] || return 0
+    local link="${CODEX_HOME:-${HOME}/.codex}/auth.json"
+    [ -L "${link}" ] && [ "$(readlink "${link}")" = "${HOME}/.codex-auth/auth.json" ] && return 0
+    echo "franky: ERROR codex auth.json is no longer a link to the auth volume - refusing to" \
+         "report success (a refreshed login would be lost)" >&2
+    return 1
+}
+# END check_codex_auth
 
 # Make INNER containers inherit the egress proxy (proxy URLs ONLY - never creds). With no proxy
 # env set (e.g. local dev), write nothing so docker keeps its defaults.
@@ -125,8 +141,10 @@ fi
 # per-run nonce and wait (capped) for the host to copy the session and touch the nonce marker. If
 # the host is gone, the cap runs out and --rm still removes the container, so no stopped
 # container keeps the tokens.
-if [ -n "${FRANKY_SESSION_HOLD:-}" ]; then
-    hold_nonce="${FRANKY_SESSION_HOLD}"
+if [ -n "${FRANKY_SESSION_HOLD:-}" ] || [ "${codex_link}" = 1 ]; then
+    # A Codex subscription run is supervised too (no hold without a nonce), so the link check
+    # below can run after the engine exits.
+    hold_nonce="${FRANKY_SESSION_HOLD:-}"
     unset FRANKY_SESSION_HOLD
     # Job control only for the launch: it starts the engine in its own process group with
     # default signal dispositions (a plain `&` here starts it with SIGINT/SIGQUIT ignored).
@@ -147,7 +165,9 @@ if [ -n "${FRANKY_SESSION_HOLD:-}" ]; then
         rc=$?
         kill -0 "${child}" 2>/dev/null || break
     done
-    if [ "${rc}" = 0 ] && [ "${signalled}" = 0 ]; then
+    if ! check_codex_auth; then
+        [ "${rc}" != 0 ] || rc=70
+    elif [ "${rc}" = 0 ] && [ "${signalled}" = 0 ] && [ -n "${hold_nonce}" ]; then
         # Leftover engine processes must not run on, with the tokens, through the hold.
         kill -KILL -- "-${child}" 2>/dev/null
         echo "franky: engine exited, holding for session copy ${hold_nonce}" >&2
