@@ -368,6 +368,17 @@ def test_a_team_skill_with_an_unreadable_header_is_not_installed_natively(tmp_pa
     assert ".claude/skills/lint/SKILL.md" in members
 
 
+def test_a_rejected_team_skill_leaves_no_raw_copy_at_the_native_path(tmp_path, monkeypatch):
+    team = _team(tmp_path / ".claude")  # the team root is the engine's own dir
+    (team / "skills/cook/SKILL.md").write_text('---\n"hooks": x\nname: cook\n---\n')
+    spec = _load(tmp_path, monkeypatch, team=team)
+
+    members = _members(profile.build_bundle(spec, engine="claude"))
+
+    assert not [n for n in members if n.startswith(".claude/skills/cook/")]
+    assert ".claude/skills/lint/SKILL.md" in members
+
+
 @pytest.mark.parametrize(
     "text,expected",
     [

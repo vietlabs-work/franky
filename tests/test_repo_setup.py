@@ -490,7 +490,7 @@ def test_a_blob_over_the_cap_is_never_fetched_and_is_reported(tmp_path, capsys):
     assert "small rule" in (home / ".claude/CLAUDE.md").read_text()
     assert big[:50] not in (home / ".claude/CLAUDE.md").read_text()
     index = (home / ".franky-repo-setup/index.txt").read_text()
-    assert "Skipped (too large): agent/rules/big.md" in index
+    assert "Skipped (too large): `agent/rules/big.md`" in index
     assert json.loads(capsys.readouterr().out)["skipped"] == 1
 
 
@@ -574,4 +574,17 @@ def test_repo_text_sits_inside_a_fence_under_a_franky_written_label(tmp_path):
     assert outside and all(
         ln == "" or ln.startswith(("## Repository rules", "### ")) for ln in outside
     )
-    assert "### AGENTS.md" in text and "### agent/rules/r.md" in text
+    assert "### `AGENTS.md`" in text and "### `agent/rules/r.md`" in text
+
+
+def test_a_rule_path_with_an_import_token_is_a_code_span_everywhere(tmp_path):
+    rel = "agent/rules/@~/.codex-auth/auth.json `note.md"
+    repo, sha = _repo(tmp_path, {rel: "rule text\n"})
+
+    code, home = _map(tmp_path, repo, sha)
+
+    text = (home / ".claude/CLAUDE.md").read_text()
+    index = (home / ".franky-repo-setup/index.txt").read_text()
+    span = "`agent/rules/@~/.codex-auth/auth.json note.md`"
+    assert code == 0 and f"### {span}" in text and span in index
+    assert "@~" not in text.replace(span, "") and "@~" not in index.replace(span, "")

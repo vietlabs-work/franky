@@ -372,6 +372,11 @@ def clean_line(value: str, limit: int) -> str:
     return flat if len(flat) <= limit else flat[: limit - 3].rstrip() + "..."
 
 
+def code_path(value: str, limit: int) -> str:
+    """A repository path as an inline code span: no `@path` import or heading resolves in it."""
+    return f"`{clean_line(value.replace('`', ''), limit)}`"
+
+
 def fence_text(text: str) -> str:
     """Wrap repository text in ONE fenced code block so it is inert in the instruction file.
 
@@ -484,18 +489,18 @@ def map_setup(
         target = home / instruction
         existing = target.read_text(encoding="utf-8") if target.is_file() else ""
         head = existing.rstrip() + "\n\n" if existing.strip() else ""
-        body = "\n\n".join(f"### {clean_line(rel, 200)}\n\n{text}" for rel, text in sections)
+        body = "\n\n".join(f"### {code_path(rel, 200)}\n\n{text}" for rel, text in sections)
         _write(target, f"{head}## Repository rules (from {repo} at {ref[:12]})\n\n{body}\n")
 
     instruction_files = [rel for rel, _ in sections if rel in INSTRUCTION_FILES]
     index = render_index(repo, ref, skills, rules, instruction_files)
     if unsafe:
         index += "\n- Skipped (unreadable header): " + ", ".join(
-            clean_line(r, 200) for r in sorted(unsafe)[:MAX_RULES_LISTED]
+            code_path(r, 200) for r in sorted(unsafe)[:MAX_RULES_LISTED]
         )
     if too_large:
         index += "\n- Skipped (too large): " + ", ".join(
-            clean_line(r, 200) for r in sorted(too_large)[:MAX_RULES_LISTED]
+            code_path(r, 200) for r in sorted(too_large)[:MAX_RULES_LISTED]
         )
     index = cap_index(index)
     _write(home / INDEX_DIR / "index.txt", index)
@@ -524,11 +529,11 @@ def render_index(repo, ref, skills, rules, instruction_files) -> str:
     if instruction_files:
         lines.append(
             "- Instruction files: "
-            + ", ".join(clean_line(f, 200) for f in instruction_files)
+            + ", ".join(code_path(f, 200) for f in instruction_files)
             + ' (appended to your instruction file under "Repository rules")'
         )
     if rules:
-        shown = [clean_line(r, 200) for r in rules[:MAX_RULES_LISTED]]
+        shown = [code_path(r, 200) for r in rules[:MAX_RULES_LISTED]]
         more = (
             f", ... and {len(rules) - MAX_RULES_LISTED} more"
             if len(rules) > MAX_RULES_LISTED

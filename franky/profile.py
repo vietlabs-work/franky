@@ -1032,12 +1032,13 @@ def _team_members(
             rules.append((rel.as_posix(), text))
         elif rel.as_posix() == "AGENTS.md":
             agents_text = text
-    # A skill whose header cannot be read is not installed natively at all.
+    # A skill whose header cannot be read is not installed natively at all. Its dir stays
+    # owned, so the caller also drops any raw copy at that native path.
     for name in bad:
         prefix = f"{skills_dir}/{name}/"
         for key in [k for k in members if k.startswith(prefix)]:
             del members[key]
-        owned.discard(prefix)
+        owned.add(prefix)
     sections = []
     if agents_text.strip():
         sections.append(agents_text.strip())
