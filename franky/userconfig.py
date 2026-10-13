@@ -81,6 +81,7 @@ SECRET_KEYS: frozenset[str] = frozenset(
 _NON_SECRET_SETTABLE_KEYS: frozenset[str] = frozenset(
     {
         "FRANKY_ENGINE",
+        "FRANKY_PULL_ENGINES",
         MODEL_VAR,
         EFFORT_VAR,
         MEMORY_MB_VAR,
