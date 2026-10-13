@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.24] - 2026-10-13
+
 ### Added
 
 - `franky update` pre-pulls the task image of every engine this host uses: the configured one, any engine with a local released image, and those named in the new `FRANKY_PULL_ENGINES` setting (comma-separated). One failed pull no longer skips the others.
