@@ -3,13 +3,17 @@
 ## Create a release
 
 ```bash
-make release VERSION=x.y.z
+make release
 ```
+
+The script first fetches `origin` and fast-forwards clean `main` to `origin/main`.
+Without `VERSION`, it then increments the patch version in `pyproject.toml` (for example, `0.3.26` becomes `0.3.27`).
+Set `VERSION=x.y.z` to choose a version explicitly.
 
 The release script:
 
-1. Accepts a plain `x.y.z` version.
-2. Requires a clean `main` that matches `origin/main`.
+1. Requires a clean `main`, fetches `origin`, and fast-forwards to `origin/main`.
+2. Picks the next patch version or validates an explicit plain `x.y.z` version against the updated files.
 3. Refuses an existing `vX.Y.Z` tag.
 4. Updates `pyproject.toml` and `franky/__init__.py` together.
 5. Converts `Unreleased` into a dated changelog section.
@@ -18,15 +22,21 @@ The release script:
 
 Tests reject README, changelog, and package version drift before release.
 
+Dirty tracked files, local commits ahead of or divergent from `origin/main`, and sync failures stop the release.
+Git sync commands time out after 90 seconds. The script does not stash changes, reset branches, or create merge commits.
+
 ## Dry run
 
 ```bash
-make release-dry VERSION=x.y.z
+make release-dry
 # Or:
-python3 scripts/release.py x.y.z --dry-run
+python3 scripts/release.py --dry-run
 ```
 
-The dry run prints file changes and Git commands. It does not write files or change Git state.
+Both commands accept an explicit version, as in `make release-dry VERSION=x.y.z` or `python3 scripts/release.py x.y.z --dry-run`.
+
+The dry run performs the same sync first, so it can update the local checkout.
+It then prints the release plan without changing version files or creating a release commit, tag, or push.
 
 ## Recover a failed tag push
 

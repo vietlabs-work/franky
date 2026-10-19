@@ -2,7 +2,7 @@
 """Release helper for franky.
 
 Subcommands:
-  X.Y.Z [--dry-run]  - full release: validate, check state, bump, changelog, commit, tag, push
+  [X.Y.Z] [--dry-run] - full release (default: next patch version): validate, bump, tag, push
   tag X.Y.Z [--dry-run]  - recovery: tag + push only (when commit exists but tag/push failed)
   guard <tag>        - assert pyproject==__init__==tag (CI gate, exits nonzero on skew)
   notes X.Y.Z        - print the changelog section body for X.Y.Z (used as release notes)
@@ -242,7 +242,11 @@ def assert_versions_match(root: Path, tag: str) -> None:
 
 def _git(run, argv, check=True):
     """Run a git command, returning the CompletedProcess. Exits on nonzero if check=True."""
-    proc = run(["git"] + argv, capture_output=True, text=True)
+    try:
+        proc = run(["git"] + argv, capture_output=True, text=True, timeout=90)
+    except subprocess.TimeoutExpired:
+        print(f"release.py: git {' '.join(argv)} timed out after 90s", file=sys.stderr)
+        raise SystemExit(1)
     if check and proc.returncode != 0:
         print(f"release.py: git {' '.join(argv)} failed:\n{proc.stderr.strip()}", file=sys.stderr)
         raise SystemExit(1)
@@ -270,16 +274,17 @@ def _assert_tag_absent(run, v: str) -> None:
         raise SystemExit(1)
 
 
-def _assert_release_preconditions(root: Path, v: str, run) -> None:
-    """Check branch, tree cleanliness, sync with origin, and tag absence."""
-    _git(run, ["fetch", "origin"])
-
+def _sync_release_branch(run) -> None:
+    """Fast-forward a clean main to origin/main before reading release inputs."""
     branch = _git(run, ["rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
     if branch != "main":
         print(f"release.py: must be on main branch (currently on '{branch}')", file=sys.stderr)
         raise SystemExit(1)
 
     _assert_clean_tree(run)
+
+    _git(run, ["fetch", "origin"])
+    _git(run, ["merge", "--ff-only", "origin/main"])
 
     local_head = _git(run, ["rev-parse", "HEAD"]).stdout.strip()
     origin_head = _git(run, ["rev-parse", "origin/main"]).stdout.strip()
@@ -289,8 +294,6 @@ def _assert_release_preconditions(root: Path, v: str, run) -> None:
             file=sys.stderr,
         )
         raise SystemExit(1)
-
-    _assert_tag_absent(run, v)
 
 
 def _assert_release_inputs(root: Path, v: str) -> None:
@@ -418,7 +421,14 @@ def _print_release_links(run, v: str) -> None:
 
 
 def cmd_release(args, run, root: Path, sleep=time.sleep) -> None:
+    _sync_release_branch(run)
     v = args.version
+    if v is None:
+        current = read_pyproject_version(root)
+        if not valid_version(current):
+            raise SystemExit(f"release.py: invalid current version '{current}' - use plain X.Y.Z")
+        prefix, patch = current.rsplit(".", 1)
+        v = f"{prefix}.{int(patch) + 1}"
     if not valid_version(v):
         print(
             f"release.py: invalid version '{v}' - use plain X.Y.Z (no prerelease, no leading v)",
@@ -427,6 +437,7 @@ def cmd_release(args, run, root: Path, sleep=time.sleep) -> None:
         raise SystemExit(1)
 
     _assert_release_inputs(root, v)
+    _assert_tag_absent(run, v)
 
     if args.dry_run:
         print(f"[dry-run] would bump pyproject.toml and franky/__init__.py to {v}")
@@ -439,8 +450,6 @@ def cmd_release(args, run, root: Path, sleep=time.sleep) -> None:
         print("[dry-run] the tag push triggers the Release workflow (wheel -> PyPI, GHCR")
         print("[dry-run]   images, GitHub Release); would then watch it unless --no-watch")
         return
-
-    _assert_release_preconditions(root, v, run)
 
     today = str(date.today())
     set_pyproject_version(root, v)
@@ -517,12 +526,11 @@ def main(argv=None, run=None, root=None, sleep=None) -> None:
     else:
         argv = list(argv)
 
-    # If the first argument looks like a plain version (X.Y.Z), treat it as the release
-    # subcommand. This avoids ambiguity when argparse tries to resolve it as a subcommand
-    # choice, which happens on Python 3.14+ with the combined subparsers+positional layout.
-    if argv and re.fullmatch(r"\d+\.\d+\.\d+", argv[0]):
-        release_parser = argparse.ArgumentParser(prog="release.py X.Y.Z")
-        release_parser.add_argument("version", metavar="X.Y.Z")
+    # Parse releases separately so argparse cannot confuse the optional version with
+    # a subcommand on Python 3.14+.
+    if not argv or argv[0] in ("--dry-run", "--no-watch") or valid_version(argv[0]):
+        release_parser = argparse.ArgumentParser(prog="release.py [X.Y.Z]")
+        release_parser.add_argument("version", metavar="X.Y.Z", nargs="?")
         release_parser.add_argument("--dry-run", action="store_true")
         release_parser.add_argument(
             "--no-watch",

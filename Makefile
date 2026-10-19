@@ -2,8 +2,7 @@
 # Make vars are case-sensitive, so we scan the raw command-line assignments
 # ($(MAKEOVERRIDES)) and match the name case-insensitively against `version`/`v`.
 # `?=` so an exact `VERSION=` on the command line short-circuits the scan.
-# The `\#` is escaped: a bare `#` would start a Make comment and eat the `)`.
-VERSION ?= $(shell for kv in $(MAKEOVERRIDES); do n=$${kv%%=*}; l=$$(printf '%s' "$$n" | tr A-Z a-z); if [ "$$l" = version ] || [ "$$l" = v ]; then printf '%s' "$${kv\#*=}"; break; fi; done)
+VERSION ?= $(shell for kv in $(MAKEOVERRIDES); do n=$${kv%%=*}; l=$$(printf '%s' "$$n" | tr A-Z a-z); if [ "$$l" = version ] || [ "$$l" = v ]; then printf '%s' "$$kv" | cut -d= -f2-; break; fi; done)
 
 .PHONY: footprint smoke-security smoke-dind smoke-resume smoke-profile smoke-thread smoke-memory eval review-eval release release-dry
 
@@ -59,9 +58,7 @@ review-eval:
 	python3 scripts/review_eval.py $(ARGS)
 
 release:
-	@test -n "$(VERSION)" || { echo "usage: make release VERSION=X.Y.Z"; exit 2; }
-	python3 scripts/release.py "$(VERSION)"
+	python3 scripts/release.py $(if $(VERSION),"$(VERSION)")
 
 release-dry:
-	@test -n "$(VERSION)" || { echo "usage: make release-dry VERSION=X.Y.Z"; exit 2; }
-	python3 scripts/release.py "$(VERSION)" --dry-run
+	python3 scripts/release.py $(if $(VERSION),"$(VERSION)") --dry-run
