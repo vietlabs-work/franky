@@ -66,6 +66,7 @@ def _hermetic_config_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     """
     fake_path = tmp_path / "test-franky-config"
     monkeypatch.setenv("FRANKY_CONFIG_FILE", str(fake_path))
+    monkeypatch.delenv("FRANKY_REVIEW_FOOTER", raising=False)
 
 
 @pytest.fixture(autouse=True)

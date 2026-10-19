@@ -195,12 +195,12 @@ def test_iterate_without_thread_is_unchanged(monkeypatch, env):
 
 
 def test_iterate_prompt_bytes_are_pinned_without_a_prior(monkeypatch):
-    # sha256 of the iterate prompt at 8657ad7 (persona stubbed), before author threads existed.
+    # sha256 of the iterate prompt (persona stubbed); re-pin only on an intended wording change.
     monkeypatch.setattr(prompt, "load_persona", lambda: "PERSONA")
     spec = TaskSpec(repo="me/repo", text=PR_URL, source="pr")
     text = prompt.build_iterate_prompt(spec, operator_setup="")
     assert hashlib.sha256(text.encode()).hexdigest() == (
-        "50bd038e19b95389b7d496e337a36bf06c080232650802450a663447ebb92537"
+        "af55cd0d71154ef4fd2a380a3e66fde0e85fe23e4f69bac2a3299439ec893478"
     )
 
 

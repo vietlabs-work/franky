@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `FRANKY_REVIEW_FOOTER` sets the last line of a `review-pr` body. Unset keeps `<sub>Automated review by Franky</sub>`. A value replaces it as is, up to 500 characters; a longer value fails at start with a config error. An empty value posts no footer.
+
+### Changed
+
+- An `APPROVE` review now ends with the marker `<!-- bot-review:ID -->` instead of `<!-- franky-review:ID -->`. The accepted-risk check still ignores approvals that carry either marker.
+- Agent prompts and the persona no longer name Franky, so the agent does not copy the name into reviews, commits, or PR text.
+
 ## [0.3.25] - 2026-10-13
 
 ### Added
