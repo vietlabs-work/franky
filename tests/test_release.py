@@ -526,7 +526,13 @@ def test_release_auto_version_refuses_invalid_current(repo, current):
 
 
 @pytest.mark.parametrize(
-    "assignment, expected", [([], "0.1.1"), (["VERSION=2.0.0"], "2.0.0"), (["v=3.0.0"], "3.0.0")]
+    "assignment, expected",
+    [
+        ([], "0.1.1"),
+        (["VERSION=2.0.0"], "2.0.0"),
+        (["v=3.0.0"], "3.0.0"),
+        (["vERsiOn=4.0.0"], "4.0.0"),
+    ],
 )
 def test_make_release_dry_version(repo, monkeypatch, assignment, expected):
     monkeypatch.delenv("VERSION", raising=False)
@@ -543,6 +549,7 @@ def test_make_release_dry_version(repo, monkeypatch, assignment, expected):
     )
 
     assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert proc.stderr == ""
     assert f"would bump pyproject.toml and franky/__init__.py to {expected}" in proc.stdout
     assert read_pyproject_version(repo) == read_init_version(repo) == "0.1.0"
 
