@@ -127,6 +127,7 @@ from .reviewpr import (
     render_review_body,
     reply_body,
     review_event,
+    review_footer,
     thread_reply_target,
     verify_accepted,
 )
@@ -1341,7 +1342,7 @@ def _publish_review(
     If GitHub rejects the anchors (422), retries ONCE with every finding in the body.
 
     With `allow_approve` the event may be APPROVE; the payload then ends with a unique
-    `<!-- franky-review:<nonce> -->` marker. If that POST does not succeed:
+    `<!-- bot-review:<nonce> -->` marker. If that POST does not succeed:
     - HTTP 422 with inline comments: retry once as a body-only APPROVE after a head check;
     - a confirmed refusal (wrapper refusal line, or HTTP 422) wrote nothing: re-check the head and
       post COMMENT instead;
@@ -1887,6 +1888,10 @@ def review_pr(
             raise
         except ValueError as exc:
             raise ConfigError(f"config file error: {exc}") from exc
+        try:
+            review_footer()
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
 
         try:
             cfg = load_config(engine, os.environ)

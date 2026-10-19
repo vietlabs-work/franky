@@ -37,6 +37,7 @@ comment (with its databaseId) and its last comment, which `thread_reply_target` 
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Callable, Iterable
 from datetime import datetime
@@ -69,7 +70,11 @@ RESOLVE_MUTATION = (
 MAX_THREAD_PAGES = 5
 MAX_REPLY_EVIDENCE_CHARS = 600
 MAX_REPLY_CHARS = 2000  # the host gh wrapper refuses a longer reply body
-APPROVE_MARKER = "franky-review"  # `<!-- franky-review:<nonce> -->` ends an APPROVE body
+APPROVE_MARKER = "bot-review"  # `<!-- bot-review:<nonce> -->` ends an APPROVE body
+_APPROVE_MARKERS = (
+    f"<!-- {APPROVE_MARKER}:",
+    "<!-- franky-review:",
+)  # older runs wrote the legacy name
 
 _EFFECTIVE_REVIEW_STATES = frozenset({"APPROVED", "CHANGES_REQUESTED", "DISMISSED"})
 MAX_INLINE = 8  # inline comments per review
@@ -77,6 +82,20 @@ MAX_QUESTIONS = 2  # question findings kept per review
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 _LABELS = {"blocking": "Blocking", "normal": "Major", "question": "Question", "nit": "Nit"}
 _FOOTER = "<sub>Automated review by Franky</sub>"
+REVIEW_FOOTER_VAR = "FRANKY_REVIEW_FOOTER"
+MAX_FOOTER_CHARS = 500  # fits inside _TAIL_RESERVE with the APPROVE marker
+
+
+def review_footer() -> str:
+    """Unset: the default footer. Empty: no footer. Otherwise the operator's value as is."""
+    value = os.environ.get(REVIEW_FOOTER_VAR)
+    if value is None:
+        return _FOOTER
+    if len(value) > MAX_FOOTER_CHARS:
+        raise ValueError(f"{REVIEW_FOOTER_VAR} is longer than {MAX_FOOTER_CHARS} characters")
+    return value
+
+
 # Host-side length caps: the prompt asks for short text, these guarantee it.
 MAX_TITLE_CHARS = 200
 MAX_BODY_CHARS = 1500
@@ -454,7 +473,8 @@ def _body(
             blocks[key] = _block(title, items, sep, room)
             room -= len(blocks[key]) + 2
     parts += [blocks[k] for k in ("rows", "prior", "verified", "failed") if k in blocks]
-    parts.append(_FOOTER)
+    if footer := review_footer():
+        parts.append(footer)
     return "\n\n".join(parts)
 
 
@@ -686,7 +706,7 @@ def _approval_ok(reviews: list, login: str, head_sha: str, raised_at: object) ->
         and review["author_association"] in _AUTHORITY
         and user.get("type") != "Bot"
         and not str(user.get("login", "")).lower().endswith("[bot]")
-        and APPROVE_MARKER not in str(review.get("body") or "")
+        and not any(m in str(review.get("body") or "") for m in _APPROVE_MARKERS)
     )
 
 

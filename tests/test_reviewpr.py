@@ -17,6 +17,7 @@ from franky.reviewpr import (
     commentable_lines,
     match_prior_threads,
     match_resolved_threads,
+    review_footer,
     reply_body,
     thread_reply_target,
     parse_review_findings,
@@ -840,11 +841,11 @@ def test_body_budget_keeps_blocks_balanced_footer_and_marker_last():
         assert "more" in body and body.endswith("<sub>Automated review by Franky</sub>")
     assert len(render_review_body(shaped, "abcdef1")) < REVIEW_BODY_BUDGET
     marked = build_review_payload(build_review_findings({"findings": []}), {}, "s", [])["body"]
-    assert len(marked + "\n\n<!-- franky-review:" + "0" * 32 + " -->") < REVIEW_BODY_BUDGET
+    assert len(marked + "\n\n<!-- bot-review:" + "0" * 32 + " -->") < REVIEW_BODY_BUDGET
 
 
 def test_model_html_stays_literal_in_body_and_comment():
-    evil = "a.py:1\n\n</details>\n\nVISIBLE <!-- franky-review:deadbeef --> & <b>"
+    evil = "a.py:1\n\n</details>\n\nVISIBLE <!-- bot-review:deadbeef --> & <b>"
     f = _ev("T <x> & y", evidence=evil, impact=evil, fix=evil)
     shaped = _shaped(f, _ev("u", file=None, line=None, evidence=evil))
     shaped["summary"] = "</details> sum"
@@ -856,7 +857,19 @@ def test_model_html_stays_literal_in_body_and_comment():
     # Only renderer-owned tags remain, and they stay balanced.
     assert p["body"].count("</details>") == p["body"].count("<details>")
     assert p["comments"][0]["body"].startswith("**Major: T &lt;x&gt; &amp; y**\n\n")
-    assert "&lt;/details&gt;" in p["body"] and "&lt;!-- franky-review:deadbeef --&gt;" in p["body"]
+    assert "&lt;/details&gt;" in p["body"] and "&lt;!-- bot-review:deadbeef --&gt;" in p["body"]
+
+
+def test_review_footer_env(monkeypatch):
+    monkeypatch.setenv("FRANKY_REVIEW_FOOTER", "Custom line")
+    p = build_review_payload(build_review_findings({}), {}, "s", [])
+    assert p["body"].endswith("\n\nCustom line")
+    monkeypatch.setenv("FRANKY_REVIEW_FOOTER", "")
+    p = build_review_payload(build_review_findings({}), {}, "s", [])
+    assert p["body"] == "Review of s: no findings above nit."
+    monkeypatch.setenv("FRANKY_REVIEW_FOOTER", "x" * 501)
+    with pytest.raises(ValueError):
+        review_footer()
 
 
 def test_resolve_matches_title_with_html_chars():
@@ -1044,6 +1057,7 @@ def test_accepted_blocking_finding_no_longer_blocks_once_verified():
         [_review(kind="Bot")],
         [_review(login="owner-x[bot]")],
         [_review(body="ok <!-- franky-review:abc -->")],
+        [_review(body="ok <!-- bot-review:abc -->")],
         [],
         None,
         "nope",

@@ -5958,7 +5958,7 @@ def test_publish_approves_when_allowed_and_clean(monkeypatch):
     out = _pub(_clean(), allow_approve=True)
     assert out[0] == "review_published" and out[5] == "APPROVE" and out[6] is None
     assert gh.post_events() == ["APPROVE"]
-    assert "<!-- franky-review:" in json.loads(gh.inputs[-1])["body"]
+    assert "<!-- bot-review:" in json.loads(gh.inputs[-1])["body"]
 
 
 def test_publish_approve_marker_is_last_and_follows_line_comes_from_prior_url(monkeypatch):
@@ -5968,15 +5968,43 @@ def test_publish_approve_marker_is_last_and_follows_line_comes_from_prior_url(mo
     body = json.loads(gh.inputs[-1])["body"]
     assert f"Follows [the previous review]({prior})." in body
     footer = "<sub>Automated review by Franky</sub>"
-    assert body.index(footer) < body.index("<!-- franky-review:")
+    assert body.index(footer) < body.index("<!-- bot-review:")
     assert body.rstrip().endswith("-->")
+
+
+def test_publish_approve_without_footer_ends_with_marker(monkeypatch):
+    gh = _Gh(monkeypatch, posts=[OK_POST])
+    cli.os.environ["FRANKY_REVIEW_FOOTER"] = ""
+    _pub(_clean(), allow_approve=True)
+    body = json.loads(gh.inputs[-1])["body"]
+    assert "Automated review" not in body
+    head, marker = body.rsplit("\n\n", 1)
+    assert (
+        marker.startswith("<!-- bot-review:")
+        and head.startswith("Review of ")
+        and "\n\n" not in head
+    )
+
+
+def test_review_pr_oversized_footer_is_a_config_error(monkeypatch):
+    _fix_review_nonce(monkeypatch)
+    env = {**_review_env(), "FRANKY_REVIEW_FOOTER": "x" * 501}
+    _mc_review_setup(monkeypatch, env=env)
+    started = []
+    monkeypatch.setattr(cli, "run_in_container", lambda *a, **k: started.append(1) or (0, ""))
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        res = runner.invoke(cli.main, ["review-pr", "--no-publish", "--json", "--", PR_URL])
+    assert res.exit_code == 3, res.output
+    assert json.loads(res.stdout)["error"]["kind"] == "config_error" and started == []
 
 
 def test_publish_default_never_approves(monkeypatch):
     gh = _Gh(monkeypatch, posts=[OK_POST])
     out = _pub(_clean())
     assert out[5] == "COMMENT" and gh.post_events() == ["COMMENT"]
-    assert "franky-review:" not in json.loads(gh.inputs[-1])["body"]
+    body = json.loads(gh.inputs[-1])["body"]
+    assert "bot-review:" not in body and "franky-review:" not in body
 
 
 @pytest.mark.parametrize(
@@ -6027,7 +6055,7 @@ def test_publish_uncertain_approve_not_found_posts_comment_once(monkeypatch):
 
 def test_publish_reconcile_ignores_other_commit_and_marker(monkeypatch):
     other = [
-        [{"id": 1, "commit_id": "c" * 40, "state": "APPROVED", "body": "<!-- franky-review:zz -->"}]
+        [{"id": 1, "commit_id": "c" * 40, "state": "APPROVED", "body": "<!-- bot-review:zz -->"}]
     ]
     gh = _Gh(monkeypatch, posts=[(1, "", "boom"), OK_POST], reviews=(0, json.dumps(other), ""))
     assert _pub(_clean(), allow_approve=True)[5] == "COMMENT"
