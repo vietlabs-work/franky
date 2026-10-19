@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.26] - 2026-10-19
+
 ### Added
 
 - `FRANKY_REVIEW_FOOTER` sets the last line of a `review-pr` body. Unset keeps `<sub>Automated review by Franky</sub>`. A value replaces it as is, up to 500 characters; a longer value fails at start with a config error. An empty value posts no footer.
