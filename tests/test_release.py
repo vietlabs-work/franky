@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import subprocess
 from pathlib import Path
 
@@ -116,6 +117,32 @@ def make_fake_run(responses=None):
         return subprocess.CompletedProcess(argv, 0, "", "")
 
     return runner, calls
+
+
+@pytest.fixture
+def local_git(repo, monkeypatch):
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+
+    def git(*args):
+        return subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+
+    origin = repo.parent / f"{repo.name}-origin.git"
+    git("init", "--bare", str(origin))
+    git("init", "--initial-branch=main")
+    git("config", "user.name", "Release Test")
+    git("config", "user.email", "release@example.invalid")
+    git("add", "pyproject.toml", "franky/__init__.py", "README.md", "CHANGELOG.md")
+    git("commit", "-m", "Initial version")
+    git("remote", "add", "origin", str(origin))
+    git("push", "-u", "origin", "main")
+    return git
 
 
 # --- valid_version ---
@@ -305,15 +332,17 @@ def test_release_happy_path_git_commands(repo):
     assert "README.md" in git_calls[add_idx]
 
 
-def test_release_refuses_dirty_tree(repo):
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_release_refuses_dirty_tree(repo, dry_run):
     responses = [
         (["git", "fetch"], 0, "", ""),
         (["git", "rev-parse", "--abbrev-ref", "HEAD"], 0, "main", ""),
         (["git", "status", "--porcelain", "--untracked-files=no"], 0, "M pyproject.toml", ""),
     ]
-    fake_run, _ = make_fake_run(responses)
+    fake_run, calls = make_fake_run(responses)
     with pytest.raises(SystemExit):
-        main(["1.2.3"], run=fake_run, root=repo)
+        main(["1.2.3", *(["--dry-run"] if dry_run else [])], run=fake_run, root=repo)
+    assert not any(c[1] in ("fetch", "merge", "add", "commit", "tag", "push") for c in calls)
 
 
 def test_release_clean_tree_ignores_untracked(repo):
@@ -437,17 +466,20 @@ def test_origin_web_url_normalizes_remote_forms(repo):
     assert release._origin_web_url(fake_run) is None
 
 
-def test_release_refuses_wrong_branch(repo):
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_release_refuses_wrong_branch(repo, dry_run):
     responses = [
         (["git", "fetch"], 0, "", ""),
         (["git", "rev-parse", "--abbrev-ref", "HEAD"], 0, "feature-x", ""),
     ]
-    fake_run, _ = make_fake_run(responses)
+    fake_run, calls = make_fake_run(responses)
     with pytest.raises(SystemExit):
-        main(["1.2.3"], run=fake_run, root=repo)
+        main(["1.2.3", *(["--dry-run"] if dry_run else [])], run=fake_run, root=repo)
+    assert not any(c[1] in ("fetch", "merge", "add", "commit", "tag", "push") for c in calls)
 
 
-def test_release_refuses_unsynced_main(repo):
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_release_refuses_local_main_ahead_of_origin(repo, dry_run):
     responses = [
         (["git", "fetch"], 0, "", ""),
         (["git", "rev-parse", "--abbrev-ref", "HEAD"], 0, "main", ""),
@@ -455,12 +487,14 @@ def test_release_refuses_unsynced_main(repo):
         (["git", "rev-parse", "HEAD"], 0, "abc123", ""),
         (["git", "rev-parse", "origin/main"], 0, "def456", ""),
     ]
-    fake_run, _ = make_fake_run(responses)
+    fake_run, calls = make_fake_run(responses)
     with pytest.raises(SystemExit):
-        main(["1.2.3"], run=fake_run, root=repo)
+        main(["1.2.3", *(["--dry-run"] if dry_run else [])], run=fake_run, root=repo)
+    assert not any(c[1] in ("add", "commit", "tag", "push") for c in calls)
 
 
-def test_release_refuses_existing_tag(repo):
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_release_refuses_existing_tag(repo, dry_run):
     responses = [
         (["git", "fetch"], 0, "", ""),
         (["git", "rev-parse", "--abbrev-ref", "HEAD"], 0, "main", ""),
@@ -469,15 +503,14 @@ def test_release_refuses_existing_tag(repo):
         (["git", "rev-parse", "origin/main"], 0, "abc123", ""),
         (["git", "rev-parse", "-q", "--verify"], 0, "abc123", ""),
     ]
-    fake_run, _ = make_fake_run(responses)
+    fake_run, calls = make_fake_run(responses)
     with pytest.raises(SystemExit):
-        main(["1.2.3"], run=fake_run, root=repo)
+        main(["1.2.3", *(["--dry-run"] if dry_run else [])], run=fake_run, root=repo)
+    assert not any(c[1] in ("add", "commit", "tag", "push") for c in calls)
 
 
 def test_release_dry_run_no_file_writes(repo):
-    # Dry-run returns before any git call, so the fake run is never consulted. Assert NO file
-    # was mutated (all three version sources untouched) and NO git mutation ran.
-    fake_run, calls = make_fake_run()
+    fake_run, calls = make_fake_run(_happy_release_responses())
     main(["1.2.3", "--dry-run"], run=fake_run, root=repo)
     assert read_pyproject_version(repo) == "0.1.0"
     assert read_init_version(repo) == "0.1.0"
@@ -492,14 +525,14 @@ def test_release_dry_run_no_file_writes(repo):
 def test_release_auto_version_dry_run(repo, capsys, current, expected):
     set_pyproject_version(repo, current)
     before = {path: path.read_bytes() for path in repo.rglob("*") if path.is_file()}
-    fake_run, calls = make_fake_run()
+    fake_run, calls = make_fake_run(_happy_release_responses())
 
     main(["--dry-run"], run=fake_run, root=repo)
 
     assert (
         f"would bump pyproject.toml and franky/__init__.py to {expected}" in capsys.readouterr().out
     )
-    assert calls == []
+    assert ["git", "merge", "--ff-only", "origin/main"] in calls
     assert {path: path.read_bytes() for path in before} == before
 
 
@@ -516,12 +549,12 @@ def test_release_auto_version_happy_path(repo, args):
 @pytest.mark.parametrize("current", ["1.2", "1.2.x", "1.2.3rc1"])
 def test_release_auto_version_refuses_invalid_current(repo, current):
     set_pyproject_version(repo, current)
-    fake_run, calls = make_fake_run()
+    fake_run, calls = make_fake_run(_happy_release_responses())
 
     with pytest.raises(SystemExit, match="invalid current version"):
         main(["--dry-run"], run=fake_run, root=repo)
 
-    assert calls == []
+    assert not any(c[1] in ("add", "commit", "tag", "push") for c in calls)
     assert read_pyproject_version(repo) == current
 
 
@@ -534,7 +567,7 @@ def test_release_auto_version_refuses_invalid_current(repo, current):
         (["vERsiOn=4.0.0"], "4.0.0"),
     ],
 )
-def test_make_release_dry_version(repo, monkeypatch, assignment, expected):
+def test_make_release_dry_version(repo, local_git, monkeypatch, assignment, expected):
     monkeypatch.delenv("VERSION", raising=False)
     (repo / "scripts").mkdir()
     (repo / "scripts" / "release.py").write_bytes((ROOT / "scripts" / "release.py").read_bytes())
@@ -555,19 +588,115 @@ def test_make_release_dry_version(repo, monkeypatch, assignment, expected):
 
 
 @pytest.mark.parametrize("dry_run", [False, True])
+def test_release_syncs_before_reading_version_and_changelog(repo, capsys, dry_run):
+    (repo / "CHANGELOG.md").write_text("# Changelog\n\n## [Unreleased]\n")
+    fake_run, calls = make_fake_run(_happy_release_responses())
+
+    def runner(argv, **kwargs):
+        if argv == ["git", "merge", "--ff-only", "origin/main"]:
+            set_pyproject_version(repo, "0.2.9")
+            set_init_version(repo, "0.2.9")
+            (repo / "CHANGELOG.md").write_text("# Changelog\n\n## [Unreleased]\n\n- New feature.\n")
+        return fake_run(argv, **kwargs)
+
+    main(["--dry-run"] if dry_run else ["--no-watch"], run=runner, root=repo)
+
+    assert calls.index(["git", "fetch", "origin"]) < calls.index(
+        ["git", "merge", "--ff-only", "origin/main"]
+    )
+    if dry_run:
+        assert "to 0.2.10" in capsys.readouterr().out
+        assert read_pyproject_version(repo) == "0.2.9"
+        assert not any(c[1] in ("add", "commit", "tag", "push") for c in calls)
+    else:
+        assert read_pyproject_version(repo) == read_init_version(repo) == "0.2.10"
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+@pytest.mark.parametrize("command", [["fetch", "origin"], ["merge", "--ff-only", "origin/main"]])
+def test_release_sync_failure_never_starts_release(repo, dry_run, command):
+    responses = [(["git", *command], 1, "", "sync failed"), *_happy_release_responses()]
+    fake_run, calls = make_fake_run(responses)
+
+    with pytest.raises(SystemExit):
+        main(["--dry-run"] if dry_run else ["--no-watch"], run=fake_run, root=repo)
+
+    assert read_pyproject_version(repo) == "0.1.0"
+    assert not any(c[1] in ("add", "commit", "tag", "push") for c in calls)
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_release_rechecks_explicit_version_after_sync(repo, dry_run):
+    fake_run, calls = make_fake_run(_happy_release_responses())
+
+    def runner(argv, **kwargs):
+        if argv == ["git", "merge", "--ff-only", "origin/main"]:
+            set_pyproject_version(repo, "2.0.0")
+        return fake_run(argv, **kwargs)
+
+    with pytest.raises(SystemExit):
+        main(
+            ["1.2.3", *(["--dry-run"] if dry_run else [])],
+            run=runner,
+            root=repo,
+            sleep=lambda *_: None,
+        )
+
+    assert read_pyproject_version(repo) == "2.0.0"
+    assert not any(c[1] in ("add", "commit", "tag", "push") for c in calls)
+
+
+def test_release_dry_run_fast_forwards_local_git(repo, local_git, monkeypatch, capsys):
+    previous = local_git("rev-parse", "HEAD").stdout.strip()
+    set_pyproject_version(repo, "0.2.9")
+    set_init_version(repo, "0.2.9")
+    local_git("add", "pyproject.toml", "franky/__init__.py")
+    local_git("commit", "-m", "New upstream version")
+    local_git("push", "origin", "main")
+    upstream = local_git("rev-parse", "HEAD").stdout.strip()
+    local_git("reset", "--hard", previous)
+    monkeypatch.chdir(repo)
+
+    main(["--dry-run"], root=repo)
+
+    assert "to 0.2.10" in capsys.readouterr().out
+    assert read_pyproject_version(repo) == read_init_version(repo) == "0.2.9"
+    assert local_git("rev-parse", "HEAD").stdout.strip() == upstream
+    assert local_git("tag", "--list").stdout == ""
+    assert local_git("status", "--porcelain").stdout == ""
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_release_sync_timeout_stops_release(repo, dry_run, capsys):
+    fake_run, calls = make_fake_run(_happy_release_responses())
+
+    def runner(argv, **kwargs):
+        if argv == ["git", "fetch", "origin"]:
+            assert kwargs["timeout"] == 90
+            raise subprocess.TimeoutExpired(argv, 90)
+        return fake_run(argv, **kwargs)
+
+    with pytest.raises(SystemExit):
+        main(["--dry-run"] if dry_run else ["--no-watch"], run=runner, root=repo)
+
+    assert "timed out" in capsys.readouterr().err
+    assert not any(c[1] in ("merge", "add", "commit", "tag", "push") for c in calls)
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
 def test_release_refuses_empty_unreleased_before_side_effects(repo, dry_run):
     changelog = repo / "CHANGELOG.md"
     changelog.write_text(
         "# Changelog\n\n## [Unreleased]\n\n## [0.1.0] - 2026-01-01\n\nOld stuff.\n"
     )
     before = {path: path.read_text() for path in repo.rglob("*") if path.is_file()}
-    fake_run, calls = make_fake_run()
+    fake_run, calls = make_fake_run(_happy_release_responses())
     args = ["1.2.3"] + (["--dry-run"] if dry_run else [])
 
     with pytest.raises(SystemExit):
         main(args, run=fake_run, root=repo)
 
-    assert calls == []
+    assert not any(c[1] in ("add", "commit", "tag", "push") for c in calls)
     assert {path: path.read_text() for path in before} == before
 
 
@@ -575,13 +704,13 @@ def test_release_refuses_empty_unreleased_before_side_effects(repo, dry_run):
 @pytest.mark.parametrize("version", ["0.0.9", "0.1.0"])
 def test_release_refuses_non_increasing_version_before_side_effects(repo, dry_run, version):
     before = {path: path.read_text() for path in repo.rglob("*") if path.is_file()}
-    fake_run, calls = make_fake_run()
+    fake_run, calls = make_fake_run(_happy_release_responses())
     args = [version] + (["--dry-run"] if dry_run else [])
 
     with pytest.raises(SystemExit):
         main(args, run=fake_run, root=repo)
 
-    assert calls == []
+    assert not any(c[1] in ("add", "commit", "tag", "push") for c in calls)
     assert {path: path.read_text() for path in before} == before
 
 
