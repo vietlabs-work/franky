@@ -3,12 +3,15 @@
 ## Create a release
 
 ```bash
-make release VERSION=x.y.z
+make release
 ```
+
+Without `VERSION`, the script increments the patch version in `pyproject.toml` (for example, `0.3.26` becomes `0.3.27`).
+Set `VERSION=x.y.z` to choose a version explicitly.
 
 The release script:
 
-1. Accepts a plain `x.y.z` version.
+1. Picks the next patch version or accepts an explicit plain `x.y.z` version.
 2. Requires a clean `main` that matches `origin/main`.
 3. Refuses an existing `vX.Y.Z` tag.
 4. Updates `pyproject.toml` and `franky/__init__.py` together.
@@ -21,10 +24,12 @@ Tests reject README, changelog, and package version drift before release.
 ## Dry run
 
 ```bash
-make release-dry VERSION=x.y.z
+make release-dry
 # Or:
-python3 scripts/release.py x.y.z --dry-run
+python3 scripts/release.py --dry-run
 ```
+
+Both commands accept an explicit version, as in `make release-dry VERSION=x.y.z` or `python3 scripts/release.py x.y.z --dry-run`.
 
 The dry run prints file changes and Git commands. It does not write files or change Git state.
 

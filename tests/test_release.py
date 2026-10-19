@@ -488,6 +488,65 @@ def test_release_dry_run_no_file_writes(repo):
     assert mutating == []
 
 
+@pytest.mark.parametrize("current, expected", [("0.1.0", "0.1.1"), ("1.2.9", "1.2.10")])
+def test_release_auto_version_dry_run(repo, capsys, current, expected):
+    set_pyproject_version(repo, current)
+    before = {path: path.read_bytes() for path in repo.rglob("*") if path.is_file()}
+    fake_run, calls = make_fake_run()
+
+    main(["--dry-run"], run=fake_run, root=repo)
+
+    assert (
+        f"would bump pyproject.toml and franky/__init__.py to {expected}" in capsys.readouterr().out
+    )
+    assert calls == []
+    assert {path: path.read_bytes() for path in before} == before
+
+
+@pytest.mark.parametrize("args", [[], ["--no-watch"]])
+def test_release_auto_version_happy_path(repo, args):
+    fake_run, calls = make_fake_run(_happy_release_responses())
+
+    main(args, run=fake_run, root=repo, sleep=lambda *_: None)
+
+    assert read_pyproject_version(repo) == read_init_version(repo) == "0.1.1"
+    assert ["git", "push", "origin", "main", "v0.1.1"] in calls
+
+
+@pytest.mark.parametrize("current", ["1.2", "1.2.x", "1.2.3rc1"])
+def test_release_auto_version_refuses_invalid_current(repo, current):
+    set_pyproject_version(repo, current)
+    fake_run, calls = make_fake_run()
+
+    with pytest.raises(SystemExit, match="invalid current version"):
+        main(["--dry-run"], run=fake_run, root=repo)
+
+    assert calls == []
+    assert read_pyproject_version(repo) == current
+
+
+@pytest.mark.parametrize(
+    "assignment, expected", [([], "0.1.1"), (["VERSION=2.0.0"], "2.0.0"), (["v=3.0.0"], "3.0.0")]
+)
+def test_make_release_dry_version(repo, monkeypatch, assignment, expected):
+    monkeypatch.delenv("VERSION", raising=False)
+    (repo / "scripts").mkdir()
+    (repo / "scripts" / "release.py").write_bytes((ROOT / "scripts" / "release.py").read_bytes())
+    (repo / "Makefile").write_bytes((ROOT / "Makefile").read_bytes())
+
+    proc = subprocess.run(
+        ["make", "--no-print-directory", "release-dry", *assignment],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+    assert proc.returncode == 0, proc.stderr + proc.stdout
+    assert f"would bump pyproject.toml and franky/__init__.py to {expected}" in proc.stdout
+    assert read_pyproject_version(repo) == read_init_version(repo) == "0.1.0"
+
+
 @pytest.mark.parametrize("dry_run", [False, True])
 def test_release_refuses_empty_unreleased_before_side_effects(repo, dry_run):
     changelog = repo / "CHANGELOG.md"

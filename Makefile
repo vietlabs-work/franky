@@ -59,9 +59,7 @@ review-eval:
 	python3 scripts/review_eval.py $(ARGS)
 
 release:
-	@test -n "$(VERSION)" || { echo "usage: make release VERSION=X.Y.Z"; exit 2; }
-	python3 scripts/release.py "$(VERSION)"
+	python3 scripts/release.py $(if $(VERSION),"$(VERSION)")
 
 release-dry:
-	@test -n "$(VERSION)" || { echo "usage: make release-dry VERSION=X.Y.Z"; exit 2; }
-	python3 scripts/release.py "$(VERSION)" --dry-run
+	python3 scripts/release.py $(if $(VERSION),"$(VERSION)") --dry-run

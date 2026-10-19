@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `make release` and `make release-dry` default to the next patch version when `VERSION` is omitted.
+
 ## [0.3.26] - 2026-10-19
 
 ### Added

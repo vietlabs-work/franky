@@ -2,7 +2,7 @@
 """Release helper for franky.
 
 Subcommands:
-  X.Y.Z [--dry-run]  - full release: validate, check state, bump, changelog, commit, tag, push
+  [X.Y.Z] [--dry-run] - full release (default: next patch version): validate, bump, tag, push
   tag X.Y.Z [--dry-run]  - recovery: tag + push only (when commit exists but tag/push failed)
   guard <tag>        - assert pyproject==__init__==tag (CI gate, exits nonzero on skew)
   notes X.Y.Z        - print the changelog section body for X.Y.Z (used as release notes)
@@ -516,6 +516,13 @@ def main(argv=None, run=None, root=None, sleep=None) -> None:
         argv = sys.argv[1:]
     else:
         argv = list(argv)
+
+    if not argv or argv[0] in ("--dry-run", "--no-watch"):
+        current = read_pyproject_version(root)
+        if not valid_version(current):
+            raise SystemExit(f"release.py: invalid current version '{current}' - use plain X.Y.Z")
+        prefix, patch = current.rsplit(".", 1)
+        argv.insert(0, f"{prefix}.{int(patch) + 1}")
 
     # If the first argument looks like a plain version (X.Y.Z), treat it as the release
     # subcommand. This avoids ambiguity when argparse tries to resolve it as a subcommand
