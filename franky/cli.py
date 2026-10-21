@@ -1189,6 +1189,31 @@ def _read_pr_reviews(repo: str, pr_number: int, secrets: list[str]) -> list | No
     return reviews
 
 
+def _read_repo_permission(repo: str, login: str, secrets: list[str]) -> str | None:
+    """`login`'s permission on `repo` (admin, write, read or none), or None when the read failed
+    (already logged). An App token sees a private org member's review as CONTRIBUTOR, so an
+    accepted risk asks GitHub for the permission instead.
+
+    The exact `gh api` shape is what the host wrapper allows: do not add flags."""
+    try:
+        code, out, err = run_gh(
+            ["api", f"repos/{repo}/collaborators/{login}/permission"],
+            os.environ,
+            timeout=_resolve_gh_timeout(os.environ),
+        )
+        data = json.loads(out) if code == 0 else None
+        if not isinstance(data, dict):
+            raise ValueError(err.strip() or "unparsable permission")
+    except (FrankyError, DockerError, OSError, subprocess.TimeoutExpired, ValueError) as exc:
+        click.echo(
+            f"franky: could not read a repository permission: {redact(str(exc), secrets)[:200]}",
+            err=True,
+        )
+        return None
+    permission = data.get("permission")
+    return permission if isinstance(permission, str) else None
+
+
 def _find_marked_review(gh, repo: str, pr_number: int, sha: str, marker: str):
     """Reconcile an uncertain APPROVE POST. Returns ("found", review), ("absent", None) or
     ("unknown", None). Absent needs two clean reads, a short sleep apart; any failed, refused,
@@ -2104,6 +2129,7 @@ def review_pr(
                             pinned_sha,
                             pr_meta.get("author"),
                             (prior_handoff or {}).get("findings"),
+                            lambda login: _read_repo_permission(repo, login, secrets),
                         )
                     shaped["omitted_prior"] = threads.omitted_prior(shaped, prior_handoff, secrets)
                     shaped["prior_overflow"] = bool((prior_handoff or {}).get("overflow"))

@@ -3956,6 +3956,7 @@ def _mc_review_setup(
     later_sha=None,
     author=None,
     reviews=None,
+    permission=None,
 ):
     """Wire a hermetic review-pr: env, images present, live-head fetch + container + gh api all
     mocked. `recheck_sha` defaults to `live_sha` (head unchanged); pass a different value to
@@ -3994,6 +3995,9 @@ def _mc_review_setup(
         if args[1].endswith("/reviews?per_page=100"):
             seen_gh_calls.reads.append(list(args))
             return reviews if reviews is not None else (0, "[[]]", "")
+        if "/collaborators/" in args[1]:
+            seen_gh_calls.reads.append(list(args))
+            return permission if permission is not None else (1, "", "not found")
         seen_gh_calls.append(list(args))
         seen_gh_calls.inputs.append(k.get("input"))
         return gcode, gout, ""
@@ -4700,7 +4704,13 @@ def test_review_pr_thread_re_review_that_omits_a_prior_finding_never_approves(
 
 
 def _accept_rerun(
-    monkeypatch, tmp_path, reviews, *, author="author-y", approve_at="2099-01-01T00:00:00Z"
+    monkeypatch,
+    tmp_path,
+    reviews,
+    *,
+    author="author-y",
+    approve_at="2099-01-01T00:00:00Z",
+    permission=None,
 ):
     """Run 1 raises a Major; run 2 reports it accepted by owner-x. Returns the gh calls."""
     _fix_review_nonce(monkeypatch)
@@ -4709,6 +4719,7 @@ def _accept_rerun(
         env=_thread_env(tmp_path),
         author=author,
         reviews=reviews,
+        permission=permission,
         gh=(0, json.dumps({"html_url": REVIEW_URL, "id": 555, "submitted_at": POSTED_AT})),
     )
     major = {
@@ -4792,6 +4803,48 @@ def test_review_pr_thread_accepted_risk_needs_an_authorized_association(monkeypa
     calls = _accept_rerun(monkeypatch, tmp_path, _approval(assoc="CONTRIBUTOR"))
     assert _review(["--thread", "--allow-approve", "--engine", "claude"]).exit_code == 0
     assert json.loads(calls.inputs[-1])["event"] == "REQUEST_CHANGES"
+
+
+PERMISSION_READ = ["api", "repos/me/repo/collaborators/owner-x/permission"]
+
+
+def test_review_pr_thread_accepted_risk_by_a_private_member_with_write_approves(
+    monkeypatch, tmp_path
+):
+    calls = _accept_rerun(
+        monkeypatch,
+        tmp_path,
+        _approval(assoc="CONTRIBUTOR"),
+        permission=(0, json.dumps({"permission": "write", "role_name": "write"}), ""),
+    )
+    assert _review(["--thread", "--allow-approve", "--engine", "claude"]).exit_code == 0
+    assert json.loads(calls.inputs[-1])["event"] == "APPROVE"
+    assert calls.reads[-1] == PERMISSION_READ
+
+
+@pytest.mark.parametrize(
+    "permission",
+    [(0, json.dumps({"permission": "read"}), ""), (1, "", "denied"), (0, "not json", ""),
+     (0, "[1]", ""), OSError("no gh"), subprocess.TimeoutExpired("gh", 5)],
+)  # fmt: skip
+def test_review_pr_thread_accepted_risk_by_a_contributor_without_write_stays_blocking(
+    monkeypatch, tmp_path, permission
+):
+    calls = _accept_rerun(monkeypatch, tmp_path, _approval(assoc="CONTRIBUTOR"))
+    original = cli.run_gh
+
+    def fake(args, env, **k):
+        if "/collaborators/" in args[1]:
+            calls.reads.append(list(args))
+            if isinstance(permission, Exception):
+                raise permission
+            return permission
+        return original(args, env, **k)
+
+    monkeypatch.setattr(cli, "run_gh", fake)
+    assert _review(["--thread", "--allow-approve", "--engine", "claude"]).exit_code == 0
+    assert json.loads(calls.inputs[-1])["event"] == "REQUEST_CHANGES"
+    assert calls.reads[-1] == PERMISSION_READ
 
 
 def test_review_pr_thread_unpublished_run_stamps_no_raised_at(monkeypatch, tmp_path):

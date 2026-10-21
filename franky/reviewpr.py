@@ -666,13 +666,22 @@ def _utc(value: object) -> datetime | None:
 
 
 _AUTHORITY = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})  # review author_association
+_WRITE_PERMISSIONS = frozenset({"admin", "maintain", "write"})  # repository permission
 
 
-def _approval_ok(reviews: list, login: str, head_sha: str, raised_at: object) -> bool:
+def _approval_ok(
+    reviews: list,
+    login: str,
+    head_sha: str,
+    raised_at: object,
+    permission_of: Callable[[str], object] | None = None,
+) -> bool:
     """True when `login`'s latest effective review is a human APPROVED on `head_sha`, submitted
     after `raised_at`, by an owner, member or collaborator. COMMENTED and PENDING reviews do not
     count either way. Any effective review of the login with an unreadable `submitted_at`, or a
-    newest-time tie that review ids cannot break, fails closed."""
+    newest-time tie that review ids cannot break, fails closed.
+    An App token sees a private org member as CONTRIBUTOR (or NONE), so for any other string
+    association `permission_of(login)` is asked, last: it must be admin, maintain or write."""
     raised = _utc(raised_at)
     mine = []
     for r in map(_dict, reviews):
@@ -698,16 +707,20 @@ def _approval_ok(reviews: list, login: str, head_sha: str, raised_at: object) ->
             return False
         last = [m for m in last if m[1]["id"] == top]
     at, review, user = last[0]
-    return (
+    assoc = review.get("author_association")
+    if not (
         review["state"] == "APPROVED"
         and str(review.get("commit_id", "")).lower() == head_sha.lower()
         and at > raised
-        and isinstance(review.get("author_association"), str)
-        and review["author_association"] in _AUTHORITY
+        and isinstance(assoc, str)
         and user.get("type") != "Bot"
         and not str(user.get("login", "")).lower().endswith("[bot]")
         and not any(m in str(review.get("body") or "") for m in _APPROVE_MARKERS)
-    )
+    ):
+        return False
+    if assoc in _AUTHORITY:
+        return True
+    return permission_of is not None and permission_of(login) in _WRITE_PERMISSIONS
 
 
 def verify_accepted(
@@ -716,6 +729,7 @@ def verify_accepted(
     head_sha: str,
     pr_author: str | None,
     prior_findings: object,
+    permission_of: Callable[[str], object] | None = None,
 ) -> None:
     """Keep an "accepted" finding only when GitHub itself shows the named person accepted it.
 
@@ -728,7 +742,9 @@ def verify_accepted(
       accepted finding already used;
     - the accepter's latest effective review (APPROVED, CHANGES_REQUESTED or DISMISSED) is an
       APPROVED on `head_sha`, submitted strictly after the prior finding's `raised_at`, and its
-      `author_association` is OWNER, MEMBER or COLLABORATOR;
+      `author_association` is OWNER, MEMBER or COLLABORATOR, or else `permission_of` (one read
+      per login, never raising) reports the person's repository permission as admin, maintain
+      or write;
     - the accepter is not a bot and the review is not one of Franky's own (APPROVE marker).
     Never raises on malformed input.
     """
@@ -739,6 +755,14 @@ def verify_accepted(
     )
     used: set[int] = set()
     demoted = False
+    perms: dict[str, object] = {}
+
+    def permission(login: str) -> object:
+        key = login.lower()
+        if key not in perms and permission_of is not None:
+            perms[key] = permission_of(login)
+        return perms.get(key)
+
     for f in shaped["findings"]:
         if f["status"] != "accepted":
             continue
@@ -751,7 +775,13 @@ def verify_accepted(
         ]
         if ok and len(hits) == 1 and hits[0] not in used:
             used.add(hits[0])
-            ok = _approval_ok(reviews, f["accepted_by"], head_sha, prior[hits[0]].get("raised_at"))
+            ok = _approval_ok(
+                reviews,
+                f["accepted_by"],
+                head_sha,
+                prior[hits[0]].get("raised_at"),
+                permission if permission_of is not None else None,
+            )
         else:
             ok = False
         if not ok:

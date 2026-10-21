@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `review-pr --thread` now accepts a risk from a private org member. A GitHub App token shows that person's approval as `CONTRIBUTOR`, so the host reads the person's repository permission and accepts only `admin`, `maintain` or `write`. Before, the finding stayed blocking and the review requested changes again.
 - `make release` and `make release-dry` fast-forward clean `main` to `origin/main` before reading release inputs, then default to the next patch version when `VERSION` is omitted.
 
 ## [0.3.26] - 2026-10-19
