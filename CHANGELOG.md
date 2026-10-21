@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.27] - 2026-10-21
+
 ### Changed
 
 - `review-pr --thread` now accepts a risk from a private org member. A GitHub App token shows that person's approval as `CONTRIBUTOR`, so the host reads the person's repository permission and accepts only `admin`, `maintain` or `write`. Before, the finding stayed blocking and the review requested changes again.
