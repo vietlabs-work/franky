@@ -1070,6 +1070,83 @@ def test_unverified_acceptance_falls_back_to_open(reviews):
     assert shaped["has_blocking"] is True
 
 
+class _Perms:
+    """A fake repository-permission read that records every login it is asked about."""
+
+    def __init__(self, value):
+        self.value, self.asked = value, []
+
+    def __call__(self, login):
+        self.asked.append(login)
+        return self.value
+
+
+def _verify_perm(reviews, perms, finding=None):
+    shaped = _shaped(finding or _accepted(severity="blocking"))
+    verify_accepted(shaped, reviews, HEAD, "author-y", PRIOR, permission_of=perms)
+    return shaped
+
+
+@pytest.mark.parametrize("permission", ["write", "maintain", "admin"])
+@pytest.mark.parametrize("assoc", ["CONTRIBUTOR", "NONE"])
+def test_a_private_member_with_write_permission_can_accept(assoc, permission):
+    # An App token sees a private org member as CONTRIBUTOR: the repository permission decides.
+    perms = _Perms(permission)
+    shaped = _verify_perm([_review(assoc=assoc)], perms)
+    assert shaped["findings"][0]["status"] == "accepted"
+    assert shaped["has_blocking"] is False
+    assert perms.asked == ["owner-x"]
+
+
+@pytest.mark.parametrize("permission", ["read", "triage", "none", "", None, 5, "WRITE"])
+def test_a_non_writer_cannot_accept_through_the_permission_read(permission):
+    shaped = _verify_perm([_review(assoc="CONTRIBUTOR")], _Perms(permission))
+    assert shaped["findings"][0]["status"] == "open"
+    assert shaped["has_blocking"] is True
+
+
+@pytest.mark.parametrize(
+    "review",
+    [
+        _review(assoc="CONTRIBUTOR", sha="b" * 40),
+        _review(assoc="CONTRIBUTOR", at=RAISED),
+        _review(assoc="CONTRIBUTOR", kind="Bot"),
+        _review("CHANGES_REQUESTED", assoc="CONTRIBUTOR"),
+        _review(assoc=None),
+        _review(assoc=5),
+    ],
+)
+def test_the_permission_read_never_rescues_a_failed_approval(review):
+    perms = _Perms("admin")
+    assert _verify_perm([review], perms)["findings"][0]["status"] == "open"
+    assert perms.asked == []
+
+
+def test_an_authorized_association_needs_no_permission_read():
+    perms = _Perms(None)
+    assert _verify_perm([_review()], perms)["findings"][0]["status"] == "accepted"
+    assert perms.asked == []
+
+
+def test_the_permission_is_read_once_per_login():
+    perms = _Perms("write")
+    prior = PRIOR + [{"title": "other", "file": "a.py", "raised_at": RAISED}]
+    shaped = _shaped(
+        _accepted(severity="blocking"),
+        _f(title="other", status="accepted", accepted_by="Owner-X", severity="blocking"),
+    )
+    verify_accepted(
+        shaped, [_review(assoc="CONTRIBUTOR")], HEAD, "author-y", prior, permission_of=perms
+    )
+    assert [f["status"] for f in shaped["findings"]] == ["accepted", "accepted"]
+    assert len(perms.asked) == 1
+
+
+def test_a_contributor_without_a_permission_reader_stays_open():
+    shaped = _verify([_review(assoc="CONTRIBUTOR")], _accepted(severity="blocking"))
+    assert shaped["findings"][0]["status"] == "open"
+
+
 def test_a_later_comment_review_does_not_hide_the_approval_and_login_case_is_ignored():
     reviews = [_review(login="Owner-X"), _review("COMMENTED", at="2026-01-05T00:00:00Z")]
     assert _verify(reviews)["findings"][0]["status"] == "accepted"
