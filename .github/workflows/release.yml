@@ -83,10 +83,10 @@ jobs:
         with:
           name: dist
           path: dist
-      # Pinned to a commit SHA (v1.14.0): a floating ref on an OIDC job holding id-token:write
+      # Pinned to a commit SHA (v1.14.3): a floating ref on an OIDC job holding id-token:write
       # is a supply-chain risk. skip-existing makes a re-run idempotent if a later job failed
       # after PyPI already published this version (PyPI forbids re-upload).
-      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086
         with:
           skip-existing: true
 
