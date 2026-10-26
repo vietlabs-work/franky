@@ -154,13 +154,14 @@ SETUP_MANIFESTS: dict[str, SetupManifest] = {
         dirs=("skills", "commands", "prompts", "agents", "rules"),
     ),
     # A team-owned, engine-neutral setup: `AGENTS.md`, `skills/<name>/SKILL.md` (+ text
-    # references), `rules/*.md`, `knowledge/**.md`, `commands/pr.md` (the PR-description spec) and
-    # `MANIFEST.json`. No hooks, MCP, settings or executables ever ship from it. `profile.py`
-    # maps it onto each engine's native locations at pack time.
+    # references), `rules/*.md`, `knowledge/**.md`, `commands/pr.md` (the PR-description spec),
+    # `tool/**` (helper scripts a skill runs as data) and `MANIFEST.json`. No hooks, MCP or
+    # settings ever ship from it, and no file ever gets an execute bit. `profile.py` maps it onto
+    # each engine's native locations at pack time.
     "team": SetupManifest(
         default_root="~/.franky/team",
         files=("AGENTS.md", "MANIFEST.json"),
-        dirs=("skills", "rules", "knowledge", "commands"),
+        dirs=("skills", "rules", "knowledge", "commands", "tool"),
     ),
 }
 
@@ -234,6 +235,9 @@ DENY_NAMES = (
     "id_ecdsa*",
     "id_ed25519*",
     "id_rsa*",
+    "*credentials*.json",
+    "kubeconfig*",
+    "*.kubeconfig",
     "settings.json",
     "settings.local.json",
     "token.json",
@@ -433,7 +437,19 @@ def expand_setup(kind: str, root: Path, budget: ReadBudget | None = None) -> Set
 
 
 TEAM_TEXT_SUFFIXES = (".md", ".markdown", ".txt", ".rst")
-TEAM_SKILL_DENIED_SUFFIXES = (".yaml", ".yml", ".toml", ".json")
+# Script and data files a skill runs with `bash` or `python3`. Shipped as inert text: no execute
+# bit is needed or kept, they are secret-scanned like every setup file, and the agent can already
+# run anything it types inside the container.
+TEAM_SCRIPT_SUFFIXES = (".py", ".sh", ".json")
+TEAM_SCRIPT_DIRS = ("skills", "tool")
+# Structured config an engine or tool would load on its own: never shipped, even as data.
+TEAM_DENIED_SUFFIXES = (".yaml", ".yml", ".toml")
+TEAM_DENIED_NAMES = (".mcp.json", "mcp.json", ".claude.json")
+# A script or data file never ships from a directory that holds a tool's login or config
+# (`.docker/config.json`, gcloud, kube and gh configs).
+TEAM_DENIED_PARTS = frozenset(
+    {".docker", ".kube", ".aws", ".ssh", ".gnupg", ".gcloud", "gcloud", "gh", ".azure", ".netrc"}
+)
 SKILL_FRONTMATTER_KEYS = ("name", "description")
 AGENT_FRONTMATTER_KEYS = ("name", "description", "tools", "model")
 
@@ -487,11 +503,13 @@ def sanitize_frontmatter(text: str, allowed) -> str | None:
 
 
 def _team_admits(path: Path, root: Path) -> bool:
-    """A team setup ships Markdown or plain-text documents, plus its own MANIFEST.json.
+    """A team setup ships text documents, plus script and data files, plus its MANIFEST.json.
 
-    Everything else under the layout is refused, whatever its name: scripts (with or without an
-    execute bit), MCP or other structured config (`.mcp.json`, `.yaml`), settings, and archives.
-    The check runs on the declared name and on the symlink-resolved target.
+    Documents (`.md`, `.markdown`, `.txt`, `.rst`) must have no execute bit. `.py`, `.sh` and
+    `.json` files are admitted only under `skills/<name>/` and `tool/`, whatever their mode.
+    Everything else under the layout is refused: YAML and TOML, MCP config (`.mcp.json`),
+    settings, archives, and an `agents/` directory inside a skill. The check runs on the declared
+    name and on the symlink-resolved target.
     """
     if path.name == TEAM_MANIFEST_NAME and path.parent == root:
         return True
@@ -499,19 +517,39 @@ def _team_admits(path: Path, root: Path) -> bool:
         inner = path.relative_to(root).parts
     except ValueError:
         return False
-    # Inside a skill dir, structured config and an `agents/` subdirectory never load.
-    if inner[:1] == ("skills",) and len(inner) >= 3:
-        if "agents" in (p.lower() for p in inner[2:-1]) or inner[-1].lower().endswith(
-            TEAM_SKILL_DENIED_SUFFIXES
-        ):
-            return False
+    if (
+        inner[:1] == ("skills",)
+        and len(inner) >= 3
+        and "agents" in (p.lower() for p in inner[2:-1])
+    ):
+        return False
     try:
-        if path.stat().st_mode & 0o111:
-            return False
         resolved = path.resolve()
     except OSError:
         return False
-    return all(p.suffix.lower() in TEAM_TEXT_SUFFIXES for p in (path, resolved))
+    if inner[:1] in (("skills",), ("tool",)):
+        # No symlink anywhere in a shipped script or skill tree: the name must be the file.
+        if resolved != root.resolve().joinpath(*inner) or path.is_symlink():
+            return False
+        if TEAM_DENIED_PARTS & {p.lower() for p in inner[:-1]}:
+            return False
+    names = (path, resolved)
+    if any(
+        p.name.lower() in TEAM_DENIED_NAMES or p.suffix.lower() in TEAM_DENIED_SUFFIXES
+        for p in names
+    ):
+        return False
+    in_script_dir = inner[:1] in {(d,) for d in TEAM_SCRIPT_DIRS} and (
+        inner[0] == "tool" or len(inner) >= 3
+    )
+    if in_script_dir and all(p.suffix.lower() in TEAM_SCRIPT_SUFFIXES for p in names):
+        return True
+    try:
+        if path.stat().st_mode & 0o111:
+            return False
+    except OSError:
+        return False
+    return all(p.suffix.lower() in TEAM_TEXT_SUFFIXES for p in names)
 
 
 def read_team_manifest(root: Path) -> dict | None:

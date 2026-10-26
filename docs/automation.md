@@ -26,6 +26,10 @@ Interactive commands fail with exit `2` in a non-TTY. They do not wait forever. 
 | `8` | JIRA or network failure, including review publication. |
 | `9` | Run timeout. |
 
+## Skill review results
+
+`review-pr --skill` adds a `ledger` object and `skill_notes` to the result, and the failure status `skill_payload_invalid` (exit `7`). A round that posts nothing ends `review_complete`. [Skill mode](review.md#skill-mode) lists the fields and codes.
+
 ## Build `--no-publish`
 
 `franky build TASK --repo OWNER/REPO --no-publish --json` commits on a branch and exports it as a git bundle. It pushes nothing and opens no PR. See [Build without publishing](review.md#build-without-publishing).

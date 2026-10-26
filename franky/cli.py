@@ -30,10 +30,10 @@ from pathlib import Path
 
 import click
 
-from . import baseref, franky_version
+from . import baseref, franky_version, skillreview
 from .transcript import Transcript, Redactor, chunks, open_secure
 from ._install import detect_install
-from .config import GH_TOKEN_VAR, Config, RepoSetup, load_config, redact, repo_allowed
+from .config import GH_LOGIN_VAR, GH_TOKEN_VAR, Config, RepoSetup, load_config, redact, repo_allowed
 from .decompose import build_plan_result, parse_decomposition
 from .diagnosis import build_diagnosis_result, parse_diagnosis
 from .economics import Usage, format_economics, parse_usage
@@ -86,6 +86,7 @@ from .profile import (
     PROFILE_FILE_CATEGORIES,
     build_bundle,
     claude_mcp_config_path,
+    container_path,
     codex_mcp_overrides,
     load_profile,
     new_repo_marker,
@@ -108,14 +109,18 @@ from .prompt import (
     build_replay_prompt,
     build_resume_prompt,
     build_review_pr_prompt,
+    build_skill_review_prompt,
     build_setup_block,
     task_slug,
     workspace_clone_dir,
 )
 from .reviewpr import (
     APPROVE_MARKER,
+    MAX_REPLY_CHARS,
     MAX_THREAD_PAGES,
     RESOLVE_MUTATION,
+    _APPROVE_MARKERS,
+    SKILL_THREADS_QUERY,
     THREADS_QUERY,
     build_body_only_payload,
     build_review_findings,
@@ -1247,11 +1252,13 @@ def _find_marked_review(gh, repo: str, pr_number: int, sha: str, marker: str):
     return "absent", None
 
 
-def _read_review_threads(gh, repo: str, pr_number: int, secrets: list[str]) -> list | None:
+def _read_review_threads(
+    gh, repo: str, pr_number: int, secrets: list[str], query: str = THREADS_QUERY
+) -> list | None:
     """Every review thread node of the PR, or None when the read failed (already logged)."""
     owner, name = repo.split("/", 1)
     base = [
-        "api", "graphql", "-f", f"query={THREADS_QUERY}",
+        "api", "graphql", "-f", f"query={query}",
         "-F", f"owner={owner}", "-F", f"name={name}", "-F", f"number={pr_number}",
     ]  # fmt: skip
     nodes: list = []
@@ -1348,6 +1355,356 @@ def _poster_login(resp: dict) -> str | None:
     return login[: -len("[bot]")] if login.lower().endswith("[bot]") else login
 
 
+def _host_gh(pr_url: str):
+    """The host-side `gh` runner of a publishing pass: timeouts and a missing binary become
+    Franky errors."""
+    timeout = _resolve_gh_timeout(os.environ)
+
+    def gh(args: list[str], **kw):
+        try:
+            return run_gh(args, os.environ, timeout=timeout, **kw)
+        except subprocess.TimeoutExpired as exc:
+            raise FrankyError(
+                f"publishing the review to {pr_url} exceeded {int(exc.timeout)}s",
+                code=EXIT_TIMEOUT,
+                kind="timeout",
+            ) from exc
+        except OSError as exc:
+            raise DockerError(
+                "the `gh` CLI is not installed or not executable on the host - "
+                "review-pr publishes via gh"
+            ) from exc
+
+    return gh
+
+
+def _finish_skill_review(
+    output: str,
+    nonce: str,
+    policy: skillreview.SkillPolicy,
+    *,
+    repo: str,
+    pr_number: int,
+    pr_url: str,
+    pinned_sha: str,
+    secrets: list[str],
+    log_path,
+    job_id: str,
+    no_publish: bool,
+    resolve: bool,
+    reply: bool,
+):
+    """Validate a skill run's payload and post it. Returns (status, reason, exit code, review
+    url, review id, event, threads resolved, threads replied, ledger, notes, payload_ok)."""
+    try:
+        footer = review_footer()
+        payload = skillreview.build_payload(
+            skillreview.parse_skill_payload(output, nonce), policy, pinned_sha, secrets, footer
+        )
+    except skillreview.SkillError as exc:
+        reason = f"skill review payload refused ({exc.code}) - see the redacted log ({log_path})"
+        return ("skill_payload_invalid", reason, EXIT_AGENT, *([None] * 8), False)
+    except Exception:
+        reason = f"skill review payload unreadable - see the redacted log ({log_path})"
+        return ("skill_payload_invalid", reason, EXIT_AGENT, *([None] * 8), False)
+
+    def done(
+        status, reason, code, url=None, rid=None, event=None, resolved=None, replied=None,
+        notes=None, link=None, text=None,
+    ):  # fmt: skip
+        summary = skillreview.ledger_summary(payload, policy, pinned_sha, link or url)
+        return status, reason, code, url, rid, event, resolved, replied, summary, notes, text, True
+
+    if payload.kind == "terminal":
+        prior = payload.prior_review_id
+        if prior:
+            # Keep the link only when it names one of the bot's own ledger reviews here.
+            reviews = _read_pr_reviews(repo, pr_number, secrets)
+            known = skillreview.bot_ledger_reviews(reviews or [], policy)
+            prior = prior if any(r.get("id") == prior for r, _l in known) else None
+        return done(
+            "review_complete",
+            f"skill round ended without a review ({payload.decision})",
+            EXIT_SUCCESS,
+            link=f"{pr_url}#pullrequestreview-{prior}" if prior else None,
+        )
+    if no_publish:
+        # The final text a publish would post, comments folded in and re-validated.
+        text = payload.body if payload.body is not None else (payload.update or {}).get("body")
+        try:
+            if payload.body is not None and payload.comments:
+                text = skillreview.fold_comments(
+                    payload.body, payload.comments, footer, policy, payload.ledger or {}
+                )
+        except skillreview.SkillError as exc:
+            reason = (
+                f"skill review payload refused ({exc.code}) - see the redacted log ({log_path})"
+            )
+            return ("skill_payload_invalid", reason, EXIT_AGENT, *([None] * 8), False)
+        return done(
+            "review_complete",
+            "skill review validated (publish=False, nothing written to GitHub)",
+            EXIT_SUCCESS,
+            text=text,
+        )
+    # Re-check the LIVE head immediately before publishing, as every review does.
+    _liveness(job_id, phase="publish")
+    r = _publish_skill_review(
+        repo, pr_number, pr_url, pinned_sha, payload, policy, secrets, footer,
+        resolve=resolve, reply=reply,
+    )  # fmt: skip
+    return done(
+        r["status"], r["reason"], r["exit_code"], r["review_url"], r["review_id"], r["event"],
+        r["resolved"], r["replied"], r["notes"],
+    )  # fmt: skip
+
+
+def _read_skill_policy_file(path: Path) -> skillreview.SkillPolicy:
+    """Read the caller's skill policy from a bounded, caller-owned regular file (never a link)."""
+    error = (
+        "--skill-policy must be a regular JSON file owned by the caller, not writable by "
+        "others, of at most 16 KiB"
+    )
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as source:
+            info = os.fstat(source.fileno())
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.geteuid()
+                or info.st_mode & 0o022
+            ):
+                raise ValueError(error)
+            raw = source.read(16 * 1024 + 1)
+        if len(raw) > 16 * 1024:
+            raise ValueError(error)
+        return skillreview.parse_policy_text(raw.decode("utf-8"))
+    except (OSError, UnicodeError) as exc:
+        raise FrankyError(error, code=EXIT_USAGE, kind="usage_error") from exc
+    except ValueError as exc:
+        # A policy refusal names the key, never a value.
+        raise FrankyError(str(exc)[:300], code=EXIT_USAGE, kind="usage_error") from exc
+
+
+def _publish_skill_review(
+    repo: str,
+    pr_number: int,
+    pr_url: str,
+    pinned_sha: str,
+    payload: skillreview.SkillPayload,
+    policy: skillreview.SkillPolicy,
+    secrets: list[str],
+    footer: str,
+    *,
+    resolve: bool,
+    reply: bool,
+) -> dict:
+    """Post a validated skill payload through the host wrapper shapes; returns result fields.
+
+    Keys: status, reason, exit_code, review_url, review_id, event, resolved, replied, notes.
+    At most one review write: a COMMENT review (POST) or a ledger update (PUT). Threads are
+    resolved and replied on only after that write, with the head unmoved, and only the bot's own
+    open threads. Nothing is posted when the head moved.
+    """
+    gh = _host_gh(pr_url)
+    notes: dict[str, int] = {}
+
+    def note(code: str) -> None:
+        notes[code] = notes.get(code, 0) + 1
+
+    def stale() -> bool:
+        live = fetch_pr_head_sha(repo, pr_number, os.environ)
+        return live is None or live.lower() != pinned_sha.lower()
+
+    def result(status, reason, code, url=None, rid=None, event=None, resolved=None, replied=None):
+        return {
+            "status": status,
+            "reason": reason,
+            "exit_code": code,
+            "review_url": url,
+            "review_id": rid,
+            "event": event,
+            "resolved": resolved,
+            "replied": replied,
+            "notes": [f"{k}:{v}" for k, v in sorted(notes.items())],
+        }
+
+    stale_result = result(
+        "publish_blocked_stale_head",
+        f"{pr_url}'s head changed since the review started (reviewed {pinned_sha}) - "
+        "refusing to publish a stale review",
+        EXIT_AGENT,
+    )
+    if stale():
+        return stale_result
+
+    want_resolve = bool(resolve and payload.resolve)
+    want_reply = bool(reply and payload.replies)
+    # Read before any write, so the prior ledger can never be the review this run posts.
+    reviews = None
+    if payload.update or want_resolve:
+        reviews = _read_pr_reviews(repo, pr_number, secrets)
+    ledgers = skillreview.bot_ledger_reviews(reviews or [], policy)
+    prior = ledgers[-1][1] if ledgers else None
+
+    def parsed(out: str) -> dict:
+        try:
+            resp = json.loads(out)
+        except (ValueError, TypeError):
+            return {}
+        return resp if isinstance(resp, dict) else {}
+
+    url = rid = event = None
+    wrote = identity_ok = False
+    reason = "no review was needed; nothing was posted"
+    status = "review_complete"
+    if payload.body is not None:
+        post = ["api", "-X", "POST", f"repos/{repo}/pulls/{pr_number}/reviews", "--input", "-"]
+        body = {
+            "event": "COMMENT",
+            "body": payload.body,
+            "commit_id": pinned_sha,
+            "comments": payload.comments or [],
+        }
+        if stale():
+            return stale_result
+        gcode, gout, gerr = gh(post, input=json.dumps(body))
+        if gcode != 0 and body["comments"] and _is_422(gerr):
+            # The anchors were rejected: nothing was written. Re-check the head, then post once
+            # more with the comments folded into the body.
+            if stale():
+                return stale_result
+            try:
+                body = {
+                    **body,
+                    "body": skillreview.fold_comments(
+                        payload.body, body["comments"], footer, policy, payload.ledger or {}
+                    ),
+                    "comments": [],
+                }
+            except skillreview.SkillError as exc:
+                return result(
+                    "skill_payload_invalid",
+                    f"skill review payload refused ({exc.code})",
+                    EXIT_AGENT,
+                )
+            note("anchors_folded")
+            gcode, gout, gerr = gh(post, input=json.dumps(body))
+        if gcode != 0:
+            return result(
+                "publish_failed",
+                f"posting the GitHub review failed: {redact(gerr.strip(), secrets)[:500]}",
+                EXIT_NETWORK,
+            )
+        resp = parsed(gout)
+        url, rid, event = resp.get("html_url"), resp.get("id"), "COMMENT"
+        status, reason = "review_published", "published a COMMENT review"
+        wrote, identity_ok = True, skillreview.is_bot_user(resp.get("user"), policy)
+    elif payload.update:
+        target = payload.update["review_id"]
+        if reviews is None:
+            return result("publish_failed", "could not read the PR reviews", EXIT_NETWORK)
+        row = next((r for r, _led in ledgers if r.get("id") == target), None)
+        if (
+            row is None
+            or row.get("state") != "COMMENTED"
+            or any(m in str(row.get("body") or "") for m in _APPROVE_MARKERS)
+        ):
+            return result(
+                "skill_payload_invalid",
+                "skill review payload refused (skill_update_target)",
+                EXIT_AGENT,
+            )
+        put = [
+            "api",
+            "-X",
+            "PUT",
+            f"repos/{repo}/pulls/{pr_number}/reviews/{target}",
+            "--input",
+            "-",
+        ]
+        if stale():
+            return stale_result
+        gcode, gout, gerr = gh(put, input=json.dumps({"body": payload.update["body"]}))
+        if gcode != 0:
+            return result(
+                "publish_failed",
+                f"updating the GitHub review failed: {redact(gerr.strip(), secrets)[:500]}",
+                EXIT_NETWORK,
+            )
+        resp = parsed(gout)
+        rid, event = target, "COMMENT"
+        url = resp.get("html_url") or f"{pr_url}#pullrequestreview-{target}"
+        status, reason = "review_published", "updated the ledger of an existing review"
+        wrote = True
+        identity_ok = "user" not in resp or skillreview.is_bot_user(resp.get("user"), policy)
+
+    resolved = 0 if resolve else None
+    replied = 0 if reply else None
+    if want_resolve or want_reply:
+        if not wrote:
+            note("resolve_no_ledger")
+        elif not identity_ok:
+            note("identity_mismatch")
+    if (want_resolve or want_reply) and wrote and identity_ok and not stale():
+        nodes = _read_review_threads(gh, repo, pr_number, secrets, SKILL_THREADS_QUERY)
+        if nodes is None:
+            note("threads_unreadable")
+            nodes = []
+        own = [n for n in nodes if skillreview.own_thread(n, policy)]
+        ok_locs = skillreview.cleared_locs(prior, payload.ledger or {}, policy)
+        by_id = {n["id"]: n for n in own if isinstance(n.get("id"), str)}
+        writes: list[tuple[str, list[str]]] = []
+        if want_resolve:
+            for tid in payload.resolve or []:
+                node = by_id.get(tid)
+                if node is None:
+                    note("resolve_not_ours")
+                elif skillreview.thread_anchor(node) not in ok_locs:
+                    note("resolve_not_cleared")
+                else:
+                    argv = ["api", "graphql", "-f", f"query={RESOLVE_MUTATION}", "-F", f"id={tid}"]
+                    writes.append(("resolve", argv))
+        if want_reply:
+            due = {}
+            for n in own:
+                cid = thread_reply_target(n)
+                if cid is not None:
+                    due[cid] = n
+            for r in payload.replies or []:
+                if r["comment_id"] not in due:
+                    note("reply_not_due")
+                elif len(r["body"]) > MAX_REPLY_CHARS or not r["body"].strip():
+                    note("reply_refused")
+                else:
+                    due.pop(r["comment_id"])  # one reply per thread
+                    argv = [
+                        "api", "-X", "POST",
+                        f"repos/{repo}/pulls/{pr_number}/comments/{r['comment_id']}/replies",
+                        "-f", f"body={r['body']}",
+                    ]  # fmt: skip
+                    writes.append(("reply", argv))
+        # The head was checked just above; re-check every 10 thread writes.
+        for i, (what, argv) in enumerate(writes):
+            if i and i % 10 == 0 and stale():
+                break
+            try:
+                gcode, _gout, gerr = gh(argv)
+            except (FrankyError, DockerError) as exc:
+                gcode, gerr = 1, str(exc)
+            if gcode == 0:
+                if what == "resolve":
+                    resolved += 1
+                else:
+                    replied += 1
+            else:
+                click.echo(
+                    f"franky: could not {what} a thread: {redact(gerr.strip(), secrets)[:200]}",
+                    err=True,
+                )
+    return result(status, reason, EXIT_SUCCESS, url, rid, event, resolved, replied)
+
+
 def _publish_review(
     repo: str,
     pr_number: int,
@@ -1385,22 +1742,7 @@ def _publish_review(
     bot's matching threads for findings marked resolved (login from the POST response). With
     `reply_prior`, the same pass replies once on its threads whose finding is still open.
     """
-    timeout = _resolve_gh_timeout(os.environ)
-
-    def gh(args: list[str], **kw):
-        try:
-            return run_gh(args, os.environ, timeout=timeout, **kw)
-        except subprocess.TimeoutExpired as exc:
-            raise FrankyError(
-                f"publishing the review to {pr_url} exceeded {int(exc.timeout)}s",
-                code=EXIT_TIMEOUT,
-                kind="timeout",
-            ) from exc
-        except OSError as exc:
-            raise DockerError(
-                "the `gh` CLI is not installed or not executable on the host - "
-                "review-pr publishes via gh"
-            ) from exc
+    gh = _host_gh(pr_url)
 
     def stale() -> bool:
         live = fetch_pr_head_sha(repo, pr_number, os.environ)
@@ -1739,6 +2081,21 @@ def _review_ticket_context(
     "re-review kept open (never twice in a row). Requires --thread; refused with --no-publish.",
 )
 @click.option(
+    "--skill",
+    "skill",
+    default=None,
+    help="Run this team skill (from the `team` setup) as the review method instead of Franky's "
+    "own. Needs --skill-policy; the host validates and posts what the skill prepares, always as "
+    "a COMMENT. Refused with --allow-approve and the --at-sha eval mode.",
+)
+@click.option(
+    "--skill-policy",
+    "skill_policy_path",
+    type=click.Path(path_type=Path),
+    default=None,
+    help="JSON policy file for --skill (ledger schema, caps, bot login). Read on the host.",
+)
+@click.option(
     "--thread",
     "use_thread",
     is_flag=True,
@@ -1798,6 +2155,8 @@ def review_pr(
     allow_approve: bool,
     resolve_fixed: bool,
     reply_prior: bool,
+    skill: str | None,
+    skill_policy_path: Path | None,
     use_thread: bool,
     rubric_version: str,
     engine: str | None,
@@ -1839,6 +2198,12 @@ def review_pr(
     3 config, 4 task, 5 auth, 6 docker, 7 agent, 8 net, 9 timeout).
     A successful unpublished result also includes a bounded `review_body` and the shaped
     `findings` (all of them, at most 10 by the private result limit) with `findings_total`.
+
+    --skill NAME --skill-policy FILE runs the team skill NAME (shipped by the profile's `team`
+    setup) as the review method. The skill cannot post; the host validates the payload it
+    prepares against the policy file and posts it as a COMMENT. --resolve-fixed and --reply-prior
+    then act on the skill's own lists, only on the bot's own threads. A round with nothing to post
+    ends `review_complete`. The result gains a `ledger` object. See docs/review.md.
 
     --at-sha/--diff-base (eval mode) freeze the review at a historical commit of the PR and diff
     it against a pinned base, blind to later PR state. They require --no-publish and refuse
@@ -1888,6 +2253,29 @@ def review_pr(
                 code=EXIT_USAGE,
                 kind="usage_error",
             )
+
+        skill_policy = None
+        if skill is not None or skill_policy_path is not None:
+            if skill is None or skill_policy_path is None:
+                raise FrankyError(
+                    "--skill and --skill-policy must be given together",
+                    code=EXIT_USAGE,
+                    kind="usage_error",
+                )
+            if not skillreview.SKILL_NAME_RE.match(skill):
+                raise FrankyError(
+                    "--skill must be a skill directory name (letters, digits, `.`, `_`, `-`)",
+                    code=EXIT_USAGE,
+                    kind="usage_error",
+                )
+            if allow_approve or frozen:
+                raise FrankyError(
+                    "--skill posts COMMENT reviews only and cannot be combined with "
+                    "--allow-approve or --at-sha/--diff-base",
+                    code=EXIT_USAGE,
+                    kind="usage_error",
+                )
+            skill_policy = _read_skill_policy_file(skill_policy_path)
 
         expected_head_sha = (expected_head_sha or "").strip().lower()
         if expected_head_sha and not _SHA_RE.match(expected_head_sha):
@@ -1942,6 +2330,9 @@ def review_pr(
             raise
         except ValueError as exc:
             raise NetworkError(redact(str(exc), cfg_secrets_safe())) from exc
+        if skill_policy is not None:
+            # The posting login for the skill: a name, passed to the container as `-e GH_LOGIN`.
+            cfg.passthrough_env[GH_LOGIN_VAR] = skill_policy.bot_login
 
         # Lock the thread BEFORE the head pin, so two runs for one PR can never interleave.
         thread = None
@@ -1991,6 +2382,7 @@ def review_pr(
                 prose=not (quiet or as_json),
             )
         franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
+        team_sink: dict = {}
         bundle, _setup_block, review_setup = _load_profile_bundle(
             None,
             process_env,
@@ -1998,8 +2390,22 @@ def review_pr(
             cfg,
             # Frozen (eval) runs stay hermetic: the team files ship, no repository is fetched.
             None if frozen else (lambda: (repo, baseref.resolve_base_sha(repo, os.environ))),
+            team_sink=team_sink,
         )
-        if not frozen:
+        if skill_policy_path is not None:
+            where = skill_policy_path.resolve()
+            if where in team_sink.get("files", ()) or any(
+                where.is_relative_to(r) for r in team_sink.get("roots", ())
+            ):
+                raise ConfigError(
+                    "--skill-policy must not sit inside a profile, setup or bundle input"
+                )
+        if skill is not None and skill not in team_sink.get("skills", ()):
+            raise ConfigError(
+                f"--skill {skill!r} is not in the profile's team setup "
+                "(needs [setups] team with skills/<name>/SKILL.md)"
+            )
+        if not frozen and skill is None:
             # After the profile bundle: MCP env values are in `secrets` before ticket text is
             # redacted. Frozen (eval) mode never fetches tickets.
             tickets, context_sources = _review_ticket_context(pr_meta, os.environ, secrets)
@@ -2042,21 +2448,34 @@ def review_pr(
                 session_bytes=threads.session_bytes(thread),
                 now=now,
             )
-        prompt = build_review_pr_prompt(
-            repo,
-            canonical_pr_url,
-            instructions,
-            nonce,
-            handoff=prior_handoff,
-            last_sha=prior_sha,
-            head_sha=pinned_sha,
-            diff_base=diff_base,
-            frozen=frozen,
-            tickets=tickets,
-            tickets_missing=tickets_missing,
-            jira_tools=cfg.atlassian_tools,
-            operator_setup="" if frozen else review_setup,
-        )
+        if skill_policy is not None:
+            prompt = build_skill_review_prompt(
+                repo,
+                canonical_pr_url,
+                instructions,
+                nonce,
+                skill=skill,
+                where=team_sink["where"],
+                policy=skill_policy,
+                head_sha=pinned_sha,
+                operator_setup=review_setup,
+            )
+        else:
+            prompt = build_review_pr_prompt(
+                repo,
+                canonical_pr_url,
+                instructions,
+                nonce,
+                handoff=prior_handoff,
+                last_sha=prior_sha,
+                head_sha=pinned_sha,
+                diff_base=diff_base,
+                frozen=frozen,
+                tickets=tickets,
+                tickets_missing=tickets_missing,
+                jira_tools=cfg.atlassian_tools,
+                operator_setup="" if frozen else review_setup,
+            )
 
         diagnostics: dict = {}
         # A failed resumed attempt never blocks the review: _thread_pass drops that session and
@@ -2107,12 +2526,47 @@ def review_pr(
         findings_out: list | None = None
         findings_total: int | None = None
         shaped: dict | None = None
+        ledger_out: dict | None = None
+        skill_notes: list | None = None
 
         # Timeout first (124 is nonzero) -> dedicated timeout contract, before generic agent_error.
         if code == CONTAINER_TIMEOUT_CODE:
             status, reason, exit_code = "timeout", "exceeded max-duration", EXIT_TIMEOUT
         elif code != 0:
             status, reason, exit_code = "agent_error", f"agent exited {code}", EXIT_AGENT
+        elif skill_policy is not None:
+            (
+                status,
+                reason,
+                exit_code,
+                review_url,
+                review_id,
+                review_event_out,
+                threads_resolved,
+                threads_replied,
+                ledger_out,
+                skill_notes,
+                review_body,
+                skill_ok,
+            ) = _finish_skill_review(
+                output,
+                nonce,
+                skill_policy,
+                repo=repo,
+                pr_number=pr_number,
+                pr_url=canonical_pr_url,
+                pinned_sha=pinned_sha,
+                secrets=secrets,
+                log_path=log_path,
+                job_id=job_id,
+                no_publish=no_publish,
+                resolve=resolve_fixed,
+                reply=reply_prior,
+            )
+            if skill_ok:
+                # A minimal shape so a threaded run still commits its session; the skill reads
+                # its own state from the PR, so the stored handoff carries no findings.
+                shaped = {"findings": [], "summary": f"skill {skill} review", "checks": []}
         else:
             try:
                 parsed = parse_review_findings(output, nonce)
@@ -2282,6 +2736,8 @@ def review_pr(
             thread=thread_result,
             handoff=handoff,
             context_sources=context_sources,
+            ledger=ledger_out,
+            skill_notes=skill_notes,
         )
         _emit_result(
             result,
@@ -3346,6 +3802,7 @@ def _load_profile_bundle(
     secrets: list[str],
     cfg: Config,
     repo_setup_ref: Callable[[], tuple[str, str | None]] | None = None,
+    team_sink: dict | None = None,
 ) -> tuple[bytes | None, str, str]:
     """Load, scan, and pack the operator profile; return (bundle_bytes, prompt_setup_block).
 
@@ -3366,6 +3823,9 @@ def _load_profile_bundle(
     `team` setup: always the default-branch head (a PR author controls the PR head and can pick
     its base, so neither is trusted). It sets `cfg.repo_setup`, so the container loads the repository's own skills and rules
     at that commit before the engine starts. An unresolvable commit fails closed and retryable.
+
+    `team_sink`, when given, receives the team setup's container path (`where`) and the names of
+    the team skills that ship a SKILL.md (`skills`), for `review-pr --skill`.
     """
     from pathlib import Path
 
@@ -3409,6 +3869,12 @@ def _load_profile_bundle(
 
     engine = cfg.engine.name
     with_repo = False
+    team = getattr(spec, "team_scan", None)
+    if team is not None and team_sink is not None:
+        team_sink["where"] = container_path(team.root)
+        team_sink["skills"] = _team_skill_names(team)
+        team_sink["roots"] = [r.resolve() for r in spec.setup_roots().values()]
+        team_sink["files"] = {Path(f).resolve() for f in spec.all_files() if isinstance(f, Path)}
     if getattr(spec, "team_scan", None) is not None and repo_setup_ref is not None:
         repo, ref = repo_setup_ref()
         if not (ref and _FULL_SHA_RE.match(ref)):
@@ -3436,6 +3902,26 @@ def _load_profile_bundle(
         )
     except ValueError as exc:
         raise ConfigError(redact(str(exc), secrets)) from exc
+
+
+def _team_skill_names(team) -> set[str]:
+    """Skills a team setup ships as `skills/<name>/SKILL.md` exactly, whose header is readable."""
+    root = team.root.resolve()
+    names = set()
+    for p in team.files:
+        try:
+            rel = p.resolve().relative_to(root).parts
+            text = p.read_text(encoding="utf-8")
+        except (ValueError, OSError, UnicodeError):
+            continue
+        if (
+            len(rel) == 3
+            and rel[0] == "skills"
+            and rel[2] == "SKILL.md"
+            and setups.sanitize_frontmatter(text, setups.SKILL_FRONTMATTER_KEYS) is not None
+        ):
+            names.add(rel[1])
+    return names
 
 
 def _make_progress(engine, verbose: bool):

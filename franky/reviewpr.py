@@ -63,6 +63,10 @@ THREADS_QUERY = (
     "nodes{id isResolved path comments(first:1){nodes{databaseId author{login __typename} body}} "
     "last:comments(last:1){nodes{databaseId author{login __typename}}}}}}}}"
 )
+# Skill mode reads each thread's line too (`line`, or `originalLine` once outdated).
+SKILL_THREADS_QUERY = THREADS_QUERY.replace(
+    "nodes{id isResolved path ", "nodes{id isResolved path line originalLine "
+)
 RESOLVE_MUTATION = (
     "mutation($id:ID!){resolveReviewThread(input:{threadId:$id}){thread{isResolved}}}"
 )

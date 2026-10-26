@@ -664,6 +664,82 @@ def build_review_pr_prompt(
     return f"{persona}\n\n{task_block}{operator_setup}{ticket_block}{prior_block}\n{conventions}"
 
 
+def build_skill_review_prompt(
+    repo: str,
+    pr_url: str,
+    instructions: str,
+    nonce: str,
+    *,
+    skill: str,
+    where: str,
+    policy,
+    head_sha: str,
+    operator_setup: str = "",
+) -> str:
+    """Prompt for `review-pr --skill`: run a team skill as the review method.
+
+    `where` is the container path of the team setup, `policy` the caller's `SkillPolicy`. The
+    container cannot write to GitHub, so the skill's post, edit, reply and resolve steps become
+    payloads in the sentinel; the host validates and posts them (see `skillreview`). There is no
+    thread handoff block: the skill reads its own state from the PR (the session still resumes).
+    """
+    persona = load_persona()
+    begin, end = f"FRANKY_REVIEW_{nonce}_BEGIN", f"FRANKY_REVIEW_{nonce}_END"
+    focus = f"Focus instructions from the operator: {instructions}\n" if instructions else ""
+    skill_dir = f"{where}/skills/{skill}"
+    review_shape = (
+        '{"kind": "review", "decision": "<first-pass|delta|second-opinion>", "ledger": {...}, '
+        '"review": {"body": "...", "comments": [{"path": "...", "line": <int>, '
+        '"side": "<LEFT|RIGHT>", "body": "..."}]} or null, "resolve": ["<thread node id>"], '
+        '"replies": [{"comment_id": <int>, "body": "..."}], '
+        '"ledger_update": null or {"review_id": <int>, "body": "..."}}'
+    )
+    terminal_shape = (
+        '{"kind": "terminal", "decision": "<done|skip|halt|author-mode|not-reviewable>", '
+        '"reason": "<short text>", "prior_ledger_review_id": <int or null>}'
+    )
+    update = (
+        "`ledger_update` replaces the body of ONE earlier review of yours (a quiet round); it "
+        "needs `review` to be null, and its body must carry the same ledger block. "
+        if policy.allow_ledger_update
+        else "`ledger_update` must be null. "
+    )
+    return (
+        f"{persona}\n\nRepo: {repo}\n"
+        f"Task: review this existing pull request with the team skill `{skill}` - {pr_url}. "
+        f"Do NOT change anything.\n{focus}{operator_setup}\n"
+        "SKILL MODE - this is a READ-ONLY pass:\n"
+        f"- Follow the team skill `{skill}`: its instructions are `{skill_dir}/SKILL.md` (it is "
+        "also installed natively for your engine). "
+        f"`SKILL_DIR` is `{skill_dir}`. `CLAUDE_PLUGIN_ROOT` for plugin P is `{where}/tool/P`.\n"
+        "- Scripts are data files with no execute bit: run them with `bash <file>` or "
+        "`python3 <file>`.\n"
+        f"- Check out the PR in a disposable workspace (`gh pr checkout {pr_url}`), then run "
+        f"`git checkout --detach {head_sha}` and review exactly that commit.\n"
+        "- GitHub writes fail in this container: never post, edit, reply, resolve, approve or "
+        "request changes. Where the skill posts or edits something, put the exact payload in the "
+        "sentinel below instead. The host validates and posts it, always as a COMMENT.\n"
+        f"- Your GitHub login is `{policy.bot_login}` (the `GH_LOGIN` variable is set to it). Use "
+        "it instead of `gh api user`.\n"
+        "- END your response with EXACTLY ONE machine-readable block and NO text after it (one "
+        "line, compact JSON, no code fence):\n"
+        f"  {begin}" + "{<compact ONE-LINE JSON>}" + f"{end}\n"
+        f"  A review round: {review_shape}\n"
+        f"  A round with nothing to post: {terminal_shape}\n"
+        '- In a review round, "ledger" is the skill\'s ledger object: `schema` is '
+        f'"{policy.ledger_schema}", `reviewed_sha` is `{head_sha}`, `state` is "clean" or '
+        '"findings" and agrees with the findings (clean means no open finding). `review.body` '
+        f"must contain exactly one `<details>` block whose `<summary>` contains "
+        f'"{policy.ledger_summary_marker}" and whose json fence holds that same object. '
+        f"Limits: body {policy.max_body_chars} characters, {policy.max_comments} comments, "
+        f"{policy.max_comment_chars} characters each. {update}"
+        '"resolve" lists review thread node ids of your own threads whose findings are fixed '
+        'in the new ledger; "replies" answers human input on your own threads.\n'
+        f"- Output ONLY the sentinel block as the FINAL content of your response; add no text "
+        f"after `{end}`.\n"
+    )
+
+
 def build_replay_prompt(
     spec: TaskSpec,
     *,

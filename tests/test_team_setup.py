@@ -149,22 +149,43 @@ def test_team_sweep_ships_no_hooks_mcp_settings_or_executables(tmp_path):
         ".mcp.json",
         "settings.json",
         ".env",
-        "run.sh",
         "binary.md",
-        "helper.py",
         "servers.yaml",
         "exec-doc.md",
     }
     assert not names & refused
+    # Scripts under a skill ship as data whatever their mode; nothing else structured does.
+    assert {"run.sh", "helper.py"} <= names
     assert {p.name for p in scan.skipped_policy} == {
-        "run.sh",
-        "helper.py",
         ".mcp.json",
         "servers.yaml",
         "exec-doc.md",
     }
     assert [p.name for p in scan.skipped_binary] == ["binary.md"]
     assert "MANIFEST.json" in names and "SKILL.md" in names
+
+
+def test_team_tool_dir_ships_scripts_and_json_as_data_but_never_config(tmp_path):
+    root = _team(tmp_path / "team")
+    tool = root / "tool" / "scripts"
+    tool.mkdir(parents=True)
+    (tool / "ledger.py").write_text("print('data')\n")
+    (tool / "run.sh").write_text("echo hi\n")
+    (tool / "run.sh").chmod(0o755)
+    (tool / "repos.json").write_text("{}")
+    (tool / ".mcp.json").write_text("{}")
+    (tool / "x.yaml").write_text("a: 1\n")
+    (root / "rules" / "extra.sh").write_text("echo outside a script dir\n")
+    (root / "rules" / "extra.json").write_text("{}")
+
+    scan = setups.expand_setup("team", root)
+
+    names = {p.name for p in scan.files}
+    assert {"ledger.py", "run.sh", "repos.json"} <= names
+    assert not names & {".mcp.json", "x.yaml", "extra.sh", "extra.json"}
+    assert {"extra.sh", "extra.json", ".mcp.json", "x.yaml"} <= {
+        p.name for p in scan.skipped_policy
+    }
 
 
 def test_team_sweep_resolves_symlinks_before_the_deny_checks(tmp_path):
@@ -990,7 +1011,7 @@ def test_team_skill_dirs_refuse_structured_config_and_an_agents_dir(tmp_path, mo
         "skills/cook/a.yaml",
         "skills/cook/b.yml",
         "skills/cook/c.toml",
-        "skills/cook/d.json",
+        "skills/cook/.mcp.json",
         "skills/cook/agents/openai.md",
         "skills/cook/x/Agents/y.md",
     ):
@@ -1008,3 +1029,34 @@ def test_each_run_gets_a_fresh_marker_that_extends_the_literal():
     a, b = profile.new_repo_marker(), profile.new_repo_marker()
 
     assert a != b and a.startswith(profile.REPO_SETUP_MARKER) and len(a) >= 48
+
+
+def test_team_scripts_refuse_symlinks_and_credential_style_names(tmp_path):
+    root = _team(tmp_path / "team")
+    outside = tmp_path / "outside.py"
+    outside.write_text("print(1)\n")
+    (root / "skills/cook/link.py").symlink_to(outside)
+    (root / "tool").mkdir()
+    (root / "tool/linkdir").symlink_to(tmp_path)
+    (tmp_path / "x.py").write_text("print(2)\n")
+    (root / "tool/gcp_credentials.json").write_text("{}")
+    (root / "tool/application_default_credentials.json").write_text("{}")
+    (root / "tool/.docker").mkdir()
+    (root / "tool/.docker/config.json").write_text("{}")
+    (root / "tool/gh").mkdir()
+    (root / "tool/gh/hosts.json").write_text("{}")
+    (root / "tool/kubeconfig.json").write_text("{}")
+    (root / "tool/ok.py").write_text("print(3)\n")
+
+    names = {p.name for p in setups.expand_setup("team", root).files}
+
+    assert "ok.py" in names
+    assert not names & {
+        "link.py",
+        "x.py",
+        "gcp_credentials.json",
+        "application_default_credentials.json",
+        "config.json",
+        "hosts.json",
+        "kubeconfig.json",
+    }
