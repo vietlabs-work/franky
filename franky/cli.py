@@ -119,6 +119,8 @@ from .reviewpr import (
     MAX_REPLY_CHARS,
     MAX_THREAD_PAGES,
     RESOLVE_MUTATION,
+    _APPROVE_MARKERS,
+    SKILL_THREADS_QUERY,
     THREADS_QUERY,
     build_body_only_payload,
     build_review_findings,
@@ -1249,11 +1251,13 @@ def _find_marked_review(gh, repo: str, pr_number: int, sha: str, marker: str):
     return "absent", None
 
 
-def _read_review_threads(gh, repo: str, pr_number: int, secrets: list[str]) -> list | None:
+def _read_review_threads(
+    gh, repo: str, pr_number: int, secrets: list[str], query: str = THREADS_QUERY
+) -> list | None:
     """Every review thread node of the PR, or None when the read failed (already logged)."""
     owner, name = repo.split("/", 1)
     base = [
-        "api", "graphql", "-f", f"query={THREADS_QUERY}",
+        "api", "graphql", "-f", f"query={query}",
         "-F", f"owner={owner}", "-F", f"name={name}", "-F", f"number={pr_number}",
     ]  # fmt: skip
     nodes: list = []
@@ -1412,6 +1416,11 @@ def _finish_skill_review(
 
     if payload.kind == "terminal":
         prior = payload.prior_review_id
+        if prior:
+            # Keep the link only when it names one of the bot's own ledger reviews here.
+            reviews = _read_pr_reviews(repo, pr_number, secrets)
+            known = skillreview.bot_ledger_reviews(reviews or [], policy)
+            prior = prior if any(r.get("id") == prior for r, _l in known) else None
         return done(
             "review_complete",
             f"skill round ended without a review ({payload.decision})",
@@ -1532,6 +1541,7 @@ def _publish_skill_review(
         return resp if isinstance(resp, dict) else {}
 
     url = rid = event = None
+    wrote = identity_ok = False
     reason = "no review was needed; nothing was posted"
     status = "review_complete"
     if payload.body is not None:
@@ -1542,6 +1552,8 @@ def _publish_skill_review(
             "commit_id": pinned_sha,
             "comments": payload.comments or [],
         }
+        if stale():
+            return stale_result
         gcode, gout, gerr = gh(post, input=json.dumps(body))
         if gcode != 0 and body["comments"] and _is_422(gerr):
             # The anchors were rejected: nothing was written. Re-check the head, then post once
@@ -1552,7 +1564,7 @@ def _publish_skill_review(
                 body = {
                     **body,
                     "body": skillreview.fold_comments(
-                        payload.body, body["comments"], footer, policy
+                        payload.body, body["comments"], footer, policy, payload.ledger or {}
                     ),
                     "comments": [],
                 }
@@ -1573,11 +1585,17 @@ def _publish_skill_review(
         resp = parsed(gout)
         url, rid, event = resp.get("html_url"), resp.get("id"), "COMMENT"
         status, reason = "review_published", "published a COMMENT review"
+        wrote, identity_ok = True, skillreview.is_bot_user(resp.get("user"), policy)
     elif payload.update:
         target = payload.update["review_id"]
         if reviews is None:
             return result("publish_failed", "could not read the PR reviews", EXIT_NETWORK)
-        if not any(r.get("id") == target for r, _led in ledgers):
+        row = next((r for r, _led in ledgers if r.get("id") == target), None)
+        if (
+            row is None
+            or row.get("state") != "COMMENTED"
+            or any(m in str(row.get("body") or "") for m in _APPROVE_MARKERS)
+        ):
             return result(
                 "skill_payload_invalid",
                 "skill review payload refused (skill_update_target)",
@@ -1591,6 +1609,8 @@ def _publish_skill_review(
             "--input",
             "-",
         ]
+        if stale():
+            return stale_result
         gcode, gout, gerr = gh(put, input=json.dumps({"body": payload.update["body"]}))
         if gcode != 0:
             return result(
@@ -1602,16 +1622,23 @@ def _publish_skill_review(
         rid, event = target, "COMMENT"
         url = resp.get("html_url") or f"{pr_url}#pullrequestreview-{target}"
         status, reason = "review_published", "updated the ledger of an existing review"
+        wrote = True
+        identity_ok = "user" not in resp or skillreview.is_bot_user(resp.get("user"), policy)
 
     resolved = 0 if resolve else None
     replied = 0 if reply else None
-    if (want_resolve or want_reply) and not stale():
-        nodes = _read_review_threads(gh, repo, pr_number, secrets)
+    if want_resolve or want_reply:
+        if not wrote:
+            note("resolve_no_ledger")
+        elif not identity_ok:
+            note("identity_mismatch")
+    if (want_resolve or want_reply) and wrote and identity_ok and not stale():
+        nodes = _read_review_threads(gh, repo, pr_number, secrets, SKILL_THREADS_QUERY)
         if nodes is None:
             note("threads_unreadable")
             nodes = []
         own = [n for n in nodes if skillreview.own_thread(n, policy)]
-        ok_paths = skillreview.cleared_paths(prior, payload.ledger or {})
+        ok_locs = skillreview.cleared_locs(prior, payload.ledger or {}, policy)
         by_id = {n["id"]: n for n in own if isinstance(n.get("id"), str)}
         writes: list[tuple[str, list[str]]] = []
         if want_resolve:
@@ -1619,7 +1646,7 @@ def _publish_skill_review(
                 node = by_id.get(tid)
                 if node is None:
                     note("resolve_not_ours")
-                elif node.get("path") not in ok_paths:
+                elif skillreview.thread_anchor(node) not in ok_locs:
                     note("resolve_not_cleared")
                 else:
                     argv = ["api", "graphql", "-f", f"query={RESOLVE_MUTATION}", "-F", f"id={tid}"]
@@ -1643,8 +1670,9 @@ def _publish_skill_review(
                         "-f", f"body={r['body']}",
                     ]  # fmt: skip
                     writes.append(("reply", argv))
-        for what, argv in writes:
-            if stale():
+        # The head was checked just above; re-check every 10 thread writes.
+        for i, (what, argv) in enumerate(writes):
+            if i and i % 10 == 0 and stale():
                 break
             try:
                 gcode, _gout, gerr = gh(argv)
@@ -2338,6 +2366,14 @@ def review_pr(
             None if frozen else (lambda: (repo, baseref.resolve_base_sha(repo, os.environ))),
             team_sink=team_sink,
         )
+        if skill_policy_path is not None:
+            where = skill_policy_path.resolve()
+            if where in team_sink.get("files", ()) or any(
+                where.is_relative_to(r) for r in team_sink.get("roots", ())
+            ):
+                raise ConfigError(
+                    "--skill-policy must not sit inside a profile, setup or bundle input"
+                )
         if skill is not None and skill not in team_sink.get("skills", ()):
             raise ConfigError(
                 f"--skill {skill!r} is not in the profile's team setup "
@@ -3806,11 +3842,9 @@ def _load_profile_bundle(
     team = getattr(spec, "team_scan", None)
     if team is not None and team_sink is not None:
         team_sink["where"] = container_path(team.root)
-        team_sink["skills"] = {
-            p.parent.name
-            for p in team.files
-            if p.name == "SKILL.md" and p.parent.parent.name == "skills"
-        }
+        team_sink["skills"] = _team_skill_names(team)
+        team_sink["roots"] = [r.resolve() for r in spec.setup_roots().values()]
+        team_sink["files"] = {Path(f).resolve() for f in spec.all_files() if isinstance(f, Path)}
     if getattr(spec, "team_scan", None) is not None and repo_setup_ref is not None:
         repo, ref = repo_setup_ref()
         if not (ref and _FULL_SHA_RE.match(ref)):
@@ -3838,6 +3872,26 @@ def _load_profile_bundle(
         )
     except ValueError as exc:
         raise ConfigError(redact(str(exc), secrets)) from exc
+
+
+def _team_skill_names(team) -> set[str]:
+    """Skills a team setup ships as `skills/<name>/SKILL.md` exactly, whose header is readable."""
+    root = team.root.resolve()
+    names = set()
+    for p in team.files:
+        try:
+            rel = p.resolve().relative_to(root).parts
+            text = p.read_text(encoding="utf-8")
+        except (ValueError, OSError, UnicodeError):
+            continue
+        if (
+            len(rel) == 3
+            and rel[0] == "skills"
+            and rel[2] == "SKILL.md"
+            and setups.sanitize_frontmatter(text, setups.SKILL_FRONTMATTER_KEYS) is not None
+        ):
+            names.add(rel[1])
+    return names
 
 
 def _make_progress(engine, verbose: bool):

@@ -89,7 +89,7 @@ def test_policy_is_strict():
         "max_body_chars": 2000,
         "max_comments": 2,
         "max_comment_chars": 200,
-        "bot_login": "bot-x",
+        "bot_login": "bot-x[bot]",
     }
     pol = skillreview.parse_policy(base)
     assert (pol.allow_ledger_update, pol.blocking_field, pol.blocking_values) == (
@@ -97,6 +97,8 @@ def test_policy_is_strict():
         "sev",
         ("blocking",),
     )
+    assert pol.cleared_statuses == ("fixed", "resolved", "wontfix")
+    assert pol.open_statuses == ("open",)
     for bad in (
         {**base, "extra": 1},
         {k: v for k, v in base.items() if k != "bot_login"},
@@ -104,6 +106,9 @@ def test_policy_is_strict():
         {**base, "max_comments": 51},
         {**base, "max_body_chars": 70000},
         {**base, "bot_login": "not a login"},
+        {**base, "bot_login": "bot-x"},
+        {**base, "cleared_statuses": []},
+        {**base, "open_statuses": ["fixed"]},
         {**base, "allow_ledger_update": "yes"},
         {**base, "blocking_values": []},
         {**base, "ledger_schema": " padded "},
@@ -288,10 +293,13 @@ def test_summary_counts_open_and_blocking_by_policy_field():
 # --- prior ledger, threads --------------------------------------------------------------------
 
 
-def review_row(rid, led, login=LOGIN, at="2026-10-01T00:00:00Z", body=None):
+def review_row(
+    rid, led, login=LOGIN, at="2026-10-01T00:00:00Z", body=None, typ="Bot", state="COMMENTED"
+):
     return {
         "id": rid,
-        "user": {"login": login},
+        "state": state,
+        "user": {"login": login, "type": typ},
         "submitted_at": at,
         "body": body if body is not None else block(led),
     }
@@ -303,6 +311,8 @@ def test_newest_own_ledger_review_wins_and_others_are_ignored():
         review_row(2, new, at="2026-10-02T00:00:00Z"),
         review_row(1, old, at="2026-10-01T00:00:00Z"),
         review_row(3, ledger(), login="someone"),
+        review_row(6, ledger(), login="acme-bot"),  # no [bot]: not the bot
+        review_row(7, ledger(), typ="User"),
         review_row(4, ledger(), body="no block"),
         review_row(5, ledger(schema="other"), at="2026-10-03T00:00:00Z"),
         "junk",
@@ -310,39 +320,74 @@ def test_newest_own_ledger_review_wins_and_others_are_ignored():
     got = skillreview.bot_ledger_reviews(rows, policy())
     assert [r["id"] for r, _ in got] == [1, 2]
     assert got[-1][1] == new
-    assert skillreview.bot_ledger_reviews([review_row(1, old, login="ACME-BOT")], policy())
+    assert skillreview.bot_ledger_reviews([review_row(1, old, login="ACME-BOT[bot]")], policy())
 
 
-def test_cleared_paths_need_every_open_prior_finding_cleared():
+def test_cleared_locs_need_exactly_one_open_prior_finding_that_is_now_cleared():
+    pol = policy()
     prior = ledger(
         [
             finding("a", "x.py:1"),
             finding("b", "x.py:9"),
             finding("c", "y.py:2"),
             finding("d", "z.py:1", "fixed"),
+            finding("e", "w.py:5"),
+            finding("f", "w.py:5"),
         ]
     )
     new = ledger(
         [
             finding("a", "x.py:1", "fixed"),
             finding("b", "x.py:9"),
-            finding("c", "y.py:2", "dismissed"),
+            finding("c", "y.py:2", "wontfix"),
+            finding("e", "w.py:5", "fixed"),
+            finding("f", "w.py:5"),
         ]
     )
-    assert skillreview.cleared_paths(prior, new) == {"y.py"}
-    assert skillreview.cleared_paths(None, new) == set()
+    assert skillreview.cleared_locs(prior, new, pol) == {("x.py", 1), ("y.py", 2)}
+    assert skillreview.cleared_locs(None, new, pol) == set()
     dropped = ledger([finding("a", "x.py:1", "fixed")])
-    assert skillreview.cleared_paths(prior, dropped) == set()  # a, b: b missing => not cleared
+    assert skillreview.cleared_locs(prior, dropped, pol) == {("x.py", 1)}
+
+
+def test_finding_identity_and_statuses_are_strict():
+    bad = [
+        [finding("a"), finding("a", "b.py:1")],
+        [finding("")],
+        [{"loc": "a.py:1"}],
+        [finding("a", "a.py")],
+        [finding("a", "a.py:0")],
+        [finding("a", "a b.py:3")],
+        [finding("a", "a<b>.py:3")],
+        [finding("a", status="dismissed")],
+        [finding("a", status="Fixed")],
+    ]
+    for f in bad:
+        assert code_of(review_payload({**ledger(), "findings": f, "state": "findings"})) == (
+            "skill_ledger_findings"
+        )
+    custom = policy(cleared_statuses=["dismissed"], open_statuses=["open", "todo"])
+    led = ledger([finding("a", status="todo"), finding("b", status="dismissed")], state="findings")
+    assert build(review_payload(led), pol=custom).ledger["state"] == "findings"
 
 
 def node(
-    tid="T1", path="y.py", login="acme-bot", typename="Bot", resolved=False, cid=100, last=None
+    tid="T1",
+    path="y.py",
+    login="acme-bot",
+    typename="Bot",
+    resolved=False,
+    cid=100,
+    last=None,
+    line=2,
 ):
     first = {"databaseId": cid, "author": {"login": login, "__typename": typename}, "body": "x"}
     return {
         "id": tid,
         "isResolved": resolved,
         "path": path,
+        "line": line,
+        "originalLine": None,
         "comments": {"nodes": [first]},
         "last": {"nodes": [last or first]},
     }
@@ -352,6 +397,7 @@ def test_own_thread_requires_an_open_thread_started_by_the_bot():
     pol = policy()
     assert skillreview.own_thread(node(), pol)
     assert skillreview.own_thread(node(login="Acme-Bot"), pol)
+    assert not skillreview.own_thread(node(login="acme-bot[bot]"), pol)  # GraphQL has no suffix
     assert not skillreview.own_thread(node(login="someone"), pol)
     assert not skillreview.own_thread(node(typename="User"), pol)
     assert not skillreview.own_thread(node(resolved=True), pol)
@@ -530,7 +576,13 @@ def setup_run(
                     post
                     or (
                         0,
-                        json.dumps({"html_url": f"{PR_URL}#pullrequestreview-555", "id": 555}),
+                        json.dumps(
+                            {
+                                "html_url": f"{PR_URL}#pullrequestreview-555",
+                                "id": 555,
+                                "user": {"login": LOGIN, "type": "Bot"},
+                            }
+                        ),
                         "",
                     )
                 )
@@ -597,7 +649,7 @@ def test_a_terminal_round_posts_nothing_and_succeeds(monkeypatch, tmp_path):
         "reason": "cap reached",
         "prior_ledger_review_id": 7,
     }
-    calls, _ = setup_run(monkeypatch, tmp_path, payload)
+    calls, _ = setup_run(monkeypatch, tmp_path, payload, reviews=[review_row(7, ledger())])
     res, data = run(tmp_path)
     assert res.exit_code == 0 and not calls
     assert data["status"] == "review_complete" and "review_url" not in data
@@ -643,7 +695,12 @@ def test_rejected_anchors_fold_the_comments_into_one_more_post(monkeypatch, tmp_
         attempts.append(n)
         if len(attempts) == 1:
             return 1, "", "gh: Unprocessable Entity (HTTP 422)"
-        return 0, json.dumps({"html_url": f"{PR_URL}#pullrequestreview-8", "id": 8}), ""
+        resp = {
+            "html_url": f"{PR_URL}#pullrequestreview-8",
+            "id": 8,
+            "user": {"login": LOGIN, "type": "Bot"},
+        }
+        return 0, json.dumps(resp), ""
 
     calls, _ = setup_run(
         monkeypatch, tmp_path, review_payload(ledger(), comments=[inline(body="look")]), post=post
@@ -838,3 +895,190 @@ def test_a_skill_missing_from_the_team_setup_is_a_config_error(monkeypatch, tmp_
     calls, _ = setup_run(monkeypatch, tmp_path, review_payload(ledger()), skills=("other",))
     res, _data = run(tmp_path)
     assert res.exit_code == 3 and not calls
+
+
+# --- identity, ordering, anchors, paths (fix round) ---------------------------------------------
+
+
+def resolve_case(monkeypatch, tmp_path, *, post=None, review=True, thread_line=2, heads=None):
+    prior = ledger([finding("a", "y.py:2")])
+    new = ledger([finding("a", "y.py:2", "fixed")])
+    payload = review_payload(new, resolve=["T-y"])
+    if not review:
+        payload["review"] = None
+    calls, _ = setup_run(
+        monkeypatch,
+        tmp_path,
+        payload,
+        reviews=[review_row(1, prior)],
+        threads=[node("T-y", "y.py", line=thread_line)],
+        post=post,
+        heads=heads,
+    )
+    res, data = run(tmp_path, "--thread", "--resolve-fixed")
+    return calls, res, data
+
+
+def test_resolve_needs_the_thread_line_to_match_the_cleared_finding(monkeypatch, tmp_path):
+    calls, res, data = resolve_case(monkeypatch, tmp_path, thread_line=7)
+    assert data["threads_resolved"] == 0 and data["skill_notes"] == ["resolve_not_cleared:1"]
+    calls, res, data = resolve_case(monkeypatch, tmp_path, thread_line=2)
+    assert data["threads_resolved"] == 1
+
+
+def test_a_poster_that_is_not_the_bot_blocks_resolve(monkeypatch, tmp_path):
+    other = (
+        0,
+        json.dumps({"html_url": "u", "id": 5, "user": {"login": "x[bot]", "type": "Bot"}}),
+        "",
+    )
+    calls, res, data = resolve_case(monkeypatch, tmp_path, post=other)
+    assert data["threads_resolved"] == 0 and data["skill_notes"] == ["identity_mismatch:1"]
+    assert not [c for c in calls if c[:2] == ["api", "graphql"]]
+    human = (
+        0,
+        json.dumps({"html_url": "u", "id": 5, "user": {"login": LOGIN, "type": "User"}}),
+        "",
+    )
+    _c, _r, data = resolve_case(monkeypatch, tmp_path, post=human)
+    assert data["skill_notes"] == ["identity_mismatch:1"]
+
+
+def test_resolve_needs_a_write_in_the_same_run(monkeypatch, tmp_path):
+    calls, res, data = resolve_case(monkeypatch, tmp_path, review=False)
+    assert res.exit_code == 0 and not calls
+    assert data["threads_resolved"] == 0 and data["skill_notes"] == ["resolve_no_ledger:1"]
+
+
+def test_the_head_is_checked_right_before_each_review_write(monkeypatch, tmp_path):
+    # pin, publish-entry check, then the check before the POST sees a moved head
+    calls, _ = setup_run(
+        monkeypatch, tmp_path, review_payload(ledger()), heads=[SHA, SHA, "c" * 40]
+    )
+    res, data = run(tmp_path)
+    assert data["status"] == "publish_blocked_stale_head" and not calls
+    led = ledger([finding("a", status="fixed")])
+    upd = {"review_id": 9, "body": "Q.\n\n" + block(led)}
+    calls, _ = setup_run(
+        monkeypatch,
+        tmp_path,
+        review_payload(led, decision="delta", review=None, ledger_update=upd),
+        reviews=[review_row(9, ledger())],
+        heads=[SHA, SHA, "c" * 40],
+    )
+    res, data = run(tmp_path)
+    assert data["status"] == "publish_blocked_stale_head" and not calls
+
+
+@pytest.mark.parametrize(
+    "row",
+    [
+        review_row(9, ledger(), state="APPROVED"),
+        review_row(9, ledger(), state="DISMISSED"),
+        review_row(9, ledger(), body=block(ledger()) + "\n<!-- bot-review:abc -->"),
+    ],
+)
+def test_a_ledger_update_never_edits_an_approval_or_a_marked_review(monkeypatch, tmp_path, row):
+    led = ledger([finding("a", status="fixed")])
+    upd = {"review_id": 9, "body": "Q.\n\n" + block(led)}
+    calls, _ = setup_run(
+        monkeypatch,
+        tmp_path,
+        review_payload(led, decision="delta", review=None, ledger_update=upd),
+        reviews=[row],
+    )
+    res, data = run(tmp_path)
+    assert res.exit_code == 7 and not calls and "skill_update_target" in data["reason"]
+
+
+def test_a_terminal_link_must_name_one_of_the_bots_ledger_reviews(monkeypatch, tmp_path):
+    payload = {"kind": "terminal", "decision": "done", "reason": "r", "prior_ledger_review_id": 7}
+    setup_run(monkeypatch, tmp_path, payload, reviews=[review_row(8, ledger())])
+    res, data = run(tmp_path)
+    assert data["ledger"]["review_url"] is None
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/etc/passwd", "a/../b", "..", "a b.py", "a`b.py", "a<b.py", "a\nb.py", "", "a\x00.py"],
+)
+def test_comment_paths_must_be_safe_repo_relative_names(path):
+    bad = [{"path": path, "line": 1, "body": "b"}]
+    assert code_of(review_payload(ledger(), comments=bad)) == "skill_payload_shape"
+    assert (
+        code_of(
+            review_payload(ledger(), comments=[{"path": "sk-secret.py", "line": 1, "body": "b"}]),
+            secrets=["sk-secret"],
+        )
+        == "skill_payload_shape"
+    )
+    assert build(
+        review_payload(ledger(), comments=[{"path": "src/a-b_c.py", "line": 1, "body": "b"}])
+    )
+
+
+def test_folded_comments_are_escaped_and_the_final_body_is_rechecked():
+    pol, led = policy(), ledger()
+    body = "Lead.\n\n" + block(led)
+    comments = [
+        {
+            "path": "a.py",
+            "line": 3,
+            "side": "RIGHT",
+            "body": "x <details><summary>acme-ledger:v1</summary> `y`",
+        }
+    ]
+    final = skillreview.fold_comments(body, comments, "", pol, led)
+    assert (
+        "<details><summary>acme-ledger:v1</summary> `y`" not in final.split("```\n</details>", 1)[1]
+    )
+    assert skillreview.ledger_block(final, MARKER) == led
+    with pytest.raises(SkillError) as exc:
+        skillreview.fold_comments(body, comments, "", pol, ledger([finding("z")]))
+    assert exc.value.code == "skill_body_block"
+    big = [{"path": "a.py", "line": 3, "body": "z" * 7000}]
+    with pytest.raises(SkillError) as exc:
+        skillreview.fold_comments(body, big, "", pol, led)
+    assert exc.value.code == "skill_body_cap"
+
+
+def test_the_policy_file_may_not_sit_inside_a_bundle_input(monkeypatch, tmp_path):
+    setup_run(monkeypatch, tmp_path, review_payload(ledger()))
+    team = tmp_path / "team"
+    team.mkdir()
+    inside = team / "policy.json"
+    inside.write_text(write_policy(tmp_path).read_text())
+    inside.chmod(0o600)
+
+    def fake_bundle(profile_path, cred_env, secrets, cfg, repo_setup_ref=None, team_sink=None):
+        team_sink.update(where="/w", skills={"deep-review"}, roots=[team.resolve()], files=set())
+        return None, "", ""
+
+    monkeypatch.setattr(cli, "_load_profile_bundle", fake_bundle)
+    res = CliRunner().invoke(
+        cli.main,
+        ["review-pr", PR_URL, "--skill", "deep-review", "--skill-policy", str(inside), "--json"],
+    )
+    assert res.exit_code == 3, res.output
+    outside = write_policy(tmp_path)
+    res = CliRunner().invoke(
+        cli.main,
+        ["review-pr", PR_URL, "--skill", "deep-review", "--skill-policy", str(outside), "--json"],
+    )
+    assert res.exit_code == 0, res.output
+
+
+def test_a_skill_is_admitted_only_as_skills_name_skill_md_with_a_readable_header(tmp_path):
+    from types import SimpleNamespace
+
+    root = tmp_path / "team"
+    (root / "skills/ok").mkdir(parents=True)
+    (root / "skills/ok/SKILL.md").write_text("---\nname: ok\n---\nbody\n")
+    (root / "skills/bad").mkdir(parents=True)
+    (root / "skills/bad/SKILL.md").write_text('---\n"hooks": 1\n---\n')
+    (root / "skills/deep/nested").mkdir(parents=True)
+    (root / "skills/deep/nested/SKILL.md").write_text("x\n")
+    (root / "rules").mkdir()
+    (root / "rules/SKILL.md").write_text("x\n")
+    team = SimpleNamespace(root=root, files=[p for p in root.rglob("SKILL.md")])
+    assert cli._team_skill_names(team) == {"ok"}

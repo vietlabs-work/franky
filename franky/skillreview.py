@@ -29,7 +29,10 @@ TERMINAL_DECISIONS = frozenset({"done", "skip", "halt", "author-mode", "not-revi
 LEDGER_STATES = frozenset({"clean", "findings"})
 SIDES = frozenset({"LEFT", "RIGHT"})
 SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
-_LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})(?:\[bot\])?$")
+_LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\[bot\]$")
+_LOC_RE = re.compile(r"^[^\s`<>]+:[1-9][0-9]*$")
+# A repo-relative path that is inert inside a markdown code span and an HTML attribute.
+_PATH_RE = re.compile(r"^[A-Za-z0-9._@+=~,\-][A-Za-z0-9._@+=~,/\-]*$")
 MAX_REASON_CHARS = 300
 MAX_PATH_CHARS = 300
 MAX_RESOLVE = 100
@@ -58,16 +61,31 @@ class SkillPolicy:
     allow_ledger_update: bool = False
     blocking_field: str = "sev"
     blocking_values: tuple[str, ...] = ("blocking",)
-
-    @property
-    def bare_login(self) -> str:
-        return bare(self.bot_login)
+    cleared_statuses: tuple[str, ...] = ("fixed", "resolved", "wontfix")
+    open_statuses: tuple[str, ...] = ("open",)
 
 
-def bare(login: object) -> str:
-    """A login without a trailing `[bot]`, lowercased, for comparison."""
-    text = str(login or "").strip().lower()
-    return text[: -len("[bot]")] if text.endswith("[bot]") else text
+def is_bot_login(login: object, policy: SkillPolicy) -> bool:
+    """REST identity: the full `slug[bot]` login, case-insensitive, nothing stripped."""
+    return isinstance(login, str) and login.lower() == policy.bot_login.lower()
+
+
+def is_bot_user(user: object, policy: SkillPolicy) -> bool:
+    """A REST `user` object: type Bot AND the exact full login."""
+    return (
+        isinstance(user, dict)
+        and user.get("type") == "Bot"
+        and is_bot_login(user.get("login"), policy)
+    )
+
+
+def is_bot_author(author: object, policy: SkillPolicy) -> bool:
+    """A GraphQL author. GraphQL reports a bot's login without `[bot]`, so that suffix is the
+    only difference allowed; the typename must be Bot."""
+    if not isinstance(author, dict) or author.get("__typename") != "Bot":
+        return False
+    login = author.get("login")
+    return isinstance(login, str) and login.lower() + "[bot]" == policy.bot_login.lower()
 
 
 def _int(raw: dict, key: str, low: int, high: int) -> int:
@@ -97,7 +115,13 @@ _REQUIRED = (
     "max_comment_chars",
     "bot_login",
 )
-_OPTIONAL = ("allow_ledger_update", "blocking_field", "blocking_values")
+_OPTIONAL = (
+    "allow_ledger_update",
+    "blocking_field",
+    "blocking_values",
+    "cleared_statuses",
+    "open_statuses",
+)
 
 
 def parse_policy(raw: object) -> SkillPolicy:
@@ -112,7 +136,7 @@ def parse_policy(raw: object) -> SkillPolicy:
         raise ValueError(f"skill policy: missing key(s): {', '.join(missing)}")
     login = _str(raw, "bot_login", 60)
     if not _LOGIN_RE.match(login):
-        raise ValueError("skill policy: bot_login is not a GitHub login")
+        raise ValueError("skill policy: bot_login must be a full `slug[bot]` login")
     allow = raw.get("allow_ledger_update", False)
     if not isinstance(allow, bool):
         raise ValueError("skill policy: allow_ledger_update must be a boolean")
@@ -125,6 +149,21 @@ def parse_policy(raw: object) -> SkillPolicy:
         or not all(isinstance(v, str) and v and len(v) <= 40 for v in values)
     ):
         raise ValueError("skill policy: blocking_values must be 1-10 short strings")
+    sets = {}
+    for key, default in (
+        ("cleared_statuses", ["fixed", "resolved", "wontfix"]),
+        ("open_statuses", ["open"]),
+    ):
+        vals = raw.get(key, default)
+        if (
+            not isinstance(vals, list)
+            or not 1 <= len(vals) <= 10
+            or not all(isinstance(v, str) and v and len(v) <= 40 for v in vals)
+        ):
+            raise ValueError(f"skill policy: {key} must be 1-10 short strings")
+        sets[key] = tuple(vals)
+    if set(sets["cleared_statuses"]) & set(sets["open_statuses"]):
+        raise ValueError("skill policy: cleared_statuses and open_statuses overlap")
     return SkillPolicy(
         ledger_schema=_str(raw, "ledger_schema", 100),
         ledger_summary_marker=_str(raw, "ledger_summary_marker", 100),
@@ -135,6 +174,8 @@ def parse_policy(raw: object) -> SkillPolicy:
         allow_ledger_update=allow,
         blocking_field=field_name,
         blocking_values=tuple(values),
+        cleared_statuses=sets["cleared_statuses"],
+        open_statuses=sets["open_statuses"],
     )
 
 
@@ -173,8 +214,13 @@ def ledger_block(body: str, marker: str) -> dict:
     return obj
 
 
-def _is_open(finding: dict) -> bool:
-    return finding.get("status", "open") == "open"
+def finding_state(finding: dict, policy: SkillPolicy) -> str | None:
+    """ "open", "cleared", or None for a status in neither set (compared exactly, case matters).
+    A missing status is open."""
+    status = finding.get("status")
+    if status is None or status in policy.open_statuses:
+        return "open"
+    return "cleared" if status in policy.cleared_statuses else None
 
 
 def validate_ledger(ledger: object, policy: SkillPolicy, pinned_sha: str) -> dict:
@@ -189,9 +235,17 @@ def validate_ledger(ledger: object, policy: SkillPolicy, pinned_sha: str) -> dic
     findings = ledger.get("findings")
     if not isinstance(findings, list) or not all(isinstance(f, dict) for f in findings):
         raise SkillError("skill_ledger_findings")
+    ids = [f.get("id") for f in findings]
+    if not all(isinstance(i, str) and i for i in ids) or len(set(ids)) != len(ids):
+        raise SkillError("skill_ledger_findings")
+    for f in findings:
+        if not isinstance(f.get("loc"), str) or not _LOC_RE.match(f["loc"]):
+            raise SkillError("skill_ledger_findings")
+        if finding_state(f, policy) is None:
+            raise SkillError("skill_ledger_findings")
     if ledger.get("state") not in LEDGER_STATES:
         raise SkillError("skill_ledger_state")
-    n_open = sum(_is_open(f) for f in findings)
+    n_open = sum(finding_state(f, policy) == "open" for f in findings)
     if (ledger["state"] == "clean") != (n_open == 0):
         raise SkillError("skill_ledger_state")
     return ledger
@@ -199,7 +253,7 @@ def validate_ledger(ledger: object, policy: SkillPolicy, pinned_sha: str) -> dic
 
 def ledger_counts(ledger: dict, policy: SkillPolicy) -> tuple[int, int]:
     """(open, blocking) finding counts; blocking = open findings whose policy field matches."""
-    live = [f for f in ledger.get("findings") or [] if _is_open(f)]
+    live = [f for f in ledger.get("findings") or [] if finding_state(f, policy) == "open"]
     blocking = [f for f in live if f.get(policy.blocking_field) in policy.blocking_values]
     return len(live), len(blocking)
 
@@ -307,7 +361,14 @@ def build_payload(
                 raise SkillError("skill_payload_shape")
             path, line = c.get("path"), _pos(c.get("line"))
             side = c.get("side", "RIGHT")
-            if not isinstance(path, str) or not path or len(path) > MAX_PATH_CHARS:
+            if (
+                not isinstance(path, str)
+                or not path
+                or len(path) > MAX_PATH_CHARS
+                or not _PATH_RE.match(path)
+                or ".." in path.split("/")
+                or redact(path, secrets) != path
+            ):
                 raise SkillError("skill_payload_shape")
             if line is None or side not in SIDES or not isinstance(c.get("body"), str):
                 raise SkillError("skill_payload_shape")
@@ -343,13 +404,21 @@ def build_payload(
     return payload
 
 
-def fold_comments(body: str, comments: list[dict], footer: str, policy: SkillPolicy) -> str:
+def fold_comments(
+    body: str, comments: list[dict], footer: str, policy: SkillPolicy, ledger: dict
+) -> str:
     """Body-only fallback when GitHub rejects the inline anchors: the comments join the body,
-    ahead of the footer. SkillError("skill_body_cap") when the result no longer fits."""
+    ahead of the footer. Raises SkillError when the result is not exactly one ledger block equal
+    to `ledger`, or no longer fits its cap."""
     if footer and body.endswith(footer):
         body = body[: -len(footer)].rstrip()
-    extra = "\n\n".join(f"- `{c['path']}:{c['line']}`: {c['body']}" for c in comments)
+    extra = "\n\n".join(
+        f"- `{c['path']}:{int(c['line'])}`: " + neutralize(c["body"]).replace("<", "&lt;")
+        for c in comments
+    )
     final = f"{body}\n\n{extra}" + (f"\n\n{footer}" if footer else "")
+    if ledger_block(final, policy.ledger_summary_marker) != ledger:
+        raise SkillError("skill_body_block")
     if len(final) > policy.max_body_chars:
         raise SkillError("skill_body_cap")
     return final
@@ -364,12 +433,10 @@ def _review_sort_key(r: dict) -> tuple:
 
 def bot_ledger_reviews(reviews: list, policy: SkillPolicy) -> list[tuple[dict, dict]]:
     """The bot's own reviews that hold exactly one valid ledger block of the schema, oldest
-    first, as (review, ledger). A review whose block is missing, broken or another schema is
-    skipped."""
+    first, as (review, ledger). The author must be a REST Bot with the exact full login."""
     out = []
     for r in sorted((r for r in reviews if isinstance(r, dict)), key=_review_sort_key):
-        user = r.get("user")
-        if not isinstance(user, dict) or bare(user.get("login")) != policy.bare_login:
+        if not is_bot_user(r.get("user"), policy):
             continue
         try:
             led = ledger_block(str(r.get("body") or ""), policy.ledger_summary_marker)
@@ -380,44 +447,51 @@ def bot_ledger_reviews(reviews: list, policy: SkillPolicy) -> list[tuple[dict, d
     return out
 
 
-def _loc_path(finding: dict) -> str:
+def _loc(finding: dict) -> tuple[str, int] | None:
     loc = finding.get("loc")
-    if not isinstance(loc, str):
-        return ""
-    head, _sep, tail = loc.rpartition(":")
-    return head if head and tail.isdigit() else loc
+    if not isinstance(loc, str) or not _LOC_RE.match(loc):
+        return None
+    path, _sep, line = loc.rpartition(":")
+    return path, int(line)
 
 
-def cleared_paths(prior: dict | None, new: dict) -> set[str]:
-    """Paths whose prior open findings are ALL cleared in the new ledger.
+def cleared_locs(prior: dict | None, new: dict, policy: SkillPolicy) -> set[tuple[str, int]]:
+    """(path, line) anchors a thread may be resolved for.
 
-    A thread may resolve only when its file has at least one open prior finding and every open
-    prior finding on that file is present in the new ledger with a status other than `open`. A
-    finding the new ledger drops counts as not cleared (fail closed)."""
+    The anchor must be the `loc` of exactly ONE open finding of the prior ledger, and that
+    finding must be present in the new ledger with a cleared status. A finding the new ledger
+    drops is not cleared. Anything ambiguous is absent."""
     if prior is None:
         return set()
     now = {f.get("id"): f for f in new.get("findings") or [] if isinstance(f, dict)}
-    by_path: dict[str, list[bool]] = {}
+    seen: dict[tuple[str, int], list[bool]] = {}
     for f in prior.get("findings") or []:
-        if not isinstance(f, dict) or not _is_open(f) or not _loc_path(f):
+        if not isinstance(f, dict) or finding_state(f, policy) != "open" or _loc(f) is None:
             continue
-        current = now.get(f.get("id"))
-        by_path.setdefault(_loc_path(f), []).append(current is not None and not _is_open(current))
-    return {p for p, flags in by_path.items() if all(flags)}
+        cur = now.get(f.get("id"))
+        seen.setdefault(_loc(f), []).append(
+            cur is not None and finding_state(cur, policy) == "cleared"
+        )
+    return {loc for loc, flags in seen.items() if flags == [True]}
 
 
 def own_thread(node: object, policy: SkillPolicy) -> bool:
     """An open review thread whose first comment is by the policy's bot."""
     if not isinstance(node, dict) or node.get("isResolved") is not False:
         return False
-    nodes = (
-        (node.get("comments") or {}).get("nodes")
-        if isinstance(node.get("comments"), dict)
-        else None
-    )
+    comments = node.get("comments")
+    nodes = comments.get("nodes") if isinstance(comments, dict) else None
     first = nodes[0] if isinstance(nodes, list) and nodes and isinstance(nodes[0], dict) else {}
-    author = first.get("author") if isinstance(first.get("author"), dict) else {}
-    return author.get("__typename") == "Bot" and bare(author.get("login")) == policy.bare_login
+    return is_bot_author(first.get("author"), policy)
+
+
+def thread_anchor(node: dict) -> tuple[str, int] | None:
+    """(path, line) of a thread, from its line or, once outdated, its original line."""
+    path = node.get("path")
+    line = node.get("line") if type(node.get("line")) is int else node.get("originalLine")
+    if not isinstance(path, str) or type(line) is not int or line < 1:
+        return None
+    return path, line
 
 
 def ledger_summary(

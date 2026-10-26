@@ -235,6 +235,9 @@ DENY_NAMES = (
     "id_ecdsa*",
     "id_ed25519*",
     "id_rsa*",
+    "*credentials*.json",
+    "kubeconfig*",
+    "*.kubeconfig",
     "settings.json",
     "settings.local.json",
     "token.json",
@@ -442,6 +445,11 @@ TEAM_SCRIPT_DIRS = ("skills", "tool")
 # Structured config an engine or tool would load on its own: never shipped, even as data.
 TEAM_DENIED_SUFFIXES = (".yaml", ".yml", ".toml")
 TEAM_DENIED_NAMES = (".mcp.json", "mcp.json", ".claude.json")
+# A script or data file never ships from a directory that holds a tool's login or config
+# (`.docker/config.json`, gcloud, kube and gh configs).
+TEAM_DENIED_PARTS = frozenset(
+    {".docker", ".kube", ".aws", ".ssh", ".gnupg", ".gcloud", "gcloud", "gh", ".azure", ".netrc"}
+)
 SKILL_FRONTMATTER_KEYS = ("name", "description")
 AGENT_FRONTMATTER_KEYS = ("name", "description", "tools", "model")
 
@@ -519,6 +527,12 @@ def _team_admits(path: Path, root: Path) -> bool:
         resolved = path.resolve()
     except OSError:
         return False
+    if inner[:1] in (("skills",), ("tool",)):
+        # No symlink anywhere in a shipped script or skill tree: the name must be the file.
+        if resolved != root.resolve().joinpath(*inner) or path.is_symlink():
+            return False
+        if TEAM_DENIED_PARTS & {p.lower() for p in inner[:-1]}:
+            return False
     names = (path, resolved)
     if any(
         p.name.lower() in TEAM_DENIED_NAMES or p.suffix.lower() in TEAM_DENIED_SUFFIXES

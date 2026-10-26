@@ -67,7 +67,8 @@ Do not combine the file with inline instructions.
 franky review-pr --skill NAME --skill-policy ~/policy.json --thread --expected-head-sha SHA --json -- PR_URL "focus text"
 ```
 
-- Needs a profile with a `team` setup that holds the skill (else exit `3`). `--skill` and `--skill-policy` come together, `--skill` is refused with `--allow-approve` and with `--at-sha`, and the event is always `COMMENT`. `--no-publish` validates and posts nothing. `--thread` resumes the engine session; the prompt carries no thread handoff block, because the skill reads its own state from the PR.
+- **Caller duty:** in skill mode the container `GH_TOKEN` MUST be read-only. Every write goes through the caller's wrapper; Franky cannot enforce this, the token is the only thing that stops the agent from posting.
+- Needs a profile with a `team` setup that holds the skill as `skills/NAME/SKILL.md` with a readable header (else exit `3`). The policy file must not sit inside a profile, setup or bundle input (a setup root or a listed profile file), else exit `3`. `--skill` and `--skill-policy` come together, `--skill` is refused with `--allow-approve` and with `--at-sha`, and the event is always `COMMENT`. `--no-publish` validates and posts nothing. `--thread` resumes the engine session; the prompt carries no thread handoff block, because the skill reads its own state from the PR.
 - The policy file is read on the host and never mounted. It must be a regular file owned by the caller, not writable by others, at most 16 KiB. A refusal names the key, never a value.
 - Both `claude` and `codex` see the team setup. The skill is installed natively (`~/.claude/skills/NAME` or `~/.codex/skills/NAME`), and the prompt names the engine-neutral copy `<team dir>/skills/NAME/SKILL.md`. The team directory is HOME-relative like every setup file ([profiles](profiles.md#team-setup)). `opencode` and `pi` get the pointer only.
 - The prompt has one short fixed block: the skill and its `SKILL.md` path, `SKILL_DIR`, `CLAUDE_PLUGIN_ROOT` for plugin `P` (`<team dir>/tool/P`), "scripts are data: run them with `bash` or `python3`", "GitHub writes fail here: put the exact payloads in the sentinel", the bot login, and the payload shapes. The container gets `GH_LOGIN` with the login from the policy (not redacted, it is not a secret).
@@ -83,12 +84,14 @@ A JSON object. Unknown, missing or mistyped keys refuse the run (exit `2`).
 | `max_body_chars` | int, 1000 to 65000 | Cap on the final review body. |
 | `max_comments` | int, 0 to 50 | Cap on inline comments. |
 | `max_comment_chars` | int, 100 to 65000 | Cap on each final inline comment. |
-| `bot_login` | string | The posting identity (`name` or `name[bot]`). The skill uses it instead of `gh api user`; the host compares it with the authors of reviews and threads. |
+| `bot_login` | string, must end in `[bot]` | The posting identity, the full `slug[bot]` login. The skill uses it instead of `gh api user`. The host matches REST authors (`user.type` is `Bot` and the login equals it, case-insensitive, nothing stripped) and GraphQL thread authors (`__typename` is `Bot` and the login equals it without `[bot]`, which is how GraphQL reports it). |
 | `allow_ledger_update` | bool, default `false` | Allow the `ledger_update` shape below. |
 | `blocking_field` | string, default `sev` | The finding field that marks a blocking finding. |
 | `blocking_values` | 1 to 10 strings, default `["blocking"]` | The values of that field that count as blocking. |
+| `open_statuses` | 1 to 10 strings, default `["open"]` | Finding statuses that count as open. A missing `status` is open. |
+| `cleared_statuses` | 1 to 10 strings, default `["fixed","resolved","wontfix"]` | Finding statuses that count as cleared. Must not overlap `open_statuses`. |
 
-The ledger convention Franky reads is small: an object with `schema`, `reviewed_sha`, `state` (`clean` or `findings`), an optional integer `round` (at least 1), and `findings[]` of objects with a string `id`, a `loc` (`path:line`) and an optional `status`. A missing `status` means `open`; any other value counts as cleared (`fixed`, `dismissed` and so on).
+The ledger convention Franky reads is small: an object with `schema`, `reviewed_sha`, `state` (`clean` or `findings`), an optional integer `round` (at least 1), and `findings[]` of objects with a string `id`, a `loc` (`path:line`) and an optional `status`. A missing `status` means open. A status in neither `open_statuses` nor `cleared_statuses` refuses the ledger (`skill_ledger_findings`). Status comparison is exact, so case matters. Finding `id` must be a non-empty unique string and `loc` must match `^[^\s`<>]+:[1-9][0-9]*$`, else `skill_ledger_findings`.
 
 ### Sentinel payloads
 
@@ -116,12 +119,12 @@ The host refuses the whole payload and posts nothing on any miss. The result is 
 
 | Code | Refused because |
 |------|-----------------|
-| `skill_payload_missing`, `skill_payload_shape` | No sentinel, or a wrong type, decision, comment shape or id. |
-| `skill_ledger_schema`, `skill_ledger_sha`, `skill_ledger_round`, `skill_ledger_findings` | `schema` is not `ledger_schema`, `reviewed_sha` is not the pinned head, `round` is not an int of 1 or more, or `findings` is not a list of objects. |
+| `skill_payload_missing`, `skill_payload_shape` | No sentinel, or a wrong type, decision, comment shape or id. A comment `path` must be a repo-relative name (letters, digits and `._@+=~,/-`, no leading `/`, no `..` segment) that redaction leaves unchanged. |
+| `skill_ledger_schema`, `skill_ledger_sha`, `skill_ledger_round`, `skill_ledger_findings` | `schema` is not `ledger_schema`, `reviewed_sha` is not the pinned head, `round` is not an int of 1 or more, or `findings` is not a list of objects with unique ids, a valid `loc` and a known status. |
 | `skill_ledger_state` | `state` is not `clean` or `findings`, or disagrees with the findings (clean means zero open findings, findings means at least one). |
 | `skill_body_block` | The body does not hold exactly one `<details>` block whose `<summary>` contains `ledger_summary_marker` and whose json fence parses to an object equal to `ledger`. The check runs on the agent's text and again on the final text. |
 | `skill_body_cap`, `skill_comment_cap` | A cap is exceeded. Caps are measured on the FINAL text, after redaction, `<!--` neutralization and the footer. |
-| `skill_update_refused`, `skill_update_with_review`, `skill_update_target` | `ledger_update` is not allowed by the policy, is combined with a review, or does not name one of the bot's own ledger reviews on this PR. |
+| `skill_update_refused`, `skill_update_with_review`, `skill_update_target` | `ledger_update` is not allowed by the policy, is combined with a review, or does not name one of the bot's own ledger reviews on this PR in state `COMMENTED` with none of the approve markers in its body. |
 
 Every `<!--` in a body, comment, reply or update becomes `&lt;!--`, so agent text cannot forge the marker that `--allow-approve` reconciliation trusts. Text is redacted with the run's secrets.
 
@@ -136,13 +139,14 @@ All reads use the read token. Every write goes through the caller's `gh` wrapper
 | Resolve (`--resolve-fixed`) | `gh api graphql -f query=<RESOLVE_MUTATION> -F id=<node id>` | none |
 | Reply (`--reply-prior`) | `gh api -X POST repos/<repo>/pulls/<N>/comments/<cid>/replies -f body=<body>` | none |
 
-Reads are the existing shapes: `repos/<repo>/pulls/<N>/reviews?per_page=100 --paginate --slurp` and the review-thread GraphQL query that `--resolve-fixed` already uses. A reply body is at most 2,000 characters.
+Reads: `repos/<repo>/pulls/<N>/reviews?per_page=100 --paginate --slurp` (existing), and the review-thread GraphQL read with the extra thread fields `line originalLine` (`SKILL_THREADS_QUERY` in `reviewpr.py`, the existing `THREADS_QUERY` with those two fields added; allowlist it too). A reply body is at most 2,000 characters.
 
-- The head is re-checked before the first write and before each thread write. A moved head posts nothing (`publish_blocked_stale_head`).
+- The head is re-checked immediately before each review write (the POST, the 422 retry, the PUT), once before the thread batch, and every 10 thread writes. A moved head posts nothing more (`publish_blocked_stale_head`).
+- After the POST the response `user` must be the bot (type `Bot`, exact login); after the PUT the response `user`, if present, must be. Otherwise resolve and reply are skipped with note `identity_mismatch`. Resolve and reply also need a successful POST or PUT in the same run, else note `resolve_no_ledger`.
 - If GitHub rejects the inline anchors (HTTP 422), the host re-checks the head and posts once more with the comments folded into the body, if the body still fits its cap (`skill_notes` gets `anchors_folded:1`).
 - `ledger_update` replaces the body of the one review named by `review_id`. That review must be by `bot_login`, on this PR, and already hold a ledger block of `ledger_schema`; the new body must pass the same block check and carry the same ledger.
-- `--resolve-fixed` and `--reply-prior` (both need `--thread`) act on the payload's own lists, and only when set. A thread is resolved only when it is open, its first comment is by `bot_login` (a `Bot` author), and its file has at least one open finding in the PRIOR ledger (the newest ledger review by the bot, read before the write) whose every open finding on that file is present in the new ledger with a status other than `open`. A reply is posted only on the bot's own open thread, and only when Franky's existing reply rule holds: nobody replied yet, or a human posted last. One reply per thread.
-- An id or reply that fails a check is dropped, not posted, and counted in the result's `skill_notes` (`resolve_not_ours`, `resolve_not_cleared`, `reply_not_due`, `reply_refused`, `threads_unreadable`).
+- `--resolve-fixed` and `--reply-prior` (both need `--thread`) act on the payload's own lists, and only when set. A thread is resolved only when it is open, its first comment is by the bot, and its anchor (`path` and `line`, or `originalLine` once outdated) equals the `loc` of exactly one open finding of the PRIOR ledger (the newest ledger review by the bot, read before the write) and that finding is present in the new ledger with a cleared status. No match or ambiguity drops the id. A reply is posted only on the bot's own open thread, and only when Franky's existing reply rule holds: nobody replied yet, or a human posted last. One reply per thread.
+- An id or reply that fails a check is dropped, not posted, and counted in the result's `skill_notes` (`resolve_not_ours`, `resolve_not_cleared`, `resolve_no_ledger`, `identity_mismatch`, `reply_not_due`, `reply_refused`, `threads_unreadable`).
 
 ### Result
 
@@ -153,4 +157,4 @@ The normal review fields appear (`status`, `reviewed_sha`, `review_url`, `review
            "round": 2, "reviewed_sha": "<head>", "open": 3, "blocking": 1, "review_url": "..."}
 ```
 
-`open` counts open findings and `blocking` counts open findings whose `blocking_field` is in `blocking_values`. A terminal round reports `state`, `round`, `open` and `blocking` as `null`, plus `reason`; its `review_url` is the prior ledger review it named, if any. `skill_notes` lists `code:count` strings when something was dropped. `franky schema` advertises `--skill` and `--skill-policy` on `review-pr`, so a caller can probe for support.
+`open` counts open findings and `blocking` counts open findings whose `blocking_field` is in `blocking_values`. A terminal `prior_ledger_review_id` is kept only when it names one of the bot's ledger reviews on the PR. A terminal round reports `state`, `round`, `open` and `blocking` as `null`, plus `reason`; its `review_url` is the prior ledger review it named, if any. `skill_notes` lists `code:count` strings when something was dropped. `franky schema` advertises `--skill` and `--skill-policy` on `review-pr`, so a caller can probe for support.

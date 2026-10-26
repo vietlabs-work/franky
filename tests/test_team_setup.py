@@ -1029,3 +1029,34 @@ def test_each_run_gets_a_fresh_marker_that_extends_the_literal():
     a, b = profile.new_repo_marker(), profile.new_repo_marker()
 
     assert a != b and a.startswith(profile.REPO_SETUP_MARKER) and len(a) >= 48
+
+
+def test_team_scripts_refuse_symlinks_and_credential_style_names(tmp_path):
+    root = _team(tmp_path / "team")
+    outside = tmp_path / "outside.py"
+    outside.write_text("print(1)\n")
+    (root / "skills/cook/link.py").symlink_to(outside)
+    (root / "tool").mkdir()
+    (root / "tool/linkdir").symlink_to(tmp_path)
+    (tmp_path / "x.py").write_text("print(2)\n")
+    (root / "tool/gcp_credentials.json").write_text("{}")
+    (root / "tool/application_default_credentials.json").write_text("{}")
+    (root / "tool/.docker").mkdir()
+    (root / "tool/.docker/config.json").write_text("{}")
+    (root / "tool/gh").mkdir()
+    (root / "tool/gh/hosts.json").write_text("{}")
+    (root / "tool/kubeconfig.json").write_text("{}")
+    (root / "tool/ok.py").write_text("print(3)\n")
+
+    names = {p.name for p in setups.expand_setup("team", root).files}
+
+    assert "ok.py" in names
+    assert not names & {
+        "link.py",
+        "x.py",
+        "gcp_credentials.json",
+        "application_default_credentials.json",
+        "config.json",
+        "hosts.json",
+        "kubeconfig.json",
+    }
