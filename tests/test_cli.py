@@ -5735,18 +5735,22 @@ def test_review_pr_redacts_a_token_inside_a_ticket_comment(monkeypatch, tmp_path
     assert "- 2026-01-02: ***REDACTED***" in prompts[0]
 
 
+SIGNOFF = {"reason": "match", "path": "a/pay/X.java", "rule": "**/pay/**", "more": 0}
+
+
 def test_review_pr_publish_passes_the_pr_base_sha_to_the_signoff_floor(monkeypatch, tmp_path):
     _jira_review_setup(monkeypatch, tmp_path, meta={"base_sha": "b" * 40})
     seen = []
 
     def fake_publish(*a, **k):
         seen.append(k)
-        return ("review_published", "ok", 0, None, None, "COMMENT", None, None)
+        return ("review_published", "ok", 0, None, None, "COMMENT", None, None, SIGNOFF)
 
     monkeypatch.setattr(cli, "_publish_review", fake_publish)
     res = _review(["--engine", "claude", "--allow-approve"])
     assert res.exit_code == 0, res.output
     assert seen[0]["base_sha"] == "b" * 40 and seen[0]["allow_approve"] is True
+    assert json.loads(res.stdout)["signoff"] == SIGNOFF
 
 
 def test_review_pr_with_only_jira_cli_fetches_and_reports_included(monkeypatch, tmp_path):
@@ -5944,7 +5948,10 @@ def test_publish_matching_signoff_glob_posts_comment_not_approve(monkeypatch):
     assert out[0] == "review_published" and out[5] == "COMMENT"
     assert "human sign-off" in out[1]
     assert gh.post_events() == ["COMMENT"]
-    assert "code-clean, human sign-off required" in json.loads(gh.inputs[-1])["body"]
+    body = json.loads(gh.inputs[-1])["body"]
+    assert "A human must approve it, because `a/pay/X.java` matches `**/pay/**` in" in body
+    assert "**Looks good: no findings above nit.**" in body
+    assert out[8] == {"reason": "match", "path": "a/pay/X.java", "rule": "**/pay/**", "more": 0}
     assert reads == [("me/repo", BASE_SHA40)]
 
 
@@ -5960,7 +5967,7 @@ def test_publish_signoff_copy_still_stamps_posted_at_on_the_callers_shape(monkey
     out = _pub(shaped, allow_approve=True, base_sha=BASE_SHA40)
     assert out[5] == "COMMENT"
     assert shaped["posted_at"] == "2026-01-02T03:04:05Z"
-    assert "signoff_required" not in shaped
+    assert "signoff" not in shaped
 
 
 def test_publish_no_matching_signoff_glob_still_approves(monkeypatch):

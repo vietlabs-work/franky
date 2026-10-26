@@ -128,6 +128,7 @@ from .reviewpr import (
     reply_body,
     review_event,
     review_footer,
+    signoff_reason,
     thread_reply_target,
     verify_accepted,
 )
@@ -1406,7 +1407,7 @@ def _publish_review(
         return live is None or live.lower() != pinned_sha.lower()
 
     def fail(status: str, reason: str, code: int):
-        return (status, reason, code, None, None, None, None, None)
+        return (status, reason, code, None, None, None, None, None, None)
 
     stale_result = fail(
         "publish_blocked_stale_head",
@@ -1433,15 +1434,22 @@ def _publish_review(
 
     notes: list[str] = []
     caller_shaped = shaped
+    signoff = None
+    globs_cache: list = []  # one read of the globs file, shared by the decision and the reason
+
+    def read_globs():
+        if not globs_cache:
+            globs_cache.append(fetch_signoff_globs(repo, base_sha or "", os.environ))
+        return globs_cache[0]
+
     if (
         allow_approve
         and review_event(shaped, True) == "APPROVE"
-        and human_signoff_required(
-            files, lambda: fetch_signoff_globs(repo, base_sha or "", os.environ)
-        )
+        and human_signoff_required(files, read_globs)
     ):
         allow_approve = False
-        shaped = {**shaped, "signoff_required": True}
+        signoff = signoff_reason(files, read_globs)
+        shaped = {**shaped, "signoff": signoff}
         notes.append(" (human sign-off required)")
 
     commentable = commentable_lines(files or [])
@@ -1556,6 +1564,7 @@ def _publish_review(
         event,
         resolved,
         replied,
+        signoff,
     )
 
 
@@ -2085,6 +2094,7 @@ def review_pr(
         review_url: str | None = None
         review_id: int | None = None
         review_event_out: str | None = None
+        signoff_out: dict | None = None
         threads_resolved: int | None = None
         threads_replied: int | None = None
         findings_summary: str | None = None
@@ -2179,6 +2189,7 @@ def review_pr(
                             review_event_out,
                             threads_resolved,
                             threads_replied,
+                            signoff_out,
                         ) = _publish_review(
                             repo,
                             pr_number,
@@ -2261,6 +2272,7 @@ def review_pr(
             review_url=review_url,
             review_id=review_id,
             review_event=review_event_out,
+            signoff=signoff_out,
             threads_resolved=threads_resolved,
             threads_replied=threads_replied,
             thread=thread_result,

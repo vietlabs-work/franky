@@ -46,7 +46,6 @@ from .config import redact
 from .sentinel import scan_sentinel_json
 
 SIGNOFF_FILE = ".github/human-signoff-paths"
-SIGNOFF_LINE = "code-clean, human sign-off required (`.github/human-signoff-paths`)."
 _FILES_API_CAP = 3000  # the PR files API never lists more than this many files
 
 _VALID_SEVERITIES = frozenset({"blocking", "normal", "question", "nit"})
@@ -339,6 +338,37 @@ def _esc(text: str) -> str:
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+_CODE_MAX = 200
+
+
+def _code(text: str) -> str:
+    """`text` as one inline code span that a backtick inside it cannot close early.
+
+    HTML is not live inside a code span, so the text is not escaped; it is cut to
+    _CODE_MAX characters so a huge path or rule cannot push the body past its budget."""
+    text = " ".join(text.split("\n")).replace("\r", " ")
+    if len(text) > _CODE_MAX:
+        text = text[: _CODE_MAX - 3] + "..."
+    fence = "`" * (max((len(r) for r in re.findall(r"`+", text)), default=0) + 1)
+    pad = " " if text.startswith("`") or text.endswith("`") else ""
+    return f"{fence}{pad}{text}{pad}{fence}"
+
+
+def signoff_text(info: dict) -> str:
+    """The body paragraph for an APPROVE the human sign-off floor turned into a COMMENT."""
+    head = "**Looks good: no findings above nit.** Automated approval is off for this PR. "
+    reason = info.get("reason")
+    if reason == "match":
+        more = info.get("more") or 0
+        extra = f" (and {more} more file{'s' if more != 1 else ''})" if more else ""
+        why = f"{_code(info['path'])}{extra} matches {_code(info['rule'])} in {_code(SIGNOFF_FILE)}"
+    elif reason == "list_changed":
+        why = f"it changes {_code(SIGNOFF_FILE)}"
+    else:
+        why = "the sign-off list or the PR file list could not be read"
+    return f"{head}A human must approve it, because {why}."
+
+
 def _label(f: dict) -> str:
     return _LABELS[f["severity"]]
 
@@ -429,8 +459,8 @@ def _body(
         )
     if prior_url and REVIEW_URL_RE.match(prior_url):
         parts.append(f"Follows [the previous review]({prior_url}).")
-    if shaped.get("signoff_required"):
-        parts.append(SIGNOFF_LINE)
+    if shaped.get("signoff"):
+        parts.append(signoff_text(shaped["signoff"]))
     room = REVIEW_BODY_BUDGET - _TAIL_RESERVE - sum(len(p) + 2 for p in parts)
     rows = [
         "\n\n".join([f"**{_label(f)}: {_esc(f['title'])}**{_loc(f)}", *_detail(f)])
@@ -620,6 +650,48 @@ def human_signoff_required(files: list | None, read_globs: Callable[[], list[str
         return True
     globs = read_globs()
     return globs is None or signoff_match(globs, paths)
+
+
+def _deciding_rule(globs: list[str], path: str) -> str | None:
+    """The rule text that leaves `path` matched (the last matching rule, when not negated)."""
+    rule = None
+    for g in globs:
+        if _signoff_regex(g.removeprefix("!")).fullmatch(path):
+            rule = None if g.startswith("!") else g
+    return rule
+
+
+def signoff_reason(files: list | None, read_globs: Callable[[], list[str] | None]) -> dict | None:
+    """Why `human_signoff_required` is True: None exactly when it is False.
+
+    A dict `{"reason": "match" | "list_changed" | "unreadable", "path", "rule", "more"}`. `match`
+    names the first matched path (file order), the rule as written that decided it, and how many
+    other paths matched. `list_changed` names the sign-off file. `unreadable` carries no path.
+    """
+    unreadable = {"reason": "unreadable", "path": None, "rule": None, "more": 0}
+    if files is None or len(files) >= _FILES_API_CAP:
+        return unreadable
+    paths: list[str] = []
+    for entry in files:
+        name = entry.get("filename") if isinstance(entry, dict) else None
+        if not isinstance(name, str):
+            return unreadable
+        paths.append(name)
+        if isinstance(entry.get("previous_filename"), str):
+            paths.append(entry["previous_filename"])
+        elif entry.get("status") == "renamed":
+            return unreadable
+    if not paths:
+        return None
+    if SIGNOFF_FILE in paths:
+        return {"reason": "list_changed", "path": SIGNOFF_FILE, "rule": None, "more": 0}
+    globs = read_globs()
+    if globs is None:
+        return unreadable
+    hits = [(p, r) for p in dict.fromkeys(paths) if (r := _deciding_rule(globs, p))]
+    if not hits:
+        return None
+    return {"reason": "match", "path": hits[0][0], "rule": hits[0][1], "more": len(hits) - 1}
 
 
 def review_event(shaped: dict, allow_approve: bool = False) -> str:
