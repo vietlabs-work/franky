@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- When the human sign-off floor turns a `review-pr --allow-approve` APPROVE into a COMMENT, the body now says the PR looks good and names the changed file, the matching rule in `.github/human-signoff-paths` and how many more files match. The result JSON gains an optional `signoff` object (`reason`, `path`, `rule`, `more`). The approve decision does not change.
+- `review-pr` requests changes only when the same review could approve: with `--allow-approve` and no human sign-off floor. Otherwise an open blocking finding is posted as a `COMMENT`, because a change request stays on the PR until an approval or a human dismissal clears it. Behavior change: without `--allow-approve`, `review-pr` never posts `REQUEST_CHANGES`.
+
 ## [0.3.28] - 2026-10-26
 
 - Reviews and planning passes start nested Docker only when needed, with `franky-docker-start` available for Docker-dependent reproduction. Builds keep eager startup. Concurrent startup calls share one bounded launch, and diagnostics report the last startup outcome after a retry.
