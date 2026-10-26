@@ -1428,6 +1428,49 @@ def test_capture_diagnostics_dind_ready_markers():
     assert neither_diag["dind_ready"] is None
 
 
+@pytest.mark.parametrize("ready_last", [False, True])
+@pytest.mark.parametrize("split", [False, True])
+def test_capture_diagnostics_uses_last_daemon_outcome(ready_last, split, monkeypatch):
+    markers = ["rootless dockerd did not become ready", "rootless dockerd ready"]
+    if not ready_last:
+        markers.reverse()
+    if split:
+        monkeypatch.setattr(container_mod, "chunks", lambda text: iter(text))
+    diag = capture_diagnostics(
+        "t",
+        "p",
+        "\n".join(markers),
+        lambda *a, **k: None,
+        task_launched=False,
+        proxy_launched=False,
+        secrets=[],
+    )
+    assert diag["dind_ready"] is ready_last
+
+
+@pytest.mark.parametrize("mode", ["eager", "deferred"])
+def test_run_in_container_propagates_docker_start_mode(mode):
+    seen = []
+
+    def task(argv, **kwargs):
+        seen.extend(argv)
+        return subprocess.CompletedProcess(argv, 0, stdout="done", stderr="")
+
+    runner, _ = _orchestration_runner(task)
+    assert (
+        run_in_container(
+            _cfg(), ["pi"], docker_start=mode, runner=runner, env={}, sleeper=NOOP_SLEEP
+        )[0]
+        == 0
+    )
+    assert ("FRANKY_DOCKER_START=deferred" in seen) is (mode == "deferred")
+
+
+def test_docker_start_mode_refuses_unknown_values():
+    with pytest.raises(ValueError, match="docker_start"):
+        build_docker_argv("franky", {}, ["pi"], docker_start="guess")
+
+
 def test_capture_diagnostics_tmpfs_full_heuristic():
     no_space = capture_diagnostics(
         "t",

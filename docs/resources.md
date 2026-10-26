@@ -13,6 +13,8 @@ For two jobs on a 16 GiB Mac, allocate at least 6 GiB to Docker Desktop. Start w
 
 Limits are ceilings, not reservations. The disk watchdog samples approximately every five seconds, so it is not a filesystem quota. Volume deletion is not secure erasure.
 
+Reviews and planning passes avoid the nested Docker daemon's startup time and idle memory until they need Docker. Builds, iteration, resumes, diagnostics, and replays keep eager startup. Resource limits stay the same for two or four concurrent jobs; actual savings depend on how many passes need Docker.
+
 Docker shares common image layers across Franky instances. Engine-specific images omit the other engine clients.
 
 Synthetic checks do not prove that an arbitrary repository or live model workload fits. Test your largest repository before increasing concurrency.

@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
-# Franky DinD entrypoint (issue #12): bring up a rootless Docker daemon INSIDE this hardened
-# container, then exec the coding-agent engine. Always on - franky's value is building+testing
-# repos, and many repos' suites need local infra (docker compose, testcontainers, `docker build`).
+# Set up task-local Docker and exec the engine. Read-only passes defer daemon startup until
+# Docker-dependent reproduction needs it; write passes start it before the engine.
 #
 # Egress: the daemon inherits this container's HTTP(S)_PROXY/NO_PROXY env, so the DAEMON's own
 # registry pulls AND `docker build`/BuildKit `FROM` fetches go through the Squid egress proxy. We
@@ -60,33 +59,12 @@ if [ -n "${HTTP_PROXY:-}${HTTPS_PROXY:-}" ]; then
 JSON
 fi
 
-# Start rootless dockerd in the background. It inherits HTTP(S)_PROXY/NO_PROXY from this env, so
-# its registry pulls + BuildKit builds traverse the proxy. slirp4netns is the network backend
-# (needs /dev/net/tun, granted by the run profile); storage is native/fuse overlayfs.
-dockerd-rootless.sh >/tmp/dockerd.log 2>&1 &
-
-# Wait for the daemon socket - HARD-CAPPED (never an unbounded wait): 30 * 1s = 30s.
-ready=0
-for _ in $(seq 1 30); do
-    if docker version >/dev/null 2>&1; then
-        ready=1
-        break
-    fi
-    sleep 1
-done
-
-if [ "${ready}" = 1 ]; then
-    # Positive marker (issue #69): host-side diagnostics capture asserts DinD readiness from
-    # this exact string rather than only inferring it from the ABSENCE of the failure warning
-    # below - a positive signal beats an "I didn't see a complaint" one.
-    echo "franky: rootless dockerd ready" >&2
-else
-    # Non-fatal on purpose: tasks that do not need Docker must still run. Emit a loud,
-    # redaction-safe marker so the operator log distinguishes "infra did not come up" from an
-    # agent bug; docker-dependent build/test steps will then fail inside the task.
-    echo "franky: WARNING rootless dockerd did not become ready in 30s - docker-dependent" \
-         "build/test steps will fail (see /tmp/dockerd.log inside the container)." >&2
+# Startup failure stays nonfatal for tasks that do not need Docker. The helper retains the
+# diagnostic markers and inherits the same proxy environment when started later by the agent.
+if [ "${FRANKY_DOCKER_START:-eager}" != deferred ]; then
+    franky-docker-start || true
 fi
+unset FRANKY_DOCKER_START
 
 # Operator profile (skills/instructions/commands/agent definitions, or a whole swept
 # `~/.claude`-style setup): the host streams a gzip tar of curated, secret-scrubbed files into

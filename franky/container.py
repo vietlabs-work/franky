@@ -61,17 +61,17 @@ PROFILE_WAIT_VAR_SECS = "FRANKY_PROFILE_WAIT_SECS"
 CODEX_RUN_HOME = CODEX_AUTH_HOME
 CODEX_RUN_AUTH_MOUNT = f"{_HOME}/.codex-auth"
 _CODEX_AUTH_MAX_BYTES = 64 * 1024
-# XDG_RUNTIME_DIR for the always-on rootless Docker daemon: it puts docker.sock + runtime state
+# XDG_RUNTIME_DIR for the task-local rootless Docker daemon: it puts docker.sock + runtime state
 # here (dockerd-rootless.sh defaults to /run/user/<uid>).
 _XDG_RUNTIME = f"/run/user/{_RUN_UID}"
 # Hardening flags applied to every run. No bind mounts, no docker socket: the repo is cloned
-# INSIDE the container and so is everything the always-on rootless Docker daemon does, so the
+# INSIDE the container and so is everything the task-local rootless Docker daemon does, so the
 # agent cannot access host paths. Docker creates private anonymous volumes for build data.
 # --rm and the forced reaper remove them. Disk blocks can retain data after removal, so this
 # is disposable storage, not secure erasure. The image owns /work and HOME as uid 1001.
 #
 # WHY this profile is RELAXED vs a non-DinD container: franky runs a rootless Docker daemon
-# inside this container (always on - see Dockerfile + franky-dind-entrypoint.sh) so a task can
+# inside this container (started on demand for read-only passes) so a task can
 # build/test repos whose suites need local infra (compose, testcontainers). Rootless dockerd
 # needs a few specific, MINIMAL relaxations (validated empirically in the issue-12 spike); each
 # is justified inline. This is NOT --privileged and NOT seccomp=unconfined.
@@ -189,6 +189,7 @@ def build_docker_argv(
     apparmor_profile: str | None = None,
     session_hold: str = "",
     profile_wait_secs: int = PROFILE_WAIT_SECS,
+    docker_start: str = "eager",
 ) -> list[str]:
     """Build the full `docker run` argv. Pure - no docker invoked.
 
@@ -224,6 +225,8 @@ def build_docker_argv(
     entrypoint keeps the --rm container alive, capped, until the host has copied the engine
     session out (see run_in_container).
     """
+    if docker_start not in ("eager", "deferred"):
+        raise ValueError("unsupported docker_start mode")
     container_name = name or f"franky-run-{uuid.uuid4().hex[:12]}"
     argv = [
         "docker",
@@ -239,6 +242,8 @@ def build_docker_argv(
         # Attached stdout still streams; Docker must not persist raw pre-redaction bytes.
         "--log-driver=none",
     ]
+    if docker_start == "deferred":
+        argv += ["-e", "FRANKY_DOCKER_START=deferred"]
     if auth_volume:
         argv += [
             "--mount",
@@ -1286,17 +1291,22 @@ def capture_diagnostics(
             )
         }
         overlap = ""
+        diag["dind_ready"] = None
         for chunk in chunks(transcript):
             text = overlap + chunk
             for signal in signals:
                 signals[signal] |= signal in text
+            outcomes = [
+                (text.rfind(marker), ready)
+                for marker, ready in (
+                    ("rootless dockerd did not become ready", False),
+                    ("rootless dockerd ready", True),
+                )
+            ]
+            position, ready = max(outcomes)
+            if position >= 0:
+                diag["dind_ready"] = ready
             overlap = text[-64:]
-        if signals["rootless dockerd did not become ready"]:
-            diag["dind_ready"] = False
-        elif signals["rootless dockerd ready"]:
-            diag["dind_ready"] = True
-        else:
-            diag["dind_ready"] = None
         diag["tmpfs_full"] = signals["No space left on device"] or signals["ENOSPC"]
     except Exception:
         diag["dind_ready"] = None
@@ -1629,6 +1639,7 @@ def run_in_container(
     private_prompt_tar: bytes | None = None,
     extra_secrets: Iterable[str] = (),
     repo_setup: dict[str, str] | None = None,
+    docker_start: str = "eager",
 ) -> tuple[int, str | Transcript]:
     """Run the inner engine in a hardened, egress-controlled container; return
     (returncode, redacted_output).
@@ -1797,6 +1808,7 @@ def run_in_container(
             session_hold=hold_nonce,
             profile_wait_secs=PROFILE_WAIT_SECS
             + (int(REPO_SETUP_TIMEOUT) if repo_setup is not None else 0),
+            docker_start=docker_start,
         )
         if effective_progress is not None:
             # Redact before disk and callbacks, retaining only bounded unfinished fragments.

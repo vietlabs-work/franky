@@ -367,6 +367,7 @@ def test_iterate_thread_resumes_the_bound_build_session_with_a_fenced_prior(monk
     argv = seen[0]["argv"]
     assert _flag(argv, "--resume") == sid and "--session-id" not in argv
     assert seen[0]["tar_names"] == [f".claude/projects/-work/{sid}.jsonl"]
+    assert seen[0]["kwargs"].get("docker_start", "eager") == "eager"
     assert f"FRANKY_PRIOR_{NONCE}_BEGIN" in argv[2] and SHA in argv[2]
     assert data["thread"]["session"] == "resumed" and data["thread"]["last_sha_before"] == SHA
     assert data["handoff"]["sha"] == SHA
@@ -400,6 +401,7 @@ def test_iterate_thread_retries_once_seeded_on_a_startup_rejection(monkeypatch, 
     assert res.exit_code == 0, res.output
     data = json.loads(res.stdout)
     assert len(seen) == 2
+    assert all(attempt["kwargs"].get("docker_start", "eager") == "eager" for attempt in seen)
     assert _flag(seen[0]["argv"], "--resume") == first["thread"]["session_id"]
     new_sid = _flag(seen[1]["argv"], "--session-id")
     assert new_sid != first["thread"]["session_id"] and "--resume" not in seen[1]["argv"]

@@ -661,6 +661,7 @@ def build(
                 bundle,
                 progress=progress,
                 timeout=max_duration,
+                docker_start="deferred",
             )
             plan_log_path = _write_log(output, secrets, env=os.environ)
             if not quiet:
@@ -2382,6 +2383,7 @@ def plan(
             bundle,
             progress=progress,
             timeout=max_duration,
+            docker_start="deferred",
         )
 
         usage = _parse_usage_safe(output)
@@ -2784,6 +2786,7 @@ def _thread_pass(
                 diagnostics_sink=diagnostics,
                 private_prompt=private_prompt,
                 extra_secrets=extra_secrets,
+                docker_start="deferred" if role == "reviewer" else "eager",
                 **run_kwargs,
             )
         finally:
@@ -3212,6 +3215,7 @@ def _run_pass(
     workspace_sink: dict | None = None,
     private_prompt: bool = False,
     extra_secrets: Sequence[str] = (),
+    docker_start: str = "eager",
 ) -> tuple[int, str, float]:
     """Run one container pass for `prompt` and return (exit_code, output, duration_secs).
 
@@ -3234,6 +3238,12 @@ def _run_pass(
     redacted from the streamed output and heartbeat; never added to the container env.
     """
     session_kwargs = {} if session is None else {"session_id": session[0], "resume": session[1]}
+    if docker_start == "deferred":
+        prompt += (
+            "\nDocker startup is deferred for this read-only pass. Before Docker-dependent "
+            "reproduction, run `franky-docker-start`. If startup or tests fail, report the "
+            "failure; never claim they passed.\n"
+        )
     if cfg.atlassian_tools:
         prompt += ATLASSIAN_TOOLS_BLOCK
     inner_argv = cfg.engine.inner_argv(
@@ -3255,6 +3265,8 @@ def _run_pass(
     if cfg.effort:
         inner_argv += ["--effort", cfg.effort]
     extra = {} if timeout is None else {"timeout": timeout}
+    if docker_start != "eager":
+        extra["docker_start"] = docker_start
     if cfg.repo_setup is not None:
         # The mapper loads the repository setup before the engine starts and then swaps the
         # index marker in the prompt; it runs inside the private-prompt wrapper below.

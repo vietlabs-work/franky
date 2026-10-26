@@ -13,7 +13,7 @@ Franky applies these controls:
 - A default-deny, HTTPS-only Squid proxy with blind TLS tunnels.
 - Prompts forbid autonomous merges. Token permissions enforce the available GitHub actions.
 
-Each task runs its own rootless Docker daemon. Agents can build images, run Compose, and use testcontainers without reaching the host daemon.
+Each task has its own rootless Docker daemon. Reviews and planning passes defer startup until Docker-dependent reproduction needs it. Other passes start it before the engine. `franky-docker-start` ensures readiness within a 30-second startup budget; concurrent calls share one launch. Agents can build images, run Compose, and use testcontainers without reaching the host daemon. Startup mode does not change container hardening or egress policy.
 
 ```text
 task and nested Docker -> internal network -> Squid proxy -> allowed HTTPS hosts

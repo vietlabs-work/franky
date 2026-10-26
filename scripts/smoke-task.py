@@ -24,6 +24,7 @@ else:
         profile_wait=mode in ("profile", "both"),
         resume_wait=mode in ("resume", "both"),
         session_hold="smoke" if mode == "hold" else "",
+        docker_start="deferred" if mode == "deferred" else "eager",
         apparmor_profile=select_task_apparmor(),
     )
     if mode == "hold":

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Manual smoke test for always-on rootless Docker-in-Docker (issue #12).
+# Manual smoke test for deferred and eager rootless Docker-in-Docker.
 #
 # WHY this is a script, not a pytest: the hermetic suite never touches real Docker (a
 # load-bearing rule - see CLAUDE.md). The Dockerfile + entrypoint + the relaxed run profile can
@@ -43,7 +43,17 @@ python3 -c 'import sys; from franky.container import wait_proxy_ready; raise Sys
 
 echo "== run the franky image (real _HARDENING profile) in the cage =="
 SMOKE_NETWORK="$NET" SMOKE_PROXY_URL="http://$PROXY:3128" \
-  python3 scripts/smoke-task.py "$FRANKY_IMG" "$TASK" normal sleep 600 >/dev/null
+  python3 scripts/smoke-task.py "$FRANKY_IMG" "$TASK" deferred sleep 600 >/dev/null
+
+echo "== deferred pass starts without a daemon =="
+docker exec "$TASK" timeout 3 python3 -c '
+import os
+from pathlib import Path
+assert not Path(os.environ["XDG_RUNTIME_DIR"], "docker.sock").exists()
+assert not any(p.read_text().strip() in {"dockerd", "rootlesskit", "containerd"}
+               for p in Path("/proc").glob("[0-9]*/comm"))' \
+  || fail "deferred task started dockerd"
+docker exec "$TASK" timeout 33 franky-docker-start || fail "explicit Docker startup failed"
 
 echo "== 1. rootless dockerd readiness =="
 ready=0
@@ -94,5 +104,13 @@ if docker exec "$TASK" timeout 15 docker run --rm -e HTTP_PROXY= -e HTTPS_PROXY=
   fail "nested container reached the internet directly - egress cage breached"
 fi
 echo "   OK (no route)"
+
+echo "== default eager startup =="
+docker rm -f -v "$TASK" >/dev/null
+SMOKE_NETWORK="$NET" SMOKE_PROXY_URL="http://$PROXY:3128" \
+  python3 scripts/smoke-task.py "$FRANKY_IMG" "$TASK" normal sleep 60 >/dev/null
+ready=0
+for _ in $(seq 1 35); do docker exec "$TASK" timeout 1 docker version >/dev/null 2>&1 && { ready=1; break; }; sleep 1; done
+[ "$ready" = 1 ] || fail "default eager startup failed"
 
 echo "SMOKE PASS: rootless DinD works and stays inside the egress cage."

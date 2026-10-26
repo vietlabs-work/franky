@@ -8,7 +8,7 @@ Franky runs a pluggable coding agent in a fresh Docker container. It accepts an 
 
 The task container clones an allowlisted repository, makes or reviews changes, and can open a PR. Prompts forbid autonomous merges.
 
-Each task also runs a rootless Docker daemon. The agent can use Docker, Compose, and testcontainers without access to the host daemon.
+Each task can run a rootless Docker daemon. Reviews and planning passes start it only when Docker-dependent reproduction needs it; other passes start it before the engine. The agent runs `franky-docker-start` to ensure readiness, then can use Docker, Compose, and testcontainers without access to the host daemon.
 
 ## Development commands
 
