@@ -22,7 +22,8 @@ from . import result
 _RESULT_SCHEMA: dict = {
     "status": "result class: pr_opened | no_pr | agent_error | timeout | already_open | "
     "iterate_complete | replay_complete | review_published | review_complete | no_findings | "
-    "publish_blocked_stale_head | publish_failed | publish_uncertain | branch_ready | "
+    "publish_blocked_stale_head | publish_failed | publish_uncertain | skill_payload_invalid | "
+    "branch_ready | "
     "no_changes | export_failed | export_refused (the last four only for `build --no-publish`: "
     "branch_ready exit 0, no_changes and export_failed exit 7, export_refused exit 4)",
     "pr_url": "the PR URL (string) or null when none was produced; always null for "
@@ -91,6 +92,22 @@ _RESULT_SCHEMA: dict = {
     "of review threads it resolved",
     "threads_replied": "integer; present ONLY when `review-pr --reply-prior` ran: the number "
     "of review threads it replied on",
+    "ledger": {
+        "kind": "string: review | terminal; present ONLY for `review-pr --skill`",
+        "decision": "string; the skill's decision (first-pass | delta | second-opinion | done | "
+        "skip | halt | author-mode | not-reviewable)",
+        "state": "string: clean | findings, or null for a terminal round",
+        "round": "integer or null; the ledger's round",
+        "reviewed_sha": "string; the pinned head the round covers",
+        "open": "integer or null; open findings in the ledger",
+        "blocking": "integer or null; open findings whose policy blocking field matches",
+        "review_url": "string or null; the posted or updated review, or the prior ledger review "
+        "a terminal round named",
+        "reason": "string; present ONLY for a terminal round",
+    },
+    "skill_notes": "array of `code:count` strings; present ONLY for `review-pr --skill` when the "
+    "host dropped thread ids or replies (resolve_not_ours, resolve_not_cleared, reply_not_due, "
+    "reply_refused, threads_unreadable, anchors_folded)",
     # Present on every `review-pr` result; [] when no JIRA key was found or in frozen
     # (--at-sha/--diff-base) mode, which never fetches tickets. Never ticket text.
     "context_sources": [
@@ -213,8 +230,8 @@ _JOB_RECORD_SCHEMA: dict = {
     "status": "running | pr_opened | no_pr | agent_error | timeout | already_open | "
     "iterate_complete | killed | diagnosed | diagnose_failed | replay_complete | "
     "review_published | review_complete | no_findings | publish_blocked_stale_head | "
-    "publish_failed | publish_uncertain | branch_ready | no_changes | export_failed | "
-    "export_refused",
+    "publish_failed | publish_uncertain | skill_payload_invalid | branch_ready | no_changes | "
+    "export_failed | export_refused",
     "started_at": "ISO-8601 UTC timestamp when the run was registered",
     "ended_at": "ISO-8601 UTC timestamp when the run finished, or null while running",
     "pr_url": "the PR URL (string) or null when none was produced",

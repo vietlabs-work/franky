@@ -2,6 +2,12 @@
 
 Run `franky COMMAND --help` for flags and examples. Run `franky schema` for the complete machine-readable contract.
 
+## Review command
+
+| Command | Purpose |
+|---------|---------|
+| `franky review-pr PR_URL` | Review a PR and publish findings. `--skill NAME --skill-policy FILE` runs a team skill as the review method; the host validates and posts what it prepares ([skill mode](review.md#skill-mode)). |
+
 ## Job commands
 
 | Command | Purpose |

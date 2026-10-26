@@ -149,6 +149,8 @@ def build_result(
     thread: dict | None = None,
     handoff: dict | None = None,
     context_sources: list | None = None,
+    ledger: dict | None = None,
+    skill_notes: list | None = None,
     base_sha: str | None = None,
     head_sha: str | None = None,
     bundle_path: str | None = None,
@@ -162,7 +164,7 @@ def build_result(
     economics.Usage (input_tokens/output_tokens/cost_usd, each int|None / float|None). Status
     is one of: pr_opened | no_pr | agent_error | timeout | already_open | iterate_complete |
     replay_complete | review_published | review_complete | no_findings |
-    publish_blocked_stale_head | publish_failed | publish_uncertain.
+    publish_blocked_stale_head | publish_failed | publish_uncertain | skill_payload_invalid.
 
     For the `already_open` status (idempotency short-circuit, no container ran) the caller
     passes the sentinels `duration=0.0` and `log_path=""` - there is no run to time or log.
@@ -198,6 +200,9 @@ def build_result(
     `context_sources` is `review-pr`-only (absent, not null, elsewhere): one
     {kind, ref, status} entry per linked JIRA key Franky looked for, `[]` when none. It never
     carries ticket text.
+
+    `ledger` and `skill_notes` are `review-pr --skill`-only (absent elsewhere): the round's ledger
+    summary and the fixed codes of the thread ids or replies the host dropped.
 
     `base_sha`/`head_sha`/`bundle_path` are `build --no-publish`-only, each included ONLY when not
     None: the pinned default-branch tip the branch starts from (every --no-publish result), the
@@ -257,6 +262,10 @@ def build_result(
         result["threads_replied"] = threads_replied
     if context_sources is not None:
         result["context_sources"] = context_sources
+    if ledger is not None:
+        result["ledger"] = ledger
+    if skill_notes:
+        result["skill_notes"] = skill_notes
     if base_sha is not None:
         result["base_sha"] = base_sha
     if head_sha is not None:

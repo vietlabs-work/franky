@@ -27,6 +27,9 @@ from .result import AuthError, ConfigError
 REDACT_TOKEN = "***REDACTED***"
 
 GH_TOKEN_VAR = "GH_TOKEN"
+# `review-pr --skill` forwards the posting login to the task; it names an account, not a secret.
+GH_LOGIN_VAR = "GH_LOGIN"
+NON_SECRET_ENV = frozenset({GH_LOGIN_VAR})
 ALLOWED_REPOS_VAR = "FRANKY_ALLOWED_REPOS"
 EXTRA_ALLOWED_DOMAINS_VAR = "FRANKY_EXTRA_ALLOWED_DOMAINS"
 MODEL_VAR = "FRANKY_MODEL"
@@ -121,7 +124,7 @@ class Config:
         """
         from .atlassian import stored_secrets
 
-        values = [v for v in self.passthrough_env.values() if v]
+        values = [v for k, v in self.passthrough_env.items() if v and k not in NON_SECRET_ENV]
         # The stored Atlassian login (refresh token, current and previous access tokens, client
         # secret) is redacted from every run whether or not the tools are on.
         held = stored_secrets(os.environ)

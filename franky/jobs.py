@@ -87,6 +87,7 @@ _FAILURE_STATUSES = frozenset(
         "publish_blocked_stale_head",
         "publish_failed",
         "publish_uncertain",
+        "skill_payload_invalid",
         "no_changes",
         "export_failed",
         "export_refused",
@@ -550,7 +551,9 @@ QUIET_AFTER_SECS = 120
 # At most one heartbeat write per this many seconds, so a chatty agent costs ~nothing.
 HEARTBEAT_THROTTLE_SECS = 15
 _DONE_STATUSES = _SUCCESS_STATUSES | {"replay_complete", "diagnosed"}
-_REVIEW_PRE_PUBLISH_STATUSES = frozenset({"timeout", "agent_error", "no_findings"})
+_REVIEW_PRE_PUBLISH_STATUSES = frozenset(
+    {"timeout", "agent_error", "no_findings", "skill_payload_invalid"}
+)
 
 
 def _review_rerun_command(record: dict) -> str:
