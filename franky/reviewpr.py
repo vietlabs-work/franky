@@ -695,9 +695,12 @@ def signoff_reason(files: list | None, read_globs: Callable[[], list[str] | None
 
 
 def review_event(shaped: dict, allow_approve: bool = False) -> str:
-    """COMMENT, REQUEST_CHANGES or (only with `allow_approve`) APPROVE.
+    """COMMENT, or (only with `allow_approve`) REQUEST_CHANGES or APPROVE.
 
-    The default can never return APPROVE. With `allow_approve`, APPROVE needs every finding above
+    The default can never return APPROVE or REQUEST_CHANGES: a change request only a later
+    approval clears must not come from a review that cannot approve. A blocking finding
+    (or an omitted blocking prior one) gives REQUEST_CHANGES with `allow_approve`, else
+    COMMENT. With `allow_approve`, APPROVE needs every finding above
     nit (blocking, Major, or an open question, whose deciding fact is still unknown) to be resolved
     or accepted (an acceptance `verify_accepted` confirmed),
     no finding dropped as malformed, no prior finding left out of a threaded re-review
@@ -707,7 +710,7 @@ def review_event(shaped: dict, allow_approve: bool = False) -> str:
     """
     omitted = shaped.get("omitted_prior") or []
     if shaped["has_blocking"] or any(f.get("severity") == "blocking" for f in omitted):
-        return "REQUEST_CHANGES"
+        return "REQUEST_CHANGES" if allow_approve else "COMMENT"
     if (
         allow_approve
         and not shaped.get("dropped_malformed")

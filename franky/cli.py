@@ -1442,15 +1442,19 @@ def _publish_review(
             globs_cache.append(fetch_signoff_globs(repo, base_sha or "", os.environ))
         return globs_cache[0]
 
+    # The floor also turns REQUEST_CHANGES into COMMENT: a block the bot can never clear
+    # with an approval would stay on the PR until a human dismissed it.
+    would_be = review_event(shaped, True)
     if (
         allow_approve
-        and review_event(shaped, True) == "APPROVE"
+        and would_be in ("APPROVE", "REQUEST_CHANGES")
         and human_signoff_required(files, read_globs)
     ):
         allow_approve = False
-        signoff = signoff_reason(files, read_globs)
-        shaped = {**shaped, "signoff": signoff}
         notes.append(" (human sign-off required)")
+        if would_be == "APPROVE":
+            signoff = signoff_reason(files, read_globs)
+            shaped = {**shaped, "signoff": signoff}
 
     commentable = commentable_lines(files or [])
     post = ["api", "-X", "POST", f"repos/{repo}/pulls/{pr_number}/reviews", "--input", "-"]

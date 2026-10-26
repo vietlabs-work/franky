@@ -53,7 +53,8 @@ def test_resolved_blocking_finding_does_not_request_changes():
     shaped = _shaped({"title": "fixed", "severity": "blocking", "status": "resolved"})
     assert shaped["has_blocking"] is False and review_event(shaped) == "COMMENT"
     shaped = _shaped({"title": "still", "severity": "blocking", "status": "open"})
-    assert shaped["has_blocking"] is True and review_event(shaped) == "REQUEST_CHANGES"
+    assert shaped["has_blocking"] is True and review_event(shaped, True) == "REQUEST_CHANGES"
+    assert review_event(shaped) == "COMMENT"  # a review that cannot approve never blocks
 
 
 def test_review_body_tags_status_except_new():
@@ -75,7 +76,7 @@ def test_non_thread_review_ignores_agent_status():
         threaded=False,
     )
     assert [f["status"] for f in shaped["findings"]] == ["new", "new"]
-    assert review_event(shaped) == "REQUEST_CHANGES"
+    assert review_event(shaped, True) == "REQUEST_CHANGES"
     body = render_review_body(shaped)
     assert "[resolved]" not in body and "[open]" not in body
     assert (
@@ -167,7 +168,7 @@ def test_payload_splits_inline_and_body():
         _f("Off diff", line=99, severity="nit"),
         _f("No line", file=None, line=None),
     )
-    p = build_review_payload(shaped, c, "sha1", [])
+    p = build_review_payload(shaped, c, "sha1", [], True)
     assert p["event"] == "REQUEST_CHANGES" and p["commit_id"] == "sha1"
     assert p["comments"] == [
         {
@@ -609,7 +610,8 @@ def test_prior_finding_left_out_of_a_re_review_blocks_approve():
     assert "Not re-reported, still open: Guard the null list" in body
     assert "1 finding (0 blocking, 1 major)" in body
     shaped["omitted_prior"] = [{"title": "Race", "severity": "blocking", "file": "a.py"}]
-    assert review_event(shaped) == "REQUEST_CHANGES"
+    assert review_event(shaped, allow_approve=True) == "REQUEST_CHANGES"
+    assert review_event(shaped) == "COMMENT"
     over = _shape(threaded=True)
     over["prior_overflow"] = True
     assert review_event(over, allow_approve=True) == "COMMENT"

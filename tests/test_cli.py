@@ -4155,7 +4155,7 @@ def test_review_pr_json_success_reports_reviewed_sha_and_review_url(monkeypatch)
     assert data["repo"] == "me/repo"
 
 
-def test_review_pr_blocking_finding_requests_changes_never_approve(monkeypatch):
+def test_review_pr_blocking_finding_without_allow_approve_only_comments(monkeypatch):
     _fix_review_nonce(monkeypatch)
     calls = _mc_review_setup(
         monkeypatch,
@@ -4184,7 +4184,8 @@ def test_review_pr_blocking_finding_requests_changes_never_approve(monkeypatch):
     assert res.exit_code == 0, res.output
     data = json.loads(res.stdout)
     assert data["status"] == "review_published"
-    assert json.loads(calls.inputs[0])["event"] == "REQUEST_CHANGES"
+    # It cannot approve, so it never requests changes: that block would outlive every fix.
+    assert json.loads(calls.inputs[0])["event"] == "COMMENT"
     assert "APPROVE" not in " ".join(calls[0]) + calls.inputs[0]
 
 
@@ -4404,7 +4405,7 @@ def test_review_pr_posts_inline_comments_on_pinned_commit(monkeypatch):
         "-",
     ]
     payload = json.loads(calls.inputs[0])
-    assert payload["commit_id"] == LIVE_SHA and payload["event"] == "REQUEST_CHANGES"
+    assert payload["commit_id"] == LIVE_SHA and payload["event"] == "COMMENT"
     assert [(c["path"], c["line"], c["side"]) for c in payload["comments"]] == [
         ("app.py", 2, "RIGHT")
     ]
@@ -5106,7 +5107,7 @@ def test_review_pr_without_thread_forces_status_new(monkeypatch, tmp_path):
         res = runner.invoke(cli.main, ["review-pr", "--json", PR_URL])
     assert res.exit_code == 0, res.output
     body = json.loads(calls.inputs[0])
-    assert body["event"] == "REQUEST_CHANGES" and "[resolved]" not in body["body"]
+    assert body["event"] == "COMMENT" and "[resolved]" not in body["body"]
 
 
 def test_review_pr_without_thread_is_unchanged(monkeypatch, tmp_path):
@@ -6003,7 +6004,7 @@ def test_publish_unreadable_file_list_never_approves(monkeypatch):
     assert gh.post_events() == ["COMMENT"] and reads == []
 
 
-def test_publish_does_not_consult_the_floor_for_blocking_or_without_allow_approve(monkeypatch):
+def test_publish_floor_turns_blocking_into_comment_without_a_signoff_reason(monkeypatch):
     blocking = build_review_findings(
         {
             "summary": "s",
@@ -6013,13 +6014,25 @@ def test_publish_does_not_consult_the_floor_for_blocking_or_without_allow_approv
             "checks": [],
         }
     )
+    # A block the bot can never clear with an approval would stay until a human dismissed it.
+    gh, out, reads = _floor_pub(
+        monkeypatch, ["**/pay/**"], _signoff_files("a/pay/X.java"), shaped=blocking
+    )
+    assert gh.post_events() == ["COMMENT"] and len(reads) == 1
+    assert "human sign-off" in out[1] and out[8] is None
+    assert "Looks good" not in json.loads(gh.inputs[-1])["body"]
+    gh, _, reads = _floor_pub(
+        monkeypatch, ["**/pay/**"], _signoff_files("a/ok/X.java"), shaped=blocking
+    )
+    assert gh.post_events() == ["REQUEST_CHANGES"] and len(reads) == 1
     gh, _, reads = _floor_pub(
         monkeypatch,
         AssertionError("must not read"),
         _signoff_files("a/pay/X.java"),
         shaped=blocking,
+        allow_approve=False,
     )
-    assert reads == [] and gh.post_events() == ["REQUEST_CHANGES"]
+    assert reads == [] and gh.post_events() == ["COMMENT"]
     gh, _, reads = _floor_pub(
         monkeypatch,
         AssertionError("must not read"),
