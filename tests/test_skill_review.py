@@ -674,11 +674,36 @@ def test_an_invalid_payload_posts_nothing_and_reports_a_code(monkeypatch, tmp_pa
     assert "skill_" in data["reason"] and "ledger" not in data
 
 
-def test_no_publish_validates_and_writes_nothing(monkeypatch, tmp_path):
-    calls, _ = setup_run(monkeypatch, tmp_path, review_payload(ledger()))
+def test_no_publish_returns_the_final_body_with_comments_folded(monkeypatch, tmp_path):
+    led = ledger()
+    calls, _ = setup_run(
+        monkeypatch, tmp_path, review_payload(led, comments=[inline(body="look <!-- x -->")])
+    )
     res, data = run(tmp_path, "--no-publish")
     assert res.exit_code == 0 and not calls
     assert data["status"] == "review_complete" and data["ledger"]["open"] == 1
+    body = data["review_body"]
+    assert "`app.py:3`: look &lt;!-- x -->" in body and body.endswith("</sub>")
+    assert skillreview.ledger_block(body, MARKER) == led
+
+
+def test_no_publish_terminal_has_no_review_body(monkeypatch, tmp_path):
+    payload = {
+        "kind": "terminal",
+        "decision": "skip",
+        "reason": "draft",
+        "prior_ledger_review_id": None,
+    }
+    setup_run(monkeypatch, tmp_path, payload)
+    res, data = run(tmp_path, "--no-publish")
+    assert res.exit_code == 0 and "review_body" not in data and data["ledger"]["kind"] == "terminal"
+
+
+def test_no_publish_refuses_a_body_that_no_longer_fits(monkeypatch, tmp_path):
+    big = [inline(body="z" * 390)] * 3
+    setup_run(monkeypatch, tmp_path, review_payload(ledger(), "x" * 4700 + block(ledger()), big))
+    res, data = run(tmp_path, "--no-publish", policy_over={"max_body_chars": 5000})
+    assert res.exit_code == 7 and data["status"] == "skill_payload_invalid"
 
 
 def test_a_moved_head_blocks_the_post(monkeypatch, tmp_path):

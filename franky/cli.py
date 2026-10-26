@@ -1403,17 +1403,17 @@ def _finish_skill_review(
         )
     except skillreview.SkillError as exc:
         reason = f"skill review payload refused ({exc.code}) - see the redacted log ({log_path})"
-        return ("skill_payload_invalid", reason, EXIT_AGENT, *([None] * 7), False)
+        return ("skill_payload_invalid", reason, EXIT_AGENT, *([None] * 8), False)
     except Exception:
         reason = f"skill review payload unreadable - see the redacted log ({log_path})"
-        return ("skill_payload_invalid", reason, EXIT_AGENT, *([None] * 7), False)
+        return ("skill_payload_invalid", reason, EXIT_AGENT, *([None] * 8), False)
 
     def done(
         status, reason, code, url=None, rid=None, event=None, resolved=None, replied=None,
-        notes=None, link=None,
+        notes=None, link=None, text=None,
     ):  # fmt: skip
         summary = skillreview.ledger_summary(payload, policy, pinned_sha, link or url)
-        return status, reason, code, url, rid, event, resolved, replied, summary, notes, True
+        return status, reason, code, url, rid, event, resolved, replied, summary, notes, text, True
 
     if payload.kind == "terminal":
         prior = payload.prior_review_id
@@ -1429,10 +1429,23 @@ def _finish_skill_review(
             link=f"{pr_url}#pullrequestreview-{prior}" if prior else None,
         )
     if no_publish:
+        # The final text a publish would post, comments folded in and re-validated.
+        text = payload.body if payload.body is not None else (payload.update or {}).get("body")
+        try:
+            if payload.body is not None and payload.comments:
+                text = skillreview.fold_comments(
+                    payload.body, payload.comments, footer, policy, payload.ledger or {}
+                )
+        except skillreview.SkillError as exc:
+            reason = (
+                f"skill review payload refused ({exc.code}) - see the redacted log ({log_path})"
+            )
+            return ("skill_payload_invalid", reason, EXIT_AGENT, *([None] * 8), False)
         return done(
             "review_complete",
             "skill review validated (publish=False, nothing written to GitHub)",
             EXIT_SUCCESS,
+            text=text,
         )
     # Re-check the LIVE head immediately before publishing, as every review does.
     _liveness(job_id, phase="publish")
@@ -2533,6 +2546,7 @@ def review_pr(
                 threads_replied,
                 ledger_out,
                 skill_notes,
+                review_body,
                 skill_ok,
             ) = _finish_skill_review(
                 output,
