@@ -6,7 +6,6 @@ import pytest
 
 from franky.reviewpr import (
     SIGNOFF_FILE,
-    SIGNOFF_LINE,
     MAX_BODY_CHARS,
     MAX_INLINE,
     anchor_ok,
@@ -25,6 +24,8 @@ from franky.reviewpr import (
     render_review_body,
     review_event,
     signoff_match,
+    signoff_reason,
+    signoff_text,
 )
 
 
@@ -52,7 +53,8 @@ def test_resolved_blocking_finding_does_not_request_changes():
     shaped = _shaped({"title": "fixed", "severity": "blocking", "status": "resolved"})
     assert shaped["has_blocking"] is False and review_event(shaped) == "COMMENT"
     shaped = _shaped({"title": "still", "severity": "blocking", "status": "open"})
-    assert shaped["has_blocking"] is True and review_event(shaped) == "REQUEST_CHANGES"
+    assert shaped["has_blocking"] is True and review_event(shaped, True) == "REQUEST_CHANGES"
+    assert review_event(shaped) == "COMMENT"  # a review that cannot approve never blocks
 
 
 def test_review_body_tags_status_except_new():
@@ -74,7 +76,7 @@ def test_non_thread_review_ignores_agent_status():
         threaded=False,
     )
     assert [f["status"] for f in shaped["findings"]] == ["new", "new"]
-    assert review_event(shaped) == "REQUEST_CHANGES"
+    assert review_event(shaped, True) == "REQUEST_CHANGES"
     body = render_review_body(shaped)
     assert "[resolved]" not in body and "[open]" not in body
     assert (
@@ -166,7 +168,7 @@ def test_payload_splits_inline_and_body():
         _f("Off diff", line=99, severity="nit"),
         _f("No line", file=None, line=None),
     )
-    p = build_review_payload(shaped, c, "sha1", [])
+    p = build_review_payload(shaped, c, "sha1", [], True)
     assert p["event"] == "REQUEST_CHANGES" and p["commit_id"] == "sha1"
     assert p["comments"] == [
         {
@@ -608,7 +610,8 @@ def test_prior_finding_left_out_of_a_re_review_blocks_approve():
     assert "Not re-reported, still open: Guard the null list" in body
     assert "1 finding (0 blocking, 1 major)" in body
     shaped["omitted_prior"] = [{"title": "Race", "severity": "blocking", "file": "a.py"}]
-    assert review_event(shaped) == "REQUEST_CHANGES"
+    assert review_event(shaped, allow_approve=True) == "REQUEST_CHANGES"
+    assert review_event(shaped) == "COMMENT"
     over = _shape(threaded=True)
     over["prior_overflow"] = True
     assert review_event(over, allow_approve=True) == "COMMENT"
@@ -961,11 +964,102 @@ def test_human_signoff_floor_skips_the_read_when_it_cannot_matter():
     assert human_signoff_required([_pf("x", SIGNOFF_FILE)], _no_read) is True
 
 
-def test_body_carries_the_signoff_line_only_when_flagged():
+def test_body_carries_the_signoff_text_only_when_flagged():
     shaped = _shaped()
-    assert SIGNOFF_LINE not in render_review_body(shaped)
-    body = render_review_body({**shaped, "signoff_required": True})
-    assert "code-clean, human sign-off required" in body
+    assert "Automated approval is off" not in render_review_body(shaped)
+    info = {"reason": "match", "path": "a/pay/X.java", "rule": "**/pay/**", "more": 0}
+    body = render_review_body({**shaped, "signoff": info})
+    assert (
+        "**Looks good: no findings above nit.** Automated approval is off for this PR. "
+        "A human must approve it, because `a/pay/X.java` matches `**/pay/**` in "
+        "`.github/human-signoff-paths`." in body
+    )
+
+
+def test_signoff_text_variants():
+    base = "Automated approval is off for this PR. A human must approve it, because "
+    m = {"reason": "match", "path": "a/X.java", "rule": "/a/*", "more": 1}
+    assert f"{base}`a/X.java` (and 1 more file) matches `/a/*` in" in signoff_text(m)
+    assert "(and 3 more files)" in signoff_text({**m, "more": 3})
+    changed = {"reason": "list_changed", "path": SIGNOFF_FILE, "rule": None, "more": 0}
+    assert signoff_text(changed).endswith(f"{base}it changes `{SIGNOFF_FILE}`.")
+    unread = {"reason": "unreadable", "path": None, "rule": None, "more": 0}
+    assert signoff_text(unread).endswith(
+        f"{base}the sign-off list or the PR file list could not be read."
+    )
+
+
+def test_signoff_text_fences_the_path_verbatim_and_caps_its_length():
+    info = {"reason": "match", "path": "a/<b>&`x`.java", "rule": "**", "more": 0}
+    text = signoff_text(info)
+    assert "``a/<b>&`x`.java``" in text
+    edge = signoff_text({**info, "path": "`x"})
+    assert "`` `x ``" in edge
+    long = signoff_text({**info, "rule": "r" * 70000})
+    assert len(long) < 600 and "r" * 197 + "...`" in long
+
+
+def test_signoff_reason_match_names_first_path_and_deciding_rule():
+    read = lambda: ["/a/*", "**/pay/**"]  # noqa: E731
+    files = [_pf("z/ok.txt"), _pf("a/pay/X.java"), _pf("a/Y.java"), _pf("b/pay/Z.java")]
+    assert signoff_reason(files, read) == {
+        "reason": "match",
+        "path": "a/pay/X.java",
+        "rule": "**/pay/**",
+        "more": 2,
+    }
+    # the rule text is kept as written, leading slash included
+    assert signoff_reason([_pf("a/Y.java")], read)["rule"] == "/a/*"
+
+
+def test_signoff_reason_negated_last_rule_wins():
+    read = lambda: ["**/pay/**", "!**/test/**"]  # noqa: E731
+    assert signoff_reason([_pf("a/pay/test/XTest.java")], read) is None
+    got = signoff_reason([_pf("a/pay/test/XTest.java"), _pf("a/pay/X.java")], read)
+    assert got["path"] == "a/pay/X.java" and got["more"] == 0
+    # a later positive rule re-matches what a negation cleared
+    again = signoff_reason([_pf("a/pay/test/X.java")], lambda: ["!**/test/**", "**/pay/**"])
+    assert again["rule"] == "**/pay/**"
+
+
+def test_signoff_reason_rename_counts_old_name():
+    got = signoff_reason([_pf("a/ok/X.java", "a/pay/X.java")], lambda: ["**/pay/**"])
+    assert got == {"reason": "match", "path": "a/pay/X.java", "rule": "**/pay/**", "more": 0}
+
+
+def test_signoff_reason_list_changed_and_unreadable():
+    assert signoff_reason([_pf("x"), _pf(SIGNOFF_FILE)], _no_read) == {
+        "reason": "list_changed",
+        "path": SIGNOFF_FILE,
+        "rule": None,
+        "more": 0,
+    }
+    unread = {"reason": "unreadable", "path": None, "rule": None, "more": 0}
+    assert signoff_reason(None, _no_read) == unread
+    assert signoff_reason([_pf("a")] * 3000, _no_read) == unread
+    assert signoff_reason([_pf("a"), "oops"], _no_read) == unread
+    assert signoff_reason([{"filename": "x", "status": "renamed"}], _no_read) == unread
+    assert signoff_reason([_pf("a/pay/X.java")], lambda: None) == unread
+
+
+_AGREE_CASES = [
+    ([], _no_read),
+    (None, _no_read),
+    ([_pf("a")] * 3000, _no_read),
+    ([_pf(SIGNOFF_FILE)], _no_read),
+    ([{"filename": "x", "status": "renamed"}], _no_read),
+    ([_pf("a/pay/X.java")], lambda: ["**/pay/**"]),
+    ([_pf("a/ok/X.java")], lambda: ["**/pay/**"]),
+    ([_pf("a/ok/X.java", "a/pay/X.java")], lambda: ["**/pay/**"]),
+    ([_pf("a/pay/test/X.java")], lambda: ["**/pay/**", "!**/test/**"]),
+    ([_pf("a/pay/X.java")], lambda: []),
+    ([_pf("a/pay/X.java")], lambda: None),
+]
+
+
+@pytest.mark.parametrize("files,read", _AGREE_CASES)
+def test_signoff_reason_is_none_iff_signoff_not_required(files, read):
+    assert (signoff_reason(files, read) is None) is (not human_signoff_required(files, read))
 
 
 # --- accepted risk ---------------------------------------------------------------------------
