@@ -18,9 +18,9 @@ footprint:
 		python3 scripts/footprint.py host --repo . --output "$$scratch/head.json"; \
 		python3 scripts/footprint.py compare-host --base "$$scratch/base.json" \
 			--head "$$scratch/head.json" --budgets scripts/footprint-budgets.json
-# Manual gate for always-on rootless Docker-in-Docker (#12). Needs real Docker. Run before
+# Manual gate for deferred and eager rootless Docker-in-Docker. Needs real Docker. Run before
 # merging changes to the Dockerfile,
-# franky-dind-entrypoint.sh, container.py's _HARDENING, or egress.py.
+# franky-dind-entrypoint.sh, franky-docker-start.py, container.py's _HARDENING, or egress.py.
 smoke-dind:
 	bash scripts/smoke-dind.sh
 

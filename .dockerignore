@@ -1,5 +1,6 @@
 *
 !Dockerfile
 !franky-dind-entrypoint.sh
+!franky-docker-start.py
 !franky-repo-setup.py
 !install-codex-native-launcher.sh

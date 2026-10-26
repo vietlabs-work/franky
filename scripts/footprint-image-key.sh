@@ -5,6 +5,8 @@
 set -euo pipefail
 cd "${1:-.}"
 files=(Dockerfile install-codex-native-launcher.sh franky-dind-entrypoint.sh)
+# Base commits can predate the deferred-start helper.
+[ ! -e franky-docker-start.py ] || files+=(franky-docker-start.py)
 # A base commit that predates the mapper has no such file; every other input must exist.
 [ ! -e franky-repo-setup.py ] || files+=(franky-repo-setup.py)
 files+=(proxy/Dockerfile proxy/entrypoint.sh)

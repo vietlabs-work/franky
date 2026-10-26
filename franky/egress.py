@@ -24,12 +24,12 @@ GITHUB_DOMAINS = [".github.com", ".githubusercontent.com"]
 # Package registries the agent needs to install deps during a build.
 REGISTRY_DOMAINS = ["registry.npmjs.org", "pypi.org", "files.pythonhosted.org"]
 
-# Container image registries for the always-on rootless Docker daemon (issue #12): a task's
+# Container image registries for the task-local rootless Docker daemon: a task's
 # nested `docker pull` / `docker compose` / testcontainers reach these THROUGH the proxy (the
 # nested daemon honours HTTP(S)_PROXY, so Squid does the DNS and the cage still bounds it - see
 # the issue-12 spike). Broad on purpose ("any well-known registry works out of the box") - the
 # cost is that these hosts are reachable on EVERY task, not just docker-using ones; this is an
-# accepted residual of always-on DinD (documented in the README security section).
+# accepted residual of task-local DinD (documented in the security guide).
 #
 # Squid dot-form rules apply (see GITHUB_DOMAINS): a leading dot matches the apex AND all
 # subdomains, and listing an apex alongside its dot-form is a FATAL Squid overlap - so each
@@ -71,7 +71,7 @@ def build_allowlist(
     model: str | None = None,
 ) -> list[str]:
     """The full default-deny allowlist: the engine's provider host(s) + GitHub + language
-    registries + container image registries (always-on DinD) + any operator extras. Stripped,
+    registries + container image registries (task-local DinD) + any operator extras. Stripped,
     empties dropped, deduped, sorted for determinism.
 
     `passthrough_env` is the same mapping Franky resolved its config from. `model` selects the

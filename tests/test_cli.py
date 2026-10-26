@@ -412,8 +412,10 @@ def test_build_plan_first_approved_executes_and_prs(monkeypatch):
     monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
 
     outputs = ["PLAN: do the thing", f"opened {PR_URL}"]
+    modes = []
 
     def fake_run(*a, **k):
+        modes.append(k.get("docker_start", "eager"))
         return 0, outputs.pop(0)
 
     monkeypatch.setattr(cli, "run_in_container", fake_run)
@@ -425,6 +427,7 @@ def test_build_plan_first_approved_executes_and_prs(monkeypatch):
         )
     assert res.exit_code == 0, res.output
     assert not outputs  # both passes ran
+    assert modes == ["deferred", "eager"]
     assert PR_URL in res.output
 
 
@@ -2857,6 +2860,7 @@ def test_plan_json_emits_one_decomposition_object(monkeypatch):
         # assert the decompose prompt reached the container by checking the inner argv carries
         # the nonce-fenced sentinel instruction.
         seen["argv"] = inner_argv
+        seen["docker_start"] = k.get("docker_start", "eager")
         return 0, _plan_block(payload)
 
     monkeypatch.setattr(cli, "run_in_container", fake_run)
@@ -2874,6 +2878,7 @@ def test_plan_json_emits_one_decomposition_object(monkeypatch):
     assert data["engine"] == "pi"
     assert data["repo"] == "me/repo"
     assert data["exit_code"] == 0
+    assert seen["docker_start"] == "deferred"
     # The decompose prompt (carrying the nonce sentinel) reached the container, read-only.
     assert any(f"FRANKY_PLAN_{PLAN_NONCE}_BEGIN" in str(a) for a in seen["argv"])
     assert not any("gh pr create" in str(a) for a in seen["argv"])
@@ -4984,6 +4989,7 @@ def test_review_pr_thread_failed_resume_retries_once_seeded(monkeypatch, tmp_pat
     assert data["thread"]["session"] == "seeded"
     assert data["thread"]["session_reason"] == "resume_failed"
     assert len(seen) == 2
+    assert all(attempt["kwargs"]["docker_start"] == "deferred" for attempt in seen)
     assert seen[0]["argv"][seen[0]["argv"].index("--resume") + 1] == first_sid
     retry = seen[1]["argv"]
     new_sid = retry[retry.index("--session-id") + 1]
@@ -4995,6 +5001,16 @@ def test_review_pr_thread_failed_resume_retries_once_seeded(monkeypatch, tmp_pat
     assert record["session_id"] == new_sid and record["session_ok"] is True
     # The failed attempt keeps its own redacted log (quiet under --json, so no stderr note).
     assert list((tmp_path / "test-franky-runs").rglob(f"*{data['job_id']}-resume-failed.log"))
+
+
+def test_nonthreaded_review_defers_docker_with_startup_instruction(monkeypatch, tmp_path):
+    _fix_review_nonce(monkeypatch)
+    _mc_review_setup(monkeypatch, env=_thread_env(tmp_path))
+    seen = _fake_thread_run(monkeypatch, tmp_path)
+    result = _review(["--engine", "claude", "--no-publish"])
+    assert result.exit_code == 0, result.output
+    assert seen[0]["kwargs"]["docker_start"] == "deferred"
+    assert "run `franky-docker-start`" in seen[0]["argv"][2]
 
 
 def test_review_pr_thread_failed_retry_reports_the_retry_and_never_loops(monkeypatch, tmp_path):

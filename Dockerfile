@@ -1,5 +1,5 @@
 # Franky build image: release variants bundle one coding-agent engine; the default bundles all.
-# Every image has an always-on rootless Docker daemon (issue #12), so tasks can test repos whose suites
+# Every image includes a task-local rootless Docker daemon, so tasks can test repos whose suites
 # need local infra (docker compose, testcontainers, `docker build`). Hardened at run time (see
 # franky/container.py); the image pre-bakes the toolchain so no task needs runtime root apt.
 #
@@ -143,13 +143,14 @@ RUN useradd --uid 1001 --create-home --shell /bin/bash franky \
     && setcap cap_setgid+ep /usr/bin/newgidmap \
     && chmod u-s /usr/bin/newuidmap /usr/bin/newgidmap
 
-# The DinD entrypoint starts rootless dockerd then execs the engine argv (supplied as CMD by
-# franky/container.py).
+# The entrypoint sets up task-local Docker, then execs the host-selected engine argv.
 COPY franky-dind-entrypoint.sh /usr/local/bin/franky-dind-entrypoint.sh
+COPY franky-docker-start.py /usr/local/bin/franky-docker-start
 # The repository-setup mapper (stdlib python3 + git): the host runs it with `docker exec` during
 # the profile wait, before the engine starts.
 COPY franky-repo-setup.py /usr/local/bin/franky-repo-setup
-RUN chmod +x /usr/local/bin/franky-dind-entrypoint.sh /usr/local/bin/franky-repo-setup
+RUN chmod 755 /usr/local/bin/franky-dind-entrypoint.sh /usr/local/bin/franky-docker-start \
+    /usr/local/bin/franky-repo-setup
 
 # ---- stage 5: selected engine ---------------------------------------------------------------
 FROM runtime-base

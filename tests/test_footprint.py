@@ -516,6 +516,7 @@ IMAGE_INPUTS = (
     "Dockerfile",
     "install-codex-native-launcher.sh",
     "franky-dind-entrypoint.sh",
+    "franky-docker-start.py",
     "franky-repo-setup.py",
     "proxy/Dockerfile",
     "proxy/entrypoint.sh",
@@ -553,3 +554,5 @@ def test_image_key_lists_every_file_the_dockerfiles_copy():
             if parts[:1] in (["COPY"], ["ADD"]) and not parts[1].startswith("--from="):
                 copied.update(prefix + source for source in parts[1:-1])
     assert copied | {"Dockerfile", "proxy/Dockerfile"} == set(IMAGE_INPUTS)
+    allowed = (footprint.ROOT / ".dockerignore").read_text().splitlines()
+    assert all(f"!{source}" in allowed for source in copied if "/" not in source)
