@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.28] - 2026-10-26
+
 - Reviews and planning passes start nested Docker only when needed, with `franky-docker-start` available for Docker-dependent reproduction. Builds keep eager startup. Concurrent startup calls share one bounded launch, and diagnostics report the last startup outcome after a retry.
 
 ## [0.3.27] - 2026-10-21
