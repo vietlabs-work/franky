@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.32] - 2026-10-27
+
 - `review-pr`: when the live head read fails, the `network_error` message now names the cause, `HTTP <code>`, the exception class or `bad response` (never the exception text), for example `could not read <pr>'s live head commit via the GitHub API (HTTP 502) - refusing`.
 
 ## [0.3.31] - 2026-10-27
