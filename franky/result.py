@@ -145,6 +145,7 @@ def build_result(
     review_id: int | None = None,
     review_event: str | None = None,
     signoff: dict | None = None,
+    dismissed_review_id: int | None = None,
     threads_resolved: int | None = None,
     threads_replied: int | None = None,
     thread: dict | None = None,
@@ -198,7 +199,8 @@ def build_result(
     has, `threads_resolved` the number of threads `--resolve-fixed` resolved and `threads_replied`
     the number `--reply-prior` replied on; all are `review-pr`-only and absent otherwise.
     `signoff` ({reason, path, rule, more}) is present only when the human sign-off floor turned
-    an APPROVE into a COMMENT.
+    an APPROVE into a COMMENT. `dismissed_review_id` is present only when a skill review dismissed
+    the bot's own stale APPROVE.
 
     `context_sources` is `review-pr`-only (absent, not null, elsewhere): one
     {kind, ref, status} entry per linked JIRA key Franky looked for, `[]` when none. It never
@@ -261,6 +263,8 @@ def build_result(
         result["review_event"] = review_event
     if signoff is not None:
         result["signoff"] = signoff
+    if dismissed_review_id is not None:
+        result["dismissed_review_id"] = dismissed_review_id
     if threads_resolved is not None:
         result["threads_resolved"] = threads_resolved
     if threads_replied is not None:

@@ -5,7 +5,10 @@ import json
 import pytest
 
 from franky.reviewpr import (
+    CONTENT_FILE,
+    MAX_CONTENT_FILES,
     SIGNOFF_FILE,
+    content_signoff,
     MAX_BODY_CHARS,
     MAX_INLINE,
     anchor_ok,
@@ -1040,6 +1043,76 @@ def test_signoff_reason_list_changed_and_unreadable():
     assert signoff_reason([_pf("a"), "oops"], _no_read) == unread
     assert signoff_reason([{"filename": "x", "status": "renamed"}], _no_read) == unread
     assert signoff_reason([_pf("a/pay/X.java")], lambda: None) == unread
+
+
+def test_the_content_file_is_a_sign_off_file_too():
+    changed = {"reason": "list_changed", "path": CONTENT_FILE, "rule": None, "more": 0}
+    assert signoff_reason([_pf("x"), _pf(CONTENT_FILE)], _no_read) == changed
+    assert human_signoff_required([_pf(CONTENT_FILE)], _no_read) is True
+    assert signoff_text(changed).endswith(f"it changes `{CONTENT_FILE}`.")
+
+
+def test_signoff_text_for_a_content_hit():
+    info = {"reason": "content", "path": "src/main/A.java", "rule": "**/src/main/**", "more": 2}
+    assert signoff_text(info).endswith(
+        "because `src/main/A.java` (and 2 more files) may contain a string listed in "
+        f"`{CONTENT_FILE}` (`**/src/main/**`)."
+    )
+
+
+def _content(reads):
+    return lambda path, side: reads.get((path, side), b"")
+
+
+RULES = [("**/src/main/**", "CurrencyHelper")]
+
+
+def test_content_signoff_hits_at_base_or_head_and_counts_more():
+    files = [_pf("src/main/A.java"), _pf("src/main/B.java"), _pf("src/test/C.java")]
+    assert content_signoff(files, RULES, _content({})) is None
+    base = _content({("src/main/A.java", "base"): b"x CurrencyHelper y"})
+    assert content_signoff(files, RULES, base) == {
+        "reason": "content",
+        "path": "src/main/A.java",
+        "rule": "**/src/main/**",
+        "more": 0,
+    }
+    head = _content(
+        {
+            ("src/main/A.java", "head"): b"CurrencyHelper",
+            ("src/main/B.java", "head"): b"CurrencyHelper",
+        }
+    )
+    assert content_signoff(files, RULES, head)["more"] == 1
+    # a rename is matched and read under its old name at base
+    moved = [{"filename": "x/New.java", "previous_filename": "src/main/Old.java"}]
+    old = _content({("src/main/Old.java", "base"): b"CurrencyHelper"})
+    assert content_signoff(moved, RULES, old)["path"] == "x/New.java"
+
+
+def test_content_signoff_skips_the_side_that_cannot_exist():
+    seen = []
+
+    def read(path, side):
+        seen.append((path, side))
+        return b""
+
+    files = [
+        {"filename": "src/main/A.java", "status": "added"},
+        {"filename": "src/main/B.java", "status": "removed"},
+    ]
+    assert content_signoff(files, RULES, read) is None
+    assert seen == [("src/main/A.java", "head"), ("src/main/B.java", "base")]
+
+
+def test_content_signoff_fails_closed():
+    unread = {"reason": "unreadable", "path": None, "rule": None, "more": 0}
+    files = [_pf("src/main/A.java")]
+    assert content_signoff(files, RULES, lambda p, s: None) == unread
+    assert content_signoff(files, [("!x", "y")], _content({})) == unread
+    many = [_pf(f"src/main/F{i}.java") for i in range(MAX_CONTENT_FILES)]
+    assert content_signoff(many, RULES, _content({})) is None
+    assert content_signoff([*many, _pf("src/main/Z.java")], RULES, _content({})) == unread
 
 
 _AGREE_CASES = [

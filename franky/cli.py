@@ -71,7 +71,15 @@ from .engine import (
 )
 from . import atlassian
 from .github import run_gh
-from .idempotency import fetch_pr_head_sha, fetch_signoff_globs, find_open_pr, repo_is_private
+from .idempotency import (
+    CONTENT_FILE_MAX_BYTES,
+    fetch_pr_head_sha,
+    fetch_repo_file,
+    fetch_signoff_content_rules,
+    fetch_signoff_globs,
+    find_open_pr,
+    repo_is_private,
+)
 from .jira import (
     extract_jira_keys,
     fetch_jira_comments,
@@ -126,6 +134,7 @@ from .reviewpr import (
     build_review_findings,
     build_review_payload,
     commentable_lines,
+    content_signoff,
     human_signoff_required,
     match_prior_threads,
     parse_review_findings,
@@ -134,6 +143,7 @@ from .reviewpr import (
     review_event,
     review_footer,
     signoff_reason,
+    signoff_text,
     thread_reply_target,
     verify_accepted,
 )
@@ -1252,6 +1262,56 @@ def _find_marked_review(gh, repo: str, pr_number: int, sha: str, marker: str):
     return "absent", None
 
 
+def _send_review(gh, post: list[str], p: dict):
+    """POST a review payload. An APPROVE that timed out may or may not have landed: reported as
+    a failed write (-1) so the caller reconciles instead of raising."""
+    try:
+        return gh(post, input=json.dumps(p))
+    except FrankyError as exc:
+        if p["event"] != "APPROVE" or exc.kind != "timeout":
+            raise
+        return -1, "", "timed out"
+
+
+def _approve_review(
+    gh,
+    repo: str,
+    pr_number: int,
+    sha: str,
+    post: list[str],
+    p: dict,
+    marker: str,
+    absent_is_unwritten: bool = True,
+):
+    """POST an APPROVE payload that ends with `marker`. Returns (kind, out, event, maybe_written):
+    kind "ok" (out is the review JSON, event what is on the PR), "unwritten" (a confirmed
+    refusal, or with `absent_is_unwritten` an absent review after two clean reads: out is the
+    error) or "unknown" (never repost). `maybe_written` is True once a failed POST may have
+    landed. The skill path passes `absent_is_unwritten=False`: an unconfirmed write is never
+    followed by another write."""
+    gcode, gout, gerr = _send_review(gh, post, p)
+    if gcode == 0 and _json_dict(gout).get("id") is not None:
+        return "ok", gout, "APPROVE", False
+    if _review_confirmed_unwritten(gcode, gerr):
+        return "unwritten", gerr, None, False
+    kind, review = _find_marked_review(gh, repo, pr_number, sha, marker)
+    if kind == "found":
+        event = {"APPROVED": "APPROVE", "CHANGES_REQUESTED": "REQUEST_CHANGES"}.get(
+            str(review.get("state")), "COMMENT"
+        )
+        return "ok", json.dumps(review), event, True
+    unwritten = kind == "absent" and absent_is_unwritten
+    return ("unwritten" if unwritten else "unknown"), gerr, None, True
+
+
+def _json_dict(out: str) -> dict:
+    try:
+        resp = json.loads(out)
+    except (ValueError, TypeError):
+        return {}
+    return resp if isinstance(resp, dict) else {}
+
+
 def _read_review_threads(
     gh, repo: str, pr_number: int, secrets: list[str], query: str = THREADS_QUERY
 ) -> list | None:
@@ -1393,9 +1453,12 @@ def _finish_skill_review(
     no_publish: bool,
     resolve: bool,
     reply: bool,
+    allow_approve: bool = False,
+    base_sha: str | None = None,
 ):
     """Validate a skill run's payload and post it. Returns (status, reason, exit code, review
-    url, review id, event, threads resolved, threads replied, ledger, notes, payload_ok)."""
+    url, review id, event, threads resolved, threads replied, ledger, notes, review text,
+    sign-off, payload_ok)."""
     try:
         footer = review_footer()
         payload = skillreview.build_payload(
@@ -1403,17 +1466,20 @@ def _finish_skill_review(
         )
     except skillreview.SkillError as exc:
         reason = f"skill review payload refused ({exc.code}) - see the redacted log ({log_path})"
-        return ("skill_payload_invalid", reason, EXIT_AGENT, *([None] * 8), False)
+        return ("skill_payload_invalid", reason, EXIT_AGENT, *([None] * 10), False)
     except Exception:
         reason = f"skill review payload unreadable - see the redacted log ({log_path})"
-        return ("skill_payload_invalid", reason, EXIT_AGENT, *([None] * 8), False)
+        return ("skill_payload_invalid", reason, EXIT_AGENT, *([None] * 10), False)
 
     def done(
         status, reason, code, url=None, rid=None, event=None, resolved=None, replied=None,
-        notes=None, link=None, text=None,
+        notes=None, link=None, text=None, signoff=None, dismissed=None,
     ):  # fmt: skip
         summary = skillreview.ledger_summary(payload, policy, pinned_sha, link or url)
-        return status, reason, code, url, rid, event, resolved, replied, summary, notes, text, True
+        return (
+            status, reason, code, url, rid, event, resolved, replied, summary, notes, text,
+            signoff, dismissed, True,
+        )  # fmt: skip
 
     if payload.kind == "terminal":
         prior = payload.prior_review_id
@@ -1440,7 +1506,7 @@ def _finish_skill_review(
             reason = (
                 f"skill review payload refused ({exc.code}) - see the redacted log ({log_path})"
             )
-            return ("skill_payload_invalid", reason, EXIT_AGENT, *([None] * 8), False)
+            return ("skill_payload_invalid", reason, EXIT_AGENT, *([None] * 10), False)
         return done(
             "review_complete",
             "skill review validated (publish=False, nothing written to GitHub)",
@@ -1451,11 +1517,12 @@ def _finish_skill_review(
     _liveness(job_id, phase="publish")
     r = _publish_skill_review(
         repo, pr_number, pr_url, pinned_sha, payload, policy, secrets, footer,
-        resolve=resolve, reply=reply,
+        resolve=resolve, reply=reply, allow_approve=allow_approve, base_sha=base_sha,
     )  # fmt: skip
     return done(
         r["status"], r["reason"], r["exit_code"], r["review_url"], r["review_id"], r["event"],
-        r["resolved"], r["replied"], r["notes"],
+        r["resolved"], r["replied"], r["notes"], signoff=r["signoff"],
+        dismissed=r["dismissed"],
     )  # fmt: skip
 
 
@@ -1486,6 +1553,53 @@ def _read_skill_policy_file(path: Path) -> skillreview.SkillPolicy:
         raise FrankyError(str(exc)[:300], code=EXIT_USAGE, kind="usage_error") from exc
 
 
+# The host wrapper accepts only this exact dismissal text.
+DISMISS_MESSAGE = "Withdrawn: a later automated review round could not approve this PR."
+_SIGNOFF_FIXED_TEXT = (
+    "**Looks good: no findings above nit.** A human must approve it, because of the repo's "
+    "sign-off rules."
+)
+
+
+def _skill_signoff(gh, repo: str, pr_number: int, head_sha: str, base_sha: str | None):
+    """The human sign-off floor for an approvable skill round, or None when no floor applies.
+
+    Paths (`.github/human-signoff-paths`), a change to either sign-off file, then content rules
+    (`.github/human-signoff-content`, read at the PR base): see `reviewpr.signoff_reason` and
+    `reviewpr.content_signoff`. Every unreadable input is a floor (reason `unreadable`)."""
+    unreadable = {"reason": "unreadable", "path": None, "rule": None, "more": 0}
+    try:
+        fcode, fout, _ferr = gh(
+            ["api", f"repos/{repo}/pulls/{pr_number}/files?per_page=100", "--paginate", "--slurp"]
+        )
+    except (FrankyError, DockerError):
+        return unreadable
+    files = _paged_list(fout) if fcode == 0 else None
+    globs: list = []
+
+    def read_globs():
+        if not globs:
+            globs.append(fetch_signoff_globs(repo, base_sha or "", os.environ))
+        return globs[0]
+
+    reason = signoff_reason(files, read_globs)
+    if reason is not None or not files:
+        return reason
+    rules = fetch_signoff_content_rules(repo, base_sha or "", os.environ)
+    if rules is None:
+        return unreadable
+    if not rules:
+        return None
+
+    def read_file(path: str, side: str):
+        return fetch_repo_file(
+            repo, path, base_sha if side == "base" else head_sha, os.environ,
+            max_bytes=CONTENT_FILE_MAX_BYTES, absent=None,  # a side that must exist is missing
+        )  # fmt: skip
+
+    return content_signoff(files, rules, read_file)
+
+
 def _publish_skill_review(
     repo: str,
     pr_number: int,
@@ -1498,13 +1612,30 @@ def _publish_skill_review(
     *,
     resolve: bool,
     reply: bool,
+    allow_approve: bool = False,
+    base_sha: str | None = None,
 ) -> dict:
     """Post a validated skill payload through the host wrapper shapes; returns result fields.
 
-    Keys: status, reason, exit_code, review_url, review_id, event, resolved, replied, notes.
-    At most one review write: a COMMENT review (POST) or a ledger update (PUT). Threads are
-    resolved and replied on only after that write, with the head unmoved, and only the bot's own
-    open threads. Nothing is posted when the head moved.
+    Keys: status, reason, exit_code, review_url, review_id, event, resolved, replied, notes,
+    signoff. At most one review write: a COMMENT or APPROVE review (POST) or a ledger update
+    (PUT). Threads are resolved and replied on only after that write, with the head unmoved, and
+    only the bot's own open threads. Nothing is posted when the head moved.
+
+    An approvable round is a clean one (`skillreview.approval_eligible`: no open finding, no
+    inline comment, no prior open finding left open or dropped, PR reviews readable). For such a
+    round the human sign-off floor is always computed (`_skill_signoff`); when it applies the body
+    gains the sign-off paragraph and the result `signoff`. Without a floor and with
+    `allow_approve` the review is an APPROVE ending with the `bot-review` marker, reconciled like
+    the legacy path (`_approve_review`): a confirmed refusal posts a COMMENT instead, an unknown
+    outcome (including an absent review after a possibly written POST) is `publish_uncertain`, with
+    no further write. A quiet round (ledger update) approves with a new review instead of the PUT;
+    an APPROVED update target is replaced by a new COMMENT review. Under `allow_approve`, a round
+    that does not post an APPROVE first dismisses the bot's newest APPROVED review (when it is the
+    bot's latest deciding one) with the fixed `DISMISS_MESSAGE`, head re-checked before; a failed
+    dismissal is note `dismiss_failed` and the round posts as REQUEST_CHANGES instead (a quiet round
+    as a new REQUEST_CHANGES review), so the bot's own stale approval never stands. A PUT may edit
+    only the newest ledger review of the bot.
     """
     gh = _host_gh(pr_url)
     notes: dict[str, int] = {}
@@ -1512,12 +1643,21 @@ def _publish_skill_review(
     def note(code: str) -> None:
         notes[code] = notes.get(code, 0) + 1
 
-    def stale() -> bool:
-        live = fetch_pr_head_sha(repo, pr_number, os.environ)
-        return live is None or live.lower() != pinned_sha.lower()
+    def stale(check_base: bool = False) -> bool:
+        meta: dict = {}
+        live = fetch_pr_head_sha(repo, pr_number, os.environ, meta_sink=meta)
+        if live is None or live.lower() != pinned_sha.lower():
+            return True
+        # The sign-off floor was read at the base commit: a moved base voids it.
+        return check_base and (meta.get("base_sha") or "").lower() != (base_sha or "").lower()
+
+    signoff = None
+    dismissed = None
 
     def result(status, reason, code, url=None, rid=None, event=None, resolved=None, replied=None):
         return {
+            "signoff": signoff,
+            "dismissed": dismissed,
             "status": status,
             "reason": reason,
             "exit_code": code,
@@ -1535,34 +1675,162 @@ def _publish_skill_review(
         "refusing to publish a stale review",
         EXIT_AGENT,
     )
+
+    def uncertain_result():
+        return result(
+            "publish_uncertain",
+            f"an APPROVE review on {pr_url} may or may not have been posted - check the PR "
+            "before acting; nothing was reposted",
+            EXIT_NETWORK,
+        )
+
     if stale():
         return stale_result
 
     want_resolve = bool(resolve and payload.resolve)
     want_reply = bool(reply and payload.replies)
+    # A clean round with no inline comment may be approved (when nothing on the PR contradicts it).
+    clean_round = skillreview.approval_eligible(payload, [], policy)
+    # Under --allow-approve a round that cannot approve must not leave a stale bot approval
+    # standing, so the reviews are read for every review round that writes.
+    writes = payload.kind == "review" and (payload.body is not None or payload.update is not None)
+    check_approval = allow_approve and writes
     # Read before any write, so the prior ledger can never be the review this run posts.
     reviews = None
-    if payload.update or want_resolve:
+    if payload.update or want_resolve or clean_round or check_approval:
         reviews = _read_pr_reviews(repo, pr_number, secrets)
     ledgers = skillreview.bot_ledger_reviews(reviews or [], policy)
     prior = ledgers[-1][1] if ledgers else None
+    eligible = (
+        clean_round
+        and reviews is not None
+        and skillreview.approval_eligible(payload, [led for _r, led in ledgers], policy)
+    )
+    stale_approval = None
+    if check_approval:
+        if reviews is None:
+            note("approval_unverified")  # cannot tell whether an approval stands
+        else:
+            latest = skillreview.latest_bot_decision(reviews, policy)
+            if latest is not None and latest.get("state") == "APPROVED":
+                stale_approval = latest.get("id")
 
-    def parsed(out: str) -> dict:
-        try:
-            resp = json.loads(out)
-        except (ValueError, TypeError):
-            return {}
-        return resp if isinstance(resp, dict) else {}
+    parsed = _json_dict
+
+    target = approved_target = None
+    if payload.update:
+        target = payload.update["review_id"]
+        if reviews is None:
+            return result("publish_failed", "could not read the PR reviews", EXIT_NETWORK)
+        # Only the newest ledger review of the bot may be edited.
+        latest = ledgers[-1][0] if ledgers else None
+        row = latest if latest is not None and latest.get("id") == target else None
+        # An approval cannot be edited: its body goes out as a new review instead.
+        approved_target = row is not None and row.get("state") == "APPROVED"
+        if row is None or not (
+            approved_target
+            or (
+                row.get("state") == "COMMENTED"
+                and not any(m in str(row.get("body") or "") for m in _APPROVE_MARKERS)
+            )
+        ):
+            return result(
+                "skill_payload_invalid",
+                "skill review payload refused (skill_update_target)",
+                EXIT_AGENT,
+            )
+    if eligible:
+        signoff = _skill_signoff(gh, repo, pr_number, pinned_sha, base_sha)
+        if stale():
+            return stale_result
+    approve = eligible and allow_approve and signoff is None
+    text = payload.body if payload.body is not None else (payload.update or {}).get("body")
+    if text is not None and signoff is not None:
+        # The reason never silently disappears: the full paragraph, else a fixed short one.
+        for para in (signoff_text(signoff), _SIGNOFF_FIXED_TEXT):
+            try:
+                text = skillreview.add_signoff(
+                    text, para, footer, policy, payload.ledger or {}, secrets
+                )
+                break
+            except skillreview.SkillError:
+                note("signoff_text_shortened")
+        else:
+            return result(
+                "skill_payload_invalid",
+                "skill review payload refused (skill_body_cap)",
+                EXIT_AGENT,
+            )
 
     url = rid = event = None
     wrote = identity_ok = False
     reason = "no review was needed; nothing was posted"
     status = "review_complete"
-    if payload.body is not None:
-        post = ["api", "-X", "POST", f"repos/{repo}/pulls/{pr_number}/reviews", "--input", "-"]
+    post = ["api", "-X", "POST", f"repos/{repo}/pulls/{pr_number}/reviews", "--input", "-"]
+    posted = False
+    if approve:
+        marker = f"<!-- {APPROVE_MARKER}:{uuid.uuid4().hex} -->"
         body = {
-            "event": "COMMENT",
-            "body": payload.body,
+            "event": "APPROVE",
+            "body": f"{text}\n\n{marker}",
+            "commit_id": pinned_sha,
+            "comments": [],
+        }
+        if len(body["body"]) > policy.max_body_chars:
+            note("approve_body_cap")  # the marker does not fit: post the body as a COMMENT
+            kind = "skipped"
+        else:
+            if stale(check_base=True):
+                return stale_result
+            kind, gout, aevent, maybe_written = _approve_review(
+                gh, repo, pr_number, pinned_sha, post, body, marker, absent_is_unwritten=False
+            )
+        if kind == "unknown":
+            return uncertain_result()
+        if kind == "ok":
+            resp = parsed(gout)
+            url, rid, event = resp.get("html_url"), resp.get("id"), aevent
+            status, reason = "review_published", f"published a {event} review"
+            wrote, identity_ok, posted = (
+                True,
+                skillreview.is_bot_user(resp.get("user"), policy),
+                True,
+            )
+        elif kind == "unwritten":  # a confirmed refusal: nothing was written
+            if stale():
+                return stale_result
+            note("approve_refused")  # a refused approval is posted as a COMMENT below
+    block = False
+    if not posted and stale_approval is not None:
+        # This round does not approve: the bot's own older approval must not stand.
+        if stale():
+            return stale_result
+        try:
+            dcode, dout, _derr = gh(
+                [
+                    "api",
+                    "-X",
+                    "PUT",
+                    f"repos/{repo}/pulls/{pr_number}/reviews/{stale_approval}/dismissals",
+                    "--input",
+                    "-",
+                ],
+                input=json.dumps({"message": DISMISS_MESSAGE, "event": "DISMISS"}),
+            )
+        except (FrankyError, DockerError):
+            dcode = 1
+        if dcode == 0:
+            dismissed = stale_approval
+        else:
+            # Fail closed: the bot's newer REQUEST_CHANGES overrides its own stale APPROVE.
+            note("dismiss_failed")
+            block = True
+    if posted:
+        pass
+    elif payload.body is not None or (payload.update and (approved_target or block)):
+        body = {
+            "event": "REQUEST_CHANGES" if block else "COMMENT",
+            "body": text,
             "commit_id": pinned_sha,
             "comments": payload.comments or [],
         }
@@ -1597,24 +1865,10 @@ def _publish_skill_review(
                 EXIT_NETWORK,
             )
         resp = parsed(gout)
-        url, rid, event = resp.get("html_url"), resp.get("id"), "COMMENT"
-        status, reason = "review_published", "published a COMMENT review"
+        url, rid, event = resp.get("html_url"), resp.get("id"), body["event"]
+        status, reason = "review_published", f"published a {event} review"
         wrote, identity_ok = True, skillreview.is_bot_user(resp.get("user"), policy)
     elif payload.update:
-        target = payload.update["review_id"]
-        if reviews is None:
-            return result("publish_failed", "could not read the PR reviews", EXIT_NETWORK)
-        row = next((r for r, _led in ledgers if r.get("id") == target), None)
-        if (
-            row is None
-            or row.get("state") != "COMMENTED"
-            or any(m in str(row.get("body") or "") for m in _APPROVE_MARKERS)
-        ):
-            return result(
-                "skill_payload_invalid",
-                "skill review payload refused (skill_update_target)",
-                EXIT_AGENT,
-            )
         put = [
             "api",
             "-X",
@@ -1625,7 +1879,7 @@ def _publish_skill_review(
         ]
         if stale():
             return stale_result
-        gcode, gout, gerr = gh(put, input=json.dumps({"body": payload.update["body"]}))
+        gcode, gout, gerr = gh(put, input=json.dumps({"body": text}))
         if gcode != 0:
             return result(
                 "publish_failed",
@@ -1812,40 +2066,20 @@ def _publish_review(
         return p
 
     def send(p: dict):
-        try:
-            return gh(post, input=json.dumps(p))
-        except FrankyError as exc:
-            # An APPROVE that timed out may or may not have landed: report it as uncertain.
-            if p["event"] != "APPROVE" or exc.kind != "timeout":
-                raise
-            return -1, "", "timed out"
+        return _send_review(gh, post, p)
 
-    def parsed(out: str) -> dict:
-        try:
-            resp = json.loads(out)
-        except (ValueError, TypeError):
-            return {}
-        return resp if isinstance(resp, dict) else {}
-
+    parsed = _json_dict
     maybe_written = False
 
     def approve(p: dict):
         """POST an APPROVE payload: ("ok", gout, event), ("unwritten", err, None) or
         ("unknown", err, None)."""
         nonlocal maybe_written
-        gcode, gout, gerr = send(p)
-        if gcode == 0 and parsed(gout).get("id") is not None:
-            return "ok", gout, "APPROVE"
-        if _review_confirmed_unwritten(gcode, gerr):
-            return "unwritten", gerr, None
-        maybe_written = True
-        kind, review = _find_marked_review(gh, repo, pr_number, pinned_sha, marker)
-        if kind == "found":
-            event = {"APPROVED": "APPROVE", "CHANGES_REQUESTED": "REQUEST_CHANGES"}.get(
-                str(review.get("state")), "COMMENT"
-            )
-            return "ok", json.dumps(review), event
-        return ("unwritten" if kind == "absent" else "unknown"), gerr, None
+        kind, out, event, written = _approve_review(
+            gh, repo, pr_number, pinned_sha, post, p, marker
+        )
+        maybe_written = maybe_written or written
+        return kind, out, event
 
     payload = build(allow_approve)
     if payload["event"] == "APPROVE":
@@ -2085,8 +2319,9 @@ def _review_ticket_context(
     "skill",
     default=None,
     help="Run this team skill (from the `team` setup) as the review method instead of Franky's "
-    "own. Needs --skill-policy; the host validates and posts what the skill prepares, always as "
-    "a COMMENT. Refused with --allow-approve and the --at-sha eval mode.",
+    "own. Needs --skill-policy; the host validates and posts what the skill prepares, as a "
+    "COMMENT, or as an APPROVE for a clean round with --allow-approve and no human sign-off "
+    "floor. Refused with the --at-sha eval mode.",
 )
 @click.option(
     "--skill-policy",
@@ -2268,10 +2503,9 @@ def review_pr(
                     code=EXIT_USAGE,
                     kind="usage_error",
                 )
-            if allow_approve or frozen:
+            if frozen:
                 raise FrankyError(
-                    "--skill posts COMMENT reviews only and cannot be combined with "
-                    "--allow-approve or --at-sha/--diff-base",
+                    "--skill cannot be combined with --at-sha/--diff-base",
                     code=EXIT_USAGE,
                     kind="usage_error",
                 )
@@ -2518,6 +2752,7 @@ def review_pr(
         review_id: int | None = None
         review_event_out: str | None = None
         signoff_out: dict | None = None
+        dismissed_out: int | None = None
         threads_resolved: int | None = None
         threads_replied: int | None = None
         findings_summary: str | None = None
@@ -2547,6 +2782,8 @@ def review_pr(
                 ledger_out,
                 skill_notes,
                 review_body,
+                signoff_out,
+                dismissed_out,
                 skill_ok,
             ) = _finish_skill_review(
                 output,
@@ -2562,6 +2799,8 @@ def review_pr(
                 no_publish=no_publish,
                 resolve=resolve_fixed,
                 reply=reply_prior,
+                allow_approve=allow_approve,
+                base_sha=pr_meta.get("base_sha"),
             )
             if skill_ok:
                 # A minimal shape so a threaded run still commits its session; the skill reads
@@ -2731,6 +2970,7 @@ def review_pr(
             review_id=review_id,
             review_event=review_event_out,
             signoff=signoff_out,
+            dismissed_review_id=dismissed_out,
             threads_resolved=threads_resolved,
             threads_replied=threads_replied,
             thread=thread_result,

@@ -111,6 +111,7 @@ def _no_idempotency_network(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cli, "fetch_jira_comments", lambda *a, **k: "")
     # The human sign-off list is one more GitHub GET; default it to "no list" (no floor).
     monkeypatch.setattr(cli, "fetch_signoff_globs", lambda *a, **k: [])
+    monkeypatch.setattr(cli, "fetch_signoff_content_rules", lambda *a, **k: [])
 
 
 @pytest.fixture(autouse=True)

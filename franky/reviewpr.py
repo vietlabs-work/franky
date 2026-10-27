@@ -46,6 +46,8 @@ from .config import redact
 from .sentinel import scan_sentinel_json
 
 SIGNOFF_FILE = ".github/human-signoff-paths"
+CONTENT_FILE = ".github/human-signoff-content"
+MAX_CONTENT_FILES = 20  # files a content rule may read before the floor applies unread
 _FILES_API_CAP = 3000  # the PR files API never lists more than this many files
 
 _VALID_SEVERITIES = frozenset({"blocking", "normal", "question", "nit"})
@@ -367,7 +369,14 @@ def signoff_text(info: dict) -> str:
         extra = f" (and {more} more file{'s' if more != 1 else ''})" if more else ""
         why = f"{_code(info['path'])}{extra} matches {_code(info['rule'])} in {_code(SIGNOFF_FILE)}"
     elif reason == "list_changed":
-        why = f"it changes {_code(SIGNOFF_FILE)}"
+        why = f"it changes {_code(info.get('path') or SIGNOFF_FILE)}"
+    elif reason == "content":
+        more = info.get("more") or 0
+        extra = f" (and {more} more file{'s' if more != 1 else ''})" if more else ""
+        why = (
+            f"{_code(info['path'])}{extra} may contain a string listed in "
+            f"{_code(CONTENT_FILE)} ({_code(info['rule'])})"
+        )
     else:
         why = "the sign-off list or the PR file list could not be read"
     return f"{head}A human must approve it, because {why}."
@@ -650,7 +659,7 @@ def human_signoff_required(files: list | None, read_globs: Callable[[], list[str
             return True  # a rename that hides its old path cannot be checked
     if not paths:
         return False
-    if SIGNOFF_FILE in paths:
+    if SIGNOFF_FILE in paths or CONTENT_FILE in paths:
         return True
     globs = read_globs()
     return globs is None or signoff_match(globs, paths)
@@ -670,7 +679,8 @@ def signoff_reason(files: list | None, read_globs: Callable[[], list[str] | None
 
     A dict `{"reason": "match" | "list_changed" | "unreadable", "path", "rule", "more"}`. `match`
     names the first matched path (file order), the rule as written that decided it, and how many
-    other paths matched. `list_changed` names the sign-off file. `unreadable` carries no path.
+    other paths matched. `list_changed` names the changed sign-off file (the paths file or the
+    content file). `unreadable` carries no path.
     """
     unreadable = {"reason": "unreadable", "path": None, "rule": None, "more": 0}
     if files is None or len(files) >= _FILES_API_CAP:
@@ -687,8 +697,9 @@ def signoff_reason(files: list | None, read_globs: Callable[[], list[str] | None
             return unreadable
     if not paths:
         return None
-    if SIGNOFF_FILE in paths:
-        return {"reason": "list_changed", "path": SIGNOFF_FILE, "rule": None, "more": 0}
+    changed = next((f for f in (SIGNOFF_FILE, CONTENT_FILE) if f in paths), None)
+    if changed:
+        return {"reason": "list_changed", "path": changed, "rule": None, "more": 0}
     globs = read_globs()
     if globs is None:
         return unreadable
@@ -696,6 +707,53 @@ def signoff_reason(files: list | None, read_globs: Callable[[], list[str] | None
     if not hits:
         return None
     return {"reason": "match", "path": hits[0][0], "rule": hits[0][1], "more": len(hits) - 1}
+
+
+def content_signoff(
+    files: list,
+    rules: list[tuple[str, str]],
+    read_file: Callable[[str, str], bytes | None],
+) -> dict | None:
+    """The content floor: a changed file that matches a `.github/human-signoff-content` rule
+    and holds the rule's fixed string at the PR base or head.
+
+    `files` is a readable PR file list (the caller ran `signoff_reason` first); `rules` are
+    (glob, string) pairs; `read_file(path, "base" | "head")` returns the bytes (b"" for an absent
+    file) or None when unreadable. A rename is matched and read under both names. Fails closed:
+    a negated glob, more than MAX_CONTENT_FILES matching files, or any unreadable file gives
+    `{"reason": "unreadable", ...}`. A hit gives `{"reason": "content", "path", "rule", "more"}`
+    (the first hit in file order, the rule that matched, and how many other files hit).
+    Returns None when nothing matches.
+    """
+    unreadable = {"reason": "unreadable", "path": None, "rule": None, "more": 0}
+    if any(g.startswith("!") for g, _n in rules):
+        return unreadable
+    compiled = [(g, n.encode("utf-8"), _signoff_regex(g)) for g, n in rules]
+    matched = []
+    for entry in files:
+        name = entry["filename"]
+        old = entry.get("previous_filename") or name
+        hit = [(g, n) for g, n, rx in compiled if rx.fullmatch(name) or rx.fullmatch(old)]
+        if hit:
+            matched.append((entry, name, old, hit))
+    if len(matched) > MAX_CONTENT_FILES:
+        return unreadable
+    hits = []
+    for entry, name, old, rules_hit in matched:
+        reads = []
+        if entry.get("status") != "added":
+            reads.append(read_file(old, "base"))
+        if entry.get("status") != "removed":
+            reads.append(read_file(name, "head"))
+        if any(r is None for r in reads):
+            return unreadable
+        for g, needle in rules_hit:
+            if any(needle in r for r in reads):  # type: ignore[operator]
+                hits.append((name, g))
+                break
+    if not hits:
+        return None
+    return {"reason": "content", "path": hits[0][0], "rule": hits[0][1], "more": len(hits) - 1}
 
 
 def review_event(shaped: dict, allow_approve: bool = False) -> str:

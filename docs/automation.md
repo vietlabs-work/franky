@@ -28,7 +28,7 @@ Interactive commands fail with exit `2` in a non-TTY. They do not wait forever. 
 
 ## Skill review results
 
-`review-pr --skill` adds a `ledger` object and `skill_notes` to the result, and the failure status `skill_payload_invalid` (exit `7`). A round that posts nothing ends `review_complete`. [Skill mode](review.md#skill-mode) lists the fields and codes.
+`review-pr --skill` adds a `ledger` object and `skill_notes` to the result (and `signoff` when the sign-off floor applied), and the failure status `skill_payload_invalid` (exit `7`). A round that posts nothing ends `review_complete`. [Skill mode](review.md#skill-mode) lists the fields and codes.
 
 ## Build `--no-publish`
 

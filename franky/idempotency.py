@@ -20,6 +20,7 @@ import binascii
 import json
 import re
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping
 
@@ -168,7 +169,68 @@ def repo_is_private(
 
 
 _SIGNOFF_PATH = ".github/human-signoff-paths"
+_SIGNOFF_CONTENT_PATH = ".github/human-signoff-content"
 _SIGNOFF_MAX_BYTES = 64 * 1024
+CONTENT_FILE_MAX_BYTES = 1024 * 1024
+
+
+def fetch_repo_file(
+    repo: str,
+    path: str,
+    sha: str,
+    env: Mapping[str, str],
+    *,
+    max_bytes: int = _SIGNOFF_MAX_BYTES,
+    absent: bytes | None = b"",
+    opener: Callable = urllib.request.urlopen,
+    timeout: float = _FETCH_TIMEOUT,
+) -> bytes | None:
+    """The bytes of `path` at commit `sha` of `repo` (GitHub REST contents API, base64).
+
+    `absent` (default b"") when the file does not exist (HTTP 404; pass None to treat a missing
+    file as unreadable) and None on ANY other failure, a non-file, an
+    unexpected encoding or a size over `max_bytes` (fail closed: callers treat None as unknown).
+    """
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", sha or ""):
+        return None
+    quoted = urllib.parse.quote(path, safe="/")
+    url = f"https://api.github.com/repos/{repo}/contents/{quoted}?ref={sha}"
+    headers = {"Accept": "application/vnd.github+json", "User-Agent": "franky-idempotency"}
+    token = env.get("GH_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    try:
+        with opener(urllib.request.Request(url, headers=headers), timeout=timeout) as resp:
+            if getattr(resp, "status", None) != 200:
+                return None
+            data = json.load(resp)
+    except urllib.error.HTTPError as exc:
+        return absent if exc.code == 404 else None
+    except Exception:
+        return None
+    if not isinstance(data, dict) or data.get("type") != "file":
+        return None
+    size, content = data.get("size"), data.get("content")
+    if data.get("encoding") != "base64" or not isinstance(content, str):
+        return None
+    if not isinstance(size, int) or size > max_bytes:
+        return None
+    try:
+        return base64.b64decode(content.replace("\n", ""), validate=True)
+    except (binascii.Error, ValueError):
+        return None
+
+
+def _list_lines(raw: bytes | None) -> list[str] | None:
+    """Non-blank, non-comment lines of a UTF-8 file, or None for an unreadable one."""
+    if raw is None:
+        return None
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeError:
+        return None
+    lines = (line.strip() for line in text.splitlines())
+    return [line for line in lines if line and not line.startswith("#")]
 
 
 def fetch_signoff_globs(
@@ -184,36 +246,32 @@ def fetch_signoff_globs(
     `review-pr` passes the PR BASE commit, never the head: the PR author controls the head.
     Returns [] when the file does not exist (HTTP 404: no floor) and None on ANY other failure
     (fail closed: the caller must not approve). Blank lines and `#` comments are dropped.
-
-    GitHub REST: GET /repos/{repo}/contents/{path}?ref={sha}. Same urllib + GH_TOKEN style as
-    fetch_pr_head_sha.
     """
-    if not re.fullmatch(r"[0-9a-fA-F]{40}", sha or ""):
+    raw = fetch_repo_file(repo, _SIGNOFF_PATH, sha, env, opener=opener, timeout=timeout)
+    return _list_lines(raw)
+
+
+def fetch_signoff_content_rules(
+    repo: str,
+    sha: str,
+    env: Mapping[str, str],
+    *,
+    opener: Callable = urllib.request.urlopen,
+    timeout: float = _FETCH_TIMEOUT,
+) -> list[tuple[str, str]] | None:
+    """The `<glob> <fixed string>` rules of `.github/human-signoff-content` at `sha`.
+
+    Same contract as `fetch_signoff_globs`: [] for a missing file, None on any failure or a
+    malformed line (a rule with no string), read at the PR BASE commit."""
+    lines = _list_lines(
+        fetch_repo_file(repo, _SIGNOFF_CONTENT_PATH, sha, env, opener=opener, timeout=timeout)
+    )
+    if lines is None:
         return None
-    url = f"https://api.github.com/repos/{repo}/contents/{_SIGNOFF_PATH}?ref={sha}"
-    headers = {"Accept": "application/vnd.github+json", "User-Agent": "franky-idempotency"}
-    token = env.get("GH_TOKEN")
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    try:
-        with opener(urllib.request.Request(url, headers=headers), timeout=timeout) as resp:
-            if getattr(resp, "status", None) != 200:
-                return None
-            data = json.load(resp)
-    except urllib.error.HTTPError as exc:
-        return [] if exc.code == 404 else None
-    except Exception:
-        return None
-    if not isinstance(data, dict) or data.get("type") != "file":
-        return None
-    size, content = data.get("size"), data.get("content")
-    if data.get("encoding") != "base64" or not isinstance(content, str):
-        return None
-    if not isinstance(size, int) or size > _SIGNOFF_MAX_BYTES:
-        return None
-    try:
-        text = base64.b64decode(content.replace("\n", ""), validate=True).decode("utf-8")
-    except (binascii.Error, ValueError):
-        return None
-    lines = (line.strip() for line in text.splitlines())
-    return [line for line in lines if line and not line.startswith("#")]
+    rules = []
+    for line in lines:
+        glob, _sep, needle = line.partition(" ")
+        if not glob or not needle.strip():
+            return None
+        rules.append((glob, needle.strip()))
+    return rules
