@@ -276,3 +276,37 @@ def test_fetch_repo_file_returns_bytes_empty_for_404_and_honors_the_cap():
 def test_fetch_repo_file_can_treat_a_404_as_unreadable():
     assert fetch_repo_file("me/repo", "a", BASE, {}, absent=None, opener=_http_error(404)) is None
     assert fetch_repo_file("me/repo", "a", BASE, {}, opener=_http_error(404)) == b""
+
+
+# --- fetch_pr_head_sha error_sink ------------------------------------------------------------
+
+
+def _raising_opener(exc):
+    def opener(req, timeout=None):
+        raise exc
+
+    return opener
+
+
+def test_error_sink_names_the_failure_without_its_message():
+    import urllib.error
+
+    cases = [
+        (_raising_opener(urllib.error.HTTPError("u", 502, "x", {}, None)), "HTTP 502"),
+        (_raising_opener(TimeoutError("https://api.github.com/secret-path")), "TimeoutError"),
+        (lambda req, timeout=None: _FakeResp({"head": {}}, status=200), "bad response"),
+        (lambda req, timeout=None: _FakeResp({}, status=404), "HTTP 404"),
+    ]
+    for opener, want in cases:
+        why = {}
+        assert fetch_pr_head_sha("me/repo", 7, {}, opener=opener, error_sink=why) is None
+        assert why == {"reason": want}
+
+
+def test_error_sink_is_untouched_on_success():
+    why = {}
+    payload = {"head": {"sha": _SHA}}
+    assert (
+        fetch_pr_head_sha("me/repo", 7, {}, opener=_pr_opener(payload, []), error_sink=why) == _SHA
+    )
+    assert why == {}
