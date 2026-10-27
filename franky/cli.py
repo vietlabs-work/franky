@@ -1633,7 +1633,9 @@ def _publish_skill_review(
     an APPROVED update target is replaced by a new COMMENT review. Under `allow_approve`, a round
     that does not post an APPROVE first dismisses the bot's newest APPROVED review (when it is the
     bot's latest deciding one) with the fixed `DISMISS_MESSAGE`, head re-checked before; a failed
-    dismissal is note `dismiss_failed` and the round is still posted. A PUT may edit only the newest ledger review of the bot.
+    dismissal is note `dismiss_failed` and the round posts as REQUEST_CHANGES instead (a quiet round
+    as a new REQUEST_CHANGES review), so the bot's own stale approval never stands. A PUT may edit
+    only the newest ledger review of the bot.
     """
     gh = _host_gh(pr_url)
     notes: dict[str, int] = {}
@@ -1798,6 +1800,7 @@ def _publish_skill_review(
             if stale():
                 return stale_result
             note("approve_refused")  # a refused approval is posted as a COMMENT below
+    block = False
     if not posted and stale_approval is not None:
         # This round does not approve: the bot's own older approval must not stand.
         if stale():
@@ -1819,12 +1822,14 @@ def _publish_skill_review(
         if dcode == 0:
             dismissed = stale_approval
         else:
+            # Fail closed: the bot's newer REQUEST_CHANGES overrides its own stale APPROVE.
             note("dismiss_failed")
+            block = True
     if posted:
         pass
-    elif payload.body is not None or (payload.update and approved_target):
+    elif payload.body is not None or (payload.update and (approved_target or block)):
         body = {
-            "event": "COMMENT",
+            "event": "REQUEST_CHANGES" if block else "COMMENT",
             "body": text,
             "commit_id": pinned_sha,
             "comments": payload.comments or [],

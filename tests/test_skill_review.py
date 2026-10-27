@@ -1520,11 +1520,11 @@ def test_no_standing_bot_approval_means_no_dismissal(monkeypatch, tmp_path, extr
     assert posts(calls)[0]["event"] == "COMMENT" and "dismissed_review_id" not in data
 
 
-def test_a_failed_dismissal_is_noted_and_the_round_is_still_posted(monkeypatch, tmp_path):
+def test_a_failed_dismissal_posts_request_changes_over_the_stale_approval(monkeypatch, tmp_path):
     calls, res, data = approve_run(
         monkeypatch, tmp_path, review_payload(OPEN), reviews=[APPROVED_ROW], put=(1, "", "boom")
     )
-    assert posts(calls)[0]["event"] == "COMMENT"
+    assert posts(calls)[0]["event"] == "REQUEST_CHANGES"
     assert data["skill_notes"] == ["dismiss_failed:1"] and "dismissed_review_id" not in data
 
 
@@ -1556,6 +1556,17 @@ def test_a_quiet_round_after_an_approval_dismisses_and_posts_a_new_comment(monke
     (posted,) = posts(calls)
     assert posted["event"] == "COMMENT" and "Quiet." in posted["body"]
     assert data["review_event"] == "COMMENT" and data["dismissed_review_id"] == 5
+
+
+def test_a_quiet_round_whose_dismissal_fails_posts_request_changes(monkeypatch, tmp_path):
+    upd = {"review_id": 5, "body": "Quiet.\n\n" + block(OPEN)}
+    payload = review_payload(OPEN, decision="delta", review=None, ledger_update=upd)
+    calls, res, data = approve_run(
+        monkeypatch, tmp_path, payload, reviews=[APPROVED_ROW], put=(1, "", "boom")
+    )
+    (posted,) = posts(calls)
+    assert posted["event"] == "REQUEST_CHANGES" and "Quiet." in posted["body"]
+    assert data["skill_notes"] == ["dismiss_failed:1"] and "dismissed_review_id" not in data
 
 
 def test_an_absent_review_after_an_unconfirmed_approve_is_uncertain_not_a_comment(
