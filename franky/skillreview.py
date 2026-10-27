@@ -475,6 +475,70 @@ def cleared_locs(prior: dict | None, new: dict, policy: SkillPolicy) -> set[tupl
     return {loc for loc, flags in seen.items() if flags == [True]}
 
 
+def prior_settled(priors: list[dict], new: dict, policy: SkillPolicy) -> bool:
+    """True when no finding is still open from the earlier rounds. `priors` are the bot's
+    ledgers, oldest first. A finding's latest-known state is the one in the newest ledger that
+    lists it, so a finding dropped by an intermediate round stays owed. Every finding whose
+    latest-known state is open must be in the new ledger, by id, with a cleared status. No prior
+    ledger is fine."""
+    latest: dict = {}
+    for led in priors:
+        for f in led.get("findings") or []:
+            if isinstance(f, dict):
+                latest[f.get("id")] = f
+    now = {f.get("id"): f for f in new.get("findings") or [] if isinstance(f, dict)}
+    for fid, f in latest.items():
+        if finding_state(f, policy) != "open":
+            continue
+        cur = now.get(fid)
+        if cur is None or finding_state(cur, policy) != "cleared":
+            return False
+    return True
+
+
+def approval_eligible(payload: SkillPayload, priors: list[dict], policy: SkillPolicy) -> bool:
+    """A clean review round may be approved: a review (not terminal) that carries a validated
+    body or ledger update, a clean ledger, no open or blocking finding, no inline comment, and no
+    earlier open finding left open or dropped (`prior_settled` over every prior bot ledger from a
+    successful read of the PR reviews)."""
+    led = payload.ledger or {}
+    return (
+        payload.kind == "review"
+        and (payload.body is not None or payload.update is not None)
+        and led.get("state") == "clean"
+        and ledger_counts(led, policy) == (0, 0)
+        and not payload.comments
+        and prior_settled(priors, led, policy)
+    )
+
+
+def latest_bot_decision(reviews: list, policy: SkillPolicy) -> str | None:
+    """State (APPROVED or CHANGES_REQUESTED) of the bot's newest deciding review, else None."""
+    mine = [
+        r
+        for r in sorted((r for r in reviews if isinstance(r, dict)), key=_review_sort_key)
+        if is_bot_user(r.get("user"), policy)
+        and r.get("state") in ("APPROVED", "CHANGES_REQUESTED")
+    ]
+    return mine[-1]["state"] if mine else None
+
+
+def add_signoff(
+    body: str, text: str, footer: str, policy: SkillPolicy, ledger: dict, secrets: Iterable[str]
+) -> str:
+    """The sign-off paragraph joins the body ahead of the footer. Redacted and neutralized like
+    every posted text; raises SkillError when the result is not exactly the one ledger block or
+    no longer fits its cap."""
+    if footer and body.endswith(footer):
+        body = body[: -len(footer)].rstrip()
+    final = f"{body}\n\n{_final(text, secrets)}" + (f"\n\n{footer}" if footer else "")
+    if ledger_block(final, policy.ledger_summary_marker) != ledger:
+        raise SkillError("skill_body_block")
+    if len(final) > policy.max_body_chars:
+        raise SkillError("skill_body_cap")
+    return final
+
+
 def own_thread(node: object, policy: SkillPolicy) -> bool:
     """An open review thread whose first comment is by the policy's bot."""
     if not isinstance(node, dict) or node.get("isResolved") is not False:

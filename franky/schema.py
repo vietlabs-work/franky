@@ -89,7 +89,8 @@ _RESULT_SCHEMA: dict = {
     "publishes a GitHub review: the event actually posted (an APPROVE that was refused "
     "is reported as COMMENT)",
     "signoff": "object; present ONLY when the human sign-off floor turned an APPROVE into a "
-    "COMMENT: reason match|list_changed|unreadable, path, rule, more",
+    "COMMENT (or applied to a clean `--skill` round): reason match|content|list_changed|"
+    "unreadable, path, rule, more",
     "threads_resolved": "integer; present ONLY when `review-pr --resolve-fixed` ran: the number "
     "of review threads it resolved",
     "threads_replied": "integer; present ONLY when `review-pr --reply-prior` ran: the number "

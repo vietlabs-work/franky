@@ -10,6 +10,7 @@ from franky import cli, config, prompt, schema, skillreview
 from franky.skillreview import SkillError, SkillPolicy
 
 SHA = "a" * 40
+BASE = "b" * 40
 PR_URL = "https://github.com/me/repo/pull/11"
 NONCE = "feedfacecafe0003"
 LOGIN = "acme-bot[bot]"
@@ -505,8 +506,20 @@ def setup_run(
     post=None,
     put=None,
     log=None,
+    files=(),
+    globs=(),
+    rules=(),
+    contents=None,
+    review_reads=None,
+    bases=None,
 ):
-    """A hermetic skill review: env, images, team profile, container output and `gh` all faked."""
+    """A hermetic skill review: env, images, team profile, container output and `gh` all faked.
+
+    `files`, `globs` and `rules` feed the human sign-off floor (PR files, `human-signoff-paths`
+    globs, `human-signoff-content` (glob, string) rules); `contents` maps (path, "base"|"head")
+    to bytes for the content reads (a missing key is a 404, None is a failed read). `bases` lists
+    the live base shas the next head checks report (then BASE).
+    `review_reads` is a list of (code, out, err) results the next PR-review reads return first."""
     env = {
         "FRANKY_ALLOWED_REPOS": "me/repo",
         "GH_TOKEN": "ghp_fake",
@@ -521,7 +534,25 @@ def setup_run(
     shas = list(heads or [])
 
     def fake_fetch(repo, number, e, **k):
+        if k.get("meta_sink") is not None:
+            k["meta_sink"].update(base_sha=bases.pop(0) if bases else BASE)
         return shas.pop(0) if shas else SHA
+
+    reads = {}
+
+    def fake_file(repo, path, ref, env, **k):
+        reads[(path, ref)] = k.get("max_bytes")
+        side = "base" if ref == BASE else "head"
+        # a missing key is a 404, which the caller's `absent` turns into b"" or None
+        return (contents or {}).get((path, side), k.get("absent", b""))
+
+    monkeypatch.setattr(
+        cli, "fetch_signoff_globs", lambda *a, **k: None if globs is None else list(globs)
+    )
+    monkeypatch.setattr(
+        cli, "fetch_signoff_content_rules", lambda *a, **k: None if rules is None else list(rules)
+    )
+    monkeypatch.setattr(cli, "fetch_repo_file", fake_file)
 
     monkeypatch.setattr(cli, "fetch_pr_head_sha", fake_fetch)
 
@@ -549,7 +580,11 @@ def setup_run(
     def fake_gh(args, e, **k):
         path = args[1]
         if path.endswith("/reviews?per_page=100"):
+            if review_reads:
+                return review_reads.pop(0)
             return 0, json.dumps([reviews or []]), ""
+        if "/files?" in path:
+            return (1, "", "boom") if files is None else (0, json.dumps([list(files)]), "")
         if path == "graphql" and "reviewThreads" in " ".join(args):
             data = {
                 "data": {
@@ -590,6 +625,8 @@ def setup_run(
         return 0, "{}", ""
 
     monkeypatch.setattr(cli, "run_gh", fake_gh)
+    monkeypatch.setattr(cli, "_sleep", lambda s: None)
+    calls.reads = reads
     return calls, seen
 
 
@@ -870,10 +907,10 @@ def test_flag_combinations_are_refused_with_exit_2(monkeypatch, tmp_path):
     setup_run(monkeypatch, tmp_path, review_payload(ledger()))
     pol = str(write_policy(tmp_path))
     cases = [
+        ["--skill", "deep-review", "--skill-policy", pol, "--allow-approve", "--no-publish"],
         ["--skill", "deep-review"],
         ["--skill-policy", pol],
         ["--skill", "bad name", "--skill-policy", pol],
-        ["--skill", "deep-review", "--skill-policy", pol, "--allow-approve"],
         [
             "--skill",
             "deep-review",
@@ -998,7 +1035,6 @@ def test_the_head_is_checked_right_before_each_review_write(monkeypatch, tmp_pat
 @pytest.mark.parametrize(
     "row",
     [
-        review_row(9, ledger(), state="APPROVED"),
         review_row(9, ledger(), state="DISMISSED"),
         review_row(9, ledger(), body=block(ledger()) + "\n<!-- bot-review:abc -->"),
     ],
@@ -1107,3 +1143,421 @@ def test_a_skill_is_admitted_only_as_skills_name_skill_md_with_a_readable_header
     (root / "rules/SKILL.md").write_text("x\n")
     team = SimpleNamespace(root=root, files=[p for p in root.rglob("SKILL.md")])
     assert cli._team_skill_names(team) == {"ok"}
+
+
+# --- approval ----------------------------------------------------------------------------------
+
+MARK = "<!-- bot-review:"
+CLEAN = ledger([])
+
+
+def pf(name, status="modified", previous=None):
+    return {
+        "filename": name,
+        "status": status,
+        **({"previous_filename": previous} if previous else {}),
+    }
+
+
+def posts(calls):
+    return [json.loads(i) for c, i in zip(calls, calls.inputs) if "POST" in c]
+
+
+def approve_run(monkeypatch, tmp_path, payload=None, extra=("--allow-approve",), **kw):
+    calls, _ = setup_run(monkeypatch, tmp_path, payload or review_payload(CLEAN), **kw)
+    res, data = run(tmp_path, *extra)
+    return calls, res, data
+
+
+def test_a_clean_round_with_allow_approve_posts_an_approve_with_the_marker(monkeypatch, tmp_path):
+    calls, res, data = approve_run(monkeypatch, tmp_path)
+    assert res.exit_code == 0, res.output
+    (posted,) = posts(calls)
+    assert posted["event"] == "APPROVE" and posted["comments"] == []
+    assert posted["body"].rstrip().endswith("-->") and MARK in posted["body"]
+    assert ledger_ok(posted["body"].split(MARK)[0])
+    assert data["status"] == "review_published" and data["review_event"] == "APPROVE"
+    assert "signoff" not in data and data["ledger"]["state"] == "clean"
+
+
+def test_without_allow_approve_a_clean_round_is_a_comment_and_carries_no_signoff(
+    monkeypatch, tmp_path
+):
+    calls, res, data = approve_run(monkeypatch, tmp_path, extra=())
+    (posted,) = posts(calls)
+    assert posted["event"] == "COMMENT" and MARK not in posted["body"]
+    assert data["review_event"] == "COMMENT" and "signoff" not in data
+
+
+def test_a_prior_finding_that_the_new_ledger_settles_still_approves(monkeypatch, tmp_path):
+    new = ledger([finding("a", status="fixed")])
+    calls, res, data = approve_run(
+        monkeypatch, tmp_path, review_payload(new), reviews=[review_row(7, ledger([finding("a")]))]
+    )
+    assert data["review_event"] == "APPROVE"
+
+
+@pytest.mark.parametrize(
+    "payload,reviews",
+    [
+        (review_payload(ledger([finding("a")])), []),  # an open finding
+        (review_payload(CLEAN, comments=[inline()]), []),  # an inline comment
+        (review_payload(CLEAN), [review_row(7, ledger())]),  # the prior open finding was dropped
+        (  # a prior open finding stays open under another name is a drop of the first
+            review_payload(ledger([finding("b", status="fixed")])),
+            [review_row(7, ledger())],
+        ),
+    ],
+)
+def test_a_round_that_is_not_clean_or_drops_a_prior_finding_never_approves(
+    monkeypatch, tmp_path, payload, reviews
+):
+    calls, res, data = approve_run(monkeypatch, tmp_path, payload, reviews=reviews)
+    (posted,) = posts(calls)
+    assert posted["event"] == "COMMENT" and data["review_event"] == "COMMENT"
+    assert "signoff" not in data
+
+
+def test_unreadable_pr_reviews_never_approve(monkeypatch, tmp_path):
+    calls, res, data = approve_run(monkeypatch, tmp_path, review_reads=[(1, "", "boom")])
+    (posted,) = posts(calls)
+    assert posted["event"] == "COMMENT" and "signoff" not in data
+
+
+def test_a_path_floor_posts_a_comment_with_the_reason_and_reports_signoff(monkeypatch, tmp_path):
+    calls, res, data = approve_run(
+        monkeypatch, tmp_path, files=[pf("pay/X.java")], globs=["pay/**"]
+    )
+    (posted,) = posts(calls)
+    assert posted["event"] == "COMMENT" and MARK not in posted["body"]
+    assert "**Looks good: no findings above nit.**" in posted["body"]
+    assert "`pay/X.java` matches `pay/**` in `.github/human-signoff-paths`" in posted["body"]
+    assert "<!--" not in posted["body"] and ledger_ok(posted["body"])
+    assert posted["body"].endswith("</sub>")
+    assert data["review_event"] == "COMMENT"
+    assert data["signoff"] == {"reason": "match", "path": "pay/X.java", "rule": "pay/**", "more": 0}
+
+
+def test_the_floor_is_computed_for_a_clean_round_without_allow_approve(monkeypatch, tmp_path):
+    calls, res, data = approve_run(
+        monkeypatch, tmp_path, extra=(), files=[pf("pay/X.java")], globs=["pay/**"]
+    )
+    assert "Looks good" in posts(calls)[0]["body"] and data["signoff"]["reason"] == "match"
+
+
+@pytest.mark.parametrize(
+    "kw,reason",
+    [
+        ({"files": None}, "unreadable"),
+        ({"files": [pf("a.py")], "globs": None}, "unreadable"),
+        ({"files": [pf("a.py")], "rules": None}, "unreadable"),
+        ({"files": [pf(".github/human-signoff-content", "added")]}, "list_changed"),
+        ({"files": [pf(".github/human-signoff-paths")]}, "list_changed"),
+        (
+            {"files": [pf("x/New.java", "renamed", "pay/Old.java")], "globs": ["pay/**"]},
+            "match",
+        ),
+    ],
+)
+def test_unreadable_or_changed_sign_off_inputs_are_a_floor(monkeypatch, tmp_path, kw, reason):
+    calls, res, data = approve_run(monkeypatch, tmp_path, **kw)
+    assert posts(calls)[0]["event"] == "COMMENT" and data["signoff"]["reason"] == reason
+    assert "Looks good" in posts(calls)[0]["body"]
+
+
+CRULES = [("**/src/main/**", "CurrencyHelper")]
+
+
+@pytest.mark.parametrize(
+    "contents,floor",
+    [
+        (
+            {("src/main/A.java", "base"): b"use CurrencyHelper", ("src/main/A.java", "head"): b""},
+            True,
+        ),
+        (
+            {("src/main/A.java", "base"): b"", ("src/main/A.java", "head"): b"use CurrencyHelper"},
+            True,
+        ),
+        ({("src/main/A.java", "base"): b"ok", ("src/main/A.java", "head"): b"nothing here"}, False),
+        ({("src/main/A.java", "base"): b"ok"}, "unreadable"),  # head is a 404: it must exist
+        ({("src/main/A.java", "head"): b"ok"}, "unreadable"),  # base is a 404 for a modified file
+    ],
+)
+def test_content_rules_floor_on_a_string_at_base_or_head(monkeypatch, tmp_path, contents, floor):
+    calls, res, data = approve_run(
+        monkeypatch, tmp_path, files=[pf("src/main/A.java")], rules=CRULES, contents=contents
+    )
+    (posted,) = posts(calls)
+    if floor == "unreadable":
+        assert posted["event"] == "COMMENT" and data["signoff"]["reason"] == "unreadable"
+        return
+    if floor:
+        assert posted["event"] == "COMMENT"
+        assert "`src/main/A.java` may contain a string listed in" in posted["body"]
+        assert data["signoff"] == {
+            "reason": "content",
+            "path": "src/main/A.java",
+            "rule": "**/src/main/**",
+            "more": 0,
+        }
+    else:
+        assert posted["event"] == "APPROVE" and "signoff" not in data
+    # base is the PR base commit, head the reviewed commit, and reads are size capped
+    assert all(ref in (BASE, SHA) for _p, ref in calls.reads)
+    assert set(calls.reads.values()) == {cli.CONTENT_FILE_MAX_BYTES}
+
+
+def test_content_rules_over_the_file_cap_or_with_a_failed_read_are_a_floor(monkeypatch, tmp_path):
+    many = [pf(f"src/main/F{i}.java") for i in range(21)]
+    calls, res, data = approve_run(monkeypatch, tmp_path, files=many, rules=CRULES)
+    assert data["signoff"]["reason"] == "unreadable" and posts(calls)[0]["event"] == "COMMENT"
+    calls, res, data = approve_run(
+        monkeypatch,
+        tmp_path,
+        files=[pf("src/main/A.java")],
+        rules=CRULES,
+        contents={("src/main/A.java", "base"): None},
+    )
+    assert data["signoff"]["reason"] == "unreadable" and posts(calls)[0]["event"] == "COMMENT"
+
+
+def test_a_refused_approval_is_posted_as_a_comment(monkeypatch, tmp_path):
+    refused = (1, "", "GitHub wrapper refused: approval is not allowed here")
+    ok = (0, json.dumps({"html_url": "u", "id": 6, "user": {"login": LOGIN, "type": "Bot"}}), "")
+    calls, res, data = approve_run(monkeypatch, tmp_path, post=lambda n: refused if n == 1 else ok)
+    first, second = posts(calls)
+    assert first["event"] == "APPROVE" and second["event"] == "COMMENT"
+    assert MARK not in second["body"]
+    assert res.exit_code == 0 and data["review_event"] == "COMMENT"
+    assert data["skill_notes"] == ["approve_refused:1"] and data["review_id"] == 6
+
+
+def test_an_unknown_approval_outcome_is_uncertain_and_never_reposted(monkeypatch, tmp_path):
+    # the first read finds no prior ledger; the reconcile read then fails
+    calls, res, data = approve_run(
+        monkeypatch,
+        tmp_path,
+        post=(1, "", "timed out"),
+        review_reads=[(0, "[[]]", ""), (1, "", "boom")],
+    )
+    assert len(posts(calls)) == 1 and posts(calls)[0]["event"] == "APPROVE"
+    assert res.exit_code == 8 and data["status"] == "publish_uncertain"
+
+
+def test_an_approve_that_landed_but_looked_failed_is_reported_from_the_pr(monkeypatch, tmp_path):
+    def post(n):
+        return 1, "", "timed out"
+
+    calls, _ = setup_run(monkeypatch, tmp_path, review_payload(CLEAN), post=post)
+    seen = {}
+
+    real = cli.run_gh
+
+    def with_marker(args, e, **k):
+        out = real(args, e, **k)
+        if args[1].endswith("/reviews?per_page=100") and calls.inputs:
+            body = json.loads(calls.inputs[0])["body"]
+            row = {
+                "id": 77, "state": "APPROVED", "commit_id": SHA, "body": body,
+                "html_url": "u", "user": {"login": LOGIN, "type": "Bot"},
+            }  # fmt: skip
+            seen["n"] = seen.get("n", 0) + 1
+            return 0, json.dumps([[row]]), ""
+        return out
+
+    monkeypatch.setattr(cli, "run_gh", with_marker)
+    res, data = run(tmp_path, "--allow-approve")
+    assert len(posts(calls)) == 1
+    assert data["review_event"] == "APPROVE" and data["review_id"] == 77
+
+
+def test_a_quiet_clean_round_approves_with_a_new_review_instead_of_the_put(monkeypatch, tmp_path):
+    led = ledger([finding("a", status="fixed")])
+    upd = {"review_id": 9, "body": "Quiet.\n\n" + block(led)}
+    payload = review_payload(led, decision="delta", review=None, ledger_update=upd)
+    calls, res, data = approve_run(
+        monkeypatch, tmp_path, payload, reviews=[review_row(9, ledger([finding("a")]))]
+    )
+    assert not [c for c in calls if "PUT" in c]
+    (posted,) = posts(calls)
+    assert posted["event"] == "APPROVE" and "Quiet." in posted["body"] and MARK in posted["body"]
+    assert data["review_event"] == "APPROVE" and data["review_id"] == 555
+
+
+def test_a_quiet_round_on_a_floor_file_keeps_the_put_and_adds_the_reason(monkeypatch, tmp_path):
+    led = ledger([finding("a", status="fixed")])
+    upd = {"review_id": 9, "body": "Quiet.\n\n" + block(led)}
+    payload = review_payload(led, decision="delta", review=None, ledger_update=upd)
+    calls, res, data = approve_run(
+        monkeypatch, tmp_path, payload, reviews=[review_row(9, ledger([finding("a")]))],
+        files=[pf("pay/X.java")], globs=["pay/**"],
+    )  # fmt: skip
+    assert calls[0][:4] == ["api", "-X", "PUT", "repos/me/repo/pulls/11/reviews/9"]
+    body = json.loads(calls.inputs[0])["body"]
+    assert "Looks good" in body and "<!--" not in body and ledger_ok(body)
+    assert data["signoff"]["reason"] == "match" and data["review_event"] == "COMMENT"
+
+
+def test_an_approved_update_target_is_replaced_by_a_new_comment_review(monkeypatch, tmp_path):
+    led = ledger([finding("a")])
+    upd = {"review_id": 9, "body": "Quiet.\n\n" + block(led)}
+    payload = review_payload(led, decision="delta", review=None, ledger_update=upd)
+    calls, res, data = approve_run(
+        monkeypatch, tmp_path, payload, extra=(),
+        reviews=[review_row(9, ledger(), state="APPROVED")],
+    )  # fmt: skip
+    assert not [c for c in calls if "PUT" in c]
+    (posted,) = posts(calls)
+    assert posted["event"] == "COMMENT" and "Quiet." in posted["body"]
+    assert res.exit_code == 0 and data["review_event"] == "COMMENT"
+
+
+def test_prior_settled_needs_every_open_prior_finding_cleared_by_id():
+    pol = policy()
+    prior = ledger([finding("a"), finding("b", status="fixed")])
+    assert skillreview.prior_settled([], CLEAN, pol)
+    assert skillreview.prior_settled([prior], ledger([finding("a", status="wontfix")]), pol)
+    assert not skillreview.prior_settled([prior], ledger([]), pol)
+    assert not skillreview.prior_settled([prior], ledger([finding("a")]), pol)
+    # a finding that an intermediate round dropped is still owed; a cleared one is not
+    assert not skillreview.prior_settled([prior, ledger([])], ledger([]), pol)
+    assert skillreview.prior_settled([prior, ledger([finding("a", status="fixed")])], CLEAN, pol)
+
+
+def test_a_clean_round_with_no_body_and_no_update_posts_nothing(monkeypatch, tmp_path):
+    calls, res, data = approve_run(monkeypatch, tmp_path, review_payload(CLEAN, review=None))
+    assert res.exit_code == 0 and not calls
+    assert data["status"] == "review_complete" and "review_event" not in data
+
+
+def test_a_finding_dropped_by_an_intermediate_round_still_blocks_approval(monkeypatch, tmp_path):
+    rows = [
+        review_row(5, ledger([finding("a")]), at="2026-10-01T00:00:00Z"),
+        review_row(6, ledger([]), at="2026-10-02T00:00:00Z"),  # round 2 silently dropped it
+    ]
+    calls, res, data = approve_run(monkeypatch, tmp_path, reviews=rows)
+    assert posts(calls)[0]["event"] == "COMMENT"
+    rows[1] = review_row(6, ledger([finding("a", status="fixed")]), at="2026-10-02T00:00:00Z")
+    calls, res, data = approve_run(monkeypatch, tmp_path, reviews=rows)
+    assert posts(calls)[0]["event"] == "APPROVE"
+
+
+OPEN = ledger([finding("a")])
+APPROVED_ROW = review_row(5, OPEN, state="APPROVED")
+
+
+def test_open_findings_withdraw_a_stale_bot_approval(monkeypatch, tmp_path):
+    calls, res, data = approve_run(
+        monkeypatch, tmp_path, review_payload(OPEN, comments=[inline()]), reviews=[APPROVED_ROW]
+    )
+    (posted,) = posts(calls)
+    assert posted["event"] == "REQUEST_CHANGES" and posted["comments"] == [inline()]
+    assert data["review_event"] == "REQUEST_CHANGES" and data["status"] == "review_published"
+
+
+@pytest.mark.parametrize(
+    "extra,rows",
+    [
+        ((), [APPROVED_ROW]),  # without --allow-approve a COMMENT stays a COMMENT
+        (("--allow-approve",), [review_row(5, OPEN)]),  # no approval stands
+        (
+            ("--allow-approve",),
+            [
+                APPROVED_ROW,
+                review_row(6, OPEN, state="CHANGES_REQUESTED", at="2026-10-02T00:00:00Z"),
+            ],
+        ),
+        (("--allow-approve",), [review_row(5, OPEN, login="someone", state="APPROVED")]),
+    ],
+)
+def test_a_round_that_withdraws_nothing_stays_a_comment(monkeypatch, tmp_path, extra, rows):
+    calls, res, data = approve_run(
+        monkeypatch, tmp_path, review_payload(OPEN), extra=extra, reviews=rows
+    )
+    assert posts(calls)[0]["event"] == "COMMENT" and data["review_event"] == "COMMENT"
+
+
+def test_unreadable_reviews_cannot_withdraw_and_say_so(monkeypatch, tmp_path):
+    calls, res, data = approve_run(
+        monkeypatch, tmp_path, review_payload(OPEN), review_reads=[(1, "", "boom")]
+    )
+    assert posts(calls)[0]["event"] == "COMMENT"
+    assert data["skill_notes"] == ["approval_unverified:1"]
+
+
+def test_a_quiet_round_with_open_findings_withdraws_with_a_new_review(monkeypatch, tmp_path):
+    upd = {"review_id": 5, "body": "Quiet.\n\n" + block(OPEN)}
+    payload = review_payload(OPEN, decision="delta", review=None, ledger_update=upd)
+    calls, res, data = approve_run(monkeypatch, tmp_path, payload, reviews=[APPROVED_ROW])
+    assert not [c for c in calls if "PUT" in c]
+    (posted,) = posts(calls)
+    assert posted["event"] == "REQUEST_CHANGES" and "Quiet." in posted["body"]
+    assert data["review_event"] == "REQUEST_CHANGES"
+
+
+def test_an_absent_review_after_an_unconfirmed_approve_is_uncertain_not_a_comment(
+    monkeypatch, tmp_path
+):
+    calls, res, data = approve_run(monkeypatch, tmp_path, post=(1, "", "timed out"))
+    assert len(posts(calls)) == 1 and not [c for c in calls if "PUT" in c]
+    assert res.exit_code == 8 and data["status"] == "publish_uncertain"
+
+
+def test_a_quiet_round_may_edit_only_the_newest_ledger_review(monkeypatch, tmp_path):
+    led = ledger([finding("a", status="fixed")])
+    upd = {"review_id": 9, "body": "Quiet.\n\n" + block(led)}
+    payload = review_payload(led, decision="delta", review=None, ledger_update=upd)
+    rows = [
+        review_row(9, ledger([finding("a")]), at="2026-10-01T00:00:00Z"),
+        review_row(10, ledger([finding("a")]), at="2026-10-02T00:00:00Z"),
+    ]
+    calls, res, data = approve_run(monkeypatch, tmp_path, payload, extra=(), reviews=rows)
+    assert res.exit_code == 7 and not calls and "skill_update_target" in data["reason"]
+
+
+def test_a_moved_base_voids_the_floor_and_blocks_the_approval(monkeypatch, tmp_path):
+    # pin, publish start, after the floor reads, then the check right before the approval
+    calls, res, data = approve_run(monkeypatch, tmp_path, bases=[BASE, BASE, BASE, "c" * 40])
+    assert not calls and data["status"] == "publish_blocked_stale_head"
+
+
+def long_body_payload(lead_chars=900):
+    led = CLEAN
+    return review_payload(led, "x" * lead_chars + "\n\n" + block(led)), (
+        len("x" * lead_chars + "\n\n" + block(led)) + 2 + len(cli.review_footer())
+    )
+
+
+def test_the_sign_off_paragraph_falls_back_to_a_fixed_short_one_and_never_vanishes(
+    monkeypatch, tmp_path
+):
+    payload, base_len = long_body_payload()
+    cap = base_len + 2 + len(cli._SIGNOFF_FIXED_TEXT)
+    calls, res, data = approve_run(
+        monkeypatch, tmp_path, payload, files=[pf("pay/X.java")], globs=["pay/**"],
+    )  # fmt: skip
+    assert "matches `pay/**`" in posts(calls)[0]["body"]  # fits under the default cap
+    calls, _ = setup_run(monkeypatch, tmp_path, payload, files=[pf("pay/X.java")], globs=["pay/**"])
+    res, data = run(tmp_path, "--allow-approve", policy_over={"max_body_chars": cap})
+    body = posts(calls)[0]["body"]
+    assert cli._SIGNOFF_FIXED_TEXT in body and "pay/X.java" not in body
+    assert data["signoff"]["reason"] == "match" and data["skill_notes"] == [
+        "signoff_text_shortened:1"
+    ]
+    # not even the short paragraph fits: the payload is refused, nothing is posted
+    calls, _ = setup_run(monkeypatch, tmp_path, payload, files=[pf("pay/X.java")], globs=["pay/**"])
+    res, data = run(tmp_path, "--allow-approve", policy_over={"max_body_chars": cap - 1})
+    assert res.exit_code == 7 and not posts(calls)
+    assert data["status"] == "skill_payload_invalid"
+
+
+def test_an_approve_body_that_does_not_fit_with_its_marker_is_posted_as_a_comment(
+    monkeypatch, tmp_path
+):
+    payload, base_len = long_body_payload()
+    calls, _ = setup_run(monkeypatch, tmp_path, payload)
+    res, data = run(tmp_path, "--allow-approve", policy_over={"max_body_chars": base_len})
+    (posted,) = posts(calls)
+    assert posted["event"] == "COMMENT" and MARK not in posted["body"]
+    assert data["skill_notes"] == ["approve_body_cap:1"]

@@ -7,7 +7,12 @@ import urllib.error
 
 import pytest
 
-from franky.idempotency import fetch_signoff_globs, find_open_pr
+from franky.idempotency import (
+    fetch_repo_file,
+    fetch_signoff_content_rules,
+    fetch_signoff_globs,
+    find_open_pr,
+)
 
 
 class _FakeResp:
@@ -234,3 +239,40 @@ def test_signoff_globs_non_200_and_bad_sha_fail_closed():
 
     assert fetch_signoff_globs("me/repo", "main", {}, opener=never) is None
     assert fetch_signoff_globs("me/repo", "", {}, opener=never) is None
+
+
+def test_content_rules_split_glob_and_fixed_string():
+    seen = []
+
+    def opener(req, timeout=None):
+        seen.append(req.full_url)
+        return _FakeResp(
+            _file_payload("# c\n\n**/src/main/** CurrencyHelper\n/a.txt  two words \n")
+        )
+
+    assert fetch_signoff_content_rules("me/repo", BASE, {}, opener=opener) == [
+        ("**/src/main/**", "CurrencyHelper"),
+        ("/a.txt", "two words"),
+    ]
+    assert seen == [
+        f"https://api.github.com/repos/me/repo/contents/.github/human-signoff-content?ref={BASE}"
+    ]
+    assert fetch_signoff_content_rules("me/repo", BASE, {}, opener=_http_error(404)) == []
+    assert fetch_signoff_content_rules("me/repo", BASE, {}, opener=_http_error(500)) is None
+    # a glob with no string is malformed: fail closed
+    bad = lambda r, timeout=None: _FakeResp(_file_payload("**/src/main/**\n"))  # noqa: E731
+    assert fetch_signoff_content_rules("me/repo", BASE, {}, opener=bad) is None
+
+
+def test_fetch_repo_file_returns_bytes_empty_for_404_and_honors_the_cap():
+    ok = lambda r, timeout=None: _FakeResp(_file_payload("raw \xff"))  # noqa: E731
+    assert fetch_repo_file("me/repo", "a b/c.txt", BASE, {}, opener=ok) == "raw \xff".encode()
+    assert fetch_repo_file("me/repo", "a", BASE, {}, opener=_http_error(404)) == b""
+    assert fetch_repo_file("me/repo", "a", BASE, {}, opener=_http_error(500)) is None
+    big = lambda r, timeout=None: _FakeResp(_file_payload("a", size=11))  # noqa: E731
+    assert fetch_repo_file("me/repo", "a", BASE, {}, max_bytes=10, opener=big) is None
+
+
+def test_fetch_repo_file_can_treat_a_404_as_unreadable():
+    assert fetch_repo_file("me/repo", "a", BASE, {}, absent=None, opener=_http_error(404)) is None
+    assert fetch_repo_file("me/repo", "a", BASE, {}, opener=_http_error(404)) == b""
