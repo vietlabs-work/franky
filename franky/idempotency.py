@@ -83,8 +83,12 @@ def fetch_pr_head_sha(
     opener: Callable = urllib.request.urlopen,
     timeout: float = _FETCH_TIMEOUT,
     meta_sink: dict | None = None,
+    error_sink: dict | None = None,
 ) -> str | None:
     """Return the LIVE head commit SHA of PR `number` in `repo`, or None on any failure.
+
+    `error_sink`, when given, gets {"reason": ...} on a None return: `HTTP <code>`, the
+    exception class name (never its message, which can echo a URL), or `bad response`.
 
     GitHub REST: GET /repos/{repo}/pulls/{number}. Same opener-injection + degrade-to-None
     style as find_open_pr. UNLIKE find_open_pr (a best-effort idempotency convenience), the
@@ -107,22 +111,29 @@ def fetch_pr_head_sha(
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
+    def fail(reason: str) -> None:
+        if error_sink is not None:
+            error_sink["reason"] = reason
+
     req = urllib.request.Request(url, headers=headers)
     try:
         with opener(req, timeout=timeout) as resp:
-            if getattr(resp, "status", None) != 200:
+            status = getattr(resp, "status", None)
+            if status != 200:
+                fail(f"HTTP {status}")
                 return None
             data = json.load(resp)
-    except Exception:
+    except urllib.error.HTTPError as exc:
+        fail(f"HTTP {exc.code}")
+        return None
+    except Exception as exc:
+        fail(type(exc).__name__)
         return None
 
-    if not isinstance(data, dict):
-        return None
-    head = data.get("head")
-    if not isinstance(head, dict):
-        return None
-    sha = head.get("sha")
+    head = data.get("head") if isinstance(data, dict) else None
+    sha = head.get("sha") if isinstance(head, dict) else None
     if not isinstance(sha, str) or not sha:
+        fail("bad response")
         return None
     if meta_sink is not None:
         base = data.get("base")

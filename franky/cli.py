@@ -2588,11 +2588,14 @@ def review_pr(
             # we refuse rather than reviewing state the caller no longer expects (issue: review-pr
             # MVP). Unlike find_open_pr's best-effort idempotency check, an unreachable/unparseable
             # fetch here is fail-closed (NetworkError), not silently skipped.
-            live_sha = fetch_pr_head_sha(repo, pr_number, os.environ, meta_sink=pr_meta)
+            why: dict = {}
+            live_sha = fetch_pr_head_sha(
+                repo, pr_number, os.environ, meta_sink=pr_meta, error_sink=why
+            )
             if live_sha is None:
                 raise NetworkError(
-                    f"could not read {canonical_pr_url}'s live head commit via the GitHub API - "
-                    "refusing"
+                    f"could not read {canonical_pr_url}'s live head commit via the GitHub API "
+                    f"({why.get('reason', 'unknown')}) - refusing"
                 )
             if expected_head_sha and expected_head_sha != live_sha.lower():
                 raise TaskRejected(
