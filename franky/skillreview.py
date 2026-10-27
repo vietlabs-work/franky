@@ -512,15 +512,15 @@ def approval_eligible(payload: SkillPayload, priors: list[dict], policy: SkillPo
     )
 
 
-def latest_bot_decision(reviews: list, policy: SkillPolicy) -> str | None:
-    """State (APPROVED or CHANGES_REQUESTED) of the bot's newest deciding review, else None."""
+def latest_bot_decision(reviews: list, policy: SkillPolicy) -> dict | None:
+    """The bot's newest deciding review (state APPROVED or CHANGES_REQUESTED), else None."""
     mine = [
         r
         for r in sorted((r for r in reviews if isinstance(r, dict)), key=_review_sort_key)
         if is_bot_user(r.get("user"), policy)
         and r.get("state") in ("APPROVED", "CHANGES_REQUESTED")
     ]
-    return mine[-1]["state"] if mine else None
+    return mine[-1] if mine else None
 
 
 def add_signoff(

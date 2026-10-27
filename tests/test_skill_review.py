@@ -711,6 +711,17 @@ def test_an_invalid_payload_posts_nothing_and_reports_a_code(monkeypatch, tmp_pa
     assert "skill_" in data["reason"] and "ledger" not in data
 
 
+def test_an_unreadable_payload_reports_invalid_not_a_crash(monkeypatch, tmp_path):
+    def boom(*_a, **_k):
+        raise RuntimeError("x")
+
+    calls, _ = setup_run(monkeypatch, tmp_path, review_payload(ledger()))
+    monkeypatch.setattr(skillreview, "build_payload", boom)
+    res, data = run(tmp_path)
+    assert res.exit_code == 7 and not calls
+    assert data["status"] == "skill_payload_invalid" and "unreadable" in data["reason"]
+
+
 def test_no_publish_returns_the_final_body_with_comments_folded(monkeypatch, tmp_path):
     led = ledger()
     calls, _ = setup_run(
@@ -1447,19 +1458,49 @@ OPEN = ledger([finding("a")])
 APPROVED_ROW = review_row(5, OPEN, state="APPROVED")
 
 
-def test_open_findings_withdraw_a_stale_bot_approval(monkeypatch, tmp_path):
+DISMISS = ["api", "-X", "PUT", "repos/me/repo/pulls/11/reviews/5/dismissals", "--input", "-"]
+
+
+def dismissals(calls):
+    return [json.loads(i) for c, i in zip(calls, calls.inputs) if c == DISMISS]
+
+
+def test_open_findings_after_an_approval_dismiss_it_then_comment(monkeypatch, tmp_path):
     calls, res, data = approve_run(
         monkeypatch, tmp_path, review_payload(OPEN, comments=[inline()]), reviews=[APPROVED_ROW]
     )
+    assert calls[0] == DISMISS  # before the review is posted
+    assert dismissals(calls) == [{"message": cli.DISMISS_MESSAGE, "event": "DISMISS"}]
     (posted,) = posts(calls)
-    assert posted["event"] == "REQUEST_CHANGES" and posted["comments"] == [inline()]
-    assert data["review_event"] == "REQUEST_CHANGES" and data["status"] == "review_published"
+    assert posted["event"] == "COMMENT" and posted["comments"] == [inline()]
+    assert data["review_event"] == "COMMENT" and data["dismissed_review_id"] == 5
+
+
+def test_a_clean_round_on_a_floor_file_after_an_approval_dismisses_then_comments(
+    monkeypatch, tmp_path
+):
+    rows = [review_row(5, ledger([]), state="APPROVED")]
+    calls, res, data = approve_run(
+        monkeypatch, tmp_path, reviews=rows, files=[pf("pay/X.java")], globs=["pay/**"]
+    )
+    assert calls[0] == DISMISS
+    (posted,) = posts(calls)
+    assert posted["event"] == "COMMENT" and "Looks good" in posted["body"]
+    assert data["dismissed_review_id"] == 5 and data["signoff"]["reason"] == "match"
+
+
+def test_a_round_that_approves_again_does_not_dismiss(monkeypatch, tmp_path):
+    rows = [review_row(5, ledger([]), state="APPROVED")]
+    calls, res, data = approve_run(monkeypatch, tmp_path, reviews=rows)
+    assert not dismissals(calls) and posts(calls)[0]["event"] == "APPROVE"
+    assert "dismissed_review_id" not in data
 
 
 @pytest.mark.parametrize(
     "extra,rows",
     [
-        ((), [APPROVED_ROW]),  # without --allow-approve a COMMENT stays a COMMENT
+        ((), [APPROVED_ROW]),  # without --allow-approve nothing is dismissed
+        (("--allow-approve",), []),  # no prior approval
         (("--allow-approve",), [review_row(5, OPEN)]),  # no approval stands
         (
             ("--allow-approve",),
@@ -1471,29 +1512,50 @@ def test_open_findings_withdraw_a_stale_bot_approval(monkeypatch, tmp_path):
         (("--allow-approve",), [review_row(5, OPEN, login="someone", state="APPROVED")]),
     ],
 )
-def test_a_round_that_withdraws_nothing_stays_a_comment(monkeypatch, tmp_path, extra, rows):
+def test_no_standing_bot_approval_means_no_dismissal(monkeypatch, tmp_path, extra, rows):
     calls, res, data = approve_run(
         monkeypatch, tmp_path, review_payload(OPEN), extra=extra, reviews=rows
     )
-    assert posts(calls)[0]["event"] == "COMMENT" and data["review_event"] == "COMMENT"
+    assert not [c for c in calls if "dismissals" in c[4]]
+    assert posts(calls)[0]["event"] == "COMMENT" and "dismissed_review_id" not in data
 
 
-def test_unreadable_reviews_cannot_withdraw_and_say_so(monkeypatch, tmp_path):
+def test_a_failed_dismissal_is_noted_and_the_round_is_still_posted(monkeypatch, tmp_path):
+    calls, res, data = approve_run(
+        monkeypatch, tmp_path, review_payload(OPEN), reviews=[APPROVED_ROW], put=(1, "", "boom")
+    )
+    assert posts(calls)[0]["event"] == "COMMENT"
+    assert data["skill_notes"] == ["dismiss_failed:1"] and "dismissed_review_id" not in data
+
+
+def test_a_head_that_moved_before_the_dismissal_writes_nothing(monkeypatch, tmp_path):
+    # pin, publish start, then the check right before the dismissal sees a moved head
+    calls, res, data = approve_run(
+        monkeypatch,
+        tmp_path,
+        review_payload(OPEN),
+        reviews=[APPROVED_ROW],
+        heads=[SHA, SHA, "c" * 40],
+    )
+    assert not calls and data["status"] == "publish_blocked_stale_head"
+
+
+def test_unreadable_reviews_cannot_dismiss_and_say_so(monkeypatch, tmp_path):
     calls, res, data = approve_run(
         monkeypatch, tmp_path, review_payload(OPEN), review_reads=[(1, "", "boom")]
     )
-    assert posts(calls)[0]["event"] == "COMMENT"
+    assert posts(calls)[0]["event"] == "COMMENT" and not dismissals(calls)
     assert data["skill_notes"] == ["approval_unverified:1"]
 
 
-def test_a_quiet_round_with_open_findings_withdraws_with_a_new_review(monkeypatch, tmp_path):
+def test_a_quiet_round_after_an_approval_dismisses_and_posts_a_new_comment(monkeypatch, tmp_path):
     upd = {"review_id": 5, "body": "Quiet.\n\n" + block(OPEN)}
     payload = review_payload(OPEN, decision="delta", review=None, ledger_update=upd)
     calls, res, data = approve_run(monkeypatch, tmp_path, payload, reviews=[APPROVED_ROW])
-    assert not [c for c in calls if "PUT" in c]
+    assert calls[0] == DISMISS and len(calls) == 2
     (posted,) = posts(calls)
-    assert posted["event"] == "REQUEST_CHANGES" and "Quiet." in posted["body"]
-    assert data["review_event"] == "REQUEST_CHANGES"
+    assert posted["event"] == "COMMENT" and "Quiet." in posted["body"]
+    assert data["review_event"] == "COMMENT" and data["dismissed_review_id"] == 5
 
 
 def test_an_absent_review_after_an_unconfirmed_approve_is_uncertain_not_a_comment(

@@ -1466,19 +1466,19 @@ def _finish_skill_review(
         )
     except skillreview.SkillError as exc:
         reason = f"skill review payload refused ({exc.code}) - see the redacted log ({log_path})"
-        return ("skill_payload_invalid", reason, EXIT_AGENT, *([None] * 9), False)
+        return ("skill_payload_invalid", reason, EXIT_AGENT, *([None] * 10), False)
     except Exception:
         reason = f"skill review payload unreadable - see the redacted log ({log_path})"
-        return ("skill_payload_invalid", reason, EXIT_AGENT, *([None] * 9), False)
+        return ("skill_payload_invalid", reason, EXIT_AGENT, *([None] * 10), False)
 
     def done(
         status, reason, code, url=None, rid=None, event=None, resolved=None, replied=None,
-        notes=None, link=None, text=None, signoff=None,
+        notes=None, link=None, text=None, signoff=None, dismissed=None,
     ):  # fmt: skip
         summary = skillreview.ledger_summary(payload, policy, pinned_sha, link or url)
         return (
             status, reason, code, url, rid, event, resolved, replied, summary, notes, text,
-            signoff, True,
+            signoff, dismissed, True,
         )  # fmt: skip
 
     if payload.kind == "terminal":
@@ -1506,7 +1506,7 @@ def _finish_skill_review(
             reason = (
                 f"skill review payload refused ({exc.code}) - see the redacted log ({log_path})"
             )
-            return ("skill_payload_invalid", reason, EXIT_AGENT, *([None] * 9), False)
+            return ("skill_payload_invalid", reason, EXIT_AGENT, *([None] * 10), False)
         return done(
             "review_complete",
             "skill review validated (publish=False, nothing written to GitHub)",
@@ -1522,6 +1522,7 @@ def _finish_skill_review(
     return done(
         r["status"], r["reason"], r["exit_code"], r["review_url"], r["review_id"], r["event"],
         r["resolved"], r["replied"], r["notes"], signoff=r["signoff"],
+        dismissed=r["dismissed"],
     )  # fmt: skip
 
 
@@ -1552,6 +1553,8 @@ def _read_skill_policy_file(path: Path) -> skillreview.SkillPolicy:
         raise FrankyError(str(exc)[:300], code=EXIT_USAGE, kind="usage_error") from exc
 
 
+# The host wrapper accepts only this exact dismissal text.
+DISMISS_MESSAGE = "Withdrawn: a later automated review round could not approve this PR."
 _SIGNOFF_FIXED_TEXT = (
     "**Looks good: no findings above nit.** A human must approve it, because of the repo's "
     "sign-off rules."
@@ -1627,10 +1630,10 @@ def _publish_skill_review(
     the legacy path (`_approve_review`): a confirmed refusal posts a COMMENT instead, an unknown
     outcome (including an absent review after a possibly written POST) is `publish_uncertain`, with
     no further write. A quiet round (ledger update) approves with a new review instead of the PUT;
-    an APPROVED update target is replaced by a new COMMENT review. A round with open findings
-    under `allow_approve`, while the bot's latest deciding review is an APPROVE, posts
-    REQUEST_CHANGES instead of COMMENT (a quiet round: a new review, not the PUT), withdrawing the
-    stale approval. A PUT may edit only the newest ledger review of the bot.
+    an APPROVED update target is replaced by a new COMMENT review. Under `allow_approve`, a round
+    that does not post an APPROVE first dismisses the bot's newest APPROVED review (when it is the
+    bot's latest deciding one) with the fixed `DISMISS_MESSAGE`, head re-checked before; a failed
+    dismissal is note `dismiss_failed` and the round is still posted. A PUT may edit only the newest ledger review of the bot.
     """
     gh = _host_gh(pr_url)
     notes: dict[str, int] = {}
@@ -1647,10 +1650,12 @@ def _publish_skill_review(
         return check_base and (meta.get("base_sha") or "").lower() != (base_sha or "").lower()
 
     signoff = None
+    dismissed = None
 
     def result(status, reason, code, url=None, rid=None, event=None, resolved=None, replied=None):
         return {
             "signoff": signoff,
+            "dismissed": dismissed,
             "status": status,
             "reason": reason,
             "exit_code": code,
@@ -1684,12 +1689,13 @@ def _publish_skill_review(
     want_reply = bool(reply and payload.replies)
     # A clean round with no inline comment may be approved (when nothing on the PR contradicts it).
     clean_round = skillreview.approval_eligible(payload, [], policy)
-    n_open = skillreview.ledger_counts(payload.ledger or {}, policy)[0]
-    # A stale approval is withdrawn by a round with open findings, so that read is needed too.
-    withdrawable = allow_approve and payload.kind == "review" and n_open > 0
+    # Under --allow-approve a round that cannot approve must not leave a stale bot approval
+    # standing, so the reviews are read for every review round that writes.
+    writes = payload.kind == "review" and (payload.body is not None or payload.update is not None)
+    check_approval = allow_approve and writes
     # Read before any write, so the prior ledger can never be the review this run posts.
     reviews = None
-    if payload.update or want_resolve or clean_round or withdrawable:
+    if payload.update or want_resolve or clean_round or check_approval:
         reviews = _read_pr_reviews(repo, pr_number, secrets)
     ledgers = skillreview.bot_ledger_reviews(reviews or [], policy)
     prior = ledgers[-1][1] if ledgers else None
@@ -1698,12 +1704,14 @@ def _publish_skill_review(
         and reviews is not None
         and skillreview.approval_eligible(payload, [led for _r, led in ledgers], policy)
     )
-    withdraw = False
-    if withdrawable:
+    stale_approval = None
+    if check_approval:
         if reviews is None:
-            note("approval_unverified")  # cannot tell whether an approval stands: COMMENT
+            note("approval_unverified")  # cannot tell whether an approval stands
         else:
-            withdraw = skillreview.latest_bot_decision(reviews, policy) == "APPROVED"
+            latest = skillreview.latest_bot_decision(reviews, policy)
+            if latest is not None and latest.get("state") == "APPROVED":
+                stale_approval = latest.get("id")
 
     parsed = _json_dict
 
@@ -1790,11 +1798,33 @@ def _publish_skill_review(
             if stale():
                 return stale_result
             note("approve_refused")  # a refused approval is posted as a COMMENT below
+    if not posted and stale_approval is not None:
+        # This round does not approve: the bot's own older approval must not stand.
+        if stale():
+            return stale_result
+        try:
+            dcode, dout, _derr = gh(
+                [
+                    "api",
+                    "-X",
+                    "PUT",
+                    f"repos/{repo}/pulls/{pr_number}/reviews/{stale_approval}/dismissals",
+                    "--input",
+                    "-",
+                ],
+                input=json.dumps({"message": DISMISS_MESSAGE, "event": "DISMISS"}),
+            )
+        except (FrankyError, DockerError):
+            dcode = 1
+        if dcode == 0:
+            dismissed = stale_approval
+        else:
+            note("dismiss_failed")
     if posted:
         pass
-    elif payload.body is not None or (payload.update and (approved_target or withdraw)):
+    elif payload.body is not None or (payload.update and approved_target):
         body = {
-            "event": "REQUEST_CHANGES" if withdraw else "COMMENT",
+            "event": "COMMENT",
             "body": text,
             "commit_id": pinned_sha,
             "comments": payload.comments or [],
@@ -2717,6 +2747,7 @@ def review_pr(
         review_id: int | None = None
         review_event_out: str | None = None
         signoff_out: dict | None = None
+        dismissed_out: int | None = None
         threads_resolved: int | None = None
         threads_replied: int | None = None
         findings_summary: str | None = None
@@ -2747,6 +2778,7 @@ def review_pr(
                 skill_notes,
                 review_body,
                 signoff_out,
+                dismissed_out,
                 skill_ok,
             ) = _finish_skill_review(
                 output,
@@ -2933,6 +2965,7 @@ def review_pr(
             review_id=review_id,
             review_event=review_event_out,
             signoff=signoff_out,
+            dismissed_review_id=dismissed_out,
             threads_resolved=threads_resolved,
             threads_replied=threads_replied,
             thread=thread_result,

@@ -86,7 +86,7 @@ With a floor the review stays a `COMMENT`, its body gains the "Looks good ... A 
 
 With `--allow-approve`, an approvable round without a floor is posted as an `APPROVE` ending with a `<!-- bot-review:<nonce> -->` marker, through the same POST shape (`"event": "APPROVE"`, no comments). The legacy reconcile rules apply: a confirmed refusal (a wrapper refusal line, HTTP 422) posts a `COMMENT` instead (`skill_notes` `approve_refused:1`). Any other failure (timeout, unreadable reply) lists the PR reviews twice for a review of this head with the marker and reports what it finds. If it does not find one, even after two clean reads, the run ends `publish_uncertain` (exit `8`): no COMMENT and no PUT follows, unlike the legacy path, which posts a COMMENT when the review is confirmed absent. The complete body with its marker must fit `max_body_chars`; if only the marker does not fit, the round is posted as a `COMMENT` (`skill_notes` `approve_body_cap:1`).
 
-With `--allow-approve`, a round with open findings posts `REQUEST_CHANGES` instead of `COMMENT` when the bot's newest `APPROVED` or `CHANGES_REQUESTED` review on the PR is an `APPROVED`: the stale approval is withdrawn. A quiet round in that state posts a new `REQUEST_CHANGES` review carrying the update body instead of the PUT. If the PR reviews cannot be read the round is a `COMMENT` with note `approval_unverified`. "Open findings" means any open finding in the ledger, whatever its blocking field. `review_event` reports what was posted.
+With `--allow-approve`, every review round that writes a review but does not post an `APPROVE` (open findings, inline comments, a sign-off floor, an unreadable or dropped prior history, a cap) first dismisses the bot's own stale approval, so it cannot stand beside the new review. When the bot's newest `APPROVED` or `CHANGES_REQUESTED` review is an `APPROVED`, the host re-checks the head, then sends `gh api -X PUT repos/<repo>/pulls/<N>/reviews/<id>/dismissals --input -` with stdin `{"message": <DISMISS_MESSAGE in franky/cli.py>, "event": "DISMISS"}` (one fixed text; the caller's wrapper must allow only that exact text). It then posts the round as usual, as a `COMMENT` or the PUT; it never posts `REQUEST_CHANGES`. A failed dismissal adds note `dismiss_failed` and the round is still posted. If the PR reviews cannot be read, the round is posted with note `approval_unverified`. In both cases the earlier approval stays on the PR (branch protection that restricts who may dismiss reviews also causes `dismiss_failed`), so a human must dismiss it. The result carries `dismissed_review_id` when a dismissal succeeded.
 
 A `ledger_update` may edit only the bot's newest ledger review (else `skill_update_target`). A quiet round that is approvable, has no floor and has `--allow-approve` posts a new `APPROVE` review carrying the update body instead of the PUT. When the update target is an `APPROVED` review, which cannot be edited, the update body is posted as a new `COMMENT` review instead of failing `skill_update_target`.
 
@@ -153,6 +153,7 @@ All reads use the read token. Every write goes through the caller's `gh` wrapper
 |------|------|-------|
 | New review | `gh api -X POST repos/<repo>/pulls/<N>/reviews --input -` | `{"event": "COMMENT" or "APPROVE", "body": ..., "commit_id": "<head>", "comments": [...]}` (`APPROVE` only for an [approvable round](#approval) with `--allow-approve`, no comments, body ends with the marker) |
 | Ledger update (new, only with `allow_ledger_update`) | `gh api -X PUT repos/<repo>/pulls/<N>/reviews/<id> --input -` | `{"body": ...}` |
+| Dismiss a stale approval (`--allow-approve`) | `gh api -X PUT repos/<repo>/pulls/<N>/reviews/<id>/dismissals --input -` | `{"message": <DISMISS_MESSAGE in franky/cli.py>, "event": "DISMISS"}` |
 | Resolve (`--resolve-fixed`) | `gh api graphql -f query=<RESOLVE_MUTATION> -F id=<node id>` | none |
 | Reply (`--reply-prior`) | `gh api -X POST repos/<repo>/pulls/<N>/comments/<cid>/replies -f body=<body>` | none |
 
@@ -167,7 +168,7 @@ Reads: `repos/<repo>/pulls/<N>/reviews?per_page=100 --paginate --slurp` (existin
 
 ### Result
 
-The normal review fields appear (`status`, `reviewed_sha`, `review_url`, `review_id`, `review_event`, `threads_resolved`, `threads_replied`). `review_event` is `COMMENT`, `APPROVE` (see [approval](#approval)) or absent. `signoff` appears when the sign-off floor applied to an approvable round. A result adds:
+The normal review fields appear (`status`, `reviewed_sha`, `review_url`, `review_id`, `review_event`, `threads_resolved`, `threads_replied`). `review_event` is `COMMENT`, `APPROVE` (see [approval](#approval)) or absent. `signoff` appears when the sign-off floor applied to an approvable round, and `dismissed_review_id` when a stale bot approval was dismissed. A result adds:
 
 ```json
 "ledger": {"kind": "review|terminal", "decision": "delta", "state": "clean|findings|null",
