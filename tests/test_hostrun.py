@@ -686,9 +686,31 @@ def test_an_unrelated_process_in_the_old_process_group_is_not_signalled(monkeypa
     assert host.sent == []
 
 
-def test_processes_outside_the_start_window_are_never_proven(monkeypatch):
+def test_a_profiled_process_is_killed_whatever_its_start_time(monkeypatch):
+    """The kernel's answer is authoritative: a process under this run's profile that started far
+    outside the window is the run's, and is stopped. It is never silently dropped (CLEAN)."""
     host = FakeHost({4242: ("t", 5_000_000.0, 4242)}, profiled=[4242])
-    assert host.teardown(monkeypatch) == hostrun.CLEAN and host.sent == []
+    out = host.teardown(monkeypatch)
+    assert out == hostrun.CLEAN and (4242, 15) in host.sent and (4242, 9) in host.sent
+    assert not host.procs
+    # And one that will not die is uncertain, never clean.
+    stuck = FakeHost({4242: ("t", 5_000_000.0, 4242)}, profiled=[4242], dies_on=())
+    assert stuck.teardown(monkeypatch, deadline=3.0) == hostrun.UNCERTAIN
+
+
+def test_a_process_the_check_cannot_answer_for_is_uncertain_not_clean(monkeypatch):
+    host = FakeHost({50: ("t50", IN_WINDOW, 50)}, profiled=[])
+
+    def broken(pid, path):
+        raise OSError("no answer")
+
+    host.check = broken
+    assert host.teardown(monkeypatch) == hostrun.UNCERTAIN
+    base = _run_dir("7" * 32)
+    rec = {"host_dir": str(base), **_ident()}
+    monkeypatch.setattr(hostrun, "process_table", host.table)
+    monkeypatch.setattr(hostrun, "_sandbox_check", lambda: broken)
+    assert hostrun.run_state(rec) is None
 
 
 def test_teardown_terms_then_kills_a_stubborn_proven_process_and_returns_clean(monkeypatch):

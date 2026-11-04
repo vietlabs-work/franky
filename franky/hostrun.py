@@ -809,26 +809,35 @@ def prove(
     seen: dict | None = None,
     check=None,
     runner=subprocess.run,
+    unknown: list | None = None,
 ) -> dict[int, str]:
     """The processes proven to belong to this run: {pid: start time text}.
 
-    Kernel mode: a process whose start is inside the run's window and for which `sandbox_check`
-    says the home and the runs root are denied while the run's own `work` directory is allowed.
-    Fallback mode (hermetic tests off macOS): leader's group, seen descendants, cwd in the run."""
+    Kernel mode: `sandbox_check` is authoritative and is asked about EVERY operator process, with
+    no pre-filter by start time. A process is the run's when the home and the runs root are
+    denied to it while the run's own `work` directory is allowed, whenever it started. A process
+    the check cannot answer for is added to `unknown`, and the caller must not call the run clean.
+    Fallback mode (hermetic tests off macOS): the leader's group, seen descendants and a working
+    directory in the run, within the start window."""
     me = os.getpid()
-    candidates = [r for r in rows if r[0] != me and _in_window(ident, r[4])]
     if EVIDENCE_MODE == "kernel":
         check = check or _sandbox_check()
         if check is None:
+            if unknown is not None:
+                unknown.append(-1)
             return {}
         proven = {}
-        for pid, _pp, _g, text, _e in candidates:
+        for pid, _pp, _g, text, _e in rows:
+            if pid == me:
+                continue
             try:
                 if check(pid, home) and not check(pid, base / "work") and check(pid, root):
                     proven[pid] = text
             except Exception:
-                continue
+                if unknown is not None:
+                    unknown.append(pid)
         return proven
+    candidates = [r for r in rows if r[0] != me and _in_window(ident, r[4])]
     cwd = _cwd_pids(base, runner)
     return {
         pid: text
@@ -877,7 +886,20 @@ def teardown(
                 return UNCERTAIN
             if seen is not None and ident.get("pgid"):
                 track_descendants(ident["pgid"], seen, rows)
-            proven = prove(base, home, root, ident, rows, seen=seen, check=check, runner=runner)
+            unknown: list = []
+            proven = prove(
+                base,
+                home,
+                root,
+                ident,
+                rows,
+                seen=seen,
+                check=check,
+                runner=runner,
+                unknown=unknown,
+            )
+            if unknown:
+                return UNCERTAIN  # cannot be proven either way: never call it clean
             if not proven:
                 return CLEAN
             if clock() - start > deadline:
@@ -943,7 +965,11 @@ def run_state(record: dict, *, check=None, runner=subprocess.run) -> bool | None
     if rows is None or (EVIDENCE_MODE == "kernel" and (check or _sandbox_check()) is None):
         return None
     root = Path(os.path.realpath(runs_root()))
-    return bool(prove(base, real_home(), root, ident, rows, check=check, runner=runner))
+    unknown: list = []
+    proven = prove(
+        base, real_home(), root, ident, rows, check=check, runner=runner, unknown=unknown
+    )
+    return True if proven else (None if unknown else False)
 
 
 def teardown_record(record: dict, **kw) -> str:
