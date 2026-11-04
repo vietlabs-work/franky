@@ -33,12 +33,23 @@ import click
 from . import baseref, franky_version, skillreview
 from .transcript import Transcript, Redactor, chunks, open_secure
 from ._install import detect_install
-from .config import GH_LOGIN_VAR, GH_TOKEN_VAR, Config, RepoSetup, load_config, redact, repo_allowed
+from .config import (
+    GH_LOGIN_VAR,
+    GH_TOKEN_VAR,
+    RUNTIMES,
+    Config,
+    RepoSetup,
+    load_config,
+    redact,
+    repo_allowed,
+    resolve_runtime,
+)
 from .decompose import build_plan_result, parse_decomposition
 from .diagnosis import build_diagnosis_result, parse_diagnosis
 from .economics import Usage, format_economics, parse_usage
 from .container import (
     CONTAINER_TIMEOUT_CODE,
+    FALLBACK_TIMEOUT_SECS,
     codex_auth_login,
     codex_auth_logout,
     codex_auth_status,
@@ -57,7 +68,7 @@ from .container import (
     resolve_image,
     run_in_container,
 )
-from . import jobs, snapshot, threads
+from . import hostrun, jobs, snapshot, threads
 from .container import container_running, container_state, deliver_steer, reap_run, run_names
 from .engine import (
     CLAUDE_TOKEN_VAR,
@@ -587,6 +598,8 @@ def build(
         # Shared config + task-parse + JIRA-fetch preamble (also computes the host-predicted
         # branch before the JIRA fetch mutates spec.text - see _resolve_task_spec).
         cfg, spec, branch, secrets = _resolve_task_spec(task_input_str, repo, engine, os.environ)
+        if no_publish:
+            _refuse_host(cfg, "build --no-publish")
 
         # Idempotency pre-check (issue #50): if a Franky PR is already open on the predicted
         # branch, a retry must NOT open a second one. Report the existing PR and stop without
@@ -631,7 +644,7 @@ def build(
 
         # After the idempotency short-circuit: an already-open run makes no GitHub or token call.
         _enable_atlassian(cfg, spec.repo, secrets, prose=not (quiet or as_json))
-        franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
+        franky_img, proxy_img = _ensure_runtime(cfg)
 
         # Build the profile bundle (optional). Auto-discovers ~/.franky/profile.toml unless
         # overridden by --profile or FRANKY_PROFILE_PATH. Fails closed on detected credentials.
@@ -953,7 +966,7 @@ def iterate(
             thread = _open_thread(spec.repo, pr_number, "author")
             ctx.call_on_close(thread.close)
 
-        franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
+        franky_img, proxy_img = _ensure_runtime(cfg)
 
         bundle, setup_block, _ro = _load_profile_bundle(
             None,
@@ -2618,7 +2631,7 @@ def review_pr(
                 private=pr_meta.get("private") is True,
                 prose=not (quiet or as_json),
             )
-        franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
+        franky_img, proxy_img = _ensure_runtime(cfg)
         team_sink: dict = {}
         bundle, _setup_block, review_setup = _load_profile_bundle(
             None,
@@ -3074,7 +3087,7 @@ def plan(
         cfg, spec, _branch, secrets = _resolve_task_spec(task_input_str, repo, engine, os.environ)
         _enable_atlassian(cfg, spec.repo, secrets, prose=not (quiet or as_json))
 
-        franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
+        franky_img, proxy_img = _ensure_runtime(cfg)
         bundle, _setup_block, setup_block = _load_profile_bundle(
             profile_path_opt,
             process_env,
@@ -3191,6 +3204,23 @@ def _image_spec(env: Mapping[str, str], label: str, engine: str | None = None) -
         return label, img, "docker build -t franky .", FRANKY_IMAGE_VAR
     img = resolve_image(env, FRANKY_PROXY_IMAGE_VAR, "franky-proxy")
     return label, img, "docker build -t franky-proxy proxy/", FRANKY_PROXY_IMAGE_VAR
+
+
+def _ensure_runtime(cfg: Config) -> tuple[str, str]:
+    """The image pair for the container runtime; the host runtime has none (it checks that the
+    engine can be sandboxed instead, and refuses with exit 3 when it cannot)."""
+    if cfg.runtime == "host":
+        hostrun.preflight(cfg)
+        return "", ""
+    return _ensure_images(os.environ, cfg.engine.name)
+
+
+def _refuse_host(cfg: Config, what: str) -> None:
+    if cfg.runtime == "host":
+        raise ConfigError(
+            f"{what} is not supported with FRANKY_RUNTIME=host (it needs a container filesystem)",
+            hint="use the container runtime for this command",
+        )
 
 
 def _ensure_images(
@@ -3953,7 +3983,13 @@ def _run_pass(
     redacted from the streamed output and heartbeat; never added to the container env.
     """
     session_kwargs = {} if session is None else {"session_id": session[0], "resume": session[1]}
-    if docker_start == "deferred":
+    if cfg.runtime == "host":
+        prompt += (
+            "\nThis run executes on the host, in a sandbox, without Docker or nested "
+            "containers. Do not try to start Docker. If a step needs it, say so in your "
+            "report and never claim it passed.\n"
+        )
+    elif docker_start == "deferred":
         prompt += (
             "\nDocker startup is deferred for this read-only pass. Before Docker-dependent "
             "reproduction, run `franky-docker-start`. If startup or tests fail, report the "
@@ -4022,6 +4058,21 @@ def _run_pass(
     if hb is not None:
         progress = _liveness_progress(hb, progress, [*cfg.secret_values(), *extra_secrets])
     t0 = time.monotonic()
+    if cfg.runtime == "host":
+        # Same funnel, different runtime: never reached by a container run. The sinks a host
+        # run has no filesystem for (workspace export, resume) were refused up front.
+        host_extra = {k: v for k, v in extra.items() if k not in ("docker_start", "timeout")}
+        code, output = hostrun.run_on_host(
+            cfg,
+            inner_argv,
+            timeout=extra.get("timeout", FALLBACK_TIMEOUT_SECS),
+            profile_bundle=profile_bundle,
+            progress=progress,
+            run_id=run_id,
+            resume_workspace=resume_workspace,
+            **host_extra,
+        )
+        return code, output, time.monotonic() - t0
     code, output = run_in_container(
         cfg,
         inner_argv,
@@ -4943,6 +4994,7 @@ def _version_info(
     - "provenance": {"kind": str, "path": str} from detect_install.
     - "engine": {"name": str, "resolved": bool, "host_binary_version": str | None}.
     - "image": the resolved task image ref (FRANKY_IMAGE override or versioned GHCR ref).
+    - "runtimes": the runtimes this build supports (`container`, `host`; see FRANKY_RUNTIME).
 
     A bad FRANKY_ENGINE value must NOT crash this function - resolved will be False and
     host_binary_version will be None in that case.
@@ -4975,6 +5027,7 @@ def _version_info(
             "host_binary_version": host_binary_version,
         },
         "image": image,
+        "runtimes": list(RUNTIMES),
     }
 
 
@@ -5015,6 +5068,7 @@ def version(as_json: bool) -> None:
     else:
         click.echo(f"  engine:     {eng['name']}")
     click.echo(f"  image:      {img}")
+    click.echo(f"  runtimes:   {','.join(info['runtimes'])}")
 
 
 @main.command()
@@ -5282,9 +5336,20 @@ def job_group() -> None:
     """Inspect and control a single Franky run by its job id (see `franky jobs`)."""
 
 
+def _run_alive(record: dict) -> bool:
+    """Is the run's container (or, for a host run, its verified process group) running?"""
+    if record.get("runtime") == "host":
+        return hostrun.group_state(record) is True
+    return container_running(record.get("container", ""))
+
+
 def _job_liveness(record: dict) -> tuple[dict, bool | None]:
     """Probe a run (owner pid, docker, snapshot) and derive its state + next step."""
-    container = container_state(record.get("container", ""))
+    if record.get("runtime") == "host":
+        # A host run has no container: the verified process group is the liveness probe.
+        container = hostrun.group_state(record)
+    else:
+        container = container_state(record.get("container", ""))
     snap = record.get("snapshot_path")
     live = jobs.derive_liveness(
         record,
@@ -5325,13 +5390,23 @@ def job_status(ctx: click.Context, job_id: str, as_json: bool) -> None:
                 f"elapsed={live['elapsed_secs']}s idle={live['idle_secs']}s "
                 f"last_tool={live['last_tool']}"
             )
-            where = "running" if alive else "not running (container gone)"
+            host_run = record.get("runtime") == "host"
+            where = (
+                "running"
+                if alive
+                else "not running (host process gone)"
+                if host_run
+                else "not running (container gone)"
+            )
             click.echo(f"job:        {record.get('job_id')}")
             click.echo(f"command:    {record.get('command')}")
             click.echo(f"repo:       {record.get('repo')}")
             click.echo(f"engine:     {record.get('engine')}")
             click.echo(f"status:     {record.get('status')}")
-            click.echo(f"container:  {record.get('container')} ({where})")
+            if host_run:
+                click.echo(f"runtime:    host (process group {record.get('pgid')}, {where})")
+            else:
+                click.echo(f"container:  {record.get('container')} ({where})")
             click.echo(f"started:    {record.get('started_at')}")
             click.echo(f"ended:      {record.get('ended_at')}")
             click.echo(f"pr_url:     {record.get('pr_url')}")
@@ -5390,6 +5465,33 @@ def job_logs(ctx: click.Context, job_id: str) -> None:
         ctx.exit(exc.code)
 
 
+def _host_kill_capture(record: dict, job_id: str) -> tuple[str | None, None]:
+    """`job kill` of a host run: keep a `--thread` engine session, like the container path does,
+    as a scrubbed, verified sidecar. Best-effort; the run directory is removed after."""
+    sid = record.get("session_id")
+    kill_secrets, complete = _kill_secrets(record.get("engine"))
+    if not (complete and _valid_session_id(sid) and record.get("command") in ("build", "resume")):
+        return None, None
+    try:
+        tmp = _session_tmpdir(os.environ)
+        base = hostrun.host_dir(job_id)
+        status = hostrun.copy_session(
+            base / "home",
+            threads.session_paths(record.get("engine"), sid),
+            tmp,
+            hostrun.work_slug(Path(os.path.realpath(base)) / "work"),
+            max_bytes=threads.MAX_SESSION_BYTES,
+        )
+        if status != "ok":
+            snapshot._rmtree(tmp)
+            return None, None
+        return snapshot.finalize_snapshot(
+            tmp, snapshot.session_path_for(job_id, os.environ), kill_secrets
+        ), None
+    except Exception:
+        return None, None
+
+
 @job_group.command("kill")
 @click.argument("job_id")
 @click.option("--json", "as_json", is_flag=True, help="Emit the kill result as a JSON object.")
@@ -5418,7 +5520,10 @@ def job_kill(ctx: click.Context, job_id: str, as_json: bool) -> None:
         # docker-inspect (exit/OOM/state) + squid-log (egress) signals are.
         diag: dict = {}
         snapshot_path = session_path = session_tmp = None
-        if record.get("status") == "running":
+        host_run = record.get("runtime") == "host"
+        if record.get("status") == "running" and host_run:
+            session_path, session_tmp = _host_kill_capture(record, job_id)
+        elif record.get("status") == "running":
             # Scrub with the same effective secrets as a normal run (config file included).
             kill_secrets, config_loaded = _kill_secrets(record.get("engine"))
             try:
@@ -5468,8 +5573,10 @@ def job_kill(ctx: click.Context, job_id: str, as_json: bool) -> None:
                     )
                 except Exception:
                     session_status = None
-        reaped = reap_run(job_id)
-        if session_tmp is not None:
+        reaped = hostrun.kill_run(record) if host_run else reap_run(job_id)
+        if host_run:
+            hostrun.remove_run_dir(job_id)
+        if session_tmp is not None and not host_run:
             if session_status == "ok":
                 session_path = snapshot.finalize_snapshot(
                     session_tmp, snapshot.session_path_for(job_id, os.environ), kill_secrets
@@ -5611,7 +5718,7 @@ def job_diagnose(
         if diag_repo and repo_allowed(diag_repo, cfg.allowed_repos):
             _enable_atlassian(cfg, diag_repo, secrets, prose=not (quiet or as_json))
 
-        franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
+        franky_img, proxy_img = _ensure_runtime(cfg)
         verbose = verbose or bool(os.environ.get(FRANKY_VERBOSE_VAR))
         progress = None if (quiet and not verbose) else _make_progress(cfg.engine, verbose)
         timeout = max_duration if max_duration is not None else _DIAGNOSE_DEFAULT_TIMEOUT
@@ -5809,7 +5916,7 @@ def job_replay(
         # but those are already rejected above).
         branch = record.get("branch") or f"franky/{task_slug(spec)}"
 
-        franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
+        franky_img, proxy_img = _ensure_runtime(cfg)
         verbose = verbose or bool(os.environ.get(FRANKY_VERBOSE_VAR))
         progress = None if (quiet and not verbose) else _make_progress(cfg.engine, verbose)
 
@@ -6100,7 +6207,8 @@ def job_resume(
         # idempotency check knows about; fall back to a freshly predicted slug for old records.
         branch = record.get("branch") or f"franky/{task_slug(spec)}"
 
-        franky_img, proxy_img = _ensure_images(os.environ, cfg.engine.name)
+        _refuse_host(cfg, "job resume")
+        franky_img, proxy_img = _ensure_runtime(cfg)
         verbose = verbose or bool(os.environ.get(FRANKY_VERBOSE_VAR))
         progress = None if (quiet and not verbose) else _make_progress(cfg.engine, verbose)
 
@@ -6409,7 +6517,7 @@ def job_attach(ctx: click.Context, job_id: str, message: str | None, as_json: bo
                 kind="steering_unsupported",
             )
 
-        if not container_running(record.get("container", "")):
+        if not _run_alive(record):
             raise FrankyError(
                 f"run {job_id} is not running - nothing to steer",
                 code=EXIT_USAGE,
@@ -6455,12 +6563,15 @@ def job_attach(ctx: click.Context, job_id: str, message: str | None, as_json: bo
         # apart from its own scratch content. The audit note stores the bare safe_msg, not this.
         framed = f"\n----- operator correction -----\n{safe_msg}\n"
 
-        delivered = deliver_steer(record.get("container", ""), framed)
+        if record.get("runtime") == "host":
+            delivered = hostrun.deliver_steer(job_id, framed)
+        else:
+            delivered = deliver_steer(record.get("container", ""), framed)
         if not delivered:
             # Best-effort audit even on a failed delivery - a post-hoc look at `job status`
             # should show the attempt, not silently drop it.
             _append_steer_note(job_id, record, safe_msg, delivered=False)
-            if not container_running(record.get("container", "")):
+            if not _run_alive(record):
                 # The run finished in the gap between our alive check and the exec - report the
                 # race as run_not_alive rather than a confusing delivery failure.
                 raise FrankyError(
@@ -6753,6 +6864,16 @@ def auth_group() -> None:
     """Manage persistent engine subscription authentication."""
 
 
+def _auth_runtime() -> str:
+    """The runtime `auth` commands act on: FRANKY_RUNTIME from the env, then the config file."""
+    try:
+        env = dict(os.environ)
+        load_config_file(env)
+        return resolve_runtime(env)
+    except (ValueError, ConfigError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
 def _resolve_codex_auth_volume() -> str:
     """Resolve FRANKY_CODEX_AUTH_VOLUME from the same env the run paths use (process env,
     then the config file) so `auth login/status/logout` honour a config-file override the
@@ -6803,10 +6924,16 @@ def auth_login(engine: str) -> None:
     if engine == "claude":
         _claude_auth_login()
         return
-    image = _codex_auth_image()
-    auth_volume = _resolve_codex_auth_volume()
-    _clear_codex_auth_marker()
-    if not codex_auth_login(image, auth_volume=auth_volume):
+    host = _auth_runtime() == "host"
+    if host:
+        _clear_codex_auth_marker()
+        ok = hostrun.codex_auth_login()
+    else:
+        image = _codex_auth_image()
+        auth_volume = _resolve_codex_auth_volume()
+        _clear_codex_auth_marker()
+        ok = codex_auth_login(image, auth_volume=auth_volume)
+    if not ok:
         raise click.ClickException("Codex subscription login failed")
     path = config_file_path(dict(os.environ))
     try:
@@ -6829,8 +6956,12 @@ def auth_status(engine: str) -> None:
         return
     if not _codex_auth_marker_enabled():
         raise click.ClickException("Codex subscription login is not enabled")
-    auth_volume = _resolve_codex_auth_volume()
-    if not codex_auth_status(_codex_auth_image(), auth_volume=auth_volume):
+    if _auth_runtime() == "host":
+        ready = hostrun.codex_auth_ready()
+    else:
+        auth_volume = _resolve_codex_auth_volume()
+        ready = codex_auth_status(_codex_auth_image(), auth_volume=auth_volume)
+    if not ready:
         raise click.ClickException("Codex subscription login is not ready")
     click.echo("Codex subscription login is ready.")
 
@@ -6848,9 +6979,14 @@ def auth_logout(engine: str) -> None:
         if os.environ.get(CLAUDE_TOKEN_VAR):
             click.echo(f"{CLAUDE_TOKEN_VAR} is still exported in this shell.", err=True)
         return
-    auth_volume = _resolve_codex_auth_volume()
-    _clear_codex_auth_marker()
-    if not codex_auth_logout(auth_volume=auth_volume):
+    if _auth_runtime() == "host":
+        _clear_codex_auth_marker()
+        removed = hostrun.codex_auth_logout()
+    else:
+        auth_volume = _resolve_codex_auth_volume()
+        _clear_codex_auth_marker()
+        removed = codex_auth_logout(auth_volume=auth_volume)
+    if not removed:
         raise click.ClickException(
             "Codex subscription disabled, but the credential volume could not be removed"
         )

@@ -21,7 +21,7 @@ Interactive commands fail with exit `2` in a non-TTY. They do not wait forever. 
 | `3` | Invalid configuration. |
 | `4` | Rejected task or repository, or a `--no-publish` export refused because a run secret is in the commits. |
 | `5` | Missing or rejected authentication. |
-| `6` | Docker, image, or required host tool unavailable. |
+| `6` | Docker, image, or required host tool unavailable. Never returned with `FRANKY_RUNTIME=host`, which reports a missing tool or sandbox as `3`. |
 | `7` | Agent or result failure, including a stale review head, or a `--no-publish` run with no new commits or a failed export. |
 | `8` | JIRA or network failure, including review publication. |
 | `9` | Run timeout. |
@@ -75,6 +75,8 @@ Two more host-fixable failures get their own kind instead of `agent_error`. The 
 |--------|-----:|---------|
 | `usage_limit` | `7` | The engine's own error event reports a usage or rate limit. The message names the engine and model. Set another model with `franky config set FRANKY_MODEL <model>` or wait for the reset. |
 | `docker_error` | `6` | A pre-run check refused to start the task (for example Docker security options, free disk, or the egress proxy). Nothing ran. |
+
+A host-runtime run (`FRANKY_RUNTIME=host`) keeps the same record, started event and result files. Its record also carries `runtime` (`host`), `pgid`, `pgid_started_at` and `host_dir`, and `job status --json` reports `container_running` from the verified process group. `franky version --json` lists `runtimes`.
 
 `state` is `active` (output in the last 120 s), `quiet` (alive, silent), `orphaned` (the owning process is gone), `unknown` (liveness cannot be confirmed), or `finished`. `next` gives one `action` (`wait`, `check`, `kill`, `resume`, `rerun`, `inspect`, `done`), its `command`, `retry_safe`, and `check_after`. Do not rerun unless `retry_safe` is true. `unknown` is never proof of death.
 

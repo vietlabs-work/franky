@@ -34,3 +34,20 @@ Codex subscription authentication is the only persistent task volume. Franky scr
 A profile with a `team` setup also loads the repository's own skills and rules before the engine starts. What Franky installs is read at the default-branch head, never at the PR head or the PR base (an author can pick a base branch they made), so a PR cannot add to the installed instructions. Residual: the working directory `/work` holds the PR checkout, so an engine that also reads instruction files from its working directory can still see PR-head files. Skill and agent headers are rewritten to an allow-list (`name`, `description`, and for agents `tools`, `model`), so a repository file cannot carry `hooks`, `mcpServers` or `permissionMode` (any `SKILL.md` depth; team skills get the same rewrite). Repository instruction text joins the instruction file inside one fenced code block (a fence longer than any backtick run in it), so `@path` imports and fake headings are inert. Only the setup paths are fetched, files over 256 KiB are never downloaded, and symlinks, executables, settings, hooks, MCP and env files, and `*.yaml`, `*.yml`, `*.toml`, `*.json` and `agents/` inside a skill directory are skipped, and the run starts in `/work`, so the repository's own hooks never run. A fetch error fails the run before the engine starts. Repository text is still untrusted prompt input: it can steer the agent within the container's limits, as any repository file can.
 
 Read [`AGENTS.md`](../AGENTS.md) before changing security, container, egress, profile, or resource code.
+
+## Host runtime
+
+`FRANKY_RUNTIME=host` ([configuration](configuration.md#runtime)) trades the container boundary for the engine's own OS sandbox. It is an explicit opt-in and never a fallback. The container stays the default and its code path is unchanged.
+
+What the host runtime keeps:
+
+- A private run directory `<runs dir>/<job>.host/{home,work,tmp}` (mode `0700`, removed after the run). Profile, session and prompt bundles extract as regular files only, with no links.
+- A child environment built from scratch: `PATH`, `LANG`, `TERM`, `HOME`, `TMPDIR`, `XDG_*`, then the configured credentials. Nothing else of your environment reaches the engine.
+- Claude's Seatbelt sandbox, made mandatory by a per-run `--settings` file: Bash writes only inside the run directory, Bash cannot read your home directory except the run directory, no unsandboxed command, and a sandbox that cannot start fails the run. The file also denies Claude's Read and Edit tools the credential directories under your home and Franky's own config and Codex store. `--dangerously-skip-permissions` stays on the command: it is how the engine runs headless, and the sandbox and deny rules bound it.
+- Codex `--sandbox workspace-write` with network access, instead of the bypass flag. Codex can still read the whole disk.
+- The same output redaction, transcript, wall-clock watchdog (the whole process group is stopped; exit `124`), host-side publish validation and skill-policy checks.
+- Job control by process group. `job status`, `kill` and `attach` verify the recorded group by its start time first. A group that cannot be verified reports as running and is never signalled.
+
+What it drops: the egress proxy (the engine can reach any host), the read-only root, the memory, process and disk limits, the nested Docker daemon, and filesystem isolation for reads. A prompt-injected engine can read whatever your user can read, except what the engine's sandbox or deny rules hide, and can send it anywhere. The tokens in the engine's environment (`GH_TOKEN`, the engine credential) are readable by every process of the run. Tools that Bash needs must live outside your home directory, since Bash cannot read it.
+
+Use it only for repositories and prompts you trust at the level you would run them yourself. Prefer the container runtime when Docker works.

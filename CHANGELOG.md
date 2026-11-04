@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `FRANKY_RUNTIME=host` (default `container`) runs the engine on the host, as your user, under the engine's OS sandbox, with no Docker. It is an explicit opt-in and never a fallback: an unknown value is a config error (exit 3), and a host that cannot sandbox the engine refuses instead of running unsandboxed. Claude gets a per-run `--settings` file that makes its sandbox mandatory (`failIfUnavailable`, no unsandboxed commands, Bash writes limited to the run directory, the home directory unreadable to Bash) and denies its Read and Edit tools the host's credential paths. Codex runs `--sandbox workspace-write` with network access instead of the bypass flag. Only the claude and codex engines support it. Every run gets a private `<runs dir>/<job>.host/{home,work,tmp}` (0700, removed after), a child environment built from scratch (PATH, LANG, TERM, HOME, TMPDIR, XDG_*, then the configured credentials only), its own process group, the same redaction, transcript, progress and watchdog (timeout exits 124), and the repository setup stage before the engine (failure exits 78). Same CLI, exit codes, `--json` started event and result files; `job status`, `job kill` and `job attach` use the recorded process group, verified by its start time before any signal. `build --no-publish` and `job resume` are refused with exit 3. `franky auth login|status|logout codex` use a host store (`codex-auth/`, 0700, beside the config file) in host mode. `franky version` reports `runtimes`. See [Host runtime](docs/security.md#host-runtime).
+
 ## [0.3.32] - 2026-10-27
 
 - `review-pr`: when the live head read fails, the `network_error` message now names the cause, `HTTP <code>`, the exception class or `bad response` (never the exception text), for example `could not read <pr>'s live head commit via the GitHub API (HTTP 502) - refusing`.

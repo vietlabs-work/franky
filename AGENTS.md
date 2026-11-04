@@ -90,6 +90,7 @@ CLI -> config and task policy -> prompt -> engine command -> container runtime -
 | Atlassian | `atlassian.py` | Host-side Atlassian OAuth connection and MCP wiring |
 | Agent instructions | `prompt.py`, `persona.md`, `decompose.py`, `diagnosis.py`, `reviewpr.py`, `skillreview.py`, `sentinel.py` | Prompts and bounded structured output |
 | Runtime | `container.py`, `security.py`, `egress.py`, `franky-dind-entrypoint.sh`, `proxy/` | Docker lifecycle, isolation, policies, proxy |
+| Host runtime | `hostrun.py`, `repo_setup_script.py` (symlink to `franky-repo-setup.py`) | `FRANKY_RUNTIME=host`: per-run dir, engine OS sandbox, process-group job control, Codex host auth store |
 | Transfer | `profile.py`, `setups.py`, `snapshot.py`, `franky-repo-setup.py` | Bounded, secret-scanned profile and workspace bundles; the in-image repository-setup mapper |
 | Runs | `jobs.py`, `transcript.py`, `economics.py` | Records, redacted logs, diagnostics, usage |
 | Threads | `threads.py` | Per-PR reviewer and author sessions, handoffs, locks, prune and purge |
@@ -146,6 +147,14 @@ The term list lives outside the repo: the Actions secret `FRANKY_PRIVATE_TERMS` 
 - Start the task only after the proxy passes its bounded health check.
 
 `franky gh` is an explicit host-side exception. It exposes the full `gh` surface and is limited only by `GH_TOKEN`.
+
+### Runtime selection
+
+- The container is the default. The host runtime is an explicit opt-in (`FRANKY_RUNTIME=host`), never a fallback: do not add any path that switches runtime on a failure.
+- Host mode must refuse, with exit 3, when the engine's OS sandbox cannot run. It never runs unsandboxed and never uses the bypass flags the container uses (claude `--settings` with a mandatory sandbox, codex `--sandbox workspace-write`).
+- Container mode must stay byte-identical: `run_in_container` gets the same arguments with `FRANKY_RUNTIME` unset (`tests/test_hostrun.py` pins it).
+- Host job control signals only a process group whose recorded start time still matches.
+- Host mode builds the child environment from scratch and extracts bundles as regular files only.
 
 ### Container boundary
 

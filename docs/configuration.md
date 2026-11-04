@@ -13,6 +13,16 @@ franky config path
 
 See [`config.example.toml`](../config.example.toml) for common settings.
 
+## Runtime
+
+| Setting | Purpose |
+|---------|---------|
+| `FRANKY_RUNTIME` | `container` (default) or `host`. Any other value exits `3`. The process environment overrides the file. |
+
+`container` runs every pass in the hardened Docker task described in [Security](security.md). `host` runs the engine as your user under the engine's own OS sandbox and needs no Docker, images or proxy. It is an opt-in for hosts where Docker is not usable. It is never a fallback: Franky does not switch runtime on a Docker failure.
+
+Host mode needs the engine (`claude` or `codex`), `git` and `gh` on `PATH`, and Seatbelt (`/usr/bin/sandbox-exec`) on macOS or `bwrap` on Linux. A missing piece exits `3`. The `pi` and `opencode` engines have no OS sandbox and are refused. Host mode refuses `build --no-publish` and `job resume`, which need a container filesystem. Set `FRANKY_NO_UPDATE_CHECK=1` where Docker is absent: `franky update` pre-pulls images on a best-effort basis. Codex subscription login (`franky auth login codex`) keeps its credential in `codex-auth/` beside the config file (mode `0700`, `auth.json` `0600`) instead of a Docker volume. The residual risks are listed in [Host runtime](security.md#host-runtime).
+
 ## AppArmor
 
 Native AppArmor hosts also need the packaged task profile. Install it after each Franky update.
