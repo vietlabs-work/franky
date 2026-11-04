@@ -244,10 +244,13 @@ def test_control_files_live_outside_the_run_dir_read_only_and_are_removed(tmp_pa
 
 def test_preflight_refuses_without_the_engine_or_a_sandbox(monkeypatch):
     cfg = _cfg()
-    with pytest.raises(ConfigError, match="needs `claude` on PATH"):
-        hostrun.preflight(cfg, which=lambda b: None, platform="darwin")
     if Path("/usr/bin/sandbox-exec").exists():
+        with pytest.raises(ConfigError, match="needs `claude` on PATH"):
+            hostrun.preflight(cfg, which=lambda b: None, platform="darwin")
         hostrun.preflight(cfg, which=lambda b: "/bin/" + b, platform="darwin")
+    else:
+        with pytest.raises(ConfigError, match="needs /usr/bin/sandbox-exec"):
+            hostrun.preflight(cfg, which=lambda b: "/bin/" + b, platform="darwin")
     with pytest.raises(ConfigError, match="Seatbelt to confine reads"):
         hostrun.preflight(_cfg(CodexEngine()), which=lambda b: "/bin/" + b, platform="linux")
     with pytest.raises(ConfigError, match="bubblewrap"):
