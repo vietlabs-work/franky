@@ -151,9 +151,10 @@ The term list lives outside the repo: the Actions secret `FRANKY_PRIVATE_TERMS` 
 ### Runtime selection
 
 - The container is the default. The host runtime is an explicit opt-in (`FRANKY_RUNTIME=host`), never a fallback: do not add any path that switches runtime on a failure.
-- Host mode must refuse, with exit 3, when the engine's OS sandbox cannot run. It never runs unsandboxed and never uses the bypass flags the container uses (claude `--settings` with a mandatory sandbox, codex `--sandbox workspace-write`).
+- Host mode must refuse, with exit 3, when the engine's OS sandbox cannot run. It never runs unsandboxed and never uses the bypass flags the container uses (claude `--settings` with a mandatory sandbox and allow-only file-tool rules, codex inside a Seatbelt profile).
 - Container mode must stay byte-identical: `run_in_container` gets the same arguments with `FRANKY_RUNTIME` unset (`tests/test_hostrun.py` pins it).
 - Host job control signals only a process group whose recorded start time still matches.
+- The host settings file and Seatbelt profile live in a 0700 `<job>.ctl` directory outside every writable root, files 0400.
 - Host mode builds the child environment from scratch and extracts bundles as regular files only.
 
 ### Container boundary

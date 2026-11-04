@@ -108,33 +108,138 @@ def test_rewrite_text_maps_container_paths_to_the_run_directory(tmp_path):
 
 
 def test_engine_argv_swaps_the_container_flags_for_the_os_sandbox(tmp_path):
-    settings = tmp_path / "s.json"
+    control = tmp_path / "s.json"
     claude = ClaudeEngine().inner_argv("p", model=None)
-    out = hostrun.engine_argv(claude, "claude", settings)
-    assert out[:3] == ["claude", "--settings", str(settings)]
+    out = hostrun.engine_argv(claude, "claude", control)
+    assert out[:3] == ["claude", "--settings", str(control)]
     assert "--dangerously-skip-permissions" in out  # headless approval; the sandbox bounds it
     codex = CodexEngine().inner_argv("p", model=None)
-    out = hostrun.engine_argv(codex, "codex", settings)
+    out = hostrun.engine_argv(codex, "codex", control)
+    assert out[:4] == [hostrun.SANDBOX_EXEC, "-f", str(control), "codex"]
     assert "--dangerously-bypass-approvals-and-sandbox" not in out
-    assert out[out.index("--sandbox") + 1] == "workspace-write"
-    assert "sandbox_workspace_write.network_access=true" in out
+    # Codex's own sandbox cannot nest inside the Seatbelt profile; the profile is the sandbox.
+    assert out[out.index("--sandbox") + 1] == "danger-full-access"
     with pytest.raises(ValueError):
-        hostrun.engine_argv(["codex", "exec", "p"], "codex", settings)
+        hostrun.engine_argv(["codex", "exec", "p"], "codex", control)
     with pytest.raises(ValueError):
-        hostrun.engine_argv(PiEngine().inner_argv("p", model=None), "pi", settings)
+        hostrun.engine_argv(PiEngine().inner_argv("p", model=None), "pi", control)
 
 
-def test_claude_settings_enable_a_mandatory_sandbox_limited_to_the_run_dir(tmp_path):
-    run = tmp_path / "r.host"
+def _fake_home(tmp_path):
     home = tmp_path / "real-home"
-    s = hostrun.claude_settings(run, home, tmp_path / "cfg")
+    (home / ".ssh").mkdir(parents=True)
+    (home / "notes.txt").write_text("x")
+    run = home / ".franky" / "runs" / "r.host"
+    (run / "work").mkdir(parents=True)
+    (home / ".franky" / "runs" / "other.host").mkdir()
+    (home / ".franky" / "config").write_text("x")
+    return home, run
+
+
+def test_claude_settings_are_allow_only_and_keep_the_settings_out_of_reach(tmp_path):
+    home, run = _fake_home(tmp_path)
+    runs = run.parent
+    ctl = runs / "r.ctl"
+    s = hostrun.claude_settings(run, home, runs, (ctl,))
     sandbox = s["sandbox"]
     assert sandbox["enabled"] is True and sandbox["failIfUnavailable"] is True
     assert sandbox["allowUnsandboxedCommands"] is False
-    assert sandbox["filesystem"]["allowWrite"] == [str(run)]
+    assert sandbox["filesystem"]["allowWrite"] == [f"{run}/home", f"{run}/work", f"{run}/tmp"]
     assert sandbox["filesystem"]["denyRead"] == [str(home)]
+    assert sandbox["filesystem"]["allowRead"] == [str(run)]
     deny = s["permissions"]["deny"]
-    assert f"Read(/{home}/.ssh/**)" in deny and f"Edit(/{tmp_path}/cfg)" in deny
+    for tool in ("Read", "Edit", "Write", "Grep", "Glob"):
+        assert f"{tool}(/{home}/.ssh/**)" in deny and f"{tool}(/{home}/notes.txt)" in deny
+        assert (
+            f"{tool}(/{runs}/other.host/**)" in deny and f"{tool}(/{home}/.franky/config)" in deny
+        )
+        assert f"{tool}(/{ctl}/**)" in deny
+    # The run directory itself and the path down to it are never denied wholesale.
+    assert not any(str(run) in r or r.startswith(f"Read(/{home}/.franky/**") for r in deny)
+    assert f"Read(/{home}/.franky)" not in deny and f"Read(/{runs})" not in deny
+    # A new file directly in the home or on the way down is denied too.
+    assert f"Write(/{home}/*)" in deny and f"Edit(/{runs}/*)" in deny
+    assert "WebFetch" in deny and "WebSearch" in deny
+    assert s["permissions"]["allow"] == [f"Read(/{run}/**)", f"Edit(/{run}/**)"]
+
+
+def test_claude_settings_deny_the_whole_home_when_the_run_dir_is_elsewhere(tmp_path):
+    home = tmp_path / "home"
+    home.mkdir()
+    runs = tmp_path / "runs"
+    run = runs / "r.host"
+    (runs / "other.host").mkdir(parents=True)
+    run.mkdir()
+    s = hostrun.claude_settings(run, home, runs)
+    deny = s["permissions"]["deny"]
+    assert f"Read(/{home}/**)" in deny and f"Read(/{runs}/other.host/**)" in deny
+    assert s["sandbox"]["filesystem"]["denyRead"] == [str(home), str(runs)]
+
+
+def test_seatbelt_profile_denies_the_home_except_the_run_dir_and_codex_roots(tmp_path):
+    home, run = _fake_home(tmp_path)
+    runs = run.parent
+    text = hostrun.seatbelt_profile(run, home, runs, [Path("/opt/x/codex")])
+    lines = text.splitlines()
+    assert "(allow default)" in lines and '(deny file-write* (subpath "/"))' in lines
+    assert f'(deny file-read* file-write* (subpath "{home}"))' in lines
+    assert '(allow file-read* (subpath "/opt/x/codex"))' in lines
+    # Later rules win: the run directory allow is last, after every deny.
+    assert lines[-1] == f'(allow file-read* file-write* (subpath "{run}"))'
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").exists(),
+    reason="needs macOS Seatbelt",
+)
+def test_seatbelt_profile_blocks_reads_and_writes_outside_the_run_dir(tmp_path):
+    home, run = _fake_home(tmp_path)
+    home = Path(os.path.realpath(home))
+    run = home / ".franky" / "runs" / "r.host"
+    (home / "dummy.txt").write_text("TOPSECRET")
+    (run / "work" / "f.txt").write_text("inside")
+    profile = tmp_path / "p.sb"
+    profile.write_text(hostrun.seatbelt_profile(run, home, run.parent, []))
+    script = (
+        f"cat {home}/dummy.txt; echo r1=$?; cat {run}/work/f.txt; echo r2=$?; "
+        f"echo x > {home}/out.txt; echo w1=$?; echo y > {run}/work/o.txt; echo w2=$?"
+    )
+    proc = subprocess.run(
+        [hostrun.SANDBOX_EXEC, "-f", str(profile), "/bin/sh", "-c", script],
+        capture_output=True,
+        text=True,
+    )
+    assert "TOPSECRET" not in proc.stdout
+    assert "r1=1" in proc.stdout and "r2=0" in proc.stdout and "inside" in proc.stdout
+    assert "w1=1" in proc.stdout and "w2=0" in proc.stdout
+    assert not (home / "out.txt").exists()
+
+
+def test_control_files_live_outside_the_run_dir_read_only_and_are_removed(tmp_path):
+    seen = {}
+
+    def popen(argv, **kw):
+        ctl = hostrun.ctl_dir("a1b2c3a1b2c3")
+        base = hostrun.host_dir("a1b2c3a1b2c3")
+        seen["files"] = sorted(p.name for p in ctl.iterdir())
+        seen["modes"] = {stat.S_IMODE(os.lstat(p).st_mode) for p in ctl.iterdir()}
+        seen["dir"] = stat.S_IMODE(os.lstat(ctl).st_mode)
+        seen["outside"] = not str(ctl).startswith(str(base))
+        s = json.loads((ctl / "claude-settings.json").read_text())
+        seen["write"] = s["sandbox"]["filesystem"]["allowWrite"]
+        seen["base"] = os.path.realpath(base)
+        return subprocess.Popen(["/bin/sh", "-c", "exit 0"], **{**kw})
+
+    code, _out = hostrun.run_on_host(
+        _cfg(), ClaudeEngine().inner_argv("p", model=None), timeout=10, env={"PATH": "/usr/bin:/bin"},
+        popen=popen, run_id="a1b2c3a1b2c3",
+    )  # fmt: skip
+    assert code == 0
+    assert seen["files"] == ["claude-settings.json"] and seen["modes"] == {0o400}
+    assert seen["dir"] == 0o700 and seen["outside"]
+    assert seen["write"] == [f"{seen['base']}/home", f"{seen['base']}/work", f"{seen['base']}/tmp"]
+    assert not hostrun.ctl_dir("a1b2c3a1b2c3").exists()
+    assert not hostrun.host_dir("a1b2c3a1b2c3").exists()
 
 
 def test_preflight_refuses_without_the_engine_or_a_sandbox(monkeypatch):
@@ -143,6 +248,8 @@ def test_preflight_refuses_without_the_engine_or_a_sandbox(monkeypatch):
         hostrun.preflight(cfg, which=lambda b: None, platform="darwin")
     if Path("/usr/bin/sandbox-exec").exists():
         hostrun.preflight(cfg, which=lambda b: "/bin/" + b, platform="darwin")
+    with pytest.raises(ConfigError, match="Seatbelt to confine reads"):
+        hostrun.preflight(_cfg(CodexEngine()), which=lambda b: "/bin/" + b, platform="linux")
     with pytest.raises(ConfigError, match="bubblewrap"):
         hostrun.preflight(cfg, which=lambda b: None, platform="linux")
     with pytest.raises(ConfigError, match="not supported on win32"):
@@ -406,7 +513,7 @@ def test_codex_host_auth_store_login_status_logout(tmp_path):
     assert hostrun.codex_auth_ready() is False
 
 
-def test_codex_run_uses_the_host_store_and_writes_a_refreshed_token_back(tmp_path):
+def test_codex_run_uses_the_host_store_and_writes_a_refreshed_token_back(tmp_path, monkeypatch):
     store = hostrun.auth_dir()
     store.mkdir(mode=0o700, parents=True)
     (store / "auth.json").write_text('{"tokens": {"access": "oldtoken1234"}}')
@@ -419,6 +526,10 @@ def test_codex_run_uses_the_host_store_and_writes_a_refreshed_token_back(tmp_pat
         'echo \'{"tokens": {"access": "newtoken5678"}}\' > "$CODEX_HOME/auth.json"\n'
     )
     stub.chmod(0o755)
+    shim = bin_dir / "sandbox-exec"  # hermetic: drop `-f <profile>` and run the rest
+    shim.write_text('#!/bin/sh\nshift 2\nexec "$@"\n')
+    shim.chmod(0o755)
+    monkeypatch.setattr(hostrun, "SANDBOX_EXEC", str(shim))
     cfg = Config(engine=CodexEngine(), allowed_repos=["me/repo"], runtime="host",
                  auth_volume="franky-codex-auth")  # fmt: skip
     code, out = hostrun.run_on_host(

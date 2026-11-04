@@ -54,10 +54,9 @@ _AUTH_MAX_BYTES = 256 * 1024
 # `franky-repo-setup.py` ships in the wheel as a symlink-free copy beside this module.
 REPO_SETUP_SCRIPT = Path(__file__).with_name("repo_setup_script.py")
 
-# The host paths the engine's own built-in file tools must never read or write. The OS sandbox
-# covers Bash children only; these deny rules cover Read and Edit. Paths under the operator home.
-_DENY_HOME_DIRS = (".ssh", ".aws", ".gnupg", ".config", ".docker", ".kube", ".local/share")
-_DENY_HOME_FILES = (".netrc", ".npmrc", ".pypirc", ".franky/atlassian-jira.json")
+SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+_FILE_TOOLS = ("Read", "Edit", "Write", "Grep", "Glob")
+CTL_SUFFIX = ".ctl"
 
 
 def host_dir(run_id: str, env=None) -> Path:
@@ -65,6 +64,14 @@ def host_dir(run_id: str, env=None) -> Path:
     if not jobs._JOB_ID_RE.match(run_id):
         raise ValueError(f"invalid job id: {run_id!r}")
     return jobs.runs_dir(env) / f"{run_id}{HOST_SUFFIX}"
+
+
+def ctl_dir(run_id: str, env=None) -> Path:
+    """The per-run control directory: the engine's settings file and Seatbelt profile. A sibling
+    of the run directory, never under it or under any path the sandbox lets the engine write."""
+    if not jobs._JOB_ID_RE.match(run_id):
+        raise ValueError(f"invalid job id: {run_id!r}")
+    return jobs.runs_dir(env) / f"{run_id}{CTL_SUFFIX}"
 
 
 def auth_dir(env=None) -> Path:
@@ -82,6 +89,10 @@ def preflight(cfg, which=shutil.which, platform: str = sys.platform) -> None:
                 "FRANKY_RUNTIME=host needs /usr/bin/sandbox-exec (Seatbelt) - refusing"
             )
     elif platform.startswith("linux"):
+        if cfg.engine.name == "codex":
+            raise ConfigError(
+                "FRANKY_RUNTIME=host with codex needs macOS Seatbelt to confine reads - refusing"
+            )
         if not which("bwrap"):
             raise ConfigError("FRANKY_RUNTIME=host needs bubblewrap (`bwrap`) on Linux - refusing")
     else:
@@ -118,28 +129,85 @@ def rewrite_text(text: str, home: Path, work: Path, tmp: Path) -> str:
 _CODEX_BYPASS = "--dangerously-bypass-approvals-and-sandbox"
 
 
-def claude_settings(run: Path, real_home: Path, config_file: Path | None = None) -> dict:
-    """The per-run Claude Code settings: its OS sandbox on and mandatory, Bash writes limited to
-    the run directory, the operator home unreadable to Bash except the run directory, network
-    open (Claude's own proxy still applies), and the built-in file tools denied the host's
-    credential directories. `--dangerously-skip-permissions` stays on the argv: it is still how
-    the engine runs headless; the sandbox and these deny rules are what bound it here."""
-    deny = [f"{real_home}/{rel}/**" for rel in _DENY_HOME_DIRS]
-    deny += [f"{real_home}/{rel}" for rel in _DENY_HOME_FILES]
-    deny.append(str(auth_dir()))
-    if config_file is not None:
-        deny.append(str(config_file))
-    rules = [f"{tool}(/{path})" for path in deny for tool in ("Read", "Edit")]
+def _confine(root: Path, keep: Path) -> list[str]:
+    """Paths to deny so that, under `root`, only `keep` stays reachable: every sibling along
+    the way from `root` down to `keep`. A `keep` outside `root` denies `root` whole. The engine's
+    deny rules win over allow rules, so the allowed directory is carved out by enumeration."""
+    try:
+        parts = keep.relative_to(root).parts
+    except ValueError:
+        return [str(root)]
+    out: list[str] = []
+    cur = root
+    for part in parts:
+        try:
+            names = os.listdir(cur)
+        except OSError as exc:
+            raise ConfigError(f"FRANKY_RUNTIME=host cannot confine {cur}: {exc}") from exc
+        out += [str(cur / n) for n in names if n != part]
+        cur = cur / part
+    return out
+
+
+def _new_file_levels(root: Path, keep: Path) -> list[str]:
+    """The directories from `root` down to `keep`'s parent. The engine could still create a NEW
+    file directly in one of them (the enumeration only names what exists), so each gets a
+    single-level write deny."""
+    try:
+        parts = keep.relative_to(root).parts
+    except ValueError:
+        return []
+    levels = [str(root)]
+    cur = root
+    for part in parts[:-1]:
+        cur = cur / part
+        levels.append(str(cur))
+    return levels
+
+
+def _tool_rules(paths: list[str], tools=_FILE_TOOLS) -> list[str]:
+    return [f"{t}(/{p})" for p in paths for t in tools] + [
+        f"{t}(/{p}/**)" for p in paths for t in tools
+    ]
+
+
+def claude_settings(
+    run: Path, real_home: Path, runs_dir: Path, extra_deny: tuple[Path, ...] = ()
+) -> dict:
+    """The per-run Claude Code settings. Allow-only: the engine can read and write only the run's
+    own directory. Bash runs in Claude's mandatory OS sandbox (writes to the run's home, work and
+    tmp, no reads of the operator home or the runs directory except the run directory, no
+    unsandboxed commands). Claude's built-in file tools are not covered by that sandbox, so they
+    get deny rules for everything under the home and the runs directory except the run
+    directory, and for the settings and profile directory. WebFetch and WebSearch are denied;
+    Bash keeps open network (git, gh, the engine API). `--dangerously-skip-permissions` stays on
+    the argv for headless approval; deny rules still win over it."""
+    deny = _confine(real_home, run)
+    levels = _new_file_levels(real_home, run)
+    if not _under(run, real_home):
+        deny += _confine(runs_dir, run)
+        levels += _new_file_levels(runs_dir, run)
+    deny += [str(p) for p in extra_deny]
+    deny = list(dict.fromkeys(deny))
+    read_deny = [str(real_home)] + ([] if _under(run, real_home) else [str(runs_dir)])
     return {
-        "permissions": {"deny": rules},
+        "permissions": {
+            "deny": [
+                *_tool_rules(deny),
+                *[f"{t}(/{lvl}/*)" for lvl in levels for t in ("Edit", "Write")],
+                "WebFetch",
+                "WebSearch",
+            ],
+            "allow": [f"{t}(/{run}/**)" for t in ("Read", "Edit")],
+        },
         "sandbox": {
             "enabled": True,
             "failIfUnavailable": True,
             "allowUnsandboxedCommands": False,
             "autoAllowBashIfSandboxed": True,
             "filesystem": {
-                "allowWrite": [str(run)],
-                "denyRead": [str(real_home)],
+                "allowWrite": [str(run / "home"), str(run / "work"), str(run / "tmp")],
+                "denyRead": read_deny,
                 "allowRead": [str(run)],
             },
             "network": {"allowedDomains": ["*"]},
@@ -147,27 +215,85 @@ def claude_settings(run: Path, real_home: Path, config_file: Path | None = None)
     }
 
 
-def engine_argv(inner_argv: list[str], engine: str, settings_path: Path) -> list[str]:
-    """Swap the container's sandbox-off flags for the engine's OS sandbox. Raises ValueError
-    when the argv has no engine flag to swap (a refusal, never an unsandboxed run)."""
+def _under(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _sb(path) -> str:
+    return '"' + str(path).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def codex_install_roots(which=shutil.which) -> list[Path]:
+    """Read-only roots the codex launcher needs: its bin directory, its resolved install
+    directory and the nearest enclosing package root (it may sit under the operator home)."""
+    found = which("codex")
+    if not found:
+        return []
+    real = Path(os.path.realpath(found))
+    roots = [Path(found).parent, real.parent]
+    for ancestor in list(real.parents)[:6]:
+        if (ancestor / "package.json").is_file():
+            roots.append(ancestor)
+            break
+    return list(dict.fromkeys(roots))
+
+
+def seatbelt_profile(run: Path, real_home: Path, runs_dir: Path, install_roots: list[Path]) -> str:
+    """The Seatbelt profile around the codex process. Reads: nothing under the operator home or
+    the runs directory except the run directory and codex's own install roots (read only).
+    Writes: nothing except the run directory, `/dev` and the per-user temp area. The network
+    stays open. Later rules win in Seatbelt, so the allows come last.
+
+    Codex's own `--sandbox workspace-write` cannot run inside this profile (macOS refuses a
+    nested sandbox that is not a subset of the outer one), so codex runs with
+    `--sandbox danger-full-access` and this profile is the sandbox."""
+    lines = [
+        "(version 1)",
+        "(allow default)",
+        '(deny file-write* (subpath "/"))',
+        '(allow file-write* (subpath "/dev") (subpath "/private/var/folders"))',
+    ]
+    for root in dict.fromkeys([real_home, runs_dir]):
+        lines.append(f"(deny file-read* file-write* (subpath {_sb(root)}))")
+    for root in install_roots:
+        lines.append(f"(allow file-read* (subpath {_sb(root)}))")
+    lines.append(f"(allow file-read* file-write* (subpath {_sb(run)}))")
+    return "\n".join(lines) + "\n"
+
+
+def write_ctl_file(ctl: Path, name: str, text: str) -> Path:
+    """Write a read-only (0400) control file into the 0700 control directory."""
+    ctl.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = ctl / name
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o400)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    return path
+
+
+def engine_argv(inner_argv: list[str], engine: str, control_file: Path) -> list[str]:
+    """Swap the container's sandbox-off flags for the engine's OS sandbox. `control_file` is the
+    claude settings file or the codex Seatbelt profile. Raises ValueError when the argv has no
+    engine flag to swap (a refusal, never an unsandboxed run)."""
     argv = list(inner_argv)
     if engine == "claude":
         if "claude" not in argv or "--dangerously-skip-permissions" not in argv:
             raise ValueError("claude argv has no engine command to sandbox")
         at = argv.index("claude")
-        return [*argv[: at + 1], "--settings", str(settings_path), *argv[at + 1 :]]
+        return [*argv[: at + 1], "--settings", str(control_file), *argv[at + 1 :]]
     if engine == "codex":
-        if _CODEX_BYPASS not in argv:
+        if _CODEX_BYPASS not in argv or "codex" not in argv:
             raise ValueError("codex argv has no sandbox flag to swap")
-        at = argv.index(_CODEX_BYPASS)
-        return [
-            *argv[:at],
+        argv[argv.index(_CODEX_BYPASS) : argv.index(_CODEX_BYPASS) + 1] = [
             "--sandbox",
-            "workspace-write",
-            "-c",
-            "sandbox_workspace_write.network_access=true",
-            *argv[at + 1 :],
+            "danger-full-access",
         ]
+        at = argv.index("codex")
+        return [*argv[:at], SANDBOX_EXEC, "-f", str(control_file), *argv[at:]]
     raise ValueError(f"engine {engine!r} has no host sandbox")
 
 
@@ -455,6 +581,21 @@ def remove_run_dir(job_id: str, env=None) -> None:
         return
     if path.exists():
         snapshot._rmtree(path)
+    try:
+        ctl = ctl_dir(job_id, env)
+    except ValueError:
+        return
+    if ctl.exists():
+        _rm_ctl(ctl)
+
+
+def _rm_ctl(ctl: Path) -> None:
+    """Remove a control directory whose files are 0400 (never follows a symlink)."""
+    try:
+        os.chmod(ctl, 0o700)
+    except OSError:
+        pass
+    snapshot._rmtree(ctl)
 
 
 def deliver_steer(job_id: str, message: str, env=None) -> bool:
@@ -607,11 +748,22 @@ def run_on_host(
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(payload, fh)
 
-        settings = base / "claude-settings.json"
+        runs_dir = Path(os.path.realpath(base.parent))
+        ctl = ctl_dir(run_id, runs_env)
+        control = None
         if cfg.engine.name == "claude":
-            fd = os.open(settings, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(claude_settings(base, real_home, config_file_path(dict(os_env))), fh)
+            extra_deny = (auth_dir(runs_env), config_file_path(dict(os_env)), ctl)
+            control = write_ctl_file(
+                ctl,
+                "claude-settings.json",
+                json.dumps(claude_settings(base, real_home, runs_dir, extra_deny)),
+            )
+        elif cfg.engine.name == "codex":
+            control = write_ctl_file(
+                ctl,
+                "codex.sb",
+                seatbelt_profile(base, real_home, runs_dir, codex_install_roots()),
+            )
         argv = [rewrite_text(a, home, work, tmp) for a in inner_argv]
         # In-image helpers become the host's own interpreter and the packaged mapper.
         argv = [
@@ -624,7 +776,7 @@ def run_on_host(
             )
         ]
         try:
-            argv = engine_argv(argv, cfg.engine.name, settings)
+            argv = engine_argv(argv, cfg.engine.name, control)
         except ValueError as exc:
             raise ConfigError(f"FRANKY_RUNTIME=host refuses: {exc}") from exc
         env_map = child_env(cfg, home, tmp, os_env)
@@ -734,4 +886,8 @@ def run_on_host(
         raise
     finally:
         snapshot._rmtree(base)
+        try:
+            _rm_ctl(ctl_dir(run_id, runs_env))
+        except OSError:
+            pass
     return code, output
