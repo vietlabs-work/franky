@@ -605,43 +605,6 @@ def auth_strings(payload: dict) -> list[str]:
     return out
 
 
-def _jwt_claims(token) -> dict | None:
-    """The claims of a JWT, decoded WITHOUT verifying it. Used only to compare two logins."""
-    import base64
-
-    if not isinstance(token, str) or token.count(".") != 2:
-        return None
-    try:
-        body = token.split(".")[1]
-        claims = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
-    except (ValueError, UnicodeDecodeError):
-        return None
-    return claims if isinstance(claims, dict) else None
-
-
-def auth_identity(payload: dict) -> tuple[str, str, str | None] | None:
-    """Who an auth payload says it is: `tokens.account_id`, the id token's `sub`, and (when the
-    id token carries one) its account claim, which must equal `tokens.account_id`. None on any
-    doubt: a missing field, an unreadable token, a claim that disagrees."""
-    tokens = payload.get("tokens")
-    if not isinstance(tokens, dict):
-        return None
-    account = tokens.get("account_id")
-    claims = _jwt_claims(tokens.get("id_token"))
-    if not isinstance(account, str) or not account or claims is None:
-        return None
-    sub = claims.get("sub")
-    if not isinstance(sub, str) or not sub:
-        return None
-    auth_claim = claims.get("https://api.openai.com/auth")
-    claimed = None
-    if isinstance(auth_claim, dict) and "chatgpt_account_id" in auth_claim:
-        claimed = auth_claim["chatgpt_account_id"]
-        if not isinstance(claimed, str) or claimed != account:
-            return None
-    return account, sub, claimed
-
-
 def codex_auth_ready(env=None) -> bool:
     return _read_auth(auth_dir(env) / "auth.json") is not None
 
@@ -689,17 +652,6 @@ def _store_auth(payload: dict, store: Path) -> bool:
         json.dump(payload, fh)
     os.replace(tmp, store / "auth.json")
     return True
-
-
-def keep_refreshed_auth(base: Path, original: dict, store: Path) -> bool:
-    """After a run: keep the engine's refreshed `auth.json` only when it names the same login as
-    the one copied in (account id, id-token subject and account claim all equal). The run could
-    have replaced the file with anything; any doubt means nothing is persisted."""
-    wanted = auth_identity(original)
-    after = _parse_auth(read_file_nofollow(base, ["home", ".codex", "auth.json"], _AUTH_MAX_BYTES))
-    if wanted is None or after is None or auth_identity(after) != wanted:
-        return False
-    return _store_auth(after, store)
 
 
 def codex_auth_logout(env=None) -> bool:
@@ -848,7 +800,12 @@ def _in_window(ident: dict, epoch: float) -> bool:
 def track_descendants(leader: int, seen: dict, rows) -> None:
     """Add every descendant of the leader (and of anything already seen) to `seen`, keyed by pid
     with its start time text, by walking the parent links. Called while the leader is alive: a
-    child that later detaches or changes directory is still on the list."""
+    child that later detaches or changes directory is still on the list. A parent already in
+    `seen` is walked only while its current start time still equals the recorded one; one whose
+    pid is gone or reused is dropped, so a reused pid never pulls in unrelated processes."""
+    current = {pid: text for pid, _pp, _g, text, _e in rows}
+    for pid in [p for p, text in seen.items() if current.get(p) != text]:
+        del seen[pid]
     children: dict[int, list] = {}
     for pid, ppid, _g, text, _e in rows:
         children.setdefault(ppid, []).append((pid, text))
@@ -949,9 +906,10 @@ def kill_escaped(
     if rows is None:
         return
     cands: dict[int, str] = {}
-    current = {pid: text for pid, _pp, _g, text, _e in rows}
+    current = {pid: (text, epoch) for pid, _pp, _g, text, epoch in rows}
     for pid, text in (seen or {}).items():
-        if current.get(pid) == text and pid != os.getpid():
+        known = current.get(pid)
+        if known and known[0] == text and pid != os.getpid() and _in_window(ident, known[1]):
             cands[pid] = text
     if home is not None and root is not None:
         cands.update(profiled_pids(base, home, root, ident, rows, check))
@@ -1314,8 +1272,6 @@ def run_on_host(
                             work_slug(work),
                             max_bytes=session_sink["max_bytes"],
                         )
-                    if codex_payload is not None:
-                        keep_refreshed_auth(base, codex_payload, auth_dir(runs_env))
                 except Exception:
                     pass
         finally:

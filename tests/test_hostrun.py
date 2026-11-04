@@ -243,10 +243,35 @@ def test_track_descendants_follows_parent_links_and_ignores_a_reused_pid():
     seen = {}
     hostrun.track_descendants(10, seen, rows)
     assert seen == {11: "t11", 12: "t12"}
-    # The child moved away from its original directory later; a second walk keeps it listed,
-    # and a pid that now has another start time is not trusted.
-    hostrun.track_descendants(10, seen, [(11, 10, 10, "OTHER", 1.0), (13, 12, 12, "t13", 1.0)])
-    assert seen[11] == "t11" and seen[13] == "t13"
+    # A later walk keeps what is still the same process and adds its new children.
+    hostrun.track_descendants(
+        10, seen, [(11, 10, 10, "t11", 1.0), (12, 11, 12, "t12", 1.0), (13, 12, 12, "t13", 1.0)]
+    )
+    assert seen == {11: "t11", 12: "t12", 13: "t13"}
+
+
+def test_a_seen_parent_whose_pid_was_reused_is_dropped_and_not_walked():
+    seen = {11: "t11"}
+    rows = [
+        (10, 1, 10, "t10", 1.0),
+        (11, 1, 11, "REUSED", 9.0),  # pid 11 now belongs to an unrelated process
+        (30, 11, 11, "t30", 9.0),  # whose child must not be adopted
+    ]
+    hostrun.track_descendants(10, seen, rows)
+    assert seen == {}
+    seen = {11: "t11"}
+    hostrun.track_descendants(10, seen, [(10, 1, 10, "t10", 1.0)])  # pid gone
+    assert seen == {}
+
+
+def test_kill_escaped_ignores_a_seen_pid_started_outside_the_window(monkeypatch):
+    sent = []
+    monkeypatch.setattr(hostrun.os, "kill", lambda pid, sig: sent.append((pid, sig)))
+    rows = [(11, 10, 10, "t11", 5000.0)]  # same text, but started long after the run's window
+    monkeypatch.setattr(hostrun, "process_table", lambda runner=None: rows)
+    monkeypatch.setattr(hostrun, "escaped_pids", lambda *a, **k: {})
+    hostrun.kill_escaped(Path("/x"), _ident(started=100.0, window=100), seen={11: "t11"})
+    assert sent == []
 
 
 def test_kill_escaped_signals_only_pids_whose_start_time_still_matches(monkeypatch):
@@ -254,9 +279,9 @@ def test_kill_escaped_signals_only_pids_whose_start_time_still_matches(monkeypat
     monkeypatch.setattr(hostrun.os, "kill", lambda pid, sig: sent.append((pid, sig)))
     tables = iter(
         [
-            [(11, 10, 10, "t11", 5.0), (12, 10, 10, "t12", 5.0)],  # first read
-            [(11, 10, 10, "t11", 5.0), (12, 10, 10, "REUSED", 9.0)],  # before the TERM
-            [(11, 10, 10, "t11", 5.0), (12, 10, 10, "REUSED", 9.0)],  # before the KILL
+            [(11, 10, 10, "t11", 1_000_005.0), (12, 10, 10, "t12", 1_000_005.0)],  # first read
+            [(11, 10, 10, "t11", 1_000_005.0), (12, 10, 10, "REUSED", 1_000_900.0)],  # TERM
+            [(11, 10, 10, "t11", 1_000_005.0), (12, 10, 10, "REUSED", 1_000_900.0)],  # KILL
         ]
     )
     monkeypatch.setattr(hostrun, "process_table", lambda runner=None: next(tables))
@@ -857,27 +882,10 @@ def test_codex_host_auth_store_login_status_logout(tmp_path):
     assert hostrun.codex_auth_ready() is False
 
 
-def _jwt(**claims):
-    import base64
-
-    def seg(obj):
-        return base64.urlsafe_b64encode(json.dumps(obj).encode()).decode().rstrip("=")
-
-    return f"{seg({'alg': 'none'})}.{seg(claims)}.sig"
-
-
-def _auth(access, account="acct-1", sub="user-1", claim=None):
-    claims = {"sub": sub}
-    if claim is not None:
-        claims["https://api.openai.com/auth"] = {"chatgpt_account_id": claim}
-    return json.dumps(
-        {"tokens": {"access_token": access, "account_id": account, "id_token": _jwt(**claims)}}
-    )
-
-
-def _codex_run(tmp_path, original, refreshed):
+def test_codex_run_copies_the_host_login_in_and_never_persists_what_the_run_wrote(tmp_path):
     store = hostrun.auth_dir()
     store.mkdir(mode=0o700, parents=True)
+    original = '{"tokens": {"access_token": "old-access-1234", "account_id": "acct-1"}}'
     (store / "auth.json").write_text(original)
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
@@ -885,7 +893,8 @@ def _codex_run(tmp_path, original, refreshed):
     stub.write_text(
         "#!/bin/sh\n"
         'echo "home=$CODEX_HOME"; cat "$CODEX_HOME/auth.json"; echo\n'
-        f"echo '{refreshed}' > \"$CODEX_HOME/auth.json\"\n"
+        'echo \'{"tokens": {"access_token": "forged-9999", "account_id": "acct-1"}}\' '
+        '> "$CODEX_HOME/auth.json"\n'
     )
     stub.chmod(0o755)
     cfg = Config(
@@ -901,40 +910,11 @@ def _codex_run(tmp_path, original, refreshed):
         env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
         run_id="123abc123abc",
     )
-    return code, "".join(out.chunks()), store
-
-
-def _stored_access(store):
-    return json.loads((store / "auth.json").read_text())["tokens"]["access_token"]
-
-
-def test_codex_run_uses_the_host_store_and_keeps_a_refreshed_token_of_the_same_login(tmp_path):
-    code, text, store = _codex_run(tmp_path, _auth("old-access-1234"), _auth("new-access-5678"))
+    text = "".join(out.chunks())
     assert code == 0 and "old-access-1234" not in text and "***REDACTED***" in text
-    assert _stored_access(store) == "new-access-5678"
-
-
-@pytest.mark.parametrize(
-    "refreshed",
-    [
-        _auth("attacker-token", account="acct-2"),  # another account
-        _auth("attacker-token", sub="user-2"),  # same account id, another subject
-        _auth("attacker-token", claim="acct-9"),  # account claim disagrees with tokens.account_id
-        '{"account_id": "acct-1", "tokens": {"access_token": "attacker-token"}}',  # wrong path
-        "not json at all",
-    ],
-)
-def test_codex_run_discards_a_refreshed_auth_file_that_is_not_the_same_login(tmp_path, refreshed):
-    _code, _text, store = _codex_run(tmp_path, _auth("old-access-1234"), refreshed)
-    assert _stored_access(store) == "old-access-1234"
-
-
-def test_auth_identity_needs_every_field_and_agreeing_claims():
-    assert hostrun.auth_identity(json.loads(_auth("a"))) == ("acct-1", "user-1", None)
-    assert hostrun.auth_identity(json.loads(_auth("a", claim="acct-1")))[2] == "acct-1"
-    assert hostrun.auth_identity({"tokens": {"account_id": "x"}}) is None
-    assert hostrun.auth_identity({"tokens": {"id_token": "a.b.c", "account_id": "x"}}) is None
-    assert hostrun.auth_identity({}) is None
+    # The run could have written anything (an id token it forged, a stolen login): the host
+    # store is only ever written by `franky auth login codex`.
+    assert (store / "auth.json").read_text() == original
 
 
 # ---------------------------------------------------------------- cli wiring
