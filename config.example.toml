@@ -20,8 +20,8 @@ FRANKY_ENGINE = "pi"
 
 # --- Runtime (OPTIONAL) ------------------------------------------------------
 # container (default): every pass runs in the hardened Docker task.
-# host: run the engine on this machine, as you, under the engine's OS sandbox, with no Docker.
-# Explicit opt-in, never a fallback. Only the claude and codex engines support it. See
+# host: run the engine on this Mac, as you, inside a Seatbelt profile, with no Docker.
+# Explicit opt-in, never a fallback. macOS only; the claude and codex engines. See
 # docs/security.md (Host runtime) for what it gives up.
 # FRANKY_RUNTIME = "container"
 

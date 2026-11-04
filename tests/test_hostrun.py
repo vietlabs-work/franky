@@ -6,6 +6,7 @@ import gzip
 import io
 import json
 import os
+import shutil
 import signal
 import stat
 import subprocess
@@ -24,6 +25,23 @@ from franky.result import ConfigError
 from franky.userconfig import SETTABLE_KEYS
 
 ROOT = Path(__file__).resolve().parent.parent
+REAL_SANDBOX_EXEC = hostrun.SANDBOX_EXEC
+DARWIN = sys.platform == "darwin" and Path(REAL_SANDBOX_EXEC).exists()
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_host_root(tmp_path, monkeypatch):
+    """A private runs root per test (never /Users/Shared) and a `sandbox-exec` shim that drops
+    `-f <profile>` and runs the rest, so the run-loop tests are hermetic on every platform. The
+    real profile is exercised by the darwin-only tests, which use REAL_SANDBOX_EXEC."""
+    monkeypatch.setenv(hostrun.RUNS_ROOT_VAR, str(tmp_path / "hostroot" / "franky-host"))
+    shim_dir = tmp_path / "shim"
+    shim_dir.mkdir()
+    shim = shim_dir / "sandbox-exec"
+    shim.write_text('#!/bin/sh\nshift 2\nexec "$@"\n')
+    shim.chmod(0o755)
+    monkeypatch.setattr(hostrun, "SANDBOX_EXEC", str(shim))
+
 
 CLAUDE_ENV = {
     "FRANKY_ALLOWED_REPOS": "me/repo",
@@ -107,156 +125,193 @@ def test_rewrite_text_maps_container_paths_to_the_run_directory(tmp_path):
     assert f"{tmp}/franky-private-prompt" in out
 
 
-def test_engine_argv_swaps_the_container_flags_for_the_os_sandbox(tmp_path):
-    control = tmp_path / "s.json"
-    claude = ClaudeEngine().inner_argv("p", model=None)
-    out = hostrun.engine_argv(claude, "claude", control)
-    assert out[:3] == ["claude", "--settings", str(control)]
-    assert "--dangerously-skip-permissions" in out  # headless approval; the sandbox bounds it
-    codex = CodexEngine().inner_argv("p", model=None)
-    out = hostrun.engine_argv(codex, "codex", control)
-    assert out[:4] == [hostrun.SANDBOX_EXEC, "-f", str(control), "codex"]
+def test_engine_argv_wraps_the_engine_in_the_outer_profile(tmp_path):
+    profile, settings = tmp_path / "p.sb", tmp_path / "s.json"
+    claude_bin, codex_bin = Path("/opt/x/claude-real"), Path("/opt/x/codex-real")
+    out = hostrun.engine_argv(
+        ClaudeEngine().inner_argv("p", model=None),
+        "claude",
+        profile=profile,
+        engine_bin=claude_bin,
+        settings=settings,
+    )
+    assert out[:4] == [hostrun.SANDBOX_EXEC, "-f", str(profile), str(claude_bin)]
+    assert out[4:8] == ["--setting-sources", "", "--settings", str(settings)]
+    assert "--dangerously-skip-permissions" in out  # headless approval; the profile bounds it
+    out = hostrun.engine_argv(
+        CodexEngine().inner_argv("p", model=None), "codex", profile=profile, engine_bin=codex_bin
+    )
+    assert out[:4] == [hostrun.SANDBOX_EXEC, "-f", str(profile), str(codex_bin)]
     assert "--dangerously-bypass-approvals-and-sandbox" not in out
-    # Codex's own sandbox cannot nest inside the Seatbelt profile; the profile is the sandbox.
+    # Codex's own sandbox cannot nest inside the profile; the profile is the sandbox.
     assert out[out.index("--sandbox") + 1] == "danger-full-access"
     with pytest.raises(ValueError):
-        hostrun.engine_argv(["codex", "exec", "p"], "codex", control)
+        hostrun.engine_argv(["codex", "exec", "p"], "codex", profile=profile, engine_bin=codex_bin)
     with pytest.raises(ValueError):
-        hostrun.engine_argv(PiEngine().inner_argv("p", model=None), "pi", control)
-
-
-def _fake_home(tmp_path):
-    home = tmp_path / "real-home"
-    (home / ".ssh").mkdir(parents=True)
-    (home / "notes.txt").write_text("x")
-    run = home / ".franky" / "runs" / "r.host"
-    (run / "work").mkdir(parents=True)
-    (home / ".franky" / "runs" / "other.host").mkdir()
-    (home / ".franky" / "config").write_text("x")
-    return home, run
-
-
-def test_claude_settings_are_allow_only_and_keep_the_settings_out_of_reach(tmp_path):
-    home, run = _fake_home(tmp_path)
-    runs = run.parent
-    ctl = runs / "r.ctl"
-    s = hostrun.claude_settings(run, home, runs, (ctl,))
-    sandbox = s["sandbox"]
-    assert sandbox["enabled"] is True and sandbox["failIfUnavailable"] is True
-    assert sandbox["allowUnsandboxedCommands"] is False
-    assert sandbox["filesystem"]["allowWrite"] == [f"{run}/home", f"{run}/work", f"{run}/tmp"]
-    assert sandbox["filesystem"]["denyRead"] == [str(home)]
-    assert sandbox["filesystem"]["allowRead"] == [str(run)]
-    deny = s["permissions"]["deny"]
-    for tool in ("Read", "Edit", "Write", "Grep", "Glob"):
-        assert f"{tool}(/{home}/.ssh/**)" in deny and f"{tool}(/{home}/notes.txt)" in deny
-        assert (
-            f"{tool}(/{runs}/other.host/**)" in deny and f"{tool}(/{home}/.franky/config)" in deny
+        hostrun.engine_argv(
+            PiEngine().inner_argv("p", model=None), "pi", profile=profile, engine_bin=codex_bin
         )
-        assert f"{tool}(/{ctl}/**)" in deny
-    # The run directory itself and the path down to it are never denied wholesale.
-    assert not any(str(run) in r or r.startswith(f"Read(/{home}/.franky/**") for r in deny)
-    assert f"Read(/{home}/.franky)" not in deny and f"Read(/{runs})" not in deny
-    # A new file directly in the home or on the way down is denied too.
-    assert f"Write(/{home}/*)" in deny and f"Edit(/{runs}/*)" in deny
-    assert "WebFetch" in deny and "WebSearch" in deny
-    assert s["permissions"]["allow"] == [f"Read(/{run}/**)", f"Edit(/{run}/**)"]
 
 
-def test_claude_settings_deny_the_whole_home_when_the_run_dir_is_elsewhere(tmp_path):
-    home = tmp_path / "home"
-    home.mkdir()
-    runs = tmp_path / "runs"
-    run = runs / "r.host"
-    (runs / "other.host").mkdir(parents=True)
-    run.mkdir()
-    s = hostrun.claude_settings(run, home, runs)
-    deny = s["permissions"]["deny"]
-    assert f"Read(/{home}/**)" in deny and f"Read(/{runs}/other.host/**)" in deny
-    assert s["sandbox"]["filesystem"]["denyRead"] == [str(home), str(runs)]
+def test_claude_control_settings_turn_hooks_and_its_own_sandbox_off():
+    s = hostrun.claude_control_settings()
+    assert s["disableAllHooks"] is True and s["sandbox"] == {"enabled": False}
+    assert s["permissions"]["deny"] == ["WebFetch", "WebSearch"]
 
 
-def test_seatbelt_profile_denies_the_home_except_the_run_dir_and_codex_roots(tmp_path):
-    home, run = _fake_home(tmp_path)
-    runs = run.parent
-    text = hostrun.seatbelt_profile(run, home, runs, [Path("/opt/x/codex")])
+def _profile(tmp_path, roots=(), control=None):
+    home = tmp_path / "real-home"
+    root = tmp_path / "root"
+    run = root / ("a" * 32)
+    for d in (home, run / "home", run / "work", run / "tmp"):
+        d.mkdir(parents=True)
+    return home, root, run, hostrun.seatbelt_profile(run, home, root, list(roots), control)
+
+
+def test_seatbelt_profile_is_deny_default_with_narrow_allows(tmp_path):
+    ctl = tmp_path / "root" / ("a" * 32 + ".ctl") / "s.json"
+    home, root, run, text = _profile(tmp_path, [Path("/opt/x/codex")], ctl)
     lines = text.splitlines()
-    assert "(allow default)" in lines and '(deny file-write* (subpath "/"))' in lines
-    assert f'(deny file-read* file-write* (subpath "{home}"))' in lines
+    assert lines[:2] == ["(version 1)", "(deny default)"]
+    assert "(allow network-outbound (remote tcp))" in lines
+    assert '(allow network-outbound (literal "/private/var/run/mDNSResponder"))' in lines
+    deny_read = next(ln for ln in lines if ln.startswith("(deny file-read* file-write*"))
+    for path in (home, root, "/private/var/folders", "/private/tmp"):
+        assert f'(subpath "{path}")' in deny_read
+    write = next(ln for ln in lines if ln.startswith("(allow file-write* "))
+    assert write.count("subpath") == 3  # home, work, tmp only, never the run dir itself
+    assert f'(subpath "{run}")' not in write and f'(subpath "{run}/home")' in write
     assert '(allow file-read* (subpath "/opt/x/codex"))' in lines
-    # Later rules win: the run directory allow is last, after every deny.
-    assert lines[-1] == f'(allow file-read* file-write* (subpath "{run}"))'
+    assert f'(allow file-read* (literal "{ctl}"))' in lines
+    assert any(
+        "com.apple.SecurityServer" in ln and ln.startswith("(deny mach-lookup") for ln in lines
+    )
+    deny_exec = next(ln for ln in lines if ln.startswith("(deny process-exec"))
+    assert "/bin/launchctl" in deny_exec and "/usr/bin/security" in deny_exec
+    # Later rules win: the denies for exec and Mach services close the profile.
+    assert lines.index(deny_exec) > lines.index(write)
 
 
-@pytest.mark.skipif(
-    sys.platform != "darwin" or not Path("/usr/bin/sandbox-exec").exists(),
-    reason="needs macOS Seatbelt",
-)
-def test_seatbelt_profile_blocks_reads_and_writes_outside_the_run_dir(tmp_path):
-    home, run = _fake_home(tmp_path)
-    home = Path(os.path.realpath(home))
-    run = home / ".franky" / "runs" / "r.host"
-    (home / "dummy.txt").write_text("TOPSECRET")
+def test_engine_install_roots_refuse_a_root_that_contains_the_home_or_the_runs_root(tmp_path):
+    home = tmp_path / "h"
+    root = tmp_path / "h" / ".runs"
+    pkg = home / ".local" / "share" / "tool"
+    (pkg / "bin").mkdir(parents=True)
+    exe = pkg / "bin" / "engine"
+    exe.write_text("x")
+    assert hostrun.engine_install_roots(exe, home, root) == [pkg / "bin"]
+    # A launcher whose directory contains the home or the runs root yields no root at all.
+    (tmp_path / "engine").write_text("x")
+    assert hostrun.engine_install_roots(tmp_path / "engine", home, root) == []
+    assert hostrun.engine_install_roots(tmp_path / "engine", tmp_path / "other", root) == []
+
+
+@pytest.mark.skipif(not DARWIN, reason="needs macOS Seatbelt")
+def test_seatbelt_profile_probes_under_the_real_sandbox(tmp_path):
+    """Live probes under the generated profile: late files, reads of the home, writes to the
+    system, launchd, the keychain tool, other processes' environments, and the run dir."""
+    home = Path(os.path.realpath(Path.home()))
+    root = hostrun.ensure_runs_root()
+    token = "b" * 32
+    run = root / token
+    for d in (run, run / "home", run / "work", run / "tmp"):
+        d.mkdir(mode=0o700, parents=True, exist_ok=True)
     (run / "work" / "f.txt").write_text("inside")
     profile = tmp_path / "p.sb"
-    profile.write_text(hostrun.seatbelt_profile(run, home, run.parent, []))
+    profile.write_text(hostrun.seatbelt_profile(run, home, root, []))
+    late = home / f".franky-probe-late-{os.getpid()}"
+    other = subprocess.Popen(
+        ["/bin/sh", "-c", "sleep 30"], env={"PROBE_SECRET_ENV": "leaky", "PATH": "/bin"}
+    )
     script = (
-        f"cat {home}/dummy.txt; echo r1=$?; cat {run}/work/f.txt; echo r2=$?; "
-        f"echo x > {home}/out.txt; echo w1=$?; echo y > {run}/work/o.txt; echo w2=$?"
+        f"echo x > {late} 2>/dev/null; echo late_write=$?; "
+        f"echo x > /opt/homebrew/bin/zz-probe 2>/dev/null; echo sys_write=$?; "
+        f"ls {home} >/dev/null 2>&1; echo home_list=$?; "
+        f"ls {root} >/dev/null 2>&1; echo root_list=$?; "
+        f"cat {run}/work/f.txt; echo inside_read=$?; echo y > {run}/work/o.txt; echo inside_write=$?; "
+        f"echo y > {run}/escape.txt 2>/dev/null; echo rundir_write=$?; "
+        "/bin/launchctl print gui/$(id -u) >/dev/null 2>&1; echo launchctl=$?; "
+        "/usr/bin/security find-generic-password -s gh:github.com >/dev/null 2>&1; "
+        "echo security=$?; "
+        f"/bin/ps eww -p {other.pid} 2>&1 | grep -c PROBE_SECRET_ENV; "
+        "/usr/bin/curl -s -o /dev/null -w 'tcp=%{http_code}\\n' https://api.github.com"
     )
-    proc = subprocess.run(
-        [hostrun.SANDBOX_EXEC, "-f", str(profile), "/bin/sh", "-c", script],
-        capture_output=True,
-        text=True,
-    )
-    assert "TOPSECRET" not in proc.stdout
-    assert "r1=1" in proc.stdout and "r2=0" in proc.stdout and "inside" in proc.stdout
-    assert "w1=1" in proc.stdout and "w2=0" in proc.stdout
-    assert not (home / "out.txt").exists()
+    try:
+        late.write_text("created after launch, before the probe")  # after the profile exists
+        proc = subprocess.run(
+            [REAL_SANDBOX_EXEC, "-f", str(profile), "/bin/sh", "-c", script],
+            capture_output=True,
+            text=True,
+            cwd=run / "work",
+            timeout=60,
+        )
+        out = proc.stdout
+        assert "late_write=1" in out and "sys_write=1" in out
+        assert "home_list=1" in out and "root_list=1" in out
+        assert "inside_read=0" in out and "inside" in out and "inside_write=0" in out
+        assert "rundir_write=1" in out
+        assert "launchctl=0" not in out and "launchctl=" in out
+        assert "security=0" not in out and "security=" in out
+        assert "PROBE_SECRET_ENV" not in out and "\n0\n" in out  # no env of other processes
+        # A file that exists in the home is unreadable too (not only the ones made later).
+        read = subprocess.run(
+            [REAL_SANDBOX_EXEC, "-f", str(profile), "/bin/cat", str(late)],
+            capture_output=True,
+            text=True,
+        )
+        assert read.returncode != 0 and "created after" not in read.stdout
+    finally:
+        other.kill()
+        other.wait()
+        late.unlink(missing_ok=True)
+        snapshot_rmtree = hostrun.snapshot._rmtree
+        snapshot_rmtree(run)
+        os.chmod(root, 0o700)
+        snapshot_rmtree(root)
 
 
-def test_control_files_live_outside_the_run_dir_read_only_and_are_removed(tmp_path):
-    seen = {}
-
-    def popen(argv, **kw):
-        ctl = hostrun.ctl_dir("a1b2c3a1b2c3")
-        base = hostrun.host_dir("a1b2c3a1b2c3")
-        seen["files"] = sorted(p.name for p in ctl.iterdir())
-        seen["modes"] = {stat.S_IMODE(os.lstat(p).st_mode) for p in ctl.iterdir()}
-        seen["dir"] = stat.S_IMODE(os.lstat(ctl).st_mode)
-        seen["outside"] = not str(ctl).startswith(str(base))
-        s = json.loads((ctl / "claude-settings.json").read_text())
-        seen["write"] = s["sandbox"]["filesystem"]["allowWrite"]
-        seen["base"] = os.path.realpath(base)
-        return subprocess.Popen(["/bin/sh", "-c", "exit 0"], **{**kw})
-
-    code, _out = hostrun.run_on_host(
-        _cfg(), ClaudeEngine().inner_argv("p", model=None), timeout=10, env={"PATH": "/usr/bin:/bin"},
-        popen=popen, run_id="a1b2c3a1b2c3",
-    )  # fmt: skip
-    assert code == 0
-    assert seen["files"] == ["claude-settings.json"] and seen["modes"] == {0o400}
-    assert seen["dir"] == 0o700 and seen["outside"]
-    assert seen["write"] == [f"{seen['base']}/home", f"{seen['base']}/work", f"{seen['base']}/tmp"]
-    assert not hostrun.ctl_dir("a1b2c3a1b2c3").exists()
-    assert not hostrun.host_dir("a1b2c3a1b2c3").exists()
+def test_runs_root_is_created_0300_and_refuses_the_home_and_wrong_modes(tmp_path, monkeypatch):
+    root = hostrun.ensure_runs_root()
+    assert stat.S_IMODE(os.lstat(root).st_mode) == 0o300
+    os.chmod(root, 0o700)
+    with pytest.raises(ConfigError, match="mode 0300"):
+        hostrun.ensure_runs_root()
+    os.chmod(root, 0o300)
+    monkeypatch.setenv(hostrun.RUNS_ROOT_VAR, str(Path.home() / ".franky-hostroot-test"))
+    with pytest.raises(ConfigError, match="outside your home"):
+        hostrun.ensure_runs_root()
 
 
-def test_preflight_refuses_without_the_engine_or_a_sandbox(monkeypatch):
+def test_host_dir_of_accepts_only_a_random_directory_directly_under_the_root():
+    root = hostrun.ensure_runs_root()
+    good = root / ("c" * 32)
+    good.mkdir(mode=0o700)
+    assert hostrun.host_dir_of({"host_dir": str(good)}) == good
+    assert hostrun.host_dir_of({"host_dir": str(root / "short")}) is None
+    assert hostrun.host_dir_of({"host_dir": str(root.parent / ("c" * 32))}) is None
+    assert hostrun.host_dir_of({"host_dir": str(root / "x" / ("c" * 32))}) is None
+    assert hostrun.host_dir_of({}) is None
+    link = root / ("d" * 32)
+    link.symlink_to(good)
+    assert hostrun.host_dir_of({"host_dir": str(link)}) is None
+
+
+def test_preflight_refuses_without_the_engine_or_a_sandbox():
     cfg = _cfg()
-    if Path("/usr/bin/sandbox-exec").exists():
-        with pytest.raises(ConfigError, match="needs `claude` on PATH"):
-            hostrun.preflight(cfg, which=lambda b: None, platform="darwin")
-        hostrun.preflight(cfg, which=lambda b: "/bin/" + b, platform="darwin")
-    else:
-        with pytest.raises(ConfigError, match="needs /usr/bin/sandbox-exec"):
-            hostrun.preflight(cfg, which=lambda b: "/bin/" + b, platform="darwin")
-    with pytest.raises(ConfigError, match="Seatbelt to confine reads"):
-        hostrun.preflight(_cfg(CodexEngine()), which=lambda b: "/bin/" + b, platform="linux")
-    with pytest.raises(ConfigError, match="bubblewrap"):
-        hostrun.preflight(cfg, which=lambda b: None, platform="linux")
-    with pytest.raises(ConfigError, match="not supported on win32"):
-        hostrun.preflight(cfg, which=lambda b: "x", platform="win32")
+    with pytest.raises(ConfigError, match="needs macOS Seatbelt"):
+        hostrun.preflight(cfg, which=lambda b: "/bin/" + b, platform="linux")
+    with pytest.raises(ConfigError, match="needs macOS Seatbelt"):
+        hostrun.preflight(_cfg(CodexEngine()), which=lambda b: "/bin/" + b, platform="win32")
+    if not Path(REAL_SANDBOX_EXEC).exists():
+        return
+    with pytest.raises(ConfigError, match="needs `claude` on PATH"):
+        hostrun.preflight(cfg, which=lambda b: None, platform="darwin")
+
+
+def test_preflight_refuses_when_sandbox_exec_is_missing(monkeypatch, tmp_path):
+    monkeypatch.setattr(hostrun, "SANDBOX_EXEC", str(tmp_path / "nope"))
+    with pytest.raises(ConfigError, match="needs .*nope"):
+        hostrun.preflight(_cfg(), which=lambda b: "/bin/" + b, platform="darwin")
 
 
 def test_child_env_is_built_from_scratch():
@@ -267,11 +322,17 @@ def test_child_env_is_built_from_scratch():
         Path("/r/tmp"),
         {"PATH": "/p", "AWS_SECRET_ACCESS_KEY": "nope", "SSH_AUTH_SOCK": "/s", "LANG": "C"},
     )
+    env.pop("SSL_CERT_FILE", None)  # present only where the system CA bundle exists
     assert set(env) == {
         "PATH", "LANG", "TERM", "HOME", "TMPDIR", "XDG_CONFIG_HOME", "XDG_CACHE_HOME",
         "XDG_DATA_HOME", "XDG_STATE_HOME", "GIT_TERMINAL_PROMPT", "GH_TOKEN",
+        "GIT_CONFIG_NOSYSTEM", "GIT_CONFIG_GLOBAL", "GH_CONFIG_DIR", "CLAUDE_CODE_TMPDIR",
     }  # fmt: skip
     assert env["HOME"] == "/r/home" and env["TMPDIR"] == "/r/tmp"
+    # The operator's git and gh configuration (osxkeychain helper, signing) never applies.
+    assert env["GIT_CONFIG_NOSYSTEM"] == "1"
+    assert env["GIT_CONFIG_GLOBAL"] == "/r/home/.gitconfig"
+    assert env["GH_CONFIG_DIR"] == "/r/home/.config/gh"
 
 
 def test_repo_setup_script_ships_in_the_package_beside_the_mapper():
@@ -287,7 +348,7 @@ def test_run_on_host_runs_in_a_private_dir_with_a_scratch_env_and_cleans_up(tmp_
         'echo "cwd=$PWD home=$HOME tmp=$TMPDIR"\n'
         'echo "token=$GH_TOKEN leak=${AWS_SECRET:-unset}"\n'
         'echo "args=$*"\n'
-        'cat "$2" > /dev/null\n',
+        'cat "$4" > /dev/null\n',
     )
     env["AWS_SECRET"] = "must-not-pass"
     cfg = _cfg()
@@ -296,18 +357,17 @@ def test_run_on_host_runs_in_a_private_dir_with_a_scratch_env_and_cleans_up(tmp_
     argv = ClaudeEngine().inner_argv("see /home/franky/x and /work/repo", model=None)
     code, out = hostrun.run_on_host(cfg, argv, timeout=30, env=env, run_id=run_id)
     text = "".join(out.chunks())
-    base = hostrun.host_dir(run_id)
+    record = jobs.read_record(run_id, os.environ)
+    base = Path(record["host_dir"])
     assert code == 0, text
-    assert f"cwd={os.path.realpath(base)}/work" in text
+    assert f"cwd={base}/work" in text
     assert "leak=unset" in text
     assert "ghp_hostsecret0001" not in text and "token=***REDACTED***" in text
-    assert f"{os.path.realpath(base)}/home/x" in text and "/work/repo" not in text.replace(
-        str(os.path.realpath(base)) + "/work/repo", ""
-    )
-    assert not base.exists()  # per-run dir removed
-    record = jobs.read_record(run_id, os.environ)
+    assert f"{base}/home/x" in text and "/work/repo" not in text.replace(f"{base}/work/repo", "")
+    assert not base.exists() and not Path(f"{base}.ctl").exists()  # run and control dirs removed
     assert record["runtime"] == "host" and isinstance(record["pgid"], int)
-    assert record["host_dir"] == os.path.realpath(base)
+    assert base.parent == hostrun.ensure_runs_root() and hostrun.RUN_TOKEN_RE.match(base.name)
+    assert isinstance(record["pgid_started_epoch"], float) and record["window_secs"] > 30
 
 
 def test_run_on_host_extracts_the_profile_bundle_as_regular_files_only(tmp_path):
@@ -363,7 +423,6 @@ def test_run_on_host_refuses_an_argv_it_cannot_sandbox(tmp_path):
         hostrun.run_on_host(
             _cfg(), ["claude", "-p", "x"], timeout=5, env=env, run_id="bbb222bbb222"
         )
-    assert not hostrun.host_dir("bbb222bbb222").exists()
 
 
 def test_run_on_host_repo_setup_failure_is_78_and_never_starts_the_engine(tmp_path):
@@ -380,24 +439,51 @@ def test_run_on_host_repo_setup_failure_is_78_and_never_starts_the_engine(tmp_pa
     assert code == 78 and "repository setup failed" in text and "engine-started" not in text
 
 
-def test_session_copy_out_maps_the_host_slug_back_to_the_container_slug(tmp_path):
-    work = tmp_path / "run" / "work"
-    slug = hostrun.work_slug(work)
+def _session_run(tmp_path, slug):
+    base = tmp_path / "run"
     sid = "11111111-1111-1111-1111-111111111111"
-    home = tmp_path / "home"
-    session = home / ".claude" / "projects" / slug
+    session = base / "home" / ".claude" / "projects" / slug
     session.mkdir(parents=True)
     (session / f"{sid}.jsonl").write_text("{}\n")
     (session / sid).mkdir()
     (session / sid / "x.txt").write_text("side")
+    return base, sid, session
+
+
+def test_session_copy_out_maps_the_host_slug_back_to_the_container_slug(tmp_path):
+    slug = hostrun.work_slug(tmp_path / "run" / "work")
+    base, sid, session = _session_run(tmp_path, slug)
     (session / sid / "link").symlink_to("/etc/passwd")
     dest = tmp_path / "dest"
     paths = [f".claude/projects/-work/{sid}.jsonl", f".claude/projects/-work/{sid}"]
-    assert hostrun.copy_session(home, paths, dest, slug, max_bytes=1000) == "ok"
+    assert hostrun.copy_session(base, paths, dest, slug, max_bytes=1000) == "ok"
     assert (dest / paths[0]).is_file() and (dest / paths[1] / "x.txt").read_text() == "side"
     assert not (dest / paths[1] / "link").exists()
-    assert hostrun.copy_session(home, paths, tmp_path / "d2", slug, max_bytes=3) == "too_large"
-    assert hostrun.copy_session(home, paths, tmp_path / "d3", "other", max_bytes=1000) == "failed"
+    assert hostrun.copy_session(base, paths, tmp_path / "d2", slug, max_bytes=3) == "too_large"
+    assert hostrun.copy_session(base, paths, tmp_path / "d3", "other", max_bytes=1000) == "failed"
+
+
+def test_session_copy_out_never_follows_a_planted_link(tmp_path):
+    slug = hostrun.work_slug(tmp_path / "run" / "work")
+    base, sid, session = _session_run(tmp_path, slug)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / f"{sid}.jsonl").write_text("STOLEN")
+    # The projects dir is swapped for a link to a directory outside the run.
+    projects = base / "home" / ".claude" / "projects"
+    stash = tmp_path / "stash"
+    projects.rename(stash)
+    projects.symlink_to(outside)
+    paths = [f".claude/projects/-work/{sid}.jsonl"]
+    assert hostrun.copy_session(base, paths, tmp_path / "d", slug, max_bytes=1000) == "failed"
+    assert not (tmp_path / "d").exists() or not any((tmp_path / "d").rglob("*.jsonl"))
+    # A session file that is itself a link, and a file past the limit while reading.
+    projects.unlink()
+    stash.rename(projects)
+    f = session / f"{sid}.jsonl"
+    f.unlink()
+    f.symlink_to(outside / f"{sid}.jsonl")
+    assert hostrun.copy_session(base, paths, tmp_path / "d4", slug, max_bytes=1000) == "failed"
 
 
 def test_session_tar_lands_under_the_run_slug(tmp_path):
@@ -421,53 +507,101 @@ def test_session_tar_lands_under_the_run_slug(tmp_path):
 # ---------------------------------------------------------------- job control
 
 
-def _record(pgid, marker="Tue Nov  4 12:00:00 2026"):
-    return {"runtime": "host", "pgid": pgid, "pgid_started_at": marker}
+def _ident(pgid=4242, started=1_000_000.0, text="Tue Nov  4 12:00:00 2026", window=2000):
+    return {
+        "runtime": "host",
+        "pgid": pgid,
+        "pgid_started_at": text,
+        "pgid_started_epoch": started,
+        "window_secs": window,
+    }
 
 
-def test_group_state_requires_a_matching_start_marker():
-    ok = lambda pgid, sig: None  # noqa: E731
-    gone = lambda pgid, sig: (_ for _ in ()).throw(ProcessLookupError())  # noqa: E731
-    denied = lambda pgid, sig: (_ for _ in ()).throw(PermissionError())  # noqa: E731
-    same = lambda pid: "Tue Nov  4 12:00:00 2026"  # noqa: E731
-    assert hostrun.group_state(_record(4242), killpg=ok, marker_of=same) is True
-    assert hostrun.group_state(_record(4242), killpg=gone, marker_of=same) is False
-    assert hostrun.group_state(_record(4242), killpg=denied, marker_of=same) is None
-    assert hostrun.group_state(_record(4242), killpg=ok, marker_of=lambda p: "other") is None
-    assert hostrun.group_state(_record(4242), killpg=ok, marker_of=lambda p: None) is None
-    assert hostrun.group_state({"runtime": "host", "pgid": 4242}, killpg=ok) is None
-    assert hostrun.group_state(_record(1), killpg=ok, marker_of=same) is None
+def _members(*rows):
+    return lambda pgid: list(rows)
 
 
-def test_kill_run_never_signals_an_unverified_group():
-    sent = []
-
-    def killpg(pgid, sig):
-        sent.append((pgid, sig))
-
-    # The group exists (signal 0 probe) but its leader's start marker differs: a reused pgid.
-    assert hostrun.kill_run(_record(4242), killpg=killpg, marker_of=lambda p: "other") is False
-    assert sent == [(4242, 0)]
+LEADER = (4242, "Tue Nov  4 12:00:00 2026", 1_000_001.0)
 
 
-def test_kill_run_terms_then_kills_a_stubborn_verified_group():
-    sent = []
+def test_group_state_checks_every_member_against_the_start_window():
+    assert hostrun.group_state(_ident(), members_of=_members(LEADER)) is True
+    assert hostrun.group_state(_ident(), members_of=_members()) is False
+    assert hostrun.group_state(_ident(), members_of=lambda pgid: None) is None
+    child = (4300, "Tue Nov  4 12:00:05 2026", 1_000_050.0)
+    assert hostrun.group_state(_ident(), members_of=_members(LEADER, child)) is True
+    # A member that started after the run could have ended: a reused group, never ours.
+    late = (4301, "later", 1_000_000.0 + 5000)
+    assert hostrun.group_state(_ident(), members_of=_members(LEADER, late)) is None
+    # A member that started before the run did: not ours either.
+    early = (4302, "earlier", 999_000.0)
+    assert hostrun.group_state(_ident(), members_of=_members(early)) is None
+    # The leader must carry the recorded start time.
+    other = (4242, "Wed Nov  5 01:00:00 2026", 1_000_002.0)
+    assert hostrun.group_state(_ident(), members_of=_members(other)) is None
+    assert hostrun.group_state({"pgid": 4242}, members_of=_members(LEADER)) is None
+    assert hostrun.group_state(_ident(pgid=1), members_of=_members(LEADER)) is None
+
+
+def test_every_signal_is_identity_checked_even_the_final_kill():
+    sent, state = [], {"rows": [LEADER]}
 
     def killpg(pgid, sig):
         sent.append(sig)
 
-    rec = _record(4242, marker="M")
-    assert hostrun.kill_run(rec, killpg=killpg, sleeper=lambda s: None, marker_of=lambda p: "M")
+    def members_of(pgid):
+        return list(state["rows"])
+
+    def sleeper(_s):
+        # After the TERM the leader is gone and a stranger now owns the group id.
+        if signal.SIGTERM in sent:
+            state["rows"] = [(4242, "stranger", 5_000_000.0)]
+
+    hostrun.terminate_group(
+        _ident(), killpg=killpg, members_of=members_of, sleeper=sleeper, grace=1.0
+    )
+    assert sent == [signal.SIGTERM]  # the KILL was refused: the group no longer verifies
+
+
+def test_kill_run_never_signals_an_unverified_group():
+    sent = []
+    assert not hostrun.kill_run(
+        _ident(), killpg=lambda p, s: sent.append(s), members_of=_members((4242, "other", 1.0))
+    )
+    assert sent == []
+
+
+def test_kill_run_terms_then_kills_a_stubborn_verified_group():
+    sent = []
+    assert hostrun.kill_run(
+        _ident(), killpg=lambda p, s: sent.append(s), members_of=_members(LEADER),
+        sleeper=lambda s: None,
+    )  # fmt: skip
     assert sent.count(signal.SIGTERM) == 1 and sent[-1] == signal.SIGKILL
 
 
-def test_job_status_reports_a_host_run_by_its_process_group(monkeypatch):
+def _host_record(job_id, base=None, **extra):
     rec = jobs.new_record(
-        job_id="eee555eee555", command="build", repo="me/repo", engine="claude", task="t",
+        job_id=job_id, command="build", repo="me/repo", engine="claude", task="t",
         container="c", network="n", proxy="p", branch=None, started_at=jobs.now_iso(),
     )  # fmt: skip
-    rec.update(_record(4242))
+    rec.update(_ident())
+    if base is not None:
+        rec["host_dir"] = str(base)
+    rec.update(extra)
     jobs.write_record(rec, os.environ)
+    return rec
+
+
+def _run_dir(token="e" * 32):
+    root = hostrun.ensure_runs_root()
+    base = root / token
+    (base / "home").mkdir(parents=True, mode=0o700)
+    return base
+
+
+def test_job_status_reports_a_host_run_by_its_process_group(monkeypatch):
+    _host_record("eee555eee555")
     monkeypatch.setattr(hostrun, "group_state", lambda record: True)
     res = CliRunner().invoke(cli.main, ["job", "status", "eee555eee555", "--json"])
     assert res.exit_code == 0, res.output
@@ -478,20 +612,87 @@ def test_job_status_reports_a_host_run_by_its_process_group(monkeypatch):
     assert json.loads(res.output)["state"] == "unknown"
 
 
-def test_job_attach_delivers_to_the_host_steer_file(monkeypatch):
-    rec = jobs.new_record(
-        job_id="fff666fff666", command="build", repo="me/repo", engine="claude", task="t",
-        container="c", network="n", proxy="p", branch=None, started_at=jobs.now_iso(),
-    )  # fmt: skip
-    rec.update(_record(4242))
-    jobs.write_record(rec, os.environ)
-    home = hostrun.host_dir("fff666fff666") / "home"
-    home.mkdir(parents=True)
+def test_job_attach_delivers_to_the_host_steer_file_without_following_links(monkeypatch):
+    base = _run_dir()
+    _host_record("fff666fff666", base)
     monkeypatch.setattr(hostrun, "group_state", lambda record: True)
     res = CliRunner().invoke(cli.main, ["job", "attach", "fff666fff666", "-m", "use tabs"])
     assert res.exit_code == 0, res.output
-    assert "use tabs" in (home / ".franky-steer.md").read_text()
-    assert stat.S_IMODE(os.lstat(home / ".franky-steer.md").st_mode) == 0o600
+    steer = base / "home" / ".franky-steer.md"
+    assert "use tabs" in steer.read_text()
+    assert stat.S_IMODE(os.lstat(steer).st_mode) == 0o600
+    # A planted link at the steer path is refused, and a record naming a stray dir is ignored.
+    steer.unlink()
+    (base / "elsewhere").write_text("x")
+    steer.symlink_to(base / "elsewhere")
+    assert hostrun.deliver_steer({"host_dir": str(base)}, "x") is False
+    assert hostrun.deliver_steer({"host_dir": str(base.parent.parent)}, "x") is False
+
+
+def test_job_kill_of_an_unverifiable_host_run_keeps_the_record_and_the_directory(monkeypatch):
+    base = _run_dir("f" * 32)
+    _host_record("aab777aab777", base, status="running")
+    monkeypatch.setattr(hostrun, "group_state", lambda record: None)
+    res = CliRunner().invoke(cli.main, ["job", "kill", "aab777aab777", "--json"])
+    assert res.exit_code != 0 and "cannot be verified" in res.output
+    assert base.exists()
+    assert jobs.read_record("aab777aab777", os.environ)["status"] == "running"
+
+
+def test_job_kill_of_a_verified_host_run_stops_it_then_removes_the_directory(monkeypatch):
+    base = _run_dir("9" * 32)
+    _host_record("bbc888bbc888", base, status="running")
+    states = iter([True, False, False, False])  # verified before, stopped after
+    monkeypatch.setattr(hostrun, "group_state", lambda record: next(states, False))
+    killed = []
+    monkeypatch.setattr(hostrun, "kill_run", lambda record: killed.append(1) or True)
+    res = CliRunner().invoke(cli.main, ["job", "kill", "bbc888bbc888", "--json"])
+    assert res.exit_code == 0, res.output
+    assert killed and not base.exists()
+    assert jobs.read_record("bbc888bbc888", os.environ)["status"] == "killed"
+
+
+@pytest.mark.skipif(shutil.which("lsof") is None, reason="needs lsof")
+def test_a_setsid_child_holding_the_pipe_cannot_hang_the_reader_and_is_killed(tmp_path):
+    marker = tmp_path / "escaped-pid"
+    env = _stub_engine(
+        tmp_path,
+        'perl -e \'use POSIX; POSIX::setsid(); exec "sleep", "300"\' &\n'
+        f"echo $! > {marker}\necho leader-done\n",
+    )
+    t0 = time.monotonic()
+    code, out = hostrun.run_on_host(
+        _cfg(), ClaudeEngine().inner_argv("p", model=None), timeout=60, env=env,
+        run_id="ccd999ccd999",
+    )  # fmt: skip
+    assert code == 0 and "leader-done" in "".join(out.chunks())
+    assert time.monotonic() - t0 < 20  # the drain is bounded, not the child's 300 s
+    time.sleep(0.5)
+    pid = int(marker.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)  # found by its working directory and stopped before the dir went
+
+
+def test_an_exception_still_stops_the_group_before_the_dirs_are_removed(tmp_path, monkeypatch):
+    order = []
+    real = hostrun.teardown
+    monkeypatch.setattr(
+        hostrun,
+        "teardown",
+        lambda base, ident, **kw: (order.append(base.exists()), real(base, ident, **kw)),
+    )
+
+    def boom(*a, **k):
+        raise RuntimeError("reader blew up")
+
+    monkeypatch.setattr(hostrun.select, "select", boom)
+    env = _stub_engine(tmp_path, "sleep 300\n")
+    with pytest.raises(RuntimeError):
+        hostrun.run_on_host(
+            _cfg(), ClaudeEngine().inner_argv("p", model=None), timeout=30, env=env,
+            run_id="dde000dde000",
+        )  # fmt: skip
+    assert order == [True]  # torn down while the run directory still existed
 
 
 # ---------------------------------------------------------------- codex host auth store
@@ -516,32 +717,50 @@ def test_codex_host_auth_store_login_status_logout(tmp_path):
     assert hostrun.codex_auth_ready() is False
 
 
-def test_codex_run_uses_the_host_store_and_writes_a_refreshed_token_back(tmp_path, monkeypatch):
+def _codex_run(tmp_path, refreshed):
     store = hostrun.auth_dir()
     store.mkdir(mode=0o700, parents=True)
-    (store / "auth.json").write_text('{"tokens": {"access": "oldtoken1234"}}')
+    (store / "auth.json").write_text(
+        '{"tokens": {"access": "oldtoken1234", "account_id": "acct-1"}}'
+    )
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     stub = bin_dir / "codex"
     stub.write_text(
         "#!/bin/sh\n"
         'echo "home=$CODEX_HOME"; cat "$CODEX_HOME/auth.json"; echo\n'
-        'echo \'{"tokens": {"access": "newtoken5678"}}\' > "$CODEX_HOME/auth.json"\n'
+        f"echo '{refreshed}' > \"$CODEX_HOME/auth.json\"\n"
     )
     stub.chmod(0o755)
-    shim = bin_dir / "sandbox-exec"  # hermetic: drop `-f <profile>` and run the rest
-    shim.write_text('#!/bin/sh\nshift 2\nexec "$@"\n')
-    shim.chmod(0o755)
-    monkeypatch.setattr(hostrun, "SANDBOX_EXEC", str(shim))
-    cfg = Config(engine=CodexEngine(), allowed_repos=["me/repo"], runtime="host",
-                 auth_volume="franky-codex-auth")  # fmt: skip
+    cfg = Config(
+        engine=CodexEngine(),
+        allowed_repos=["me/repo"],
+        runtime="host",
+        auth_volume="franky-codex-auth",
+    )
     code, out = hostrun.run_on_host(
-        cfg, CodexEngine().inner_argv("p", model=None), timeout=30,
-        env={"PATH": f"{bin_dir}:/usr/bin:/bin"}, run_id="123abc123abc",
-    )  # fmt: skip
-    text = "".join(out.chunks())
+        cfg,
+        CodexEngine().inner_argv("p", model=None),
+        timeout=30,
+        env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
+        run_id="123abc123abc",
+    )
+    return code, "".join(out.chunks()), store
+
+
+def test_codex_run_uses_the_host_store_and_keeps_a_refreshed_token_of_the_same_account(tmp_path):
+    code, text, store = _codex_run(
+        tmp_path, '{"tokens": {"access": "newtoken5678", "account_id": "acct-1"}}'
+    )
     assert code == 0 and "oldtoken1234" not in text and "***REDACTED***" in text
     assert json.loads((store / "auth.json").read_text())["tokens"]["access"] == "newtoken5678"
+
+
+def test_codex_run_discards_an_auth_file_of_another_account(tmp_path):
+    _code, _text, store = _codex_run(
+        tmp_path, '{"tokens": {"access": "attacker-token", "account_id": "acct-2"}}'
+    )
+    assert json.loads((store / "auth.json").read_text())["tokens"]["access"] == "oldtoken1234"
 
 
 # ---------------------------------------------------------------- cli wiring

@@ -151,11 +151,11 @@ The term list lives outside the repo: the Actions secret `FRANKY_PRIVATE_TERMS` 
 ### Runtime selection
 
 - The container is the default. The host runtime is an explicit opt-in (`FRANKY_RUNTIME=host`), never a fallback: do not add any path that switches runtime on a failure.
-- Host mode must refuse, with exit 3, when the engine's OS sandbox cannot run. It never runs unsandboxed and never uses the bypass flags the container uses (claude `--settings` with a mandatory sandbox and allow-only file-tool rules, codex inside a Seatbelt profile).
+- Host mode (macOS only) must refuse, with exit 3, when its Seatbelt profile cannot run. It never runs unsandboxed and never uses the bypass flags the container uses. One outer `(deny default)` profile confines both engines; never rely on an engine's own settings or sandbox as the boundary.
 - Container mode must stay byte-identical: `run_in_container` gets the same arguments with `FRANKY_RUNTIME` unset (`tests/test_hostrun.py` pins it).
-- Host job control signals only a process group whose recorded start time still matches.
-- The host settings file and Seatbelt profile live in a 0700 `<job>.ctl` directory outside every writable root, files 0400.
-- Host mode builds the child environment from scratch and extracts bundles as regular files only.
+- Host run directories live in a dedicated 0300 root outside the home, one 128-bit random name per run. Settings and profile sit in a 0400 `<run>.ctl` directory outside every writable root.
+- Every host signal is preceded by an identity check (start window and leader start time). Stop the run's processes before reading anything back or removing a directory; walk every host-side path into a run with `O_NOFOLLOW` from a directory fd.
+- Host mode builds the child environment from scratch (git and gh configuration pointed inside the run) and extracts bundles as regular files only.
 
 ### Container boundary
 

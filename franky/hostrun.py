@@ -1,13 +1,12 @@
-"""Host runtime: run the engine as the operator's own user under the engine's OS sandbox.
+"""Host runtime: run the engine as the operator's own user inside a macOS Seatbelt profile.
 
 Explicit opt-in (`FRANKY_RUNTIME=host`), never a fallback. The container runtime stays the
 default and its code path is untouched. The host runtime drops what Docker gave: no egress
-proxy, no read-only root, no memory or process limits, and a filesystem the engine can read as
-the operator. What it keeps is a per-run directory (`<runs>/<job>.host/{home,work,tmp}`, 0700,
-removed after the run), a from-scratch child environment, the engine's own OS sandbox (Seatbelt
-on macOS) with writes limited to that directory, the same redactor and transcript, a hard
-wall-clock watchdog, and the same host-side publish validation. A run that cannot get its OS
-sandbox refuses; it never runs unsandboxed.
+proxy, no read-only root, no memory or process limits. What it keeps: one outer Seatbelt profile
+(`(deny default)`) around the engine and everything it starts, a per-run directory under a
+dedicated 0300 root outside the operator home, a from-scratch child environment, process-group
+job control verified by start time, the same redactor, transcript and watchdog, and the same
+host-side publish validation. A host that cannot sandbox refuses; it never runs unsandboxed.
 """
 
 from __future__ import annotations
@@ -17,11 +16,12 @@ import io
 import json
 import os
 import re
+import secrets
+import select
 import shutil
 import stat
 import subprocess
 import sys
-import threading
 import time
 import uuid
 from collections.abc import Iterable
@@ -39,7 +39,6 @@ from .profile import CONTAINER_HOME
 from .result import ConfigError
 from .transcript import CHUNK_SIZE, MAX_EVENT_CHARS, Redactor, Transcript
 
-HOST_SUFFIX = ".host"
 # The container's own paths. The prompts and stored engine sessions name them literally, so the
 # host run rewrites them to the per-run directory (and rewrites the session slug back on copy-out).
 CONTAINER_WORK = "/work"
@@ -49,29 +48,112 @@ CONTAINER_SLUG = "-work"
 
 HOST_TIMEOUT_MSG = "franky: host run timed out after {timeout}s"
 TERM_GRACE_SECS = 5.0
+DRAIN_SECS = 1.5
+# A run's processes start no later than this after the recorded start (timeout + setup + slack).
+START_WINDOW_SLACK = 600
 MAX_BUNDLE_BYTES = 64 * 1024 * 1024
 _AUTH_MAX_BYTES = 256 * 1024
 # `franky-repo-setup.py` ships in the wheel as a symlink-free copy beside this module.
 REPO_SETUP_SCRIPT = Path(__file__).with_name("repo_setup_script.py")
 
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
-_FILE_TOOLS = ("Read", "Edit", "Write", "Grep", "Glob")
-CTL_SUFFIX = ".ctl"
+SYSTEM_CA_BUNDLE = "/etc/ssl/cert.pem"
+RUN_TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
+RUNS_ROOT_VAR = "FRANKY_HOST_RUNS_DIR"
+# Programs that talk to launchd, the keychain or the desktop. They are denied exec inside the
+# profile (the Mach calls they use cannot be denied by Seatbelt on its own).
+_DENY_EXEC = (
+    "/bin/launchctl",
+    "/usr/bin/security",
+    "/usr/bin/osascript",
+    "/usr/bin/open",
+    "/usr/bin/sandbox-exec",
+    "/usr/bin/ssh-add",
+)
+_MACH_SERVICES = (
+    "com.apple.system.opendirectoryd.libinfo",
+    "com.apple.logd",
+    "com.apple.cfprefsd.daemon",
+    "com.apple.cfprefsd.agent",
+    "com.apple.dnssd.service",
+    "com.apple.SystemConfiguration.configd",
+    "com.apple.SystemConfiguration.DNSConfiguration",
+    "com.apple.trustd",
+    "com.apple.trustd.agent",
+    "com.apple.system.notification_center",
+    "com.apple.diagnosticd",
+    "com.apple.analyticsd",
+)
 
 
-def host_dir(run_id: str, env=None) -> Path:
-    """The per-run directory of `run_id`. The id is validated so it is one safe path component."""
-    if not jobs._JOB_ID_RE.match(run_id):
-        raise ValueError(f"invalid job id: {run_id!r}")
-    return jobs.runs_dir(env) / f"{run_id}{HOST_SUFFIX}"
+def real_home() -> Path:
+    return Path(os.path.realpath(Path.home()))
 
 
-def ctl_dir(run_id: str, env=None) -> Path:
-    """The per-run control directory: the engine's settings file and Seatbelt profile. A sibling
-    of the run directory, never under it or under any path the sandbox lets the engine write."""
-    if not jobs._JOB_ID_RE.match(run_id):
-        raise ValueError(f"invalid job id: {run_id!r}")
-    return jobs.runs_dir(env) / f"{run_id}{CTL_SUFFIX}"
+def _under(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def runs_root(env=None) -> Path:
+    """The dedicated root of host run directories: outside the operator home, mode 0300 (the
+    owner can create and enter, nobody can list it), one 128-bit random directory per run."""
+    source = os.environ if env is None else env
+    override = source.get(RUNS_ROOT_VAR)
+    if override:
+        return Path(override)
+    return Path("/Users/Shared") / f"franky-host-{os.getuid()}"
+
+
+def ensure_runs_root(env=None) -> Path:
+    """Create (or verify) the runs root; return its realpath. Refuses a root under the home, a
+    symlink, a foreign owner or a mode other than 0300."""
+    root = runs_root(env)
+    parent = Path(os.path.realpath(root.parent))
+    root = parent / root.name
+    if _under(root, real_home()) or root == real_home():
+        raise ConfigError(
+            f"{RUNS_ROOT_VAR} must be outside your home directory - refusing ({root})"
+        )
+    try:
+        if not os.path.lexists(root):
+            parent.mkdir(parents=True, exist_ok=True)
+            os.mkdir(root, 0o300)
+            os.chmod(root, 0o300)
+        st = os.lstat(root)
+    except OSError as exc:
+        raise ConfigError(f"cannot create the host runs root {root}: {exc}") from exc
+    if (
+        not stat.S_ISDIR(st.st_mode)
+        or st.st_uid != os.getuid()
+        or stat.S_IMODE(st.st_mode) != 0o300
+    ):
+        raise ConfigError(
+            f"the host runs root {root} must be a directory you own with mode 0300 - refusing"
+        )
+    return root
+
+
+def host_dir_of(record: dict, env=None) -> Path | None:
+    """The run directory a record names, only when it is a random-token directory directly under
+    the runs root and not a symlink. Never trusts the record's path blindly."""
+    raw = record.get("host_dir")
+    if not isinstance(raw, str):
+        return None
+    path = Path(raw)
+    if not RUN_TOKEN_RE.match(path.name):
+        return None
+    try:
+        if Path(os.path.realpath(path.parent)) != Path(os.path.realpath(runs_root(env))):
+            return None
+        if stat.S_ISLNK(os.lstat(path).st_mode):
+            return None
+    except OSError:
+        return None
+    return path
 
 
 def auth_dir(env=None) -> Path:
@@ -83,20 +165,13 @@ def auth_dir(env=None) -> Path:
 
 def preflight(cfg, which=shutil.which, platform: str = sys.platform) -> None:
     """Refuse a host run that cannot be sandboxed. Never falls back to the container."""
-    if platform == "darwin":
-        if not Path("/usr/bin/sandbox-exec").exists():
-            raise ConfigError(
-                "FRANKY_RUNTIME=host needs /usr/bin/sandbox-exec (Seatbelt) - refusing"
-            )
-    elif platform.startswith("linux"):
-        if cfg.engine.name == "codex":
-            raise ConfigError(
-                "FRANKY_RUNTIME=host with codex needs macOS Seatbelt to confine reads - refusing"
-            )
-        if not which("bwrap"):
-            raise ConfigError("FRANKY_RUNTIME=host needs bubblewrap (`bwrap`) on Linux - refusing")
-    else:
-        raise ConfigError(f"FRANKY_RUNTIME=host is not supported on {platform} - refusing")
+    if platform != "darwin":
+        raise ConfigError(
+            f"FRANKY_RUNTIME=host needs macOS Seatbelt to confine the engine; {platform} is "
+            "not supported - refusing"
+        )
+    if not Path(SANDBOX_EXEC).exists():
+        raise ConfigError(f"FRANKY_RUNTIME=host needs {SANDBOX_EXEC} (Seatbelt) - refusing")
     for binary in (cfg.engine.name, "git", "gh"):
         if not which(binary):
             raise ConfigError(
@@ -107,6 +182,7 @@ def preflight(cfg, which=shutil.which, platform: str = sys.platform) -> None:
         raise ConfigError(
             "Codex subscription login is missing or invalid - run `franky auth login codex`"
         )
+    ensure_runs_root()
 
 
 # ---------------------------------------------------------------------------
@@ -123,146 +199,111 @@ def rewrite_text(text: str, home: Path, work: Path, tmp: Path) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Engine argv and the OS sandbox
+# Engine argv and the OS sandbox: one outer Seatbelt profile for both engines
 # ---------------------------------------------------------------------------
 
 _CODEX_BYPASS = "--dangerously-bypass-approvals-and-sandbox"
 
 
-def _confine(root: Path, keep: Path) -> list[str]:
-    """Paths to deny so that, under `root`, only `keep` stays reachable: every sibling along
-    the way from `root` down to `keep`. A `keep` outside `root` denies `root` whole. The engine's
-    deny rules win over allow rules, so the allowed directory is carved out by enumeration."""
-    try:
-        parts = keep.relative_to(root).parts
-    except ValueError:
-        return [str(root)]
-    out: list[str] = []
-    cur = root
-    for part in parts:
-        try:
-            names = os.listdir(cur)
-        except OSError as exc:
-            raise ConfigError(f"FRANKY_RUNTIME=host cannot confine {cur}: {exc}") from exc
-        out += [str(cur / n) for n in names if n != part]
-        cur = cur / part
-    return out
-
-
-def _new_file_levels(root: Path, keep: Path) -> list[str]:
-    """The directories from `root` down to `keep`'s parent. The engine could still create a NEW
-    file directly in one of them (the enumeration only names what exists), so each gets a
-    single-level write deny."""
-    try:
-        parts = keep.relative_to(root).parts
-    except ValueError:
-        return []
-    levels = [str(root)]
-    cur = root
-    for part in parts[:-1]:
-        cur = cur / part
-        levels.append(str(cur))
-    return levels
-
-
-def _tool_rules(paths: list[str], tools=_FILE_TOOLS) -> list[str]:
-    return [f"{t}(/{p})" for p in paths for t in tools] + [
-        f"{t}(/{p}/**)" for p in paths for t in tools
-    ]
-
-
-def claude_settings(
-    run: Path, real_home: Path, runs_dir: Path, extra_deny: tuple[Path, ...] = ()
-) -> dict:
-    """The per-run Claude Code settings. Allow-only: the engine can read and write only the run's
-    own directory. Bash runs in Claude's mandatory OS sandbox (writes to the run's home, work and
-    tmp, no reads of the operator home or the runs directory except the run directory, no
-    unsandboxed commands). Claude's built-in file tools are not covered by that sandbox, so they
-    get deny rules for everything under the home and the runs directory except the run
-    directory, and for the settings and profile directory. WebFetch and WebSearch are denied;
-    Bash keeps open network (git, gh, the engine API). `--dangerously-skip-permissions` stays on
-    the argv for headless approval; deny rules still win over it."""
-    deny = _confine(real_home, run)
-    levels = _new_file_levels(real_home, run)
-    if not _under(run, real_home):
-        deny += _confine(runs_dir, run)
-        levels += _new_file_levels(runs_dir, run)
-    deny += [str(p) for p in extra_deny]
-    deny = list(dict.fromkeys(deny))
-    read_deny = [str(real_home)] + ([] if _under(run, real_home) else [str(runs_dir)])
+def claude_control_settings() -> dict:
+    """The control settings passed to Claude (with `--setting-sources ""`, so no user, project
+    or local settings load): hooks off, Claude's own sandbox off (a nested sandbox is refused;
+    the outer profile is the boundary), and the web tools denied. `--dangerously-skip-permissions`
+    stays on the argv for headless approval."""
     return {
-        "permissions": {
-            "deny": [
-                *_tool_rules(deny),
-                *[f"{t}(/{lvl}/*)" for lvl in levels for t in ("Edit", "Write")],
-                "WebFetch",
-                "WebSearch",
-            ],
-            "allow": [f"{t}(/{run}/**)" for t in ("Read", "Edit")],
-        },
-        "sandbox": {
-            "enabled": True,
-            "failIfUnavailable": True,
-            "allowUnsandboxedCommands": False,
-            "autoAllowBashIfSandboxed": True,
-            "filesystem": {
-                "allowWrite": [str(run / "home"), str(run / "work"), str(run / "tmp")],
-                "denyRead": read_deny,
-                "allowRead": [str(run)],
-            },
-            "network": {"allowedDomains": ["*"]},
-        },
+        "disableAllHooks": True,
+        "sandbox": {"enabled": False},
+        "permissions": {"deny": ["WebFetch", "WebSearch"]},
     }
-
-
-def _under(path: Path, root: Path) -> bool:
-    try:
-        path.relative_to(root)
-        return True
-    except ValueError:
-        return False
 
 
 def _sb(path) -> str:
     return '"' + str(path).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def codex_install_roots(which=shutil.which) -> list[Path]:
-    """Read-only roots the codex launcher needs: its bin directory, its resolved install
-    directory and the nearest enclosing package root (it may sit under the operator home)."""
-    found = which("codex")
-    if not found:
-        return []
-    real = Path(os.path.realpath(found))
-    roots = [Path(found).parent, real.parent]
+def engine_install_roots(engine_bin: Path, home: Path, root: Path) -> list[Path]:
+    """Read-only roots the engine launcher needs when it sits under the operator home: its
+    resolved directory and, for a node package, the enclosing package directory. A root that
+    equals or contains the home or the runs root is refused, never allowed."""
+    real = Path(os.path.realpath(engine_bin))
+    roots = [real.parent]
     for ancestor in list(real.parents)[:6]:
         if (ancestor / "package.json").is_file():
             roots.append(ancestor)
             break
-    return list(dict.fromkeys(roots))
+    out = []
+    for r in dict.fromkeys(roots):
+        if r == home or _under(home, r) or r == root or _under(root, r):
+            continue  # a broad prefix (`/`, `/Users`) is never allowed through
+        out.append(r)
+    return out
 
 
-def seatbelt_profile(run: Path, real_home: Path, runs_dir: Path, install_roots: list[Path]) -> str:
-    """The Seatbelt profile around the codex process. Reads: nothing under the operator home or
-    the runs directory except the run directory and codex's own install roots (read only).
-    Writes: nothing except the run directory, `/dev` and the per-user temp area. The network
-    stays open. Later rules win in Seatbelt, so the allows come last.
+def resolve_engine_bin(engine: str, path: str) -> Path:
+    """The engine launcher's absolute, symlink-resolved path (found on the child PATH)."""
+    found = shutil.which(engine, path=path)
+    if not found:
+        raise ConfigError(f"FRANKY_RUNTIME=host: `{engine}` not found on PATH - refusing")
+    return Path(os.path.realpath(found))
 
-    Codex's own `--sandbox workspace-write` cannot run inside this profile (macOS refuses a
-    nested sandbox that is not a subset of the outer one), so codex runs with
-    `--sandbox danger-full-access` and this profile is the sandbox."""
-    lines = [
+
+def seatbelt_profile(
+    run: Path,
+    home: Path,
+    root: Path,
+    install_roots: list[Path],
+    control_file: Path | None = None,
+) -> str:
+    """The outer Seatbelt profile around the engine and everything it starts. `(deny default)`.
+
+    Reads: everything outside the operator home, the runs root, `/private/var/folders` and
+    `/private/tmp`, plus the run directory, the engine's install roots and the one control
+    file. Writes: only the run's `home`, `work` and `tmp` (never the run directory itself, so
+    `home` cannot be swapped for a symlink). Network: outbound TCP and the system resolver
+    socket only; no other unix sockets. Processes: exec and fork, signal and inspect only
+    inside the sandbox (other processes' environments stay unreadable), a short Mach service
+    list (no keychain, no launchd). Later rules win in Seatbelt, so the allows come last."""
+    L = [
         "(version 1)",
-        "(allow default)",
-        '(deny file-write* (subpath "/"))',
-        '(allow file-write* (subpath "/dev") (subpath "/private/var/folders"))',
+        "(deny default)",
+        "(allow process-exec)",
+        "(allow process-fork)",
+        "(allow signal (target same-sandbox))",
+        "(allow process-info* (target same-sandbox))",
+        "(allow user-preference-read)",
+        "(allow ipc-posix-shm)",
+        '(allow sysctl-read (sysctl-name-prefix "hw.") (sysctl-name-prefix "machdep.cpu.") '
+        '(sysctl-name "kern.ostype" "kern.osrelease" "kern.osversion" "kern.version" '
+        '"kern.hostname" "kern.argmax" "kern.maxfilesperproc" "kern.ngroups" "kern.boottime" '
+        '"kern.secure_kernel" "vm.loadavg"))',
+        "(allow file-read*)",
+        "(deny file-read* file-write* "
+        f"(subpath {_sb(home)}) (subpath {_sb(root)}) "
+        '(subpath "/private/var/folders") (subpath "/private/tmp") (subpath "/private/var/tmp"))',
+        f"(allow file-read-metadata (literal {_sb(root)}))",
     ]
-    for root in dict.fromkeys([real_home, runs_dir]):
-        lines.append(f"(deny file-read* file-write* (subpath {_sb(root)}))")
-    for root in install_roots:
-        lines.append(f"(allow file-read* (subpath {_sb(root)}))")
-    lines.append(f"(allow file-read* file-write* (subpath {_sb(run)}))")
-    return "\n".join(lines) + "\n"
+    for r in install_roots:
+        L.append(f"(allow file-read* (subpath {_sb(r)}))")
+    if control_file is not None:
+        # The engine vets every component of its settings path: the file and its directory are
+        # readable by name, nothing else beside them is.
+        L.append(f"(allow file-read-metadata (literal {_sb(control_file.parent)}))")
+        L.append(f"(allow file-read* (literal {_sb(control_file)}))")
+    L += [
+        f"(allow file-read* (subpath {_sb(run)}))",
+        "(allow file-write* "
+        f"(subpath {_sb(run / 'home')}) (subpath {_sb(run / 'work')}) "
+        f"(subpath {_sb(run / 'tmp')}))",
+        '(allow file-write-data (literal "/dev/null") (literal "/dev/dtracehelper") '
+        '(literal "/dev/tty"))',
+        "(allow network-outbound (remote tcp))",
+        '(allow network-outbound (literal "/private/var/run/mDNSResponder"))',
+        "(allow mach-lookup (global-name " + " ".join(f'"{n}"' for n in _MACH_SERVICES) + "))",
+        "(deny process-exec " + " ".join(f"(literal {_sb(p)})" for p in _DENY_EXEC) + ")",
+        '(deny mach-lookup (global-name-prefix "com.apple.SecurityServer") '
+        '(global-name-prefix "com.apple.security") (global-name-prefix "com.apple.xpc.launchd"))',
+    ]
+    return "\n".join(L) + "\n"
 
 
 def write_ctl_file(ctl: Path, name: str, text: str) -> Path:
@@ -275,26 +316,39 @@ def write_ctl_file(ctl: Path, name: str, text: str) -> Path:
     return path
 
 
-def engine_argv(inner_argv: list[str], engine: str, control_file: Path) -> list[str]:
-    """Swap the container's sandbox-off flags for the engine's OS sandbox. `control_file` is the
-    claude settings file or the codex Seatbelt profile. Raises ValueError when the argv has no
-    engine flag to swap (a refusal, never an unsandboxed run)."""
+def engine_argv(
+    inner_argv: list[str],
+    engine: str,
+    *,
+    profile: Path,
+    engine_bin: Path,
+    settings: Path | None = None,
+) -> list[str]:
+    """Wrap the engine command in the outer profile. The container's sandbox-off flags are
+    dropped or replaced; the engine launcher becomes its absolute path (the profile hides the
+    home, where a launcher symlink may live). Raises ValueError when the argv has nothing to
+    swap (a refusal, never an unsandboxed run)."""
     argv = list(inner_argv)
     if engine == "claude":
-        if "claude" not in argv or "--dangerously-skip-permissions" not in argv:
+        if "claude" not in argv or "--dangerously-skip-permissions" not in argv or settings is None:
             raise ValueError("claude argv has no engine command to sandbox")
         at = argv.index("claude")
-        return [*argv[: at + 1], "--settings", str(control_file), *argv[at + 1 :]]
-    if engine == "codex":
+        argv[at : at + 1] = [str(engine_bin), "--setting-sources", "", "--settings", str(settings)]
+    elif engine == "codex":
         if _CODEX_BYPASS not in argv or "codex" not in argv:
             raise ValueError("codex argv has no sandbox flag to swap")
-        argv[argv.index(_CODEX_BYPASS) : argv.index(_CODEX_BYPASS) + 1] = [
-            "--sandbox",
+        argv[argv.index(_CODEX_BYPASS)] = "--sandbox"
+        # The container's bypass flag also skipped codex's trusted-directory check (the work
+        # directory is empty at launch); the explicit sandbox flag does not.
+        argv[argv.index("--sandbox") + 1 : argv.index("--sandbox") + 1] = [
             "danger-full-access",
+            "--skip-git-repo-check",
         ]
-        at = argv.index("codex")
-        return [*argv[:at], SANDBOX_EXEC, "-f", str(control_file), *argv[at:]]
-    raise ValueError(f"engine {engine!r} has no host sandbox")
+        argv[argv.index("codex")] = str(engine_bin)
+    else:
+        raise ValueError(f"engine {engine!r} has no host sandbox")
+    at = argv.index(str(engine_bin))
+    return [*argv[:at], SANDBOX_EXEC, "-f", str(profile), *argv[at:]]
 
 
 # ---------------------------------------------------------------------------
@@ -318,6 +372,16 @@ def child_env(cfg, home: Path, tmp: Path, os_env) -> dict[str, str]:
         "GIT_TERMINAL_PROMPT": "0",
     }
     env.update(cfg.passthrough_env)
+    # The operator's git and gh configuration (osxkeychain credential helper, signing, aliases)
+    # never applies: both resolve inside the run.
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = str(home / ".gitconfig")
+    env["GH_CONFIG_DIR"] = str(home / ".config" / "gh")
+    env["CLAUDE_CODE_TMPDIR"] = str(tmp)
+    # TLS roots from a file: the system trust store needs the keychain service, which the
+    # profile denies.
+    if Path(SYSTEM_CA_BUNDLE).is_file():
+        env["SSL_CERT_FILE"] = SYSTEM_CA_BUNDLE
     if cfg.engine.name == "codex":
         env["CODEX_HOME"] = str(home / ".codex")
     return env
@@ -361,49 +425,131 @@ def rename_session_slug(home: Path, session_dir: str, slug: str) -> None:
         os.rename(old, new)
 
 
-def copy_session(home: Path, paths: list[str], dest, slug: str, *, max_bytes: int) -> str:
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+_MAX_TREE_DEPTH = 6
+_MAX_TREE_ENTRIES = 10000
+
+
+class _TooLarge(Exception):
+    pass
+
+
+def _open_dir(base: Path, parts) -> int:
+    """Open `base`/`parts` one component at a time with O_NOFOLLOW, so no component of a path
+    inside a run directory can be a symlink the run planted. The caller closes the fd."""
+    fd = os.open(base, _DIR_FLAGS)
+    try:
+        for part in parts:
+            nxt = os.open(part, _DIR_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _read_fd_bounded(dfd: int, name: str, limit: int) -> bytes:
+    """Read a regular file by name under a directory fd, never following a link, and fail as
+    soon as more than `limit` bytes have been read (the limit applies while reading)."""
+    fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("not a regular file")
+        chunks, total = [], 0
+        while chunk := os.read(fd, 65536):
+            total += len(chunk)
+            if total > limit:
+                raise _TooLarge()
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def read_file_nofollow(base: Path, parts, limit: int) -> bytes | None:
+    """One regular file at `base`/`parts`, walked without following links; None on any failure."""
+    try:
+        dfd = _open_dir(base, parts[:-1])
+    except OSError:
+        return None
+    try:
+        return _read_fd_bounded(dfd, parts[-1], limit)
+    except (OSError, _TooLarge):
+        return None
+    finally:
+        os.close(dfd)
+
+
+def _copy_tree(dfd: int, out: Path, budget: list[int], depth: int, count: list[int]) -> None:
+    if depth > _MAX_TREE_DEPTH:
+        raise OSError("tree too deep")
+    for name in os.listdir(dfd):
+        count[0] += 1
+        if count[0] > _MAX_TREE_ENTRIES:
+            raise OSError("too many entries")
+        st = os.stat(name, dir_fd=dfd, follow_symlinks=False)
+        if stat.S_ISREG(st.st_mode):
+            data = _read_fd_bounded(dfd, name, budget[0])
+            budget[0] -= len(data)
+            out.mkdir(mode=0o700, parents=True, exist_ok=True)
+            fd = os.open(out / name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+        elif stat.S_ISDIR(st.st_mode):
+            sub = os.open(name, _DIR_FLAGS, dir_fd=dfd)
+            try:
+                _copy_tree(sub, out / name, budget, depth + 1, count)
+            finally:
+                os.close(sub)
+
+
+def copy_session(base: Path, paths: list[str], dest, slug: str, *, max_bytes: int) -> str:
     """Copy an engine session (`paths`: the session file, then its optional side dir; stored
-    under the container slug) out of the run home into `dest`, regular files only, one byte
-    budget. Mirrors `snapshot.copy_session`: ok, too_large or failed."""
+    under the container slug) out of the run's home into `dest`. Call it only after the run's
+    processes are stopped. Every component is opened with O_NOFOLLOW from a directory fd, only
+    regular files and directories are read, and the byte limit is enforced while reading.
+    Mirrors `snapshot.copy_session`: ok, too_large or failed."""
     if not paths:
         return "failed"
-    budget = max_bytes
+    budget = [max_bytes]
     for index, rel in enumerate(paths):
-        src = home / _host_rel(rel, slug)
-        target_root = Path(dest) / rel
+        parts = ["home", *_host_rel(rel, slug).split("/")]
         try:
-            st = os.lstat(src)
+            pfd = _open_dir(base, parts[:-1])
         except OSError:
             if index == 0:
                 return "failed"
             continue
-        files: list[tuple[Path, Path]] = []
-        if stat.S_ISREG(st.st_mode):
-            files.append((src, target_root))
-        elif stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode):
-            for root, dirs, names in os.walk(src, followlinks=False):
-                dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(root, d))]
-                for name in names:
-                    path = Path(root) / name
-                    files.append((path, target_root / path.relative_to(src)))
-        elif index == 0:
-            return "failed"
-        for path, out in files:
+        try:
             try:
-                if not stat.S_ISREG(os.lstat(path).st_mode):
-                    continue
-                size = os.lstat(path).st_size
-                budget -= size
-                if budget < 0:
-                    return "too_large"
-                out.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-                with os.fdopen(fd, "rb") as fh:
-                    ofd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
-                    with os.fdopen(ofd, "wb") as dst:
-                        shutil.copyfileobj(fh, dst)
+                st = os.stat(parts[-1], dir_fd=pfd, follow_symlinks=False)
             except OSError:
+                if index == 0:
+                    return "failed"
+                continue
+            target = Path(dest) / rel
+            if stat.S_ISREG(st.st_mode):
+                data = _read_fd_bounded(pfd, parts[-1], budget[0])
+                budget[0] -= len(data)
+                target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(data)
+            elif stat.S_ISDIR(st.st_mode):
+                sub = os.open(parts[-1], _DIR_FLAGS, dir_fd=pfd)
+                try:
+                    _copy_tree(sub, target, budget, 0, [0])
+                finally:
+                    os.close(sub)
+            elif index == 0:
                 return "failed"
+        except _TooLarge:
+            return "too_large"
+        except OSError:
+            return "failed"
+        finally:
+            os.close(pfd)
     try:
         landed = stat.S_ISREG(os.lstat(Path(dest) / paths[0]).st_mode)
     except OSError:
@@ -416,15 +562,18 @@ def copy_session(home: Path, paths: list[str], dest, slug: str, *, max_bytes: in
 # ---------------------------------------------------------------------------
 
 
-def _read_auth(path: Path) -> dict | None:
+def _parse_auth(raw: bytes | None) -> dict | None:
+    if not raw or len(raw) > _AUTH_MAX_BYTES:
+        return None
     try:
-        st = os.lstat(path)
-        if not stat.S_ISREG(st.st_mode) or not 0 < st.st_size <= _AUTH_MAX_BYTES:
-            return None
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, RecursionError):
+        payload = json.loads(raw.decode("utf-8"))
+    except (ValueError, RecursionError):
         return None
     return payload if isinstance(payload, dict) and payload else None
+
+
+def _read_auth(path: Path) -> dict | None:
+    return _parse_auth(read_file_nofollow(path.parent, [path.name], _AUTH_MAX_BYTES))
 
 
 def auth_strings(payload: dict) -> list[str]:
@@ -440,6 +589,21 @@ def auth_strings(payload: dict) -> list[str]:
         elif isinstance(value, str) and len(value) >= 8:
             out.append(value)
     return out
+
+
+def account_id(payload: dict) -> str | None:
+    """The account id an auth payload names (`account_id` anywhere in it), or None."""
+    pending: list = [payload]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, dict):
+            found = value.get("account_id")
+            if isinstance(found, str) and found:
+                return found
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
+    return None
 
 
 def codex_auth_ready(env=None) -> bool:
@@ -472,18 +636,16 @@ def codex_auth_login(runner=subprocess.run, env=None) -> bool:
         )
         if getattr(proc, "returncode", 1) != 0:
             return False
-        return _store_auth(scratch / "auth.json", store)
+        payload = _read_auth(scratch / "auth.json")
+        return payload is not None and _store_auth(payload, store)
     except OSError:
         return False
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
 
-def _store_auth(src: Path, store: Path) -> bool:
-    """Atomically replace `<store>/auth.json` with `src` when it is a valid auth file."""
-    payload = _read_auth(src)
-    if payload is None:
-        return False
+def _store_auth(payload: dict, store: Path) -> bool:
+    """Atomically replace `<store>/auth.json` with `payload`."""
     store.mkdir(mode=0o700, parents=True, exist_ok=True)
     tmp = store / f".auth-{uuid.uuid4().hex[:8]}"
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -491,6 +653,16 @@ def _store_auth(src: Path, store: Path) -> bool:
         json.dump(payload, fh)
     os.replace(tmp, store / "auth.json")
     return True
+
+
+def keep_refreshed_auth(base: Path, original: dict, store: Path) -> bool:
+    """After a run: keep the engine's refreshed `auth.json` only when it names the same
+    account as the login copied in. The run could have replaced the file with anything."""
+    wanted = account_id(original)
+    after = _parse_auth(read_file_nofollow(base, ["home", ".codex", "auth.json"], _AUTH_MAX_BYTES))
+    if wanted is None or after is None or account_id(after) != wanted:
+        return False
+    return _store_auth(after, store)
 
 
 def codex_auth_logout(env=None) -> bool:
@@ -502,112 +674,237 @@ def codex_auth_logout(env=None) -> bool:
 # Job control: process group identity (macOS has no /proc)
 # ---------------------------------------------------------------------------
 
+_PS_ENV = {"LC_ALL": "C", "PATH": "/bin:/usr/bin:/usr/sbin:/sbin"}
 
-def proc_start_marker(pid: int, runner=subprocess.run) -> str | None:
-    """The process start time (`ps -o lstart=`), a reuse guard for a recorded process group."""
+
+def _lstart_epoch(text: str) -> float | None:
+    try:
+        return time.mktime(time.strptime(" ".join(text.split()), "%a %b %d %H:%M:%S %Y"))
+    except ValueError:
+        return None
+
+
+def process_table(runner=subprocess.run) -> list[tuple[int, int, str, float]] | None:
+    """Every process as (pid, pgid, lstart text, start epoch), or None when `ps` fails."""
     try:
         proc = runner(
-            ["ps", "-o", "lstart=", "-p", str(pid)],
+            ["ps", "-axo", "pid=,pgid=,lstart="],
             capture_output=True,
             text=True,
-            timeout=5,
-            env={"LC_ALL": "C", "PATH": "/bin:/usr/bin"},
+            timeout=10,
+            env=_PS_ENV,
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    out = (getattr(proc, "stdout", "") or "").strip()
-    return out if getattr(proc, "returncode", 1) == 0 and out else None
+    if getattr(proc, "returncode", 1) != 0:
+        return None
+    rows = []
+    for line in (getattr(proc, "stdout", "") or "").splitlines():
+        parts = line.split(None, 2)
+        if len(parts) != 3 or not parts[0].isdigit() or not parts[1].isdigit():
+            continue
+        epoch = _lstart_epoch(parts[2])
+        if epoch is not None:
+            rows.append((int(parts[0]), int(parts[1]), " ".join(parts[2].split()), epoch))
+    return rows
 
 
-def group_state(record: dict, *, killpg=os.killpg, marker_of=proc_start_marker) -> bool | None:
+def proc_start_marker(pid: int, runner=subprocess.run) -> str | None:
+    """The process start time text of `pid` (`ps lstart`), a reuse guard."""
+    rows = process_table(runner)
+    for row in rows or []:
+        if row[0] == pid:
+            return row[2]
+    return None
+
+
+def group_members(pgid: int, runner=subprocess.run):
+    rows = process_table(runner)
+    if rows is None:
+        return None
+    return [(pid, text, epoch) for pid, group, text, epoch in rows if group == pgid]
+
+
+def new_identity(proc_pid: int, timeout: int, runner=subprocess.run) -> dict:
+    """What a record keeps to recognise the run's own process group later."""
+    return {
+        "pgid": proc_pid,
+        "pgid_started_at": proc_start_marker(proc_pid, runner=runner),
+        "pgid_started_epoch": time.time(),
+        "window_secs": int(timeout) + START_WINDOW_SLACK,
+    }
+
+
+def _identity_ok(ident: dict, members) -> bool:
+    """Every member must have started inside the run's window, and the leader (when still
+    there) must carry the recorded start time. A pgid reused later fails one of the two."""
+    epoch = ident.get("pgid_started_epoch")
+    window = ident.get("window_secs")
+    if not isinstance(epoch, (int, float)) or not isinstance(window, (int, float)):
+        return False
+    for pid, text, started in members:
+        if not epoch - 5 <= started <= epoch + window:
+            return False
+        if pid == ident.get("pgid") and ident.get("pgid_started_at") not in (None, text):
+            return False
+    return True
+
+
+def group_state(record: dict, *, members_of=group_members) -> bool | None:
     """Is the recorded host process group still the run's own? True / False / None.
 
-    True only when the group exists AND its leader's start marker equals the recorded one. A
-    group that exists but cannot be verified (marker gone or different, no permission, no record
-    of one) is None: the caller reports it as running and never signals it."""
+    False: no process is left in the group. True: it has members and every one passes the
+    identity check. None: it cannot be told (ps failed, a member outside the run's start window,
+    a different leader). A None group is reported as running and never signalled."""
     pgid = record.get("pgid")
     if not isinstance(pgid, int) or pgid <= 1:
         return None
-    try:
-        killpg(pgid, 0)
-    except ProcessLookupError:
+    members = members_of(pgid)
+    if members is None:
+        return None
+    if not members:
         return False
+    return True if _identity_ok(record, members) else None
+
+
+def signal_group(record: dict, sig: int, *, killpg=os.killpg, members_of=group_members) -> bool:
+    """Signal the group only after the identity check passed just now. True when signalled."""
+    if group_state(record, members_of=members_of) is not True:
+        return False
+    try:
+        killpg(record["pgid"], sig)
     except OSError:
-        return None
-    recorded = record.get("pgid_started_at")
-    if not recorded:
-        return None
-    return True if marker_of(pgid) == recorded else None
+        return False
+    return True
 
 
 def terminate_group(
-    pgid: int, *, killpg=os.killpg, sleeper=time.sleep, grace: float = TERM_GRACE_SECS
+    record: dict,
+    *,
+    killpg=os.killpg,
+    members_of=group_members,
+    sleeper=time.sleep,
+    grace: float = TERM_GRACE_SECS,
 ) -> None:
-    """TERM the group, wait up to `grace` seconds for it to go, then KILL it. Never raises."""
-    try:
-        killpg(pgid, 15)
-    except OSError:
+    """TERM the group, wait up to `grace` seconds, then KILL it. Each signal is identity-checked
+    right before it is sent. Never raises."""
+    if not signal_group(record, 15, killpg=killpg, members_of=members_of):
         return
     waited = 0.0
     while waited < grace:
         sleeper(0.25)
         waited += 0.25
-        try:
-            killpg(pgid, 0)
-        except OSError:
-            return
+        if group_state(record, members_of=members_of) is not True:
+            break
+    signal_group(record, 9, killpg=killpg, members_of=members_of)
+
+
+def escaped_pids(base: Path, ident: dict, runner=subprocess.run) -> list[int]:
+    """Processes outside the run's group (a `setsid` child) whose working directory is inside the
+    run directory and whose start time is inside the run's window."""
     try:
-        killpg(pgid, 9)
-    except OSError:
-        pass
+        proc = runner(
+            ["lsof", "-nP", "-w", "-d", "cwd", "-Fpn"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            env=_PS_ENV,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    rows = process_table(runner)
+    if rows is None or getattr(proc, "returncode", 1) not in (0, 1):
+        return []
+    starts = {pid: epoch for pid, _g, _t, epoch in rows}
+    prefix = str(base)
+    found, pid = [], None
+    for line in (getattr(proc, "stdout", "") or "").splitlines():
+        if line.startswith("p") and line[1:].isdigit():
+            pid = int(line[1:])
+        elif line.startswith("n") and pid is not None:
+            cwd = line[1:]
+            started = starts.get(pid)
+            if (
+                (cwd == prefix or cwd.startswith(prefix + "/"))
+                and started is not None
+                and ident["pgid_started_epoch"] - 5
+                <= started
+                <= ident["pgid_started_epoch"] + ident["window_secs"]
+                and pid != os.getpid()
+            ):
+                found.append(pid)
+    return found
 
 
-def kill_run(
-    record: dict, *, killpg=os.killpg, sleeper=time.sleep, marker_of=proc_start_marker
-) -> bool:
-    """Stop a host run by its verified process group. Returns True when a group was signalled.
+def kill_escaped(base: Path, ident: dict, *, runner=subprocess.run, sleeper=time.sleep) -> None:
+    """Stop run descendants that left the process group (found by cwd, start time checked)."""
+    pids = escaped_pids(base, ident, runner)
+    for sig in (15, 9):
+        for pid in pids:
+            try:
+                os.kill(pid, sig)
+            except OSError:
+                pass
+        if sig == 15 and pids:
+            sleeper(0.5)
+
+
+def teardown(base: Path, ident: dict, **kw) -> None:
+    """Stop everything the run started: its verified group, then escaped descendants."""
+    terminate_group(ident, **{k: v for k, v in kw.items() if k != "runner"})
+    kill_escaped(base, ident, runner=kw.get("runner", subprocess.run))
+
+
+def kill_run(record: dict, **kw) -> bool:
+    """Stop a host run by its verified process group. Returns True when it was signalled.
     An unverifiable group is never signalled."""
-    if group_state(record, killpg=killpg, marker_of=marker_of) is not True:
+    if group_state(record, members_of=kw.get("members_of", group_members)) is not True:
         return False
-    terminate_group(record["pgid"], killpg=killpg, sleeper=sleeper)
+    terminate_group(record, **kw)
     return True
 
 
-def remove_run_dir(job_id: str, env=None) -> None:
-    """Delete a run's host directory (never follows a symlink; never raises)."""
-    try:
-        path = host_dir(job_id, env)
-    except ValueError:
+def remove_run_dir(record: dict, env=None) -> None:
+    """Delete a run's directory and its control directory (never follows a link; never raises)."""
+    base = host_dir_of(record, env)
+    if base is None:
         return
-    if path.exists():
-        snapshot._rmtree(path)
-    try:
-        ctl = ctl_dir(job_id, env)
-    except ValueError:
-        return
-    if ctl.exists():
-        _rm_ctl(ctl)
+    snapshot._rmtree(base)
+    _rm_ctl(base.parent / f"{base.name}.ctl")
 
 
 def _rm_ctl(ctl: Path) -> None:
-    """Remove a control directory whose files are 0400 (never follows a symlink)."""
+    """Remove a control directory whose files are 0400."""
     try:
         os.chmod(ctl, 0o700)
     except OSError:
-        pass
+        return
     snapshot._rmtree(ctl)
 
 
-def deliver_steer(job_id: str, message: str, env=None) -> bool:
-    """Append an operator correction to the run's steer file (O_NOFOLLOW, 0600)."""
+def deliver_steer(record: dict, message: str, env=None) -> bool:
+    """Append an operator correction to the run's steer file, walking the path with O_NOFOLLOW."""
+    base = host_dir_of(record, env)
+    if base is None:
+        return False
     try:
-        path = host_dir(job_id, env) / "home" / Path(STEER_FILE).name
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+        dfd = _open_dir(base, ["home"])
+    except OSError:
+        return False
+    try:
+        fd = os.open(
+            Path(STEER_FILE).name,
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=dfd,
+        )
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(message)
         return True
     except OSError:
         return False
+    finally:
+        os.close(dfd)
 
 
 # ---------------------------------------------------------------------------
@@ -670,33 +967,36 @@ def run_on_host(
     """Run the inner engine on the host; return (returncode, redacted Transcript).
 
     Same contract as `container.run_in_container` for the parts a host run has: redaction before
-    disk and callbacks, a hard wall-clock watchdog (timeout -> 124), repository setup before the
-    engine (failure -> 78), a thread session copied out on a clean exit (or on timeout when the
-    sink opts in). Snapshots, workspace export and resume need a container filesystem and are
-    refused by the caller (exit 3); a sink passed here anyway is a bug and refuses loudly.
+    disk and callbacks, a hard wall-clock deadline that also bounds the output reader (a `setsid`
+    child holding the pipe cannot hang it; timeout -> 124), repository setup before the engine
+    (failure -> 78), a thread session copied out on a clean exit (or on timeout when the sink opts
+    in). Every exit path stops the run's verified process group, and any descendant that left it,
+    before the run directory is touched. Snapshots, workspace export and resume need a container
+    filesystem and are refused by the caller (exit 3).
     """
     for name in ("resume_workspace", "workspace_sink"):
         if unsupported.get(name) is not None:
             raise ConfigError(f"FRANKY_RUNTIME=host does not support {name}")
     run_id = run_id or uuid.uuid4().hex[:12]
     os_env = os.environ if env is None else env
-    base = host_dir(run_id, runs_env)
-    real_home = Path(os.path.realpath(Path.home()))
-    if base.exists():
-        snapshot._rmtree(base)
-    base.mkdir(mode=0o700, parents=True)
-    base = Path(os.path.realpath(base))
+    root = ensure_runs_root(runs_env)
+    home_dir = real_home()
+    token = secrets.token_hex(16)
+    base = root / token
+    ctl = root / f"{token}.ctl"
+    os.mkdir(base, 0o700)
     home, work, tmp = base / "home", base / "work", base / "tmp"
     for d in (home, work, tmp):
         d.mkdir(mode=0o700)
 
-    secrets = [*cfg.secret_values(), *extra_secrets]
+    secret_values = [*cfg.secret_values(), *extra_secrets]
     output = Transcript()
-    stream = Redactor(secrets)
+    stream = Redactor(secret_values)
     pending = ""
     code = 1
-    proc = None
-    codex_store = cfg.engine.name == "codex" and bool(cfg.auth_volume)
+    ident = None
+    finished = False
+    codex_payload = None
 
     def emit(text, *, final=False):
         nonlocal pending
@@ -714,8 +1014,6 @@ def run_on_host(
             pending = ""
 
     try:
-        from .userconfig import config_file_path
-
         slug = work_slug(work)
         extract_bundle(profile_bundle, home)
         if session_tar is not None:
@@ -732,38 +1030,41 @@ def run_on_host(
                 encoding="utf-8",
             )
             os.chmod(prompt_file, 0o600)
-        if codex_store:
-            payload = _read_auth(auth_dir(runs_env) / "auth.json")
-            if payload is None:
+        if cfg.engine.name == "codex":
+            (home / ".codex").mkdir(mode=0o700, exist_ok=True)
+        if cfg.engine.name == "codex" and cfg.auth_volume:
+            codex_payload = _read_auth(auth_dir(runs_env) / "auth.json")
+            if codex_payload is None:
                 emit(
                     "franky: Codex subscription login is missing or invalid - "
                     "run `franky auth login codex`\n",
                     final=True,
                 )
                 return 1, output
-            secrets.extend(auth_strings(payload))
-            stream = Redactor(secrets)
-            (home / ".codex").mkdir(mode=0o700, exist_ok=True)
-            fd = os.open(home / ".codex" / "auth.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            secret_values.extend(auth_strings(codex_payload))
+            stream = Redactor(secret_values)
+            fd = os.open(
+                home / ".codex" / "auth.json",
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+            )
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(payload, fh)
+                json.dump(codex_payload, fh)
 
-        runs_dir = Path(os.path.realpath(base.parent))
-        ctl = ctl_dir(run_id, runs_env)
-        control = None
+        env_map = child_env(cfg, home, tmp, os_env)
+        engine_bin = resolve_engine_bin(cfg.engine.name, env_map["PATH"])
+        settings = None
         if cfg.engine.name == "claude":
-            extra_deny = (auth_dir(runs_env), config_file_path(dict(os_env)), ctl)
-            control = write_ctl_file(
-                ctl,
-                "claude-settings.json",
-                json.dumps(claude_settings(base, real_home, runs_dir, extra_deny)),
+            settings = write_ctl_file(
+                ctl, "claude-settings.json", json.dumps(claude_control_settings())
             )
-        elif cfg.engine.name == "codex":
-            control = write_ctl_file(
-                ctl,
-                "codex.sb",
-                seatbelt_profile(base, real_home, runs_dir, codex_install_roots()),
-            )
+        profile = write_ctl_file(
+            ctl,
+            "profile.sb",
+            seatbelt_profile(
+                base, home_dir, root, engine_install_roots(engine_bin, home_dir, root), settings
+            ),
+        )
         argv = [rewrite_text(a, home, work, tmp) for a in inner_argv]
         # In-image helpers become the host's own interpreter and the packaged mapper.
         argv = [
@@ -776,10 +1077,11 @@ def run_on_host(
             )
         ]
         try:
-            argv = engine_argv(argv, cfg.engine.name, control)
+            argv = engine_argv(
+                argv, cfg.engine.name, profile=profile, engine_bin=engine_bin, settings=settings
+            )
         except ValueError as exc:
             raise ConfigError(f"FRANKY_RUNTIME=host refuses: {exc}") from exc
-        env_map = child_env(cfg, home, tmp, os_env)
 
         if repo_setup is not None:
             ok, detail = _run_repo_setup(repo_setup, cfg, home, env_map, runner)
@@ -806,88 +1108,81 @@ def run_on_host(
         except OSError as exc:
             emit(f"franky: could not launch the engine ({exc.__class__.__name__})", final=True)
             return 1, output
-        jobs.update_record(
-            run_id,
-            {
-                "runtime": "host",
-                "pgid": proc.pid,
-                "pgid_started_at": proc_start_marker(proc.pid, runner=runner),
-                "host_dir": str(base),
-            },
-            runs_env,
-        )
-        watchdog_hit = threading.Event()
+        ident = new_identity(proc.pid, timeout, runner=runner)
+        jobs.update_record(run_id, {"runtime": "host", **ident, "host_dir": str(base)}, runs_env)
 
-        def _on_deadline() -> None:
-            watchdog_hit.set()
-            terminate_group(proc.pid)
+        import codecs
 
-        watchdog = threading.Timer(timeout, _on_deadline)
-        watchdog.daemon = True
-        watchdog.start()
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        fd = proc.stdout.fileno()
+        deadline = t_start + timeout
+        exited_at = None
         timed_out = False
-        try:
-            import codecs
-
-            decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-            reader = getattr(proc.stdout, "read1", None) or getattr(proc.stdout, "read", None)
-            source = iter(lambda: reader(CHUNK_SIZE), b"") if reader else iter(proc.stdout)
-            for chunk in source:
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                timed_out = True
+                break
+            ready, _, _ = select.select([fd], [], [], min(left, 0.5))
+            if ready:
+                chunk = os.read(fd, CHUNK_SIZE)
                 if not chunk:
                     break
-                emit(decoder.decode(chunk) if isinstance(chunk, bytes) else chunk)
-                if watchdog_hit.is_set() or time.monotonic() - t_start >= timeout:
-                    timed_out = True
-                    terminate_group(proc.pid)
+                emit(decoder.decode(chunk))
+            elif proc.poll() is not None:
+                # The leader is gone and nothing is left to read: a straggler holding the pipe
+                # gets a short drain, then the reader stops regardless.
+                exited_at = exited_at or time.monotonic()
+                if time.monotonic() - exited_at > DRAIN_SECS:
                     break
-        finally:
-            watchdog.cancel()
+        if not timed_out and proc.poll() is None:
             try:
-                proc.stdout.close()
-            except OSError:
-                pass
-            try:
-                proc.wait(timeout=max(1.0, timeout - (time.monotonic() - t_start)))
+                proc.wait(timeout=max(0.1, deadline - time.monotonic()))
             except subprocess.TimeoutExpired:
                 timed_out = True
-                terminate_group(proc.pid)
-                proc.wait(timeout=5)
-            emit(decoder.decode(b"", final=True), final=True)
-        if timed_out or watchdog_hit.is_set():
+        if timed_out:
+            terminate_group(ident)
+        try:
+            proc.wait(timeout=TERM_GRACE_SECS + 5)
+        except subprocess.TimeoutExpired:
+            pass
+        emit(decoder.decode(b"", final=True), final=True)
+        if timed_out:
             code = CONTAINER_TIMEOUT_CODE
             output.write("\n" + HOST_TIMEOUT_MSG.format(timeout=timeout))
         else:
-            code = proc.returncode
-        # Leftover engine processes must not outlive the run, with the tokens.
-        try:
-            os.killpg(proc.pid, 9)
-        except OSError:
-            pass
-        if session_sink is not None and (
-            code == 0 or (session_sink.get("on_timeout") and code == CONTAINER_TIMEOUT_CODE)
-        ):
-            try:
-                session_sink["status"] = copy_session(
-                    home,
-                    session_sink["paths"],
-                    session_sink["dest"],
-                    slug,
-                    max_bytes=session_sink["max_bytes"],
-                )
-            except Exception:
-                pass
-        if codex_store:
-            try:
-                _store_auth(home / ".codex" / "auth.json", auth_dir(runs_env))
-            except OSError:
-                pass
+            code = proc.returncode if proc.returncode is not None else 1
+        finished = True
     except BaseException:
         output.close()
         raise
     finally:
-        snapshot._rmtree(base)
         try:
-            _rm_ctl(ctl_dir(run_id, runs_env))
-        except OSError:
-            pass
+            if ident is not None:
+                # Stop the producers before anything is read back, and before any dir goes.
+                teardown(base, ident, runner=runner)
+                try:
+                    proc.stdout.close()
+                except (OSError, NameError, UnboundLocalError):
+                    pass
+            if finished:
+                try:
+                    if session_sink is not None and (
+                        code == 0
+                        or (session_sink.get("on_timeout") and code == CONTAINER_TIMEOUT_CODE)
+                    ):
+                        session_sink["status"] = copy_session(
+                            base,
+                            session_sink["paths"],
+                            session_sink["dest"],
+                            work_slug(work),
+                            max_bytes=session_sink["max_bytes"],
+                        )
+                    if codex_payload is not None:
+                        keep_refreshed_auth(base, codex_payload, auth_dir(runs_env))
+                except Exception:
+                    pass
+        finally:
+            snapshot._rmtree(base)
+            _rm_ctl(ctl)
     return code, output

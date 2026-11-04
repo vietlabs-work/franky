@@ -36,6 +36,7 @@ from ._install import detect_install
 from .config import (
     GH_LOGIN_VAR,
     GH_TOKEN_VAR,
+    RUNTIME_VAR,
     RUNTIMES,
     Config,
     RepoSetup,
@@ -4062,6 +4063,13 @@ def _run_pass(
         # Same funnel, different runtime: never reached by a container run. The sinks a host
         # run has no filesystem for (workspace export, resume) were refused up front.
         host_extra = {k: v for k, v in extra.items() if k not in ("docker_start", "timeout")}
+        if snapshot_sink is not None or diagnostics_sink is not None:
+            # Said, not silent: a host run keeps no workspace snapshot (so no `job resume`) and
+            # no container diagnostics.
+            _note(
+                "franky: host runtime - no workspace snapshot or container diagnostics "
+                "are kept for this run"
+            )
         code, output = hostrun.run_on_host(
             cfg,
             inner_argv,
@@ -5348,6 +5356,23 @@ def _job_liveness(record: dict) -> tuple[dict, bool | None]:
     if record.get("runtime") == "host":
         # A host run has no container: the verified process group is the liveness probe.
         container = hostrun.group_state(record)
+        if (
+            record.get("status") == "running"
+            and container is True
+            and jobs.pid_alive(record) is False
+        ):
+            # Its owner process is gone but the verified group runs on: stop it, drop its
+            # directory, and let the record say so (the run can no longer finish).
+            hostrun.kill_run(record)
+            hostrun.remove_run_dir(record)
+            container = hostrun.group_state(record)
+            if container is False:
+                jobs.update_record(
+                    record.get("job_id", ""),
+                    {"status": "killed", "ended_at": jobs.now_iso()},
+                    os.environ,
+                )
+                record = {**record, "status": "killed"}
     else:
         container = container_state(record.get("container", ""))
     snap = record.get("snapshot_path")
@@ -5465,31 +5490,33 @@ def job_logs(ctx: click.Context, job_id: str) -> None:
         ctx.exit(exc.code)
 
 
-def _host_kill_capture(record: dict, job_id: str) -> tuple[str | None, None]:
+def _host_kill_capture(record: dict, job_id: str) -> str | None:
     """`job kill` of a host run: keep a `--thread` engine session, like the container path does,
-    as a scrubbed, verified sidecar. Best-effort; the run directory is removed after."""
+    as a scrubbed, verified sidecar. Call it after the run's processes are stopped. Best-effort."""
     sid = record.get("session_id")
     kill_secrets, complete = _kill_secrets(record.get("engine"))
-    if not (complete and _valid_session_id(sid) and record.get("command") in ("build", "resume")):
-        return None, None
+    base = hostrun.host_dir_of(record)
+    if base is None or not (
+        complete and _valid_session_id(sid) and record.get("command") in ("build", "resume")
+    ):
+        return None
     try:
         tmp = _session_tmpdir(os.environ)
-        base = hostrun.host_dir(job_id)
         status = hostrun.copy_session(
-            base / "home",
+            base,
             threads.session_paths(record.get("engine"), sid),
             tmp,
-            hostrun.work_slug(Path(os.path.realpath(base)) / "work"),
+            hostrun.work_slug(base / "work"),
             max_bytes=threads.MAX_SESSION_BYTES,
         )
         if status != "ok":
             snapshot._rmtree(tmp)
-            return None, None
+            return None
         return snapshot.finalize_snapshot(
             tmp, snapshot.session_path_for(job_id, os.environ), kill_secrets
-        ), None
+        )
     except Exception:
-        return None, None
+        return None
 
 
 @job_group.command("kill")
@@ -5521,8 +5548,18 @@ def job_kill(ctx: click.Context, job_id: str, as_json: bool) -> None:
         diag: dict = {}
         snapshot_path = session_path = session_tmp = None
         host_run = record.get("runtime") == "host"
+        if host_run and hostrun.group_state(record) is None:
+            # Never mark it killed, never remove its directory, never signal a group that is not
+            # verifiably the run's own.
+            raise FrankyError(
+                f"run {job_id} is still running or its process group cannot be verified - "
+                "nothing was signalled, its directory and record are kept",
+                code=EXIT_USAGE,
+                kind="kill_unverified",
+                hint=f"see `franky job status {job_id}`",
+            )
         if record.get("status") == "running" and host_run:
-            session_path, session_tmp = _host_kill_capture(record, job_id)
+            pass  # stop first, then capture the session (below)
         elif record.get("status") == "running":
             # Scrub with the same effective secrets as a normal run (config file included).
             kill_secrets, config_loaded = _kill_secrets(record.get("engine"))
@@ -5575,7 +5612,16 @@ def job_kill(ctx: click.Context, job_id: str, as_json: bool) -> None:
                     session_status = None
         reaped = hostrun.kill_run(record) if host_run else reap_run(job_id)
         if host_run:
-            hostrun.remove_run_dir(job_id)
+            if hostrun.group_state(record) is not False:
+                raise FrankyError(
+                    f"run {job_id} did not stop - its directory and record are kept",
+                    code=EXIT_USAGE,
+                    kind="kill_unverified",
+                    hint=f"see `franky job status {job_id}`",
+                )
+            if record.get("status") == "running":
+                session_path = _host_kill_capture(record, job_id)
+            hostrun.remove_run_dir(record)
         if session_tmp is not None and not host_run:
             if session_status == "ok":
                 session_path = snapshot.finalize_snapshot(
@@ -6564,7 +6610,7 @@ def job_attach(ctx: click.Context, job_id: str, message: str | None, as_json: bo
         framed = f"\n----- operator correction -----\n{safe_msg}\n"
 
         if record.get("runtime") == "host":
-            delivered = hostrun.deliver_steer(job_id, framed)
+            delivered = hostrun.deliver_steer(record, framed)
         else:
             delivered = deliver_steer(record.get("container", ""), framed)
         if not delivered:
@@ -6865,12 +6911,20 @@ def auth_group() -> None:
 
 
 def _auth_runtime() -> str:
-    """The runtime `auth` commands act on: FRANKY_RUNTIME from the env, then the config file."""
+    """The runtime `auth` commands act on. Container mode never loads or validates the config:
+    only a FRANKY_RUNTIME value (process environment, else that one key of the config file) is
+    looked at, and only a set value is validated."""
+    value = os.environ.get(RUNTIME_VAR)
+    if value is None:
+        try:
+            value = read_config_file(config_file_path(dict(os.environ))).get(RUNTIME_VAR)
+        except ValueError:
+            value = None
+    if not value:
+        return "container"
     try:
-        env = dict(os.environ)
-        load_config_file(env)
-        return resolve_runtime(env)
-    except (ValueError, ConfigError) as exc:
+        return resolve_runtime({RUNTIME_VAR: value})
+    except ConfigError as exc:
         raise click.ClickException(str(exc)) from exc
 
 
