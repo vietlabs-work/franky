@@ -51,6 +51,42 @@ CLAUDE_ENV = {
 }
 
 
+PYTHON = next(
+    (p for p in ("/opt/homebrew/bin/python3", "/usr/bin/python3") if Path(p).exists()), ""
+)
+
+# A launchd job submission through liblaunch, from inside the sandbox. A process outside any
+# profile that runs this starts a job that touches OUTFILE outside the sandbox.
+LAUNCHD_SUBMIT = """
+import ctypes, ctypes.util, sys
+lib = ctypes.CDLL(ctypes.util.find_library("System"))
+for name in ("launch_data_alloc", "launch_data_new_string", "launch_data_new_bool",
+             "launch_data_dict_insert", "launch_data_array_set_index", "launch_msg",
+             "launch_data_get_type", "launch_data_get_errno"):
+    getattr(lib, name).restype = ctypes.c_void_p if name.startswith("launch_data_new") or name in (
+        "launch_data_alloc", "launch_msg") else ctypes.c_int
+lib.launch_data_alloc.argtypes = [ctypes.c_int]
+lib.launch_data_new_string.argtypes = [ctypes.c_char_p]
+lib.launch_data_new_bool.argtypes = [ctypes.c_bool]
+lib.launch_data_dict_insert.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p]
+lib.launch_data_array_set_index.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
+lib.launch_msg.argtypes = [ctypes.c_void_p]
+lib.launch_data_get_type.argtypes = [ctypes.c_void_p]
+lib.launch_data_get_errno.argtypes = [ctypes.c_void_p]
+job = lib.launch_data_alloc(1)
+lib.launch_data_dict_insert(job, lib.launch_data_new_string(b"com.franky.test.submit"), b"Label")
+args = lib.launch_data_alloc(2)
+lib.launch_data_array_set_index(args, lib.launch_data_new_string(b"/usr/bin/touch"), 0)
+lib.launch_data_array_set_index(args, lib.launch_data_new_string(b"OUTFILE"), 1)
+lib.launch_data_dict_insert(job, args, b"ProgramArguments")
+lib.launch_data_dict_insert(job, lib.launch_data_new_bool(True), b"RunAtLoad")
+msg = lib.launch_data_alloc(1)
+lib.launch_data_dict_insert(msg, job, b"SubmitJob")
+resp = lib.launch_msg(msg)
+sys.exit(lib.launch_data_get_errno(resp) if resp and lib.launch_data_get_type(resp) == 9 else 2)
+"""
+
+
 def _cfg(engine=None, **kw):
     cfg = Config(
         engine=engine or ClaudeEngine(),
@@ -186,10 +222,91 @@ def test_seatbelt_profile_is_deny_default_with_narrow_allows(tmp_path):
     assert any(
         "com.apple.SecurityServer" in ln and ln.startswith("(deny mach-lookup") for ln in lines
     )
+    allow_exec = next(ln for ln in lines if ln.startswith("(allow process-exec"))
+    for r in ("/usr", "/bin", "/opt/homebrew", "/opt/x/codex"):
+        assert f'(subpath "{r}")' in allow_exec
+    # Exec is never allowed from the run directory or the home.
+    assert str(run) not in allow_exec and str(home) not in allow_exec
     deny_exec = next(ln for ln in lines if ln.startswith("(deny process-exec"))
     assert "/bin/launchctl" in deny_exec and "/usr/bin/security" in deny_exec
     # Later rules win: the denies for exec and Mach services close the profile.
     assert lines.index(deny_exec) > lines.index(write)
+
+
+def test_track_descendants_follows_parent_links_and_ignores_a_reused_pid():
+    rows = [
+        (10, 1, 10, "t10", 1.0),
+        (11, 10, 10, "t11", 1.0),
+        (12, 11, 12, "t12", 1.0),  # grandchild that called setsid: own group
+        (20, 1, 20, "t20", 1.0),  # unrelated
+    ]
+    seen = {}
+    hostrun.track_descendants(10, seen, rows)
+    assert seen == {11: "t11", 12: "t12"}
+    # The child moved away from its original directory later; a second walk keeps it listed,
+    # and a pid that now has another start time is not trusted.
+    hostrun.track_descendants(10, seen, [(11, 10, 10, "OTHER", 1.0), (13, 12, 12, "t13", 1.0)])
+    assert seen[11] == "t11" and seen[13] == "t13"
+
+
+def test_kill_escaped_signals_only_pids_whose_start_time_still_matches(monkeypatch):
+    sent = []
+    monkeypatch.setattr(hostrun.os, "kill", lambda pid, sig: sent.append((pid, sig)))
+    tables = iter(
+        [
+            [(11, 10, 10, "t11", 5.0), (12, 10, 10, "t12", 5.0)],  # first read
+            [(11, 10, 10, "t11", 5.0), (12, 10, 10, "REUSED", 9.0)],  # before the TERM
+            [(11, 10, 10, "t11", 5.0), (12, 10, 10, "REUSED", 9.0)],  # before the KILL
+        ]
+    )
+    monkeypatch.setattr(hostrun, "process_table", lambda runner=None: next(tables))
+    monkeypatch.setattr(hostrun, "escaped_pids", lambda *a, **k: {})
+    hostrun.kill_escaped(Path("/x"), _ident(), seen={11: "t11", 12: "t12"}, sleeper=lambda s: None)
+    assert sent == [(11, 15), (11, 9)]
+
+
+def test_profiled_pids_finds_processes_by_the_kernels_sandbox_answer(tmp_path):
+    base, home, root = tmp_path / "r" / "a", tmp_path / "h", tmp_path / "r"
+    ident = _ident(started=100.0, window=100)
+    rows = [(50, 1, 50, "ours", 110.0), (51, 1, 51, "plain", 110.0), (52, 1, 52, "late", 900.0)]
+    answers = {
+        50: {home: 1, base / "work": 0, root: 1},  # denied the home and root, allowed its work
+        51: {home: 0, base / "work": 0, root: 0},  # not sandboxed
+        52: {home: 1, base / "work": 0, root: 1},  # sandboxed but started outside the window
+    }
+    found = hostrun.profiled_pids(
+        base, home, root, ident, rows, check=lambda pid, path: answers[pid][Path(path)]
+    )
+    assert found == {50: "ours"}
+
+
+@pytest.mark.skipif(not DARWIN, reason="needs macOS Seatbelt")
+def test_profiled_process_that_changed_directory_and_detached_is_found_and_killed(tmp_path):
+    home = Path(os.path.realpath(Path.home()))
+    root = hostrun.ensure_runs_root()
+    run = root / ("c" * 32)
+    for d in (run, run / "home", run / "work", run / "tmp"):
+        d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    profile = tmp_path / "p.sb"
+    profile.write_text(hostrun.seatbelt_profile(run, home, root, []))
+    # A child that detaches into its own session and leaves the run directory.
+    child = subprocess.Popen(
+        [REAL_SANDBOX_EXEC, "-f", str(profile), "/usr/bin/perl", "-e",
+         'use POSIX; POSIX::setsid(); chdir "/"; sleep 120'],
+        start_new_session=True,
+    )  # fmt: skip
+    ident = hostrun.new_identity(child.pid, 60)
+    ident["pgid_started_epoch"] -= 10
+    time.sleep(1.5)
+    try:
+        rows = hostrun.process_table()
+        assert child.pid in hostrun.profiled_pids(run, home, root, ident, rows)
+        hostrun.kill_escaped(run, ident, home=home, root=root, sleeper=lambda s: time.sleep(0.2))
+        assert child.wait(timeout=10) != 0
+    finally:
+        child.kill()
+        os.chmod(root, 0o700)
+        hostrun.snapshot._rmtree(root)
 
 
 def test_engine_install_roots_refuse_a_root_that_contains_the_home_or_the_runs_root(tmp_path):
@@ -217,8 +334,20 @@ def test_seatbelt_profile_probes_under_the_real_sandbox(tmp_path):
     for d in (run, run / "home", run / "work", run / "tmp"):
         d.mkdir(mode=0o700, parents=True, exist_ok=True)
     (run / "work" / "f.txt").write_text("inside")
+    (run / "work" / "ls.py").write_text(
+        LAUNCHD_SUBMIT.replace("OUTFILE", str(run / "work" / "submitted.txt"))
+    )
     profile = tmp_path / "p.sb"
     profile.write_text(hostrun.seatbelt_profile(run, home, root, []))
+    # Control: the same submission from OUTSIDE any profile works, so the probe is meaningful.
+    control = tmp_path / "control-submitted.txt"
+    script = tmp_path / "ls.py"
+    script.write_text(LAUNCHD_SUBMIT.replace("OUTFILE", str(control)))
+    ran = subprocess.run([PYTHON, str(script)], capture_output=True).returncode == 0
+    time.sleep(1.5)
+    subprocess.run(["/bin/launchctl", "remove", "com.franky.test.submit"], capture_output=True)
+    if not (ran and control.exists()):
+        pytest.skip("launchd job submission is not available outside the sandbox here")
     late = home / f".franky-probe-late-{os.getpid()}"
     other = subprocess.Popen(
         ["/bin/sh", "-c", "sleep 30"], env={"PROBE_SECRET_ENV": "leaky", "PATH": "/bin"}
@@ -233,6 +362,11 @@ def test_seatbelt_profile_probes_under_the_real_sandbox(tmp_path):
         "/bin/launchctl print gui/$(id -u) >/dev/null 2>&1; echo launchctl=$?; "
         "/usr/bin/security find-generic-password -s gh:github.com >/dev/null 2>&1; "
         "echo security=$?; "
+        f"cp /bin/launchctl {run}/tmp/lc 2>/dev/null; {run}/tmp/lc print gui/$(id -u) "
+        ">/dev/null 2>&1; echo copied_launchctl=$?; "
+        f"cp /bin/sh {run}/tmp/sh2; {run}/tmp/sh2 -c true >/dev/null 2>&1; echo copied_sh=$?; "
+        f"cp /bin/sh {run}/work/sh3; {run}/work/sh3 -c true >/dev/null 2>&1; echo copied_sh_work=$?; "
+        f"{PYTHON} {run}/work/ls.py >/dev/null 2>&1; echo python_submit=$?; "
         f"/bin/ps eww -p {other.pid} 2>&1 | grep -c PROBE_SECRET_ENV; "
         "/usr/bin/curl -s -o /dev/null -w 'tcp=%{http_code}\\n' https://api.github.com"
     )
@@ -252,6 +386,12 @@ def test_seatbelt_profile_probes_under_the_real_sandbox(tmp_path):
         assert "rundir_write=1" in out
         assert "launchctl=0" not in out and "launchctl=" in out
         assert "security=0" not in out and "security=" in out
+        assert "copied_launchctl=0" not in out and "copied_launchctl=" in out
+        # Nothing a run drops in its own directories can be executed.
+        assert "copied_sh=0" not in out and "copied_sh_work=0" not in out
+        assert "copied_sh=" in out and "copied_sh_work=" in out
+        assert "python_submit=0" not in out and "python_submit=" in out
+        assert not (run / "work" / "submitted.txt").exists()
         assert "PROBE_SECRET_ENV" not in out and "\n0\n" in out  # no env of other processes
         # A file that exists in the home is unreadable too (not only the ones made later).
         read = subprocess.run(
@@ -717,12 +857,28 @@ def test_codex_host_auth_store_login_status_logout(tmp_path):
     assert hostrun.codex_auth_ready() is False
 
 
-def _codex_run(tmp_path, refreshed):
+def _jwt(**claims):
+    import base64
+
+    def seg(obj):
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).decode().rstrip("=")
+
+    return f"{seg({'alg': 'none'})}.{seg(claims)}.sig"
+
+
+def _auth(access, account="acct-1", sub="user-1", claim=None):
+    claims = {"sub": sub}
+    if claim is not None:
+        claims["https://api.openai.com/auth"] = {"chatgpt_account_id": claim}
+    return json.dumps(
+        {"tokens": {"access_token": access, "account_id": account, "id_token": _jwt(**claims)}}
+    )
+
+
+def _codex_run(tmp_path, original, refreshed):
     store = hostrun.auth_dir()
     store.mkdir(mode=0o700, parents=True)
-    (store / "auth.json").write_text(
-        '{"tokens": {"access": "oldtoken1234", "account_id": "acct-1"}}'
-    )
+    (store / "auth.json").write_text(original)
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     stub = bin_dir / "codex"
@@ -748,19 +904,37 @@ def _codex_run(tmp_path, refreshed):
     return code, "".join(out.chunks()), store
 
 
-def test_codex_run_uses_the_host_store_and_keeps_a_refreshed_token_of_the_same_account(tmp_path):
-    code, text, store = _codex_run(
-        tmp_path, '{"tokens": {"access": "newtoken5678", "account_id": "acct-1"}}'
-    )
-    assert code == 0 and "oldtoken1234" not in text and "***REDACTED***" in text
-    assert json.loads((store / "auth.json").read_text())["tokens"]["access"] == "newtoken5678"
+def _stored_access(store):
+    return json.loads((store / "auth.json").read_text())["tokens"]["access_token"]
 
 
-def test_codex_run_discards_an_auth_file_of_another_account(tmp_path):
-    _code, _text, store = _codex_run(
-        tmp_path, '{"tokens": {"access": "attacker-token", "account_id": "acct-2"}}'
-    )
-    assert json.loads((store / "auth.json").read_text())["tokens"]["access"] == "oldtoken1234"
+def test_codex_run_uses_the_host_store_and_keeps_a_refreshed_token_of_the_same_login(tmp_path):
+    code, text, store = _codex_run(tmp_path, _auth("old-access-1234"), _auth("new-access-5678"))
+    assert code == 0 and "old-access-1234" not in text and "***REDACTED***" in text
+    assert _stored_access(store) == "new-access-5678"
+
+
+@pytest.mark.parametrize(
+    "refreshed",
+    [
+        _auth("attacker-token", account="acct-2"),  # another account
+        _auth("attacker-token", sub="user-2"),  # same account id, another subject
+        _auth("attacker-token", claim="acct-9"),  # account claim disagrees with tokens.account_id
+        '{"account_id": "acct-1", "tokens": {"access_token": "attacker-token"}}',  # wrong path
+        "not json at all",
+    ],
+)
+def test_codex_run_discards_a_refreshed_auth_file_that_is_not_the_same_login(tmp_path, refreshed):
+    _code, _text, store = _codex_run(tmp_path, _auth("old-access-1234"), refreshed)
+    assert _stored_access(store) == "old-access-1234"
+
+
+def test_auth_identity_needs_every_field_and_agreeing_claims():
+    assert hostrun.auth_identity(json.loads(_auth("a"))) == ("acct-1", "user-1", None)
+    assert hostrun.auth_identity(json.loads(_auth("a", claim="acct-1")))[2] == "acct-1"
+    assert hostrun.auth_identity({"tokens": {"account_id": "x"}}) is None
+    assert hostrun.auth_identity({"tokens": {"id_token": "a.b.c", "account_id": "x"}}) is None
+    assert hostrun.auth_identity({}) is None
 
 
 # ---------------------------------------------------------------- cli wiring

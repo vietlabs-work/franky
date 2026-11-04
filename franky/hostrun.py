@@ -70,6 +70,18 @@ _DENY_EXEC = (
     "/usr/bin/sandbox-exec",
     "/usr/bin/ssh-add",
 )
+# Exec is allowed only from read-only system and install roots the run cannot write, never from
+# the run's own home, work or tmp (nothing a run drops there can be started, a copied launchctl
+# included). Scripts still run through an interpreter in these roots (`sh script.sh`).
+_EXEC_ROOTS = (
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/System",
+    "/Library",
+    "/opt/homebrew",
+    "/Applications",
+)
 _MACH_SERVICES = (
     "com.apple.system.opendirectoryd.libinfo",
     "com.apple.logd",
@@ -266,7 +278,9 @@ def seatbelt_profile(
     L = [
         "(version 1)",
         "(deny default)",
-        "(allow process-exec)",
+        "(allow process-exec "
+        + " ".join(f"(subpath {_sb(r)})" for r in (*_EXEC_ROOTS, *install_roots))
+        + ")",
         "(allow process-fork)",
         "(allow signal (target same-sandbox))",
         "(allow process-info* (target same-sandbox))",
@@ -591,19 +605,41 @@ def auth_strings(payload: dict) -> list[str]:
     return out
 
 
-def account_id(payload: dict) -> str | None:
-    """The account id an auth payload names (`account_id` anywhere in it), or None."""
-    pending: list = [payload]
-    while pending:
-        value = pending.pop()
-        if isinstance(value, dict):
-            found = value.get("account_id")
-            if isinstance(found, str) and found:
-                return found
-            pending.extend(value.values())
-        elif isinstance(value, list):
-            pending.extend(value)
-    return None
+def _jwt_claims(token) -> dict | None:
+    """The claims of a JWT, decoded WITHOUT verifying it. Used only to compare two logins."""
+    import base64
+
+    if not isinstance(token, str) or token.count(".") != 2:
+        return None
+    try:
+        body = token.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    return claims if isinstance(claims, dict) else None
+
+
+def auth_identity(payload: dict) -> tuple[str, str, str | None] | None:
+    """Who an auth payload says it is: `tokens.account_id`, the id token's `sub`, and (when the
+    id token carries one) its account claim, which must equal `tokens.account_id`. None on any
+    doubt: a missing field, an unreadable token, a claim that disagrees."""
+    tokens = payload.get("tokens")
+    if not isinstance(tokens, dict):
+        return None
+    account = tokens.get("account_id")
+    claims = _jwt_claims(tokens.get("id_token"))
+    if not isinstance(account, str) or not account or claims is None:
+        return None
+    sub = claims.get("sub")
+    if not isinstance(sub, str) or not sub:
+        return None
+    auth_claim = claims.get("https://api.openai.com/auth")
+    claimed = None
+    if isinstance(auth_claim, dict) and "chatgpt_account_id" in auth_claim:
+        claimed = auth_claim["chatgpt_account_id"]
+        if not isinstance(claimed, str) or claimed != account:
+            return None
+    return account, sub, claimed
 
 
 def codex_auth_ready(env=None) -> bool:
@@ -656,11 +692,12 @@ def _store_auth(payload: dict, store: Path) -> bool:
 
 
 def keep_refreshed_auth(base: Path, original: dict, store: Path) -> bool:
-    """After a run: keep the engine's refreshed `auth.json` only when it names the same
-    account as the login copied in. The run could have replaced the file with anything."""
-    wanted = account_id(original)
+    """After a run: keep the engine's refreshed `auth.json` only when it names the same login as
+    the one copied in (account id, id-token subject and account claim all equal). The run could
+    have replaced the file with anything; any doubt means nothing is persisted."""
+    wanted = auth_identity(original)
     after = _parse_auth(read_file_nofollow(base, ["home", ".codex", "auth.json"], _AUTH_MAX_BYTES))
-    if wanted is None or after is None or account_id(after) != wanted:
+    if wanted is None or after is None or auth_identity(after) != wanted:
         return False
     return _store_auth(after, store)
 
@@ -684,11 +721,11 @@ def _lstart_epoch(text: str) -> float | None:
         return None
 
 
-def process_table(runner=subprocess.run) -> list[tuple[int, int, str, float]] | None:
-    """Every process as (pid, pgid, lstart text, start epoch), or None when `ps` fails."""
+def process_table(runner=subprocess.run) -> list[tuple[int, int, int, str, float]] | None:
+    """Every process as (pid, ppid, pgid, lstart text, start epoch), or None when `ps` fails."""
     try:
         proc = runner(
-            ["ps", "-axo", "pid=,pgid=,lstart="],
+            ["ps", "-axo", "pid=,ppid=,pgid=,lstart="],
             capture_output=True,
             text=True,
             timeout=10,
@@ -700,21 +737,22 @@ def process_table(runner=subprocess.run) -> list[tuple[int, int, str, float]] | 
         return None
     rows = []
     for line in (getattr(proc, "stdout", "") or "").splitlines():
-        parts = line.split(None, 2)
-        if len(parts) != 3 or not parts[0].isdigit() or not parts[1].isdigit():
+        parts = line.split(None, 3)
+        if len(parts) != 4 or not all(x.isdigit() for x in parts[:3]):
             continue
-        epoch = _lstart_epoch(parts[2])
+        epoch = _lstart_epoch(parts[3])
         if epoch is not None:
-            rows.append((int(parts[0]), int(parts[1]), " ".join(parts[2].split()), epoch))
+            rows.append(
+                (int(parts[0]), int(parts[1]), int(parts[2]), " ".join(parts[3].split()), epoch)
+            )
     return rows
 
 
 def proc_start_marker(pid: int, runner=subprocess.run) -> str | None:
     """The process start time text of `pid` (`ps lstart`), a reuse guard."""
-    rows = process_table(runner)
-    for row in rows or []:
+    for row in process_table(runner) or []:
         if row[0] == pid:
-            return row[2]
+            return row[3]
     return None
 
 
@@ -722,7 +760,7 @@ def group_members(pgid: int, runner=subprocess.run):
     rows = process_table(runner)
     if rows is None:
         return None
-    return [(pid, text, epoch) for pid, group, text, epoch in rows if group == pgid]
+    return [(pid, text, epoch) for pid, _pp, group, text, epoch in rows if group == pgid]
 
 
 def new_identity(proc_pid: int, timeout: int, runner=subprocess.run) -> dict:
@@ -799,9 +837,69 @@ def terminate_group(
     signal_group(record, 9, killpg=killpg, members_of=members_of)
 
 
-def escaped_pids(base: Path, ident: dict, runner=subprocess.run) -> list[int]:
-    """Processes outside the run's group (a `setsid` child) whose working directory is inside the
-    run directory and whose start time is inside the run's window."""
+def _in_window(ident: dict, epoch: float) -> bool:
+    return (
+        ident["pgid_started_epoch"] - 5
+        <= epoch
+        <= ident["pgid_started_epoch"] + ident["window_secs"]
+    )
+
+
+def track_descendants(leader: int, seen: dict, rows) -> None:
+    """Add every descendant of the leader (and of anything already seen) to `seen`, keyed by pid
+    with its start time text, by walking the parent links. Called while the leader is alive: a
+    child that later detaches or changes directory is still on the list."""
+    children: dict[int, list] = {}
+    for pid, ppid, _g, text, _e in rows:
+        children.setdefault(ppid, []).append((pid, text))
+    stack = [leader, *seen]
+    done = set()
+    while stack:
+        parent = stack.pop()
+        if parent in done:
+            continue
+        done.add(parent)
+        for pid, text in children.get(parent, []):
+            if seen.setdefault(pid, text) == text:
+                stack.append(pid)
+
+
+def _sandbox_check():
+    """`sandbox_check(pid, "file-read-data", PATH, path)` from libsystem_sandbox, or None."""
+    try:
+        import ctypes
+
+        fn = ctypes.CDLL("/usr/lib/system/libsystem_sandbox.dylib").sandbox_check
+        fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+        fn.restype = ctypes.c_int
+    except (OSError, AttributeError, ImportError):
+        return None
+    return lambda pid, path: fn(pid, b"file-read-data", 1, os.fsencode(str(path)))
+
+
+def profiled_pids(base: Path, home: Path, root: Path, ident: dict, rows, check=None) -> dict:
+    """Every process under this run's profile, found by asking the kernel: the home and the runs
+    root are denied to it and the run's own work directory is allowed. Operator processes that are
+    not sandboxed (or sit in another sandbox) fail the test. Start time must be inside the run's
+    window."""
+    check = check or _sandbox_check()
+    if check is None:
+        return {}
+    found = {}
+    for pid, _pp, _g, text, epoch in rows:
+        if pid == os.getpid() or not _in_window(ident, epoch):
+            continue
+        try:
+            if check(pid, home) and not check(pid, base / "work") and check(pid, root):
+                found[pid] = text
+        except Exception:
+            continue
+    return found
+
+
+def escaped_pids(base: Path, ident: dict, rows, runner=subprocess.run) -> dict:
+    """Processes whose working directory is inside the run directory, start time inside the
+    run's window: {pid: start time text}."""
     try:
         proc = runner(
             ["lsof", "-nP", "-w", "-d", "cwd", "-Fpn"],
@@ -811,48 +909,77 @@ def escaped_pids(base: Path, ident: dict, runner=subprocess.run) -> list[int]:
             env=_PS_ENV,
         )
     except (OSError, subprocess.SubprocessError):
-        return []
-    rows = process_table(runner)
-    if rows is None or getattr(proc, "returncode", 1) not in (0, 1):
-        return []
-    starts = {pid: epoch for pid, _g, _t, epoch in rows}
+        return {}
+    if getattr(proc, "returncode", 1) not in (0, 1):
+        return {}
+    starts = {pid: (text, epoch) for pid, _pp, _g, text, epoch in rows}
     prefix = str(base)
-    found, pid = [], None
+    found, pid = {}, None
     for line in (getattr(proc, "stdout", "") or "").splitlines():
         if line.startswith("p") and line[1:].isdigit():
             pid = int(line[1:])
-        elif line.startswith("n") and pid is not None:
+        elif line.startswith("n") and pid is not None and pid != os.getpid():
             cwd = line[1:]
-            started = starts.get(pid)
+            known = starts.get(pid)
             if (
                 (cwd == prefix or cwd.startswith(prefix + "/"))
-                and started is not None
-                and ident["pgid_started_epoch"] - 5
-                <= started
-                <= ident["pgid_started_epoch"] + ident["window_secs"]
-                and pid != os.getpid()
+                and known
+                and _in_window(ident, known[1])
             ):
-                found.append(pid)
+                found[pid] = known[0]
     return found
 
 
-def kill_escaped(base: Path, ident: dict, *, runner=subprocess.run, sleeper=time.sleep) -> None:
-    """Stop run descendants that left the process group (found by cwd, start time checked)."""
-    pids = escaped_pids(base, ident, runner)
+def kill_escaped(
+    base: Path,
+    ident: dict,
+    *,
+    seen: dict | None = None,
+    home: Path | None = None,
+    root: Path | None = None,
+    runner=subprocess.run,
+    sleeper=time.sleep,
+    check=None,
+) -> None:
+    """Stop run descendants that left the process group. Candidates: processes seen as
+    descendants of the leader (same start time as when seen), processes under the run's profile
+    (asked of the kernel) and processes with their working directory in the run directory. The
+    start time is re-read and compared right before each signal."""
+    rows = process_table(runner)
+    if rows is None:
+        return
+    cands: dict[int, str] = {}
+    current = {pid: text for pid, _pp, _g, text, _e in rows}
+    for pid, text in (seen or {}).items():
+        if current.get(pid) == text and pid != os.getpid():
+            cands[pid] = text
+    if home is not None and root is not None:
+        cands.update(profiled_pids(base, home, root, ident, rows, check))
+    cands.update(escaped_pids(base, ident, rows, runner))
     for sig in (15, 9):
-        for pid in pids:
-            try:
-                os.kill(pid, sig)
-            except OSError:
-                pass
-        if sig == 15 and pids:
+        if not cands:
+            return
+        rows = process_table(runner) or []
+        current = {pid: text for pid, _pp, _g, text, _e in rows}
+        for pid, text in cands.items():
+            if current.get(pid) == text:
+                try:
+                    os.kill(pid, sig)
+                except OSError:
+                    pass
+        if sig == 15:
             sleeper(0.5)
 
 
 def teardown(base: Path, ident: dict, **kw) -> None:
     """Stop everything the run started: its verified group, then escaped descendants."""
-    terminate_group(ident, **{k: v for k, v in kw.items() if k != "runner"})
-    kill_escaped(base, ident, runner=kw.get("runner", subprocess.run))
+    group_kw = {k: kw[k] for k in ("killpg", "members_of", "sleeper", "grace") if k in kw}
+    terminate_group(ident, **group_kw)
+    kill_escaped(
+        base,
+        ident,
+        **{k: kw[k] for k in ("seen", "home", "root", "runner", "check") if k in kw},
+    )
 
 
 def kill_run(record: dict, **kw) -> bool:
@@ -995,6 +1122,7 @@ def run_on_host(
     pending = ""
     code = 1
     ident = None
+    seen: dict = {}
     finished = False
     codex_payload = None
 
@@ -1118,7 +1246,15 @@ def run_on_host(
         deadline = t_start + timeout
         exited_at = None
         timed_out = False
+        next_walk = 0.0
         while True:
+            if time.monotonic() >= next_walk and proc.poll() is None:
+                # Walk the parent links while the leader is alive, so a child that later
+                # detaches or changes directory is still on the list at teardown.
+                table = process_table(runner)
+                if table is not None:
+                    track_descendants(proc.pid, seen, table)
+                next_walk = time.monotonic() + 2.0
             left = deadline - time.monotonic()
             if left <= 0:
                 timed_out = True
@@ -1160,7 +1296,7 @@ def run_on_host(
         try:
             if ident is not None:
                 # Stop the producers before anything is read back, and before any dir goes.
-                teardown(base, ident, runner=runner)
+                teardown(base, ident, runner=runner, seen=seen, home=home_dir, root=root)
                 try:
                     proc.stdout.close()
                 except (OSError, NameError, UnboundLocalError):
