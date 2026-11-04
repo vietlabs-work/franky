@@ -5345,34 +5345,36 @@ def job_group() -> None:
 
 
 def _run_alive(record: dict) -> bool:
-    """Is the run's container (or, for a host run, its verified process group) running?"""
+    """Is the run's container (or, for a host run, a process proven to be its own) running?"""
     if record.get("runtime") == "host":
-        return hostrun.group_state(record) is True
+        return hostrun.run_state(record) is True
     return container_running(record.get("container", ""))
 
 
 def _job_liveness(record: dict) -> tuple[dict, bool | None]:
     """Probe a run (owner pid, docker, snapshot) and derive its state + next step."""
     if record.get("runtime") == "host":
-        # A host run has no container: the verified process group is the liveness probe.
-        container = hostrun.group_state(record)
+        # A host run has no container: kernel sandbox evidence is the liveness probe.
+        container = hostrun.run_state(record)
         if (
             record.get("status") == "running"
-            and container is True
+            and container is not None
             and jobs.pid_alive(record) is False
         ):
-            # Its owner process is gone but the verified group runs on: stop it, drop its
-            # directory, and let the record say so (the run can no longer finish).
-            hostrun.kill_run(record)
-            hostrun.remove_run_dir(record)
-            container = hostrun.group_state(record)
-            if container is False:
+            # Its owner process is gone, so nothing will finish it: stop whatever is proven to be
+            # its own, and only when that is confirmed clean drop its directory and say so. An
+            # unconfirmed stop keeps the directory and the record, and the state stays unknown.
+            if hostrun.teardown_record(record) == hostrun.CLEAN:
+                hostrun.remove_run_dir(record)
                 jobs.update_record(
                     record.get("job_id", ""),
                     {"status": "killed", "ended_at": jobs.now_iso()},
                     os.environ,
                 )
                 record = {**record, "status": "killed"}
+                container = False
+            else:
+                container = None
     else:
         container = container_state(record.get("container", ""))
     snap = record.get("snapshot_path")
@@ -5548,18 +5550,19 @@ def job_kill(ctx: click.Context, job_id: str, as_json: bool) -> None:
         diag: dict = {}
         snapshot_path = session_path = session_tmp = None
         host_run = record.get("runtime") == "host"
-        if host_run and hostrun.group_state(record) is None:
-            # Never mark it killed, never remove its directory, never signal a group that is not
-            # verifiably the run's own.
-            raise FrankyError(
-                f"run {job_id} is still running or its process group cannot be verified - "
-                "nothing was signalled, its directory and record are kept",
-                code=EXIT_USAGE,
-                kind="kill_unverified",
-                hint=f"see `franky job status {job_id}`",
-            )
+        if host_run:
+            # One teardown for every caller. Only "clean" lets the session be captured and the
+            # directory removed; anything else keeps the run and its record.
+            if hostrun.teardown_record(record) != hostrun.CLEAN:
+                raise FrankyError(
+                    f"run {job_id} is still running or cannot be verified stopped - "
+                    "its directory and record are kept",
+                    code=EXIT_USAGE,
+                    kind="kill_unverified",
+                    hint=f"see `franky job status {job_id}`",
+                )
         if record.get("status") == "running" and host_run:
-            pass  # stop first, then capture the session (below)
+            pass  # stopped above; the session is captured below
         elif record.get("status") == "running":
             # Scrub with the same effective secrets as a normal run (config file included).
             kill_secrets, config_loaded = _kill_secrets(record.get("engine"))
@@ -5610,15 +5613,8 @@ def job_kill(ctx: click.Context, job_id: str, as_json: bool) -> None:
                     )
                 except Exception:
                     session_status = None
-        reaped = hostrun.kill_run(record) if host_run else reap_run(job_id)
+        reaped = True if host_run else reap_run(job_id)
         if host_run:
-            if hostrun.group_state(record) is not False:
-                raise FrankyError(
-                    f"run {job_id} did not stop - its directory and record are kept",
-                    code=EXIT_USAGE,
-                    kind="kill_unverified",
-                    hint=f"see `franky job status {job_id}`",
-                )
             if record.get("status") == "running":
                 session_path = _host_kill_capture(record, job_id)
             hostrun.remove_run_dir(record)

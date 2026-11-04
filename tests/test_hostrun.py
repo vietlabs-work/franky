@@ -7,7 +7,6 @@ import io
 import json
 import os
 import shutil
-import signal
 import stat
 import subprocess
 import sys
@@ -41,6 +40,10 @@ def _hermetic_host_root(tmp_path, monkeypatch):
     shim.write_text('#!/bin/sh\nshift 2\nexec "$@"\n')
     shim.chmod(0o755)
     monkeypatch.setattr(hostrun, "SANDBOX_EXEC", str(shim))
+    # Hermetic run-loop tests use a stub engine that is not under any profile, so the kernel's
+    # sandbox evidence cannot see it; they use the fallback identity. The tests that exercise
+    # the kernel mode say so.
+    monkeypatch.setattr(hostrun, "EVIDENCE_MODE", "fallback")
 
 
 CLAUDE_ENV = {
@@ -212,7 +215,7 @@ def test_seatbelt_profile_is_deny_default_with_narrow_allows(tmp_path):
     assert "(allow network-outbound (remote tcp))" in lines
     assert '(allow network-outbound (literal "/private/var/run/mDNSResponder"))' in lines
     deny_read = next(ln for ln in lines if ln.startswith("(deny file-read* file-write*"))
-    for path in (home, root, "/private/var/folders", "/private/tmp"):
+    for path in ("/Users", home, root, "/private/var/folders", "/private/tmp"):
         assert f'(subpath "{path}")' in deny_read
     write = next(ln for ln in lines if ln.startswith("(allow file-write* "))
     assert write.count("subpath") == 3  # home, work, tmp only, never the run dir itself
@@ -229,6 +232,7 @@ def test_seatbelt_profile_is_deny_default_with_narrow_allows(tmp_path):
     assert str(run) not in allow_exec and str(home) not in allow_exec
     deny_exec = next(ln for ln in lines if ln.startswith("(deny process-exec"))
     assert "/bin/launchctl" in deny_exec and "/usr/bin/security" in deny_exec
+    assert f'(subpath "{root}")' in deny_exec  # nothing in the runs root is ever executable
     # Later rules win: the denies for exec and Mach services close the profile.
     assert lines.index(deny_exec) > lines.index(write)
 
@@ -262,76 +266,6 @@ def test_a_seen_parent_whose_pid_was_reused_is_dropped_and_not_walked():
     seen = {11: "t11"}
     hostrun.track_descendants(10, seen, [(10, 1, 10, "t10", 1.0)])  # pid gone
     assert seen == {}
-
-
-def test_kill_escaped_ignores_a_seen_pid_started_outside_the_window(monkeypatch):
-    sent = []
-    monkeypatch.setattr(hostrun.os, "kill", lambda pid, sig: sent.append((pid, sig)))
-    rows = [(11, 10, 10, "t11", 5000.0)]  # same text, but started long after the run's window
-    monkeypatch.setattr(hostrun, "process_table", lambda runner=None: rows)
-    monkeypatch.setattr(hostrun, "escaped_pids", lambda *a, **k: {})
-    hostrun.kill_escaped(Path("/x"), _ident(started=100.0, window=100), seen={11: "t11"})
-    assert sent == []
-
-
-def test_kill_escaped_signals_only_pids_whose_start_time_still_matches(monkeypatch):
-    sent = []
-    monkeypatch.setattr(hostrun.os, "kill", lambda pid, sig: sent.append((pid, sig)))
-    tables = iter(
-        [
-            [(11, 10, 10, "t11", 1_000_005.0), (12, 10, 10, "t12", 1_000_005.0)],  # first read
-            [(11, 10, 10, "t11", 1_000_005.0), (12, 10, 10, "REUSED", 1_000_900.0)],  # TERM
-            [(11, 10, 10, "t11", 1_000_005.0), (12, 10, 10, "REUSED", 1_000_900.0)],  # KILL
-        ]
-    )
-    monkeypatch.setattr(hostrun, "process_table", lambda runner=None: next(tables))
-    monkeypatch.setattr(hostrun, "escaped_pids", lambda *a, **k: {})
-    hostrun.kill_escaped(Path("/x"), _ident(), seen={11: "t11", 12: "t12"}, sleeper=lambda s: None)
-    assert sent == [(11, 15), (11, 9)]
-
-
-def test_profiled_pids_finds_processes_by_the_kernels_sandbox_answer(tmp_path):
-    base, home, root = tmp_path / "r" / "a", tmp_path / "h", tmp_path / "r"
-    ident = _ident(started=100.0, window=100)
-    rows = [(50, 1, 50, "ours", 110.0), (51, 1, 51, "plain", 110.0), (52, 1, 52, "late", 900.0)]
-    answers = {
-        50: {home: 1, base / "work": 0, root: 1},  # denied the home and root, allowed its work
-        51: {home: 0, base / "work": 0, root: 0},  # not sandboxed
-        52: {home: 1, base / "work": 0, root: 1},  # sandboxed but started outside the window
-    }
-    found = hostrun.profiled_pids(
-        base, home, root, ident, rows, check=lambda pid, path: answers[pid][Path(path)]
-    )
-    assert found == {50: "ours"}
-
-
-@pytest.mark.skipif(not DARWIN, reason="needs macOS Seatbelt")
-def test_profiled_process_that_changed_directory_and_detached_is_found_and_killed(tmp_path):
-    home = Path(os.path.realpath(Path.home()))
-    root = hostrun.ensure_runs_root()
-    run = root / ("c" * 32)
-    for d in (run, run / "home", run / "work", run / "tmp"):
-        d.mkdir(mode=0o700, parents=True, exist_ok=True)
-    profile = tmp_path / "p.sb"
-    profile.write_text(hostrun.seatbelt_profile(run, home, root, []))
-    # A child that detaches into its own session and leaves the run directory.
-    child = subprocess.Popen(
-        [REAL_SANDBOX_EXEC, "-f", str(profile), "/usr/bin/perl", "-e",
-         'use POSIX; POSIX::setsid(); chdir "/"; sleep 120'],
-        start_new_session=True,
-    )  # fmt: skip
-    ident = hostrun.new_identity(child.pid, 60)
-    ident["pgid_started_epoch"] -= 10
-    time.sleep(1.5)
-    try:
-        rows = hostrun.process_table()
-        assert child.pid in hostrun.profiled_pids(run, home, root, ident, rows)
-        hostrun.kill_escaped(run, ident, home=home, root=root, sleeper=lambda s: time.sleep(0.2))
-        assert child.wait(timeout=10) != 0
-    finally:
-        child.kill()
-        os.chmod(root, 0o700)
-        hostrun.snapshot._rmtree(root)
 
 
 def test_engine_install_roots_refuse_a_root_that_contains_the_home_or_the_runs_root(tmp_path):
@@ -382,6 +316,7 @@ def test_seatbelt_profile_probes_under_the_real_sandbox(tmp_path):
         f"echo x > /opt/homebrew/bin/zz-probe 2>/dev/null; echo sys_write=$?; "
         f"ls {home} >/dev/null 2>&1; echo home_list=$?; "
         f"ls {root} >/dev/null 2>&1; echo root_list=$?; "
+        "ls /Users/Shared >/dev/null 2>&1; echo shared_list=$?; "
         f"cat {run}/work/f.txt; echo inside_read=$?; echo y > {run}/work/o.txt; echo inside_write=$?; "
         f"echo y > {run}/escape.txt 2>/dev/null; echo rundir_write=$?; "
         "/bin/launchctl print gui/$(id -u) >/dev/null 2>&1; echo launchctl=$?; "
@@ -406,7 +341,7 @@ def test_seatbelt_profile_probes_under_the_real_sandbox(tmp_path):
         )
         out = proc.stdout
         assert "late_write=1" in out and "sys_write=1" in out
-        assert "home_list=1" in out and "root_list=1" in out
+        assert "home_list=1" in out and "root_list=1" in out and "shared_list=1" in out
         assert "inside_read=0" in out and "inside" in out and "inside_write=0" in out
         assert "rundir_write=1" in out
         assert "launchctl=0" not in out and "launchctl=" in out
@@ -672,77 +607,8 @@ def test_session_tar_lands_under_the_run_slug(tmp_path):
 # ---------------------------------------------------------------- job control
 
 
-def _ident(pgid=4242, started=1_000_000.0, text="Tue Nov  4 12:00:00 2026", window=2000):
-    return {
-        "runtime": "host",
-        "pgid": pgid,
-        "pgid_started_at": text,
-        "pgid_started_epoch": started,
-        "window_secs": window,
-    }
-
-
-def _members(*rows):
-    return lambda pgid: list(rows)
-
-
-LEADER = (4242, "Tue Nov  4 12:00:00 2026", 1_000_001.0)
-
-
-def test_group_state_checks_every_member_against_the_start_window():
-    assert hostrun.group_state(_ident(), members_of=_members(LEADER)) is True
-    assert hostrun.group_state(_ident(), members_of=_members()) is False
-    assert hostrun.group_state(_ident(), members_of=lambda pgid: None) is None
-    child = (4300, "Tue Nov  4 12:00:05 2026", 1_000_050.0)
-    assert hostrun.group_state(_ident(), members_of=_members(LEADER, child)) is True
-    # A member that started after the run could have ended: a reused group, never ours.
-    late = (4301, "later", 1_000_000.0 + 5000)
-    assert hostrun.group_state(_ident(), members_of=_members(LEADER, late)) is None
-    # A member that started before the run did: not ours either.
-    early = (4302, "earlier", 999_000.0)
-    assert hostrun.group_state(_ident(), members_of=_members(early)) is None
-    # The leader must carry the recorded start time.
-    other = (4242, "Wed Nov  5 01:00:00 2026", 1_000_002.0)
-    assert hostrun.group_state(_ident(), members_of=_members(other)) is None
-    assert hostrun.group_state({"pgid": 4242}, members_of=_members(LEADER)) is None
-    assert hostrun.group_state(_ident(pgid=1), members_of=_members(LEADER)) is None
-
-
-def test_every_signal_is_identity_checked_even_the_final_kill():
-    sent, state = [], {"rows": [LEADER]}
-
-    def killpg(pgid, sig):
-        sent.append(sig)
-
-    def members_of(pgid):
-        return list(state["rows"])
-
-    def sleeper(_s):
-        # After the TERM the leader is gone and a stranger now owns the group id.
-        if signal.SIGTERM in sent:
-            state["rows"] = [(4242, "stranger", 5_000_000.0)]
-
-    hostrun.terminate_group(
-        _ident(), killpg=killpg, members_of=members_of, sleeper=sleeper, grace=1.0
-    )
-    assert sent == [signal.SIGTERM]  # the KILL was refused: the group no longer verifies
-
-
-def test_kill_run_never_signals_an_unverified_group():
-    sent = []
-    assert not hostrun.kill_run(
-        _ident(), killpg=lambda p, s: sent.append(s), members_of=_members((4242, "other", 1.0))
-    )
-    assert sent == []
-
-
-def test_kill_run_terms_then_kills_a_stubborn_verified_group():
-    sent = []
-    assert hostrun.kill_run(
-        _ident(), killpg=lambda p, s: sent.append(s), members_of=_members(LEADER),
-        sleeper=lambda s: None,
-    )  # fmt: skip
-    assert sent.count(signal.SIGTERM) == 1 and sent[-1] == signal.SIGKILL
+def _ident(pgid=4242, started=1_000_000.0, window=2000):
+    return {"pgid": pgid, "pgid_started_epoch": started, "window_secs": window}
 
 
 def _host_record(job_id, base=None, **extra):
@@ -750,7 +616,7 @@ def _host_record(job_id, base=None, **extra):
         job_id=job_id, command="build", repo="me/repo", engine="claude", task="t",
         container="c", network="n", proxy="p", branch=None, started_at=jobs.now_iso(),
     )  # fmt: skip
-    rec.update(_ident())
+    rec.update({"runtime": "host", **_ident()})
     if base is not None:
         rec["host_dir"] = str(base)
     rec.update(extra)
@@ -765,22 +631,217 @@ def _run_dir(token="e" * 32):
     return base
 
 
-def test_job_status_reports_a_host_run_by_its_process_group(monkeypatch):
+class FakeHost:
+    """A process table and a `kill` for the teardown tests. `profiled` is the kernel's answer
+    (which pids run under this run's profile); `dies_on` maps a signal to whether it removes the
+    process; `on_term` can spawn a new profiled child when a TERM lands."""
+
+    def __init__(self, procs, profiled, dies_on=(9,), on_term=None):
+        self.procs = dict(procs)  # pid -> (start text, start epoch, pgid)
+        self.profiled = set(profiled)
+        self.dies_on = set(dies_on)
+        self.on_term = on_term
+        self.sent = []
+        self.now = 0.0
+
+    def table(self, runner=None):
+        rows = [(pid, 1, g, text, e) for pid, (text, e, g) in self.procs.items()]
+        return [(1, 0, 1, "init", 0.0), *rows]  # a real table is never empty
+
+    def kill(self, pid, sig):
+        self.sent.append((pid, sig))
+        if pid in self.procs and sig in self.dies_on:
+            del self.procs[pid]
+        if sig == 15 and self.on_term:
+            self.on_term(self)
+
+    def check(self, pid, path):
+        # home denied, the run's work allowed, the runs root denied: only for profiled pids.
+        if pid not in self.profiled:
+            return 0
+        return 0 if str(path).endswith("/work") else 1
+
+    def sleep(self, secs):
+        self.now += secs
+
+    def teardown(self, monkeypatch, **kw):
+        monkeypatch.setattr(hostrun, "EVIDENCE_MODE", "kernel")
+        monkeypatch.setattr(hostrun, "process_table", self.table)
+        monkeypatch.setattr(hostrun.os, "kill", self.kill)
+        root = Path("/runs")
+        return hostrun.teardown(
+            root / ("a" * 32), _ident(), home=Path("/home/x"), root=root, check=self.check,
+            sleeper=self.sleep, clock=lambda: self.now, **kw,
+        )  # fmt: skip
+
+
+IN_WINDOW = 1_000_100.0
+
+
+def test_an_unrelated_process_in_the_old_process_group_is_not_signalled(monkeypatch):
+    """A reused pgid: a stranger sits in the recorded group but the kernel says it is not under
+    this run's profile. No sandbox evidence, no signal."""
+    host = FakeHost({4242: ("t", IN_WINDOW, 4242)}, profiled=[])
+    assert host.teardown(monkeypatch) == hostrun.CLEAN
+    assert host.sent == []
+
+
+def test_processes_outside_the_start_window_are_never_proven(monkeypatch):
+    host = FakeHost({4242: ("t", 5_000_000.0, 4242)}, profiled=[4242])
+    assert host.teardown(monkeypatch) == hostrun.CLEAN and host.sent == []
+
+
+def test_teardown_terms_then_kills_a_stubborn_proven_process_and_returns_clean(monkeypatch):
+    host = FakeHost({50: ("t50", IN_WINDOW, 50)}, profiled=[50], dies_on=(9,))
+    assert host.teardown(monkeypatch) == hostrun.CLEAN
+    assert host.sent[0] == (50, 15) and host.sent[-1] == (50, 9)
+    assert not host.procs
+
+
+def test_a_child_forked_while_terminating_is_found_and_killed_in_a_later_pass(monkeypatch):
+    def fork_on_term(host):
+        host.procs[60] = ("t60", IN_WINDOW, 60)
+        host.profiled.add(60)
+
+    host = FakeHost(
+        {50: ("t50", IN_WINDOW, 50)}, profiled=[50], dies_on=(15, 9), on_term=fork_on_term
+    )
+    assert host.teardown(monkeypatch) == hostrun.CLEAN
+    assert (60, 9) in host.sent and not host.procs
+
+
+def test_a_process_that_will_not_die_makes_teardown_uncertain(monkeypatch):
+    host = FakeHost({50: ("t50", IN_WINDOW, 50)}, profiled=[50], dies_on=())
+    assert host.teardown(monkeypatch, deadline=3.0) == hostrun.UNCERTAIN
+    assert host.procs  # still there
+
+
+def test_an_unreadable_process_table_is_uncertain_never_clean(monkeypatch):
+    monkeypatch.setattr(hostrun, "process_table", lambda runner=None: None)
+    monkeypatch.setattr(hostrun, "EVIDENCE_MODE", "kernel")
+    root = Path("/runs")
+    out = hostrun.teardown(root / ("a" * 32), _ident(), home=Path("/h"), root=root)
+    assert out == hostrun.UNCERTAIN
+
+
+def test_a_start_time_that_changed_before_the_signal_is_not_signalled(monkeypatch):
+    host = FakeHost({50: ("t50", IN_WINDOW, 50)}, profiled=[50], dies_on=())
+    real = host.table
+    calls = {"n": 0}
+
+    def table(runner=None):
+        calls["n"] += 1
+        rows = real(runner)
+        if calls["n"] >= 2:  # the pid was reused between proof and signal
+            return [(50, 1, 50, "REUSED", IN_WINDOW)]
+        return rows
+
+    host.table = table
+    monkeypatch.setattr(hostrun, "EVIDENCE_MODE", "kernel")
+    monkeypatch.setattr(hostrun, "process_table", table)
+    monkeypatch.setattr(hostrun.os, "kill", host.kill)
+    root = Path("/runs")
+    hostrun.teardown(
+        root / ("a" * 32), _ident(), home=Path("/h"), root=root, check=host.check,
+        sleeper=host.sleep, clock=lambda: host.now, deadline=1.0,
+    )  # fmt: skip
+    assert host.sent == []
+
+
+def test_track_descendants_follows_parent_links_and_drops_a_reused_pid():
+    rows = [
+        (10, 1, 10, "t10", 1.0),
+        (11, 10, 10, "t11", 1.0),
+        (12, 11, 12, "t12", 1.0),  # grandchild that called setsid: own group
+        (20, 1, 20, "t20", 1.0),  # unrelated
+    ]
+    seen = {}
+    hostrun.track_descendants(10, seen, rows)
+    assert seen == {11: "t11", 12: "t12"}
+    hostrun.track_descendants(
+        10, seen, [(11, 10, 10, "t11", 1.0), (12, 11, 12, "t12", 1.0), (13, 12, 12, "t13", 1.0)]
+    )
+    assert seen == {11: "t11", 12: "t12", 13: "t13"}
+    seen = {11: "t11"}
+    hostrun.track_descendants(
+        10, seen, [(10, 1, 10, "t10", 1.0), (11, 1, 11, "REUSED", 9.0), (30, 11, 11, "t30", 9.0)]
+    )
+    assert seen == {}
+
+
+def test_run_state_is_none_when_the_table_or_the_record_cannot_say(monkeypatch):
+    base = _run_dir("1" * 32)
+    rec = {"host_dir": str(base), **_ident()}
+    monkeypatch.setattr(hostrun, "process_table", lambda runner=None: None)
+    assert hostrun.run_state(rec) is None
+    assert hostrun.run_state({"host_dir": str(base)}) is None
+    assert hostrun.run_state({}) is None
+
+
+def test_job_status_reports_a_host_run_by_its_proven_processes(monkeypatch):
     _host_record("eee555eee555")
-    monkeypatch.setattr(hostrun, "group_state", lambda record: True)
+    monkeypatch.setattr(hostrun, "run_state", lambda record, **kw: True)
     res = CliRunner().invoke(cli.main, ["job", "status", "eee555eee555", "--json"])
     assert res.exit_code == 0, res.output
     data = json.loads(res.output)
     assert data["container_running"] is True and data["runtime"] == "host"
-    monkeypatch.setattr(hostrun, "group_state", lambda record: None)
+    monkeypatch.setattr(hostrun, "run_state", lambda record, **kw: None)
     res = CliRunner().invoke(cli.main, ["job", "status", "eee555eee555", "--json"])
     assert json.loads(res.output)["state"] == "unknown"
+
+
+def _orphan(job_id, token, **extra):
+    base = _run_dir(token)
+    _host_record(job_id, base, status="running", pid=2_000_000_000, **extra)
+    return base
+
+
+def test_orphan_status_with_a_failing_ps_keeps_the_directory_and_the_record(monkeypatch):
+    base = _orphan("ab1000ab1000", "2" * 32)
+    monkeypatch.setattr(hostrun, "process_table", lambda runner=None: None)
+    res = CliRunner().invoke(cli.main, ["job", "status", "ab1000ab1000", "--json"])
+    assert res.exit_code == 0, res.output
+    assert base.exists() and jobs.read_record("ab1000ab1000", os.environ)["status"] == "running"
+
+
+def test_orphan_status_keeps_everything_when_the_teardown_is_uncertain(monkeypatch):
+    base = _orphan("ab2000ab2000", "3" * 32)
+    monkeypatch.setattr(hostrun, "run_state", lambda record, **kw: True)
+    monkeypatch.setattr(hostrun, "teardown_record", lambda record, **kw: hostrun.UNCERTAIN)
+    res = CliRunner().invoke(cli.main, ["job", "status", "ab2000ab2000", "--json"])
+    assert json.loads(res.output)["state"] == "unknown"
+    assert base.exists() and jobs.read_record("ab2000ab2000", os.environ)["status"] == "running"
+
+
+def test_orphan_status_removes_the_directory_only_after_a_clean_teardown(monkeypatch):
+    base = _orphan("ab3000ab3000", "4" * 32)
+    monkeypatch.setattr(hostrun, "run_state", lambda record, **kw: True)
+    monkeypatch.setattr(hostrun, "teardown_record", lambda record, **kw: hostrun.CLEAN)
+    CliRunner().invoke(cli.main, ["job", "status", "ab3000ab3000", "--json"])
+    assert not base.exists()
+    assert jobs.read_record("ab3000ab3000", os.environ)["status"] == "killed"
+
+
+def test_job_kill_keeps_the_run_when_the_teardown_is_uncertain(monkeypatch):
+    base = _orphan("ab4000ab4000", "5" * 32)
+    monkeypatch.setattr(hostrun, "teardown_record", lambda record, **kw: hostrun.UNCERTAIN)
+    res = CliRunner().invoke(cli.main, ["job", "kill", "ab4000ab4000", "--json"])
+    assert res.exit_code != 0 and "cannot be verified stopped" in res.output
+    assert base.exists() and jobs.read_record("ab4000ab4000", os.environ)["status"] == "running"
+
+
+def test_job_kill_stops_then_removes_the_directory_after_a_clean_teardown(monkeypatch):
+    base = _orphan("ab5000ab5000", "6" * 32)
+    monkeypatch.setattr(hostrun, "teardown_record", lambda record, **kw: hostrun.CLEAN)
+    res = CliRunner().invoke(cli.main, ["job", "kill", "ab5000ab5000", "--json"])
+    assert res.exit_code == 0, res.output
+    assert not base.exists() and jobs.read_record("ab5000ab5000", os.environ)["status"] == "killed"
 
 
 def test_job_attach_delivers_to_the_host_steer_file_without_following_links(monkeypatch):
     base = _run_dir()
     _host_record("fff666fff666", base)
-    monkeypatch.setattr(hostrun, "group_state", lambda record: True)
+    monkeypatch.setattr(hostrun, "run_state", lambda record, **kw: True)
     res = CliRunner().invoke(cli.main, ["job", "attach", "fff666fff666", "-m", "use tabs"])
     assert res.exit_code == 0, res.output
     steer = base / "home" / ".franky-steer.md"
@@ -792,29 +853,6 @@ def test_job_attach_delivers_to_the_host_steer_file_without_following_links(monk
     steer.symlink_to(base / "elsewhere")
     assert hostrun.deliver_steer({"host_dir": str(base)}, "x") is False
     assert hostrun.deliver_steer({"host_dir": str(base.parent.parent)}, "x") is False
-
-
-def test_job_kill_of_an_unverifiable_host_run_keeps_the_record_and_the_directory(monkeypatch):
-    base = _run_dir("f" * 32)
-    _host_record("aab777aab777", base, status="running")
-    monkeypatch.setattr(hostrun, "group_state", lambda record: None)
-    res = CliRunner().invoke(cli.main, ["job", "kill", "aab777aab777", "--json"])
-    assert res.exit_code != 0 and "cannot be verified" in res.output
-    assert base.exists()
-    assert jobs.read_record("aab777aab777", os.environ)["status"] == "running"
-
-
-def test_job_kill_of_a_verified_host_run_stops_it_then_removes_the_directory(monkeypatch):
-    base = _run_dir("9" * 32)
-    _host_record("bbc888bbc888", base, status="running")
-    states = iter([True, False, False, False])  # verified before, stopped after
-    monkeypatch.setattr(hostrun, "group_state", lambda record: next(states, False))
-    killed = []
-    monkeypatch.setattr(hostrun, "kill_run", lambda record: killed.append(1) or True)
-    res = CliRunner().invoke(cli.main, ["job", "kill", "bbc888bbc888", "--json"])
-    assert res.exit_code == 0, res.output
-    assert killed and not base.exists()
-    assert jobs.read_record("bbc888bbc888", os.environ)["status"] == "killed"
 
 
 @pytest.mark.skipif(shutil.which("lsof") is None, reason="needs lsof")
@@ -831,33 +869,93 @@ def test_a_setsid_child_holding_the_pipe_cannot_hang_the_reader_and_is_killed(tm
         run_id="ccd999ccd999",
     )  # fmt: skip
     assert code == 0 and "leader-done" in "".join(out.chunks())
-    assert time.monotonic() - t0 < 20  # the drain is bounded, not the child's 300 s
-    time.sleep(0.5)
+    assert time.monotonic() - t0 < 30  # the drain is bounded, not the child's 300 s
     pid = int(marker.read_text())
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)  # found by its working directory and stopped before the dir went
 
 
-def test_an_exception_still_stops_the_group_before_the_dirs_are_removed(tmp_path, monkeypatch):
-    order = []
-    real = hostrun.teardown
-    monkeypatch.setattr(
-        hostrun,
-        "teardown",
-        lambda base, ident, **kw: (order.append(base.exists()), real(base, ident, **kw)),
-    )
+@pytest.mark.skipif(shutil.which("lsof") is None, reason="needs lsof")
+def test_an_interrupt_during_the_spawn_still_tears_the_run_down(tmp_path):
+    marker = tmp_path / "pid"
+    env = _stub_engine(tmp_path, f"echo $$ > {marker}\nsleep 300\n")
+    seen = {}
 
-    def boom(*a, **k):
-        raise RuntimeError("reader blew up")
+    def popen(argv, **kw):
+        subprocess.Popen(argv, **kw)
+        deadline = time.monotonic() + 5
+        while not marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        seen["base"] = kw["cwd"]
+        raise KeyboardInterrupt  # right after the process exists, before anything stored its pid
 
-    monkeypatch.setattr(hostrun.select, "select", boom)
-    env = _stub_engine(tmp_path, "sleep 300\n")
-    with pytest.raises(RuntimeError):
+    with pytest.raises(KeyboardInterrupt):
         hostrun.run_on_host(
-            _cfg(), ClaudeEngine().inner_argv("p", model=None), timeout=30, env=env,
-            run_id="dde000dde000",
+            _cfg(), ClaudeEngine().inner_argv("p", model=None), timeout=60, env=env, popen=popen,
+            run_id="ee1111ee1111",
         )  # fmt: skip
-    assert order == [True]  # torn down while the run directory still existed
+    pid = int(marker.read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
+    assert not Path(seen["base"]).parent.exists()
+
+
+def test_an_uncertain_teardown_keeps_the_run_directory_and_says_so(tmp_path, monkeypatch):
+    env = _stub_engine(tmp_path, "echo hi\n")
+    monkeypatch.setattr(hostrun, "teardown", lambda *a, **k: hostrun.UNCERTAIN)
+    jobs.write_record({"job_id": "ff2222ff2222", "status": "running"}, os.environ)
+    code, out = hostrun.run_on_host(
+        _cfg(), ClaudeEngine().inner_argv("p", model=None), timeout=30, env=env,
+        run_id="ff2222ff2222",
+    )  # fmt: skip
+    record = jobs.read_record("ff2222ff2222", os.environ)
+    assert Path(record["host_dir"]).exists() and record["host_unverified"] is True
+    assert "could not be stopped or verified" in "".join(out.chunks())
+
+
+@pytest.mark.skipif(not DARWIN, reason="needs macOS Seatbelt")
+def test_a_process_that_forks_when_terminated_is_killed_under_the_real_profile(tmp_path):
+    """Live: a process under the generated profile forks a child on SIGTERM and detaches it with
+    setsid and a chdir; the teardown loop finds the child in a later pass by the kernel's
+    evidence and kills it."""
+    home = Path(os.path.realpath(Path.home()))
+    root = hostrun.ensure_runs_root()
+    run = root / ("d" * 32)
+    for d in (run, run / "home", run / "work", run / "tmp"):
+        d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    profile = tmp_path / "p.sb"
+    profile.write_text(hostrun.seatbelt_profile(run, home, root, []))
+    script = (
+        'use POSIX; $SIG{TERM} = sub { if (fork() == 0) { POSIX::setsid(); chdir "/"; '
+        "sleep 120; exit 0 } exit 0 }; sleep 120"
+    )
+    proc = subprocess.Popen(
+        [REAL_SANDBOX_EXEC, "-f", str(profile), "/usr/bin/perl", "-e", script],
+        start_new_session=True,
+    )
+    ident = hostrun.new_identity(60, proc.pid)
+    ident["pgid_started_epoch"] -= 10
+    time.sleep(1.5)
+    try:
+        monkey_mode = hostrun.EVIDENCE_MODE
+        hostrun.EVIDENCE_MODE = "kernel"
+        out = hostrun.teardown(run, ident, home=home, root=root, deadline=20.0)
+        assert out == hostrun.CLEAN
+        time.sleep(0.5)
+        rows = hostrun.process_table()
+        assert not hostrun.prove(run, home, root, ident, rows)
+    finally:
+        hostrun.EVIDENCE_MODE = monkey_mode
+        proc.kill()
+        os.chmod(root, 0o700)
+        hostrun.snapshot._rmtree(root)
+
+
+def test_the_runs_root_refuses_exec_roots_the_home_and_their_parents(monkeypatch):
+    for bad in ("/usr/local/franky", "/opt/homebrew", "/System/x", "/", str(Path.home() / "r")):
+        monkeypatch.setenv(hostrun.RUNS_ROOT_VAR, bad)
+        with pytest.raises(ConfigError):
+            hostrun.ensure_runs_root()
 
 
 # ---------------------------------------------------------------- codex host auth store

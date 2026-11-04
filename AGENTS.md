@@ -154,8 +154,7 @@ The term list lives outside the repo: the Actions secret `FRANKY_PRIVATE_TERMS` 
 - Host mode (macOS only) must refuse, with exit 3, when its Seatbelt profile cannot run. It never runs unsandboxed and never uses the bypass flags the container uses. One outer `(deny default)` profile confines both engines; never rely on an engine's own settings or sandbox as the boundary.
 - Container mode must stay byte-identical: `run_in_container` gets the same arguments with `FRANKY_RUNTIME` unset (`tests/test_hostrun.py` pins it).
 - Host run directories live in a dedicated 0300 root outside the home, one 128-bit random name per run. Settings and profile sit in a 0400 `<run>.ctl` directory outside every writable root.
-- Every host signal is preceded by an identity check (start window and leader start time). Stop the run's processes before reading anything back or removing a directory; walk every host-side path into a run with `O_NOFOLLOW` from a directory fd.
-- Host exec is allowed only from read-only system and install roots, never from the run's directories. If launchd ever accepts a job submission from inside the profile, the runtime is non-confining: stop and say so.
+- A process belongs to a host run only on the kernel's sandbox evidence (`sandbox_check` under that run's profile). Pgid, start time, parent links and cwd only discover candidates. Every caller uses `hostrun.teardown`; capture and directory removal happen only when it returns `clean`, and `uncertain` keeps the run and its record. Walk every host-side path into a run with `O_NOFOLLOW` from a directory fd.
 - Never persist anything a host run wrote to its Codex `auth.json`: only `franky auth login codex` writes the host store.
 - Host mode builds the child environment from scratch (git and gh configuration pointed inside the run) and extracts bundles as regular files only.
 

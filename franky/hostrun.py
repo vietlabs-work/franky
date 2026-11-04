@@ -47,7 +47,7 @@ PRIVATE_PROMPT_PATH = "/tmp/franky-private-prompt"
 CONTAINER_SLUG = "-work"
 
 HOST_TIMEOUT_MSG = "franky: host run timed out after {timeout}s"
-TERM_GRACE_SECS = 5.0
+TERM_GRACE_SECS = 2.0
 DRAIN_SECS = 1.5
 # A run's processes start no later than this after the recorded start (timeout + setup + slack).
 START_WINDOW_SLACK = 600
@@ -130,6 +130,12 @@ def ensure_runs_root(env=None) -> Path:
         raise ConfigError(
             f"{RUNS_ROOT_VAR} must be outside your home directory - refusing ({root})"
         )
+    for forbidden in (*_EXEC_ROOTS, real_home()):
+        f = Path(forbidden)
+        if root == f or _under(root, f) or _under(f, root):
+            raise ConfigError(
+                f"{RUNS_ROOT_VAR} must not equal, sit inside or contain {f} - refusing ({root})"
+            )
     try:
         if not os.path.lexists(root):
             parent.mkdir(parents=True, exist_ok=True)
@@ -193,6 +199,11 @@ def preflight(cfg, which=shutil.which, platform: str = sys.platform) -> None:
     if cfg.engine.name == "codex" and cfg.auth_volume and not codex_auth_ready(None):
         raise ConfigError(
             "Codex subscription login is missing or invalid - run `franky auth login codex`"
+        )
+    if EVIDENCE_MODE == "kernel" and _sandbox_check() is None:
+        raise ConfigError(
+            "FRANKY_RUNTIME=host needs libsystem_sandbox (sandbox_check) to identify a run's "
+            "processes - refusing"
         )
     ensure_runs_root()
 
@@ -291,10 +302,12 @@ def seatbelt_profile(
         '"kern.hostname" "kern.argmax" "kern.maxfilesperproc" "kern.ngroups" "kern.boottime" '
         '"kern.secure_kernel" "vm.loadavg"))',
         "(allow file-read*)",
-        "(deny file-read* file-write* "
+        '(deny file-read* file-write* (subpath "/Users") '
         f"(subpath {_sb(home)}) (subpath {_sb(root)}) "
         '(subpath "/private/var/folders") (subpath "/private/tmp") (subpath "/private/var/tmp"))',
-        f"(allow file-read-metadata (literal {_sb(root)}))",
+        # Path resolution of the run's own directory still needs these names, and nothing beside.
+        '(allow file-read-metadata (literal "/Users") (literal "/Users/Shared") '
+        f"(literal {_sb(root)}))",
     ]
     for r in install_roots:
         L.append(f"(allow file-read* (subpath {_sb(r)}))")
@@ -313,7 +326,9 @@ def seatbelt_profile(
         "(allow network-outbound (remote tcp))",
         '(allow network-outbound (literal "/private/var/run/mDNSResponder"))',
         "(allow mach-lookup (global-name " + " ".join(f'"{n}"' for n in _MACH_SERVICES) + "))",
-        "(deny process-exec " + " ".join(f"(literal {_sb(p)})" for p in _DENY_EXEC) + ")",
+        f"(deny process-exec (subpath {_sb(root)}) "
+        + " ".join(f"(literal {_sb(p)})" for p in _DENY_EXEC)
+        + ")",
         '(deny mach-lookup (global-name-prefix "com.apple.SecurityServer") '
         '(global-name-prefix "com.apple.security") (global-name-prefix "com.apple.xpc.launchd"))',
     ]
@@ -660,10 +675,22 @@ def codex_auth_logout(env=None) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Job control: process group identity (macOS has no /proc)
+# Job control: the kernel's sandbox evidence is the run identity
 # ---------------------------------------------------------------------------
+#
+# A process belongs to a run only when the kernel says it runs under THIS run's profile
+# (`sandbox_check`: the home and the runs root are denied to it, the run's own `work` directory
+# is allowed; another run's process is denied this run's directory, an unsandboxed one is allowed
+# the home). The process group, a start time and a working directory only help find candidates;
+# none of them authorizes a signal. Every caller uses `teardown`.
 
 _PS_ENV = {"LC_ALL": "C", "PATH": "/bin:/usr/bin:/usr/sbin:/sbin"}
+TEARDOWN_DEADLINE_SECS = 10.0
+CLEAN, UNCERTAIN = "clean", "uncertain"
+# "kernel": sandbox_check decides. "fallback" (not macOS, so only the hermetic tests): a process
+# is the run's when it is in the leader's process group, was seen below the leader, or has its
+# working directory in the run.
+EVIDENCE_MODE = "kernel" if sys.platform == "darwin" else "fallback"
 
 
 def _lstart_epoch(text: str) -> float | None:
@@ -697,112 +724,29 @@ def process_table(runner=subprocess.run) -> list[tuple[int, int, int, str, float
             rows.append(
                 (int(parts[0]), int(parts[1]), int(parts[2]), " ".join(parts[3].split()), epoch)
             )
-    return rows
+    return rows or None
 
 
-def proc_start_marker(pid: int, runner=subprocess.run) -> str | None:
-    """The process start time text of `pid` (`ps lstart`), a reuse guard."""
-    for row in process_table(runner) or []:
-        if row[0] == pid:
-            return row[3]
-    return None
-
-
-def group_members(pgid: int, runner=subprocess.run):
-    rows = process_table(runner)
-    if rows is None:
-        return None
-    return [(pid, text, epoch) for pid, _pp, group, text, epoch in rows if group == pgid]
-
-
-def new_identity(proc_pid: int, timeout: int, runner=subprocess.run) -> dict:
-    """What a record keeps to recognise the run's own process group later."""
+def new_identity(timeout: int, pgid: int | None = None) -> dict:
+    """What identifies the run's time window. Made BEFORE the engine is spawned, so an interrupt
+    at any point still reaches `teardown`; `pgid` is filled in after the spawn (a hint only)."""
     return {
-        "pgid": proc_pid,
-        "pgid_started_at": proc_start_marker(proc_pid, runner=runner),
+        "pgid": pgid,
         "pgid_started_epoch": time.time(),
         "window_secs": int(timeout) + START_WINDOW_SLACK,
     }
 
 
-def _identity_ok(ident: dict, members) -> bool:
-    """Every member must have started inside the run's window, and the leader (when still
-    there) must carry the recorded start time. A pgid reused later fails one of the two."""
-    epoch = ident.get("pgid_started_epoch")
-    window = ident.get("window_secs")
-    if not isinstance(epoch, (int, float)) or not isinstance(window, (int, float)):
-        return False
-    for pid, text, started in members:
-        if not epoch - 5 <= started <= epoch + window:
-            return False
-        if pid == ident.get("pgid") and ident.get("pgid_started_at") not in (None, text):
-            return False
-    return True
-
-
-def group_state(record: dict, *, members_of=group_members) -> bool | None:
-    """Is the recorded host process group still the run's own? True / False / None.
-
-    False: no process is left in the group. True: it has members and every one passes the
-    identity check. None: it cannot be told (ps failed, a member outside the run's start window,
-    a different leader). A None group is reported as running and never signalled."""
-    pgid = record.get("pgid")
-    if not isinstance(pgid, int) or pgid <= 1:
-        return None
-    members = members_of(pgid)
-    if members is None:
-        return None
-    if not members:
-        return False
-    return True if _identity_ok(record, members) else None
-
-
-def signal_group(record: dict, sig: int, *, killpg=os.killpg, members_of=group_members) -> bool:
-    """Signal the group only after the identity check passed just now. True when signalled."""
-    if group_state(record, members_of=members_of) is not True:
-        return False
-    try:
-        killpg(record["pgid"], sig)
-    except OSError:
-        return False
-    return True
-
-
-def terminate_group(
-    record: dict,
-    *,
-    killpg=os.killpg,
-    members_of=group_members,
-    sleeper=time.sleep,
-    grace: float = TERM_GRACE_SECS,
-) -> None:
-    """TERM the group, wait up to `grace` seconds, then KILL it. Each signal is identity-checked
-    right before it is sent. Never raises."""
-    if not signal_group(record, 15, killpg=killpg, members_of=members_of):
-        return
-    waited = 0.0
-    while waited < grace:
-        sleeper(0.25)
-        waited += 0.25
-        if group_state(record, members_of=members_of) is not True:
-            break
-    signal_group(record, 9, killpg=killpg, members_of=members_of)
-
-
 def _in_window(ident: dict, epoch: float) -> bool:
-    return (
-        ident["pgid_started_epoch"] - 5
-        <= epoch
-        <= ident["pgid_started_epoch"] + ident["window_secs"]
-    )
+    start = ident["pgid_started_epoch"]
+    return start - 5 <= epoch <= start + ident["window_secs"]
 
 
 def track_descendants(leader: int, seen: dict, rows) -> None:
     """Add every descendant of the leader (and of anything already seen) to `seen`, keyed by pid
-    with its start time text, by walking the parent links. Called while the leader is alive: a
-    child that later detaches or changes directory is still on the list. A parent already in
-    `seen` is walked only while its current start time still equals the recorded one; one whose
-    pid is gone or reused is dropped, so a reused pid never pulls in unrelated processes."""
+    with its start time text, walking the parent links. A parent already in `seen` is walked only
+    while its current start time still equals the recorded one; one whose pid is gone or reused is
+    dropped, so a reused pid never pulls in unrelated processes. A discovery hint only."""
     current = {pid: text for pid, _pp, _g, text, _e in rows}
     for pid in [p for p, text in seen.items() if current.get(p) != text]:
         del seen[pid]
@@ -834,29 +778,7 @@ def _sandbox_check():
     return lambda pid, path: fn(pid, b"file-read-data", 1, os.fsencode(str(path)))
 
 
-def profiled_pids(base: Path, home: Path, root: Path, ident: dict, rows, check=None) -> dict:
-    """Every process under this run's profile, found by asking the kernel: the home and the runs
-    root are denied to it and the run's own work directory is allowed. Operator processes that are
-    not sandboxed (or sit in another sandbox) fail the test. Start time must be inside the run's
-    window."""
-    check = check or _sandbox_check()
-    if check is None:
-        return {}
-    found = {}
-    for pid, _pp, _g, text, epoch in rows:
-        if pid == os.getpid() or not _in_window(ident, epoch):
-            continue
-        try:
-            if check(pid, home) and not check(pid, base / "work") and check(pid, root):
-                found[pid] = text
-        except Exception:
-            continue
-    return found
-
-
-def escaped_pids(base: Path, ident: dict, rows, runner=subprocess.run) -> dict:
-    """Processes whose working directory is inside the run directory, start time inside the
-    run's window: {pid: start time text}."""
+def _cwd_pids(base: Path, runner) -> set[int]:
     try:
         proc = runner(
             ["lsof", "-nP", "-w", "-d", "cwd", "-Fpn"],
@@ -866,87 +788,172 @@ def escaped_pids(base: Path, ident: dict, rows, runner=subprocess.run) -> dict:
             env=_PS_ENV,
         )
     except (OSError, subprocess.SubprocessError):
-        return {}
-    if getattr(proc, "returncode", 1) not in (0, 1):
-        return {}
-    starts = {pid: (text, epoch) for pid, _pp, _g, text, epoch in rows}
-    prefix = str(base)
-    found, pid = {}, None
+        return set()
+    out, pid = set(), None
     for line in (getattr(proc, "stdout", "") or "").splitlines():
         if line.startswith("p") and line[1:].isdigit():
             pid = int(line[1:])
-        elif line.startswith("n") and pid is not None and pid != os.getpid():
-            cwd = line[1:]
-            known = starts.get(pid)
-            if (
-                (cwd == prefix or cwd.startswith(prefix + "/"))
-                and known
-                and _in_window(ident, known[1])
-            ):
-                found[pid] = known[0]
-    return found
+        elif line.startswith("n") and pid is not None:
+            if line[1:] == str(base) or line[1:].startswith(str(base) + "/"):
+                out.add(pid)
+    return out
 
 
-def kill_escaped(
+def prove(
+    base: Path,
+    home: Path,
+    root: Path,
+    ident: dict,
+    rows,
+    *,
+    seen: dict | None = None,
+    check=None,
+    runner=subprocess.run,
+) -> dict[int, str]:
+    """The processes proven to belong to this run: {pid: start time text}.
+
+    Kernel mode: a process whose start is inside the run's window and for which `sandbox_check`
+    says the home and the runs root are denied while the run's own `work` directory is allowed.
+    Fallback mode (hermetic tests off macOS): leader's group, seen descendants, cwd in the run."""
+    me = os.getpid()
+    candidates = [r for r in rows if r[0] != me and _in_window(ident, r[4])]
+    if EVIDENCE_MODE == "kernel":
+        check = check or _sandbox_check()
+        if check is None:
+            return {}
+        proven = {}
+        for pid, _pp, _g, text, _e in candidates:
+            try:
+                if check(pid, home) and not check(pid, base / "work") and check(pid, root):
+                    proven[pid] = text
+            except Exception:
+                continue
+        return proven
+    cwd = _cwd_pids(base, runner)
+    return {
+        pid: text
+        for pid, _pp, group, text, _e in candidates
+        if group == ident.get("pgid") or pid in cwd or (seen or {}).get(pid) == text
+    }
+
+
+def _signal(pids: dict[int, str], sig: int, runner) -> None:
+    """Signal each pid whose start time, re-read just now, still equals the proven one."""
+    rows = process_table(runner) or []
+    current = {pid: text for pid, _pp, _g, text, _e in rows}
+    for pid, text in pids.items():
+        if current.get(pid) == text:
+            try:
+                os.kill(pid, sig)
+            except OSError:
+                pass
+
+
+def teardown(
     base: Path,
     ident: dict,
     *,
+    home: Path,
+    root: Path,
     seen: dict | None = None,
-    home: Path | None = None,
-    root: Path | None = None,
+    check=None,
     runner=subprocess.run,
     sleeper=time.sleep,
-    check=None,
-) -> None:
-    """Stop run descendants that left the process group. Candidates: processes seen as
-    descendants of the leader (same start time as when seen), processes under the run's profile
-    (asked of the kernel) and processes with their working directory in the run directory. The
-    start time is re-read and compared right before each signal."""
+    deadline: float = TEARDOWN_DEADLINE_SECS,
+    clock=time.monotonic,
+) -> str:
+    """Stop every process proven to belong to the run: discover, TERM, then KILL, repeating until
+    a pass proves nothing. Returns "clean" (nothing of the run is left) or "uncertain" (the
+    deadline passed with a process still alive, or the process table could not be read). Callers
+    capture and remove directories only on "clean". Interrupt-safe: SIGINT and SIGTERM are held
+    for the duration (main thread only)."""
+    restore = _mask_interrupts()
+    try:
+        start = clock()
+        term_at = None
+        while True:
+            rows = process_table(runner)
+            if rows is None:
+                return UNCERTAIN
+            if seen is not None and ident.get("pgid"):
+                track_descendants(ident["pgid"], seen, rows)
+            proven = prove(base, home, root, ident, rows, seen=seen, check=check, runner=runner)
+            if not proven:
+                return CLEAN
+            if clock() - start > deadline:
+                return UNCERTAIN
+            if term_at is None:
+                _signal(proven, 15, runner)
+                term_at = clock()
+            elif clock() - term_at >= TERM_GRACE_SECS:
+                _signal(proven, 9, runner)
+            sleeper(0.25)
+    finally:
+        restore()
+
+
+def _mask_interrupts():
+    """Ignore SIGINT and SIGTERM until the returned callable restores them; a no-op off the main
+    thread."""
+    import signal as _signal_mod
+
+    try:
+        old = {
+            sig: _signal_mod.signal(sig, _signal_mod.SIG_IGN)
+            for sig in (_signal_mod.SIGINT, _signal_mod.SIGTERM)
+        }
+    except ValueError:
+        return lambda: None
+
+    def restore():
+        for sig, handler in old.items():
+            _signal_mod.signal(sig, handler)
+
+    return restore
+
+
+def _record_base(record: dict, env=None) -> Path | None:
+    """The run directory a record names, by shape only (random token directly under the runs
+    root); it need not exist. Never trusts any other path."""
+    raw = record.get("host_dir")
+    if not isinstance(raw, str):
+        return None
+    path = Path(raw)
+    if not RUN_TOKEN_RE.match(path.name):
+        return None
+    if Path(os.path.realpath(path.parent)) != Path(os.path.realpath(runs_root(env))):
+        return None
+    return path
+
+
+def _record_ident(record: dict) -> dict | None:
+    epoch, window = record.get("pgid_started_epoch"), record.get("window_secs")
+    if not isinstance(epoch, (int, float)) or not isinstance(window, (int, float)):
+        return None
+    return {"pgid": record.get("pgid"), "pgid_started_epoch": epoch, "window_secs": window}
+
+
+def run_state(record: dict, *, check=None, runner=subprocess.run) -> bool | None:
+    """Is anything of the run still alive? True / False / None (cannot be told: the process table
+    or the sandbox evidence is unavailable, or the record names no usable run). Read only."""
+    base, ident = _record_base(record), _record_ident(record)
+    if base is None or ident is None:
+        return None
     rows = process_table(runner)
-    if rows is None:
-        return
-    cands: dict[int, str] = {}
-    current = {pid: (text, epoch) for pid, _pp, _g, text, epoch in rows}
-    for pid, text in (seen or {}).items():
-        known = current.get(pid)
-        if known and known[0] == text and pid != os.getpid() and _in_window(ident, known[1]):
-            cands[pid] = text
-    if home is not None and root is not None:
-        cands.update(profiled_pids(base, home, root, ident, rows, check))
-    cands.update(escaped_pids(base, ident, rows, runner))
-    for sig in (15, 9):
-        if not cands:
-            return
-        rows = process_table(runner) or []
-        current = {pid: text for pid, _pp, _g, text, _e in rows}
-        for pid, text in cands.items():
-            if current.get(pid) == text:
-                try:
-                    os.kill(pid, sig)
-                except OSError:
-                    pass
-        if sig == 15:
-            sleeper(0.5)
+    if rows is None or (EVIDENCE_MODE == "kernel" and (check or _sandbox_check()) is None):
+        return None
+    root = Path(os.path.realpath(runs_root()))
+    return bool(prove(base, real_home(), root, ident, rows, check=check, runner=runner))
 
 
-def teardown(base: Path, ident: dict, **kw) -> None:
-    """Stop everything the run started: its verified group, then escaped descendants."""
-    group_kw = {k: kw[k] for k in ("killpg", "members_of", "sleeper", "grace") if k in kw}
-    terminate_group(ident, **group_kw)
-    kill_escaped(
-        base,
-        ident,
-        **{k: kw[k] for k in ("seen", "home", "root", "runner", "check") if k in kw},
-    )
-
-
-def kill_run(record: dict, **kw) -> bool:
-    """Stop a host run by its verified process group. Returns True when it was signalled.
-    An unverifiable group is never signalled."""
-    if group_state(record, members_of=kw.get("members_of", group_members)) is not True:
-        return False
-    terminate_group(record, **kw)
-    return True
+def teardown_record(record: dict, **kw) -> str:
+    """`teardown` for a stored record (job kill, orphan reaper): "clean" or "uncertain". A record
+    that names no usable run cannot be proven gone, so it is "uncertain"."""
+    base, ident = _record_base(record), _record_ident(record)
+    if base is None or ident is None:
+        return UNCERTAIN
+    root = Path(os.path.realpath(runs_root()))
+    return teardown(base, ident, home=real_home(), root=root, **kw)
 
 
 def remove_run_dir(record: dict, env=None) -> None:
@@ -1084,6 +1091,18 @@ def run_on_host(
     finished = False
     codex_payload = None
 
+    outcome: list = []
+
+    def stop() -> str:
+        """Stop everything of the run, once; later calls return the first result."""
+        if not outcome:
+            outcome.append(
+                teardown(base, ident, home=home_dir, root=root, seen=seen, runner=runner)
+                if ident is not None
+                else CLEAN
+            )
+        return outcome[0]
+
     def emit(text, *, final=False):
         nonlocal pending
         clean = stream.feed(text, final=final)
@@ -1181,6 +1200,11 @@ def run_on_host(
                 emit(f"franky: repository setup loaded {detail}\n")
 
         t_start = time.monotonic()
+        # Cleanup is owned from here on: the identity (a time window) exists BEFORE the spawn, so
+        # an interrupt at any point reaches `teardown`, which finds the process by the kernel's
+        # sandbox evidence, not by a pid this code might not have stored yet.
+        ident = new_identity(timeout)
+        restore = _mask_interrupts()
         try:
             proc = popen(
                 argv,
@@ -1191,10 +1215,12 @@ def run_on_host(
                 cwd=str(work),
                 start_new_session=True,
             )
+            ident["pgid"] = proc.pid
         except OSError as exc:
             emit(f"franky: could not launch the engine ({exc.__class__.__name__})", final=True)
             return 1, output
-        ident = new_identity(proc.pid, timeout, runner=runner)
+        finally:
+            restore()
         jobs.update_record(run_id, {"runtime": "host", **ident, "host_dir": str(base)}, runs_env)
 
         import codecs
@@ -1235,7 +1261,7 @@ def run_on_host(
             except subprocess.TimeoutExpired:
                 timed_out = True
         if timed_out:
-            terminate_group(ident)
+            stop()
         try:
             proc.wait(timeout=TERM_GRACE_SECS + 5)
         except subprocess.TimeoutExpired:
@@ -1251,15 +1277,15 @@ def run_on_host(
         output.close()
         raise
     finally:
+        result = CLEAN
         try:
+            result = stop()
             if ident is not None:
-                # Stop the producers before anything is read back, and before any dir goes.
-                teardown(base, ident, runner=runner, seen=seen, home=home_dir, root=root)
                 try:
                     proc.stdout.close()
                 except (OSError, NameError, UnboundLocalError):
                     pass
-            if finished:
+            if finished and result == CLEAN:
                 try:
                     if session_sink is not None and (
                         code == 0
@@ -1275,6 +1301,18 @@ def run_on_host(
                 except Exception:
                     pass
         finally:
-            snapshot._rmtree(base)
-            _rm_ctl(ctl)
+            if result == CLEAN:
+                snapshot._rmtree(base)
+                _rm_ctl(ctl)
+            else:
+                # Something of the run may still be alive: its directories and credentials stay
+                # for `franky job kill` to deal with, and the run says so.
+                try:
+                    output.write(
+                        "\nfranky: WARNING host run processes could not be stopped or verified; "
+                        f"kept {base} (see `franky job kill {run_id}`)\n"
+                    )
+                except ValueError:
+                    pass  # the transcript was already closed by an exception on its way out
+                jobs.update_record(run_id, {"host_unverified": True}, runs_env)
     return code, output
