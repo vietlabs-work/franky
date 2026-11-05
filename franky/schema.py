@@ -371,6 +371,7 @@ _VERSION_RESULT_SCHEMA: dict = {
         "host_binary_version": "string or null; detected host engine version",
     },
     "image": "string; resolved task image reference",
+    "runtimes": "array of the runtimes this build supports: container, host (FRANKY_RUNTIME)",
 }
 
 _JOB_LIST_SCHEMA: dict = {"type": "array", "items": "job_record_schema"}

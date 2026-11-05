@@ -35,6 +35,11 @@ EXTRA_ALLOWED_DOMAINS_VAR = "FRANKY_EXTRA_ALLOWED_DOMAINS"
 MODEL_VAR = "FRANKY_MODEL"
 EFFORT_VAR = "FRANKY_EFFORT"
 _EFFORTS = ("low", "medium", "high", "xhigh", "max")
+RUNTIME_VAR = "FRANKY_RUNTIME"
+# `container` (the default) is the hardened Docker runtime. `host` runs the engine as the
+# operator's own user under the engine's OS sandbox; it is an explicit opt-in, never a fallback.
+RUNTIMES = ("container", "host")
+HOST_ENGINES = ("claude", "codex")
 MEMORY_MB_VAR = "FRANKY_MEMORY_MB"
 DISK_MB_VAR = "FRANKY_DISK_MB"
 DEFAULT_MEMORY_MB = 2048
@@ -103,6 +108,7 @@ class Config:
     jira_email: str = ""
     atlassian_tools: bool = False
     repo_setup: RepoSetup | None = None
+    runtime: str = "container"
 
     def enable_atlassian(self, token: str) -> None:
         """Turn the Atlassian tools on: the short-lived access token (as a header value), the MCP
@@ -154,6 +160,17 @@ def validate_allowlist_entry(entry: str) -> None:
         )
 
 
+def resolve_runtime(env: Mapping[str, str]) -> str:
+    """The runtime selector: unset or empty is `container`; anything but a known value is a
+    config error (exit 3), never a silent default."""
+    value = (env.get(RUNTIME_VAR) or "").strip()
+    if not value:
+        return "container"
+    if value not in RUNTIMES:
+        raise ConfigError(f"{RUNTIME_VAR} must be one of {', '.join(RUNTIMES)} (got {value!r})")
+    return value
+
+
 def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
     """Resolve engine + build the fail-closed passthrough env.
 
@@ -174,6 +191,13 @@ def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
         raise
     except ValueError as exc:
         raise ConfigError(str(exc)) from exc
+
+    runtime = resolve_runtime(env)
+    if runtime == "host" and engine.name not in HOST_ENGINES:
+        raise ConfigError(
+            f"{RUNTIME_VAR}=host supports only the {' and '.join(HOST_ENGINES)} engines "
+            f"(they ship an OS sandbox); engine '{engine.name}' needs the container runtime"
+        )
 
     raw_allowed = env.get(ALLOWED_REPOS_VAR, "") or ""
     allowed = [r.strip() for r in raw_allowed.split(",") if r.strip()]
@@ -269,6 +293,7 @@ def load_config(flag_engine: str | None, env: Mapping[str, str]) -> Config:
         disk_mb=_resource_budget(env, DISK_MB_VAR, DEFAULT_DISK_MB, 1024, 32768),
         jira_secrets=jira_secret_strings(env),
         jira_email=(env.get(JIRA_EMAIL_VAR) or "").strip(),
+        runtime=runtime,
     )
 
 

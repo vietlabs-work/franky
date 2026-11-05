@@ -16,7 +16,7 @@ franky review-pr https://github.com/you/repo/pull/42
 uv tool install franky-agent   # or: pipx install / pip install franky-agent
 ```
 
-Docker must be available. Franky pulls version-pinned images from GHCR on the first run. Native AppArmor hosts also need the [task profile](docs/configuration.md#apparmor).
+Docker must be available (or opt into the [host runtime](docs/configuration.md#runtime)). Franky pulls version-pinned images from GHCR on the first run. Native AppArmor hosts also need the [task profile](docs/configuration.md#apparmor).
 
 ## Configure
 

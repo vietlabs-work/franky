@@ -90,6 +90,7 @@ CLI -> config and task policy -> prompt -> engine command -> container runtime -
 | Atlassian | `atlassian.py` | Host-side Atlassian OAuth connection and MCP wiring |
 | Agent instructions | `prompt.py`, `persona.md`, `decompose.py`, `diagnosis.py`, `reviewpr.py`, `skillreview.py`, `sentinel.py` | Prompts and bounded structured output |
 | Runtime | `container.py`, `security.py`, `egress.py`, `franky-dind-entrypoint.sh`, `proxy/` | Docker lifecycle, isolation, policies, proxy |
+| Host runtime | `hostrun.py`, `repo_setup_script.py` (symlink to `franky-repo-setup.py`) | `FRANKY_RUNTIME=host`: per-run dir, engine OS sandbox, process-group job control, Codex host auth store |
 | Transfer | `profile.py`, `setups.py`, `snapshot.py`, `franky-repo-setup.py` | Bounded, secret-scanned profile and workspace bundles; the in-image repository-setup mapper |
 | Runs | `jobs.py`, `transcript.py`, `economics.py` | Records, redacted logs, diagnostics, usage |
 | Threads | `threads.py` | Per-PR reviewer and author sessions, handoffs, locks, prune and purge |
@@ -146,6 +147,16 @@ The term list lives outside the repo: the Actions secret `FRANKY_PRIVATE_TERMS` 
 - Start the task only after the proxy passes its bounded health check.
 
 `franky gh` is an explicit host-side exception. It exposes the full `gh` surface and is limited only by `GH_TOKEN`.
+
+### Runtime selection
+
+- The container is the default. The host runtime is an explicit opt-in (`FRANKY_RUNTIME=host`), never a fallback: do not add any path that switches runtime on a failure.
+- Host mode (macOS only) must refuse, with exit 3, when its Seatbelt profile cannot run. It never runs unsandboxed and never uses the bypass flags the container uses. One outer `(deny default)` profile confines both engines; never rely on an engine's own settings or sandbox as the boundary.
+- Container mode must stay byte-identical: `run_in_container` gets the same arguments with `FRANKY_RUNTIME` unset (`tests/test_hostrun.py` pins it).
+- Host run directories live in a dedicated 0300 root outside the home, one 128-bit random name per run. Settings and profile sit in a 0400 `<run>.ctl` directory outside every writable root.
+- A process belongs to a host run only on the kernel's sandbox evidence (`sandbox_check` under that run's profile). Pgid, start time, parent links and cwd only discover candidates. Every caller uses `hostrun.teardown`; capture and directory removal happen only when it returns `clean`, and `uncertain` keeps the run and its record. Walk every host-side path into a run with `O_NOFOLLOW` from a directory fd.
+- Never persist anything a host run wrote to its Codex `auth.json`: only `franky auth login codex` writes the host store.
+- Host mode builds the child environment from scratch (git and gh configuration pointed inside the run) and extracts bundles as regular files only.
 
 ### Container boundary
 

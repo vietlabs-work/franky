@@ -14,7 +14,7 @@ Run `franky COMMAND --help` for flags and examples. Run `franky schema` for the 
 |---------|---------|
 | `franky job status JOB_ID` | Show the state, the one next step, the record, and runtime diagnostics. |
 | `franky job logs JOB_ID` | Print the redacted transcript. |
-| `franky job kill JOB_ID` | Stop a run and remove its task, proxy, network, and volumes. A `--thread` build also keeps its engine session. |
+| `franky job kill JOB_ID` | Stop a run and remove its task, proxy, network, and volumes (a host run: its process group and directory). A `--thread` build also keeps its engine session. |
 | `franky job export JOB_ID` | Export the record and redacted transcript as a portable archive. |
 | `franky job diagnose JOB_ID` | Request a read-only failure analysis. |
 | `franky job replay JOB_ID` | Reproduce a build from saved inputs in a fresh container. Refuses a `build --no-publish` run. |
@@ -39,9 +39,9 @@ Run `franky COMMAND --help` for flags and examples. Run `franky schema` for the 
 
 | Command | Purpose |
 |---------|---------|
-| `franky auth login codex` | Create persistent Codex subscription authentication. |
+| `franky auth login codex` | Create persistent Codex subscription authentication (a Docker volume, or the host store with `FRANKY_RUNTIME=host`). |
 | `franky auth status codex` | Check the stored Codex authentication. |
-| `franky auth logout codex` | Delete the Codex authentication volume. |
+| `franky auth logout codex` | Delete the Codex authentication volume or host store. |
 | `franky auth login claude` | Save a Claude Code subscription token to the config file. |
 | `franky auth status claude` | Check that a Claude token is set. |
 | `franky auth logout claude` | Remove the Claude token from the config file. |

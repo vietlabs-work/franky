@@ -18,6 +18,13 @@
 #   opencode - OpenCode with an explicit Moonshot or OpenRouter model
 FRANKY_ENGINE = "pi"
 
+# --- Runtime (OPTIONAL) ------------------------------------------------------
+# container (default): every pass runs in the hardened Docker task.
+# host: run the engine on this Mac, as you, inside a Seatbelt profile, with no Docker.
+# Explicit opt-in, never a fallback. macOS only; the claude and codex engines. See
+# docs/security.md (Host runtime) for what it gives up.
+# FRANKY_RUNTIME = "container"
+
 # --- Per-job resource budgets (OPTIONAL, MiB) ------------------------------
 # The task limit includes the engine, builds, and nested Docker containers.
 # Memory: 256..8192 MiB. Each proxy has a separate fixed 128 MiB limit.
