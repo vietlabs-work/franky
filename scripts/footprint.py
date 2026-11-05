@@ -192,8 +192,12 @@ def check_images(report: dict, budgets: dict) -> None:
             or not all(isinstance(x, str) for x in layers)
         ):
             raise FootprintError(f"missing or malformed images.{name}.layers")
-        if size > _number(limits[name], f"images.{name} budget"):
-            raise FootprintError(f"{name} image exceeds its architecture budget")
+        limit = _number(limits[name], f"images.{name} budget")
+        if size > limit:
+            raise FootprintError(
+                f"{name} image exceeds its architecture budget "
+                f"({architecture}: {int(size)} > {int(limit)} bytes)"
+            )
 
 
 def check_runtime(
