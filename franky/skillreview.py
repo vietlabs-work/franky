@@ -20,9 +20,11 @@ import json
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
+from html import escape, unescape
 
 from .config import redact
-from .sentinel import scan_sentinel_json
+from .sentinel import scan_codex_review, scan_sentinel_json
+from .transcript import Transcript
 
 REVIEW_DECISIONS = frozenset({"first-pass", "delta", "second-opinion"})
 TERMINAL_DECISIONS = frozenset({"done", "skip", "halt", "author-mode", "not-reviewable"})
@@ -193,7 +195,21 @@ _BLOCK_RE = re.compile(
     r"<details>\s*<summary>(?P<summary>[^<]*)</summary>\s*```json\s*(?P<json>.*?)\s*```\s*</details>",
     re.DOTALL,
 )
-_SUMMARY_RE = re.compile(r"<summary>(?P<summary>[^<]*)</summary>")
+_SUMMARY_RE = re.compile(r"<summary>([^<]*)</summary>")
+_BODY_SUMMARY_RE = re.compile(r"<summary\b[^<>]*>([^<]*)", re.IGNORECASE)
+_LEGACY_BLOCK_RE = re.compile(
+    r"<details\b[^<>]*>\s*<summary\b[^<>]*>(?P<summary>[^<]*)</summary\s*>\s*"
+    r"(?P<fence>`{3,}|~{3,})[ \t]*json\s*(?P<json>.*?)\s*(?P=fence)[`~]*\s*</details\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+_DETAILS_OR_CODE_RE = re.compile(
+    r"(?P<code>`+)[^`]*(?P=code)|(?P<tag></?details\b[^<>]*>)", re.IGNORECASE
+)
+_JSON_MARKUP = str.maketrans({c: f"\\u{ord(c):04x}" for c in "<>&`"})
+
+
+def _marked(body: str, marker: str) -> int:
+    return sum(marker in unescape(summary) for summary in _BODY_SUMMARY_RE.findall(body))
 
 
 def ledger_block(body: str, marker: str) -> dict:
@@ -201,9 +217,16 @@ def ledger_block(body: str, marker: str) -> dict:
 
     Exactly one `<summary>` may contain `marker`, and that `<details>` block must hold a json
     fence that parses to an object. Other `<details>` blocks are none of our business."""
-    marked = [m for m in _SUMMARY_RE.finditer(body) if marker in m.group("summary")]
-    blocks = [m for m in _BLOCK_RE.finditer(body) if marker in m.group("summary")]
-    if len(marked) != 1 or len(blocks) != 1:
+    # Read existing reviews with the original grammar so a new body check cannot
+    # hide open findings from an older review.
+    summaries = _SUMMARY_RE.findall(body)
+    matches = list(_BLOCK_RE.finditer(body))
+    marked = sum(marker in summary for summary in summaries)
+    blocks = [m for m in matches if marker in m.group("summary")]
+    if not marked:
+        marked = sum(marker in unescape(summary) for summary in summaries)
+        blocks = [m for m in matches if marker in unescape(m.group("summary"))]
+    if marked != 1 or len(blocks) != 1:
         raise SkillError("skill_body_block")
     try:
         obj = json.loads(blocks[0].group("json"))
@@ -212,6 +235,61 @@ def ledger_block(body: str, marker: str) -> dict:
     if not isinstance(obj, dict):
         raise SkillError("skill_body_block")
     return obj
+
+
+def _without_legacy_ledger(body: str, policy: SkillPolicy, ledger: dict) -> str:
+    """Remove at most one matching legacy block, keeping unrelated details and prose."""
+    marker = policy.ledger_summary_marker
+    marked = _marked(body, marker)
+    candidate = None
+    for block in _LEGACY_BLOCK_RE.finditer(body):
+        has_marker = marker in unescape(block.group("summary"))
+        try:
+            obj = json.loads(block.group("json"))
+        except (ValueError, RecursionError) as exc:
+            if has_marker:
+                raise SkillError("skill_body_block") from exc
+            continue
+        if not has_marker and not (
+            isinstance(obj, dict) and obj.get("schema") == policy.ledger_schema
+        ):
+            continue
+        if candidate is not None or obj != ledger:
+            raise SkillError("skill_body_block")
+        candidate = block
+    if candidate is None:
+        if marked:
+            raise SkillError("skill_body_block")
+        return body
+    if marked != int(marker in unescape(candidate.group("summary"))):
+        raise SkillError("skill_body_block")
+    depth = 0
+    prefix = _LEGACY_BLOCK_RE.sub("", body[: candidate.start()])
+    for match in _DETAILS_OR_CODE_RE.finditer(prefix):
+        if tag := match.group("tag"):
+            depth = max(0, depth + (-1 if tag.startswith("</") else 1))
+    if depth:
+        raise SkillError("skill_body_block")
+    return body[: candidate.start()] + body[candidate.end() :]
+
+
+def _render_ledger(ledger: dict, marker: str, secrets: list[str]) -> str:
+    # Check logical strings before JSON serialization can conceal a secret behind escapes.
+    remaining = [ledger]
+    while remaining:
+        value = remaining.pop()
+        if isinstance(value, dict):
+            remaining.extend(value)
+            remaining.extend(value.values())
+        elif isinstance(value, list):
+            remaining.extend(value)
+        elif isinstance(value, str) and any(secret and secret in value for secret in secrets):
+            raise SkillError("skill_body_block")
+    encoded = json.dumps(ledger, separators=(",", ":"), allow_nan=False).translate(_JSON_MARKUP)
+    block = f"<details><summary>{escape(marker)}</summary>\n\n```json\n{encoded}\n```\n</details>"
+    if redact(block, secrets) != block or redact(marker, secrets) != marker:
+        raise SkillError("skill_body_block")
+    return block
 
 
 def finding_state(finding: dict, policy: SkillPolicy) -> str | None:
@@ -275,7 +353,9 @@ class SkillPayload:
     prior_review_id: int | None = None
 
 
-def parse_skill_payload(output: str, nonce: str) -> dict | None:
+def parse_skill_payload(output: str | Transcript, nonce: str, *, engine: str) -> dict | None:
+    if engine == "codex":
+        return scan_codex_review(output, nonce)
     return scan_sentinel_json(output, "REVIEW", nonce)
 
 
@@ -331,15 +411,15 @@ def build_payload(
         raise SkillError("skill_update_refused")
 
     def checked_body(text: object) -> str:
-        # The agent's own text must carry exactly the structured ledger; the posted text is
-        # re-checked after redaction and neutralization, then capped.
-        if not isinstance(text, str) or ledger_block(text, policy.ledger_summary_marker) != ledger:
+        if not isinstance(text, str):
             raise SkillError("skill_body_block")
-        final = _final(text, secrets)
-        if footer:
-            final = f"{final}\n\n{footer}"
-        post = ledger_block(final, policy.ledger_summary_marker)
-        if post.get("schema") != policy.ledger_schema:
+        marker = policy.ledger_summary_marker
+        prose = _final(_without_legacy_ledger(text, policy, ledger), secrets).strip()
+        # Place the block first so surrounding prose cannot hide it inside a code fence.
+        final = "\n\n".join(
+            part for part in (_render_ledger(ledger, marker, secrets), prose, footer) if part
+        )
+        if _marked(final, marker) != 1 or ledger_block(final, marker) != ledger:
             raise SkillError("skill_body_block")
         if len(final) > policy.max_body_chars:
             raise SkillError("skill_body_cap")

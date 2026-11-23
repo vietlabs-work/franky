@@ -1453,10 +1453,11 @@ def _host_gh(pr_url: str):
 
 
 def _finish_skill_review(
-    output: str,
+    output: str | Transcript,
     nonce: str,
     policy: skillreview.SkillPolicy,
     *,
+    engine: str,
     repo: str,
     pr_number: int,
     pr_url: str,
@@ -1476,7 +1477,11 @@ def _finish_skill_review(
     try:
         footer = review_footer()
         payload = skillreview.build_payload(
-            skillreview.parse_skill_payload(output, nonce), policy, pinned_sha, secrets, footer
+            skillreview.parse_skill_payload(output, nonce, engine=engine),
+            policy,
+            pinned_sha,
+            secrets,
+            footer,
         )
     except skillreview.SkillError as exc:
         reason = f"skill review payload refused ({exc.code}) - see the redacted log ({log_path})"
@@ -2806,6 +2811,7 @@ def review_pr(
                 output,
                 nonce,
                 skill_policy,
+                engine=cfg.engine.name,
                 repo=repo,
                 pr_number=pr_number,
                 pr_url=canonical_pr_url,

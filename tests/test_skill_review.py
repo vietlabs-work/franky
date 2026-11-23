@@ -8,6 +8,7 @@ from click.testing import CliRunner
 
 from franky import cli, config, prompt, schema, skillreview
 from franky.skillreview import SkillError, SkillPolicy
+from franky.transcript import MAX_EVENT_CHARS, Transcript
 
 SHA = "a" * 40
 BASE = "b" * 40
@@ -174,20 +175,62 @@ def test_ledger_must_match_schema_sha_state_and_findings():
     assert build(review_payload(ok)).ledger["state"] == "clean"
 
 
-def test_body_must_carry_the_same_single_ledger_block():
+def test_body_cannot_override_the_structured_ledger():
     led = ledger()
-    assert code_of(review_payload(led, "no block")) == "skill_body_block"
     assert code_of(review_payload(led, block(ledger([finding("other")])))) == "skill_body_block"
     assert code_of(review_payload(led, block(led) + block(led))) == "skill_body_block"
+    assert code_of(review_payload(led, block(ledger([finding("other")]), "Round 1"))) == (
+        "skill_body_block"
+    )
+    assert code_of(review_payload(led, "<details>" + block(led) + "</details>")) == (
+        "skill_body_block"
+    )
+    assert code_of(review_payload(led, f"<summary>{MARKER}</summary>")) == "skill_body_block"
+
+
+def test_conflicting_legacy_ledger_with_details_attributes_is_refused():
+    body = block(ledger([finding("other")]), "Round 1")
+    body = body.replace("<details>", "<details open>").replace("```", "~~~~")
+    assert code_of(review_payload(body=body)) == "skill_body_block"
+
+
+def test_historical_ledger_still_reads_with_an_unrelated_styled_summary():
+    led = ledger()
+    body = f'{block(led)}\n\n<SUMMARY class="example">{MARKER}</SUMMARY>'
+    assert skillreview.ledger_block(body, MARKER) == led
+
+
+def test_host_builds_the_ledger_when_the_legacy_summary_has_no_marker():
+    led = ledger()
+    unrelated = block({"schema": "unrelated"}, marker="Checks")
+    prose = f"Lead mentions `<details>`.\n\n{unrelated}\n\n{block(led, marker='Round 1')}"
+    final = build(review_payload(led, prose)).body
+    assert skillreview.ledger_block(final, MARKER) == led
+    assert final.count("<details><summary>") == 2
+    assert unrelated in final and "Lead mentions `<details>`." in final
+
+
+def test_host_ledger_stays_outside_unclosed_fence_and_round_trips_markup():
+    led = ledger(note="a </details> ```json <!-- b & c")
+    final = build(review_payload(led, "Lead.\n\n```text\nunfinished")).body
+    assert final.startswith("<details>")
+    assert final.count("</details>") == 1
+    assert "<!--" not in final
+    assert skillreview.ledger_block(final, MARKER) == led
+
+
+def test_ledger_refuses_a_secret_hidden_by_json_escapes():
+    secret = 'a"b'
+    led = ledger(**{secret: "value"})
+    assert code_of(review_payload(led), secrets=[secret]) == "skill_body_block"
 
 
 def test_caps_are_checked_on_the_final_text():
     led = ledger()
-    just = block(led)
-    room = 6000 - len(just) - len("\n\n<sub>x</sub>")
-    body = "x" * (room + 1) + just  # fits only when the footer is not counted
+    with_footer = build(review_payload(led, "x")).body
+    body = "x" * (6002 - len(with_footer))  # fits only when the footer is not counted
     assert code_of(review_payload(led, body)) == "skill_body_cap"
-    assert build(review_payload(led, body), footer="").body == body
+    assert build(review_payload(led, body), footer="").body.endswith(body)
     many = [{"path": "a", "line": 1, "body": "b"}] * 4
     assert code_of(review_payload(led, comments=many)) == "skill_comment_cap"
     long = [{"path": "a", "line": 1, "body": "y" * 401}]
@@ -512,6 +555,7 @@ def setup_run(
     contents=None,
     review_reads=None,
     bases=None,
+    codex_output=None,
 ):
     """A hermetic skill review: env, images, team profile, container output and `gh` all faked.
 
@@ -527,6 +571,8 @@ def setup_run(
         "FRANKY_RUNS_DIR": str(tmp_path / "runs"),
         "FRANKY_LOGS_DIR": str(tmp_path / "logs"),
     }
+    if codex_output is not None:
+        env.update(FRANKY_ENGINE="codex", CODEX_API_KEY="test-only")
     monkeypatch.setattr(cli.os, "environ", env)
     monkeypatch.setattr(cli, "ensure_image_available", lambda *a, **k: (True, ""))
     monkeypatch.setattr(cli, "resolve_image", lambda *a, **k: "franky")
@@ -572,7 +618,7 @@ def setup_run(
             if payload is None
             else f"FRANKY_REVIEW_{NONCE}_BEGIN{json.dumps(payload)}FRANKY_REVIEW_{NONCE}_END"
         )
-        return 0, out
+        return 0, out if codex_output is None else codex_output
 
     monkeypatch.setattr(cli, "run_in_container", fake_container)
     calls = Gh()
@@ -700,7 +746,7 @@ def test_a_terminal_round_posts_nothing_and_succeeds(monkeypatch, tmp_path):
         None,
         {"kind": "review"},
         review_payload(ledger(schema="x")),
-        review_payload(ledger(), "no block"),
+        review_payload(ledger(), f"<summary>{MARKER}</summary>"),
     ],
 )
 def test_an_invalid_payload_posts_nothing_and_reports_a_code(monkeypatch, tmp_path, payload):
@@ -709,6 +755,65 @@ def test_an_invalid_payload_posts_nothing_and_reports_a_code(monkeypatch, tmp_pa
     assert res.exit_code == 7 and not calls
     assert data["status"] == "skill_payload_invalid"
     assert "skill_" in data["reason"] and "ledger" not in data
+
+
+def codex_event(kind, **item):
+    return json.dumps({"type": "item.completed", "item": {"type": kind, **item}})
+
+
+def codex_review_result():
+    payload = json.dumps(review_payload())
+    return f"FRANKY_REVIEW_{NONCE}_BEGIN{payload}FRANKY_REVIEW_{NONCE}_END"
+
+
+def test_codex_skill_review_reads_final_result_after_oversized_tool_output(monkeypatch, tmp_path):
+    with Transcript() as output:
+        output.write(
+            codex_event("command_execution", aggregated_output="x" * MAX_EVENT_CHARS) + "\n"
+        )
+        output.write(codex_event("agent_message", text=codex_review_result()) + "\n")
+        output.write('{"type":"turn.completed"}\n')
+        output.write("franky: WARNING egress proxy example may not have been removed\n")
+        calls, _ = setup_run(monkeypatch, tmp_path, None, codex_output=output)
+        with pytest.warns(RuntimeWarning, match="parser limit"):
+            res, data = run(tmp_path, "--no-publish")
+        assert output.path is not None
+    assert res.exit_code == 0 and not calls, res.output
+    assert data["status"] == "review_complete"
+    assert skillreview.ledger_block(data["review_body"], MARKER) == ledger()
+
+
+@pytest.mark.parametrize("source", ["tool", "stale", "no-completion", "raw"])
+def test_codex_skill_review_requires_a_completed_final_model_result(monkeypatch, tmp_path, source):
+    valid = codex_review_result()
+    final = codex_event("agent_message", text=valid)
+    events = {
+        "tool": [codex_event("command_execution", aggregated_output=valid)],
+        "stale": [final, codex_event("agent_message", text="No result")],
+        "no-completion": [final],
+        "raw": [valid],
+    }[source]
+    if source != "no-completion":
+        events.append('{"type":"turn.completed"}')
+    calls, _ = setup_run(monkeypatch, tmp_path, None, codex_output="\n".join(events))
+    res, data = run(tmp_path)
+    assert res.exit_code == 7 and not calls, res.output
+    assert data["status"] == "skill_payload_invalid"
+
+
+def test_oversized_codex_model_message_invalidates_an_earlier_candidate(monkeypatch, tmp_path):
+    output = "\n".join(
+        (
+            codex_event("agent_message", text=codex_review_result()),
+            codex_event("agent_message", text="x" * MAX_EVENT_CHARS),
+            '{"type":"turn.completed"}',
+        )
+    )
+    calls, _ = setup_run(monkeypatch, tmp_path, None, codex_output=output)
+    with pytest.warns(RuntimeWarning, match="parser limit"):
+        res, data = run(tmp_path)
+    assert res.exit_code == 7 and not calls, res.output
+    assert data["status"] == "skill_payload_invalid"
 
 
 def test_an_unreadable_payload_reports_invalid_not_a_crash(monkeypatch, tmp_path):
@@ -1596,10 +1701,8 @@ def test_a_moved_base_voids_the_floor_and_blocks_the_approval(monkeypatch, tmp_p
 
 
 def long_body_payload(lead_chars=900):
-    led = CLEAN
-    return review_payload(led, "x" * lead_chars + "\n\n" + block(led)), (
-        len("x" * lead_chars + "\n\n" + block(led)) + 2 + len(cli.review_footer())
-    )
+    payload = review_payload(CLEAN, "x" * lead_chars)
+    return payload, len(build(payload, footer=cli.review_footer()).body)
 
 
 def test_the_sign_off_paragraph_falls_back_to_a_fixed_short_one_and_never_vanishes(

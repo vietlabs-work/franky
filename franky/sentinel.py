@@ -3,7 +3,7 @@
 import json
 import warnings
 
-from .transcript import MAX_EVENT_CHARS, chunks, lines
+from .transcript import MAX_EVENT_CHARS, Transcript, chunks, lines
 
 
 def _string_leaves(value):
@@ -80,3 +80,48 @@ def scan_sentinel_json(output, label: str, nonce: str) -> dict | None:
         )
         return None
     return raw.result if raw.result is not None else decoded.result
+
+
+def scan_codex_review(output: str | Transcript, nonce: str) -> dict | None:
+    """Read the last model message of a completed Codex turn without scanning tool output."""
+    begin, end = f"FRANKY_REVIEW_{nonce}_BEGIN", f"FRANKY_REVIEW_{nonce}_END"
+    message = None
+    completed = False
+    for line in lines(output):
+        if line is None:
+            # An oversized event may have replaced the last model message. A later message
+            # can establish a new result without reading or retaining the oversized event.
+            message, completed = None, False
+            continue
+        if not line.strip() or line.startswith(
+            ("franky: economics - ", "franky: WARNING container ", "franky: WARNING egress ")
+        ):
+            continue
+        try:
+            event = json.loads(line)
+        except (ValueError, RecursionError):
+            message, completed = None, False
+            continue
+        if not isinstance(event, dict):
+            message, completed = None, False
+            continue
+        event_type = event.get("type")
+        if event_type in ("turn.started", "turn.failed", "error"):
+            message, completed = None, False
+        elif event_type == "turn.completed":
+            completed = True
+        elif event_type == "item.completed":
+            item = event.get("item")
+            if isinstance(item, dict) and item.get("type") == "agent_message":
+                message, completed = item.get("text"), False
+
+    if not completed or not isinstance(message, str):
+        return None
+    message = message.strip()
+    if not (message.startswith(begin) and message.endswith(end)):
+        return None
+    try:
+        result = json.loads(message[len(begin) : -len(end)])
+    except (ValueError, RecursionError):
+        return None
+    return result if isinstance(result, dict) else None
