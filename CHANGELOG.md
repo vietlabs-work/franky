@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Skill reviews now read the final Codex message after oversized command output and generate the review's ledger block on the host.
+
 ## [0.4.1] - 2026-11-05
 
 - The image footprint check now names the architecture, the measured size and the budget when an image exceeds its budget.

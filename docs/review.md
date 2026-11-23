@@ -132,6 +132,12 @@ A `terminal` payload posts nothing and ends `review_complete` (exit `0`). A `rev
 
 ### Validation
 
+In Codex skill reviews, only the final model message of a completed turn can carry the result. An
+oversized event clears any earlier candidate. A later valid model result still works.
+
+The agent supplies review prose and a structured ledger. The host builds one marked ledger block
+from that object. Older bodies may include one matching ledger block, which the host replaces.
+
 The host refuses the whole payload and posts nothing on any miss. The result is status `skill_payload_invalid` (exit `7`) and the reason holds one fixed code, never payload text:
 
 | Code | Refused because |
@@ -139,7 +145,7 @@ The host refuses the whole payload and posts nothing on any miss. The result is 
 | `skill_payload_missing`, `skill_payload_shape` | No sentinel, or a wrong type, decision, comment shape or id. A comment `path` must be a repo-relative name (letters, digits and `._@+=~,/-`, no leading `/`, no `..` segment) that redaction leaves unchanged. |
 | `skill_ledger_schema`, `skill_ledger_sha`, `skill_ledger_round`, `skill_ledger_findings` | `schema` is not `ledger_schema`, `reviewed_sha` is not the pinned head, `round` is not an int of 1 or more, or `findings` is not a list of objects with unique ids, a valid `loc` and a known status. |
 | `skill_ledger_state` | `state` is not `clean` or `findings`, or disagrees with the findings (clean means zero open findings, findings means at least one). |
-| `skill_body_block` | The body does not hold exactly one `<details>` block whose `<summary>` contains `ledger_summary_marker` and whose json fence parses to an object equal to `ledger`. The check runs on the agent's text and again on the final text. |
+| `skill_body_block` | The body contains a conflicting, duplicate or malformed ledger block, the ledger contains a known secret, or the final body fails to round-trip exactly one marked ledger. |
 | `skill_body_cap`, `skill_comment_cap` | A cap is exceeded. Caps are measured on the FINAL text, after redaction, `<!--` neutralization and the footer. |
 | `skill_update_refused`, `skill_update_with_review`, `skill_update_target` | `ledger_update` is not allowed by the policy, is combined with a review, or does not name one of the bot's own ledger reviews on this PR in state `COMMENTED` with none of the approve markers in its body (an `APPROVED` target is replaced by a new `COMMENT` review instead). |
 
@@ -162,7 +168,7 @@ Reads: `repos/<repo>/pulls/<N>/reviews?per_page=100 --paginate --slurp` (existin
 - The head is re-checked immediately before each review write (the POST, the 422 retry, the PUT), once before the thread batch, and every 10 thread writes. A moved head posts nothing more (`publish_blocked_stale_head`).
 - After the POST the response `user` must be the bot (type `Bot`, exact login); after the PUT the response `user`, if present, must be. Otherwise resolve and reply are skipped with note `identity_mismatch`. Resolve and reply also need a successful POST or PUT in the same run, else note `resolve_no_ledger`.
 - If GitHub rejects the inline anchors (HTTP 422), the host re-checks the head and posts once more with the comments folded into the body, if the body still fits its cap (`skill_notes` gets `anchors_folded:1`).
-- `ledger_update` replaces the body of the one review named by `review_id`. That review must be by `bot_login`, on this PR, and already hold a ledger block of `ledger_schema`; the new body must pass the same block check and carry the same ledger.
+- `ledger_update` replaces the body of the one review named by `review_id`. That review must be by `bot_login`, on this PR, and already hold a ledger block of `ledger_schema`. The host renders the new ledger block as it does for a new review.
 - `--resolve-fixed` and `--reply-prior` (both need `--thread`) act on the payload's own lists, and only when set. A thread is resolved only when it is open, its first comment is by the bot, and its anchor (`path` and `line`, or `originalLine` once outdated) equals the `loc` of exactly one open finding of the PRIOR ledger (the newest ledger review by the bot, read before the write) and that finding is present in the new ledger with a cleared status. No match or ambiguity drops the id. A reply is posted only on the bot's own open thread, and only when Franky's existing reply rule holds: nobody replied yet, or a human posted last. One reply per thread.
 - An id or reply that fails a check is dropped, not posted, and counted in the result's `skill_notes` (`resolve_not_ours`, `resolve_not_cleared`, `resolve_no_ledger`, `identity_mismatch`, `reply_not_due`, `reply_refused`, `threads_unreadable`).
 

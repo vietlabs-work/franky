@@ -700,7 +700,7 @@ def build_skill_review_prompt(
     )
     update = (
         "`ledger_update` replaces the body of ONE earlier review of yours (a quiet round); it "
-        "needs `review` to be null, and its body must carry the same ledger block. "
+        "needs `review` to be null. Its body is prose. "
         if policy.allow_ledger_update
         else "`ledger_update` must be null. "
     )
@@ -729,8 +729,8 @@ def build_skill_review_prompt(
         '- In a review round, "ledger" is the skill\'s ledger object: `schema` is '
         f'"{policy.ledger_schema}", `reviewed_sha` is `{head_sha}`, `state` is "clean" or '
         '"findings" and agrees with the findings (clean means no open finding). `review.body` '
-        f"must contain exactly one `<details>` block whose `<summary>` contains "
-        f'"{policy.ledger_summary_marker}" and whose json fence holds that same object. '
+        "contains the review prose. Do not include a ledger block in the body. "
+        "The host adds it from the structured ledger. "
         f"Limits: body {policy.max_body_chars} characters, {policy.max_comments} comments, "
         f"{policy.max_comment_chars} characters each. {update}"
         '"resolve" lists review thread node ids of your own threads whose findings are fixed '
