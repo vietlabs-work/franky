@@ -593,7 +593,8 @@ def approval_eligible(payload: SkillPayload, priors: list[dict], policy: SkillPo
     body or ledger update, a clean ledger, no open or blocking finding, no inline comment, and no
     earlier open finding left open or dropped (`prior_settled` over every prior bot ledger from a
     successful read of the PR reviews). With a policy `hold_field`, no round approves while this
-    ledger or any prior bot ledger holds a non-empty hold list."""
+    round's ledger holds a non-empty hold list. Earlier ledgers are not consulted: clearing a
+    flag is the skill's job (it emits an empty list once a human has)."""
     led = payload.ledger or {}
     return (
         payload.kind == "review"
@@ -603,7 +604,6 @@ def approval_eligible(payload: SkillPayload, priors: list[dict], policy: SkillPo
         and not payload.comments
         and prior_settled(priors, led, policy)
         and not held(led, policy)
-        and not any(held(p, policy) for p in priors)
     )
 
 
@@ -667,6 +667,7 @@ def ledger_summary(
             "open": None,
             "blocking": None,
             "review_url": review_url,
+            "held": False,
             "reason": payload.reason,
         }
     led = payload.ledger or {}
@@ -681,4 +682,5 @@ def ledger_summary(
         "open": n_open,
         "blocking": n_blocking,
         "review_url": review_url,
+        "held": held(led, policy),
     }
