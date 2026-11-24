@@ -313,6 +313,7 @@ def test_summary_counts_open_and_blocking_by_policy_field():
         "open": 2,
         "blocking": 1,
         "review_url": "u",
+        "held": False,
     }
     custom = policy(blocking_field="tier", blocking_values=["p1", "p2"])
     led2 = ledger(
@@ -330,6 +331,7 @@ def test_summary_counts_open_and_blocking_by_policy_field():
         "open": None,
         "blocking": None,
         "review_url": None,
+        "held": False,
         "reason": "draft",
     }
 
@@ -719,6 +721,7 @@ def test_a_review_round_posts_one_comment_review_and_reports_the_ledger(monkeypa
         "open": 2,
         "blocking": 1,
         "review_url": data["review_url"],
+        "held": False,
     }
     assert seen["cfg"].passthrough_env["GH_LOGIN"] == LOGIN
     text = " ".join(seen["prompt"])
@@ -1780,23 +1783,52 @@ def test_a_clean_round_with_a_hold_comments_and_without_the_policy_key_approves(
     assert posts(calls)[0]["event"] == "APPROVE"
 
 
-def test_a_hold_in_any_earlier_ledger_blocks_approval_and_dismisses_an_approval(
+def test_an_earlier_hold_does_not_block_a_clean_round_that_clears_it(monkeypatch, tmp_path):
+    rows = [review_row(4, ledger([], orange=FLAG), at="2026-10-01T00:00:00Z")]
+    calls, res, data = hold_run(
+        monkeypatch, tmp_path, review_payload(ledger([], orange=[])), reviews=rows
+    )
+    assert posts(calls)[0]["event"] == "APPROVE" and data["ledger"]["held"] is False
+    assert skillreview.approval_eligible(
+        build(review_payload(ledger([], orange=[]))), [ledger([], orange=FLAG)], policy(**HOLD)
+    )
+
+
+def test_a_held_or_malformed_current_hold_is_not_eligible_and_summary_says_held():
+    pol = policy(**HOLD)
+    for bad in (FLAG, "x", None):
+        pl = build(review_payload(ledger([], orange=bad)))
+        assert not skillreview.approval_eligible(pl, [], pol)
+        assert skillreview.ledger_summary(pl, pol, SHA, None)["held"] is True
+    ok = build(review_payload(ledger([])))
+    assert skillreview.ledger_summary(ok, pol, SHA, None)["held"] is False
+    term = build({"kind": "terminal", "decision": "skip", "reason": "draft"})
+    assert skillreview.ledger_summary(term, pol, SHA, None)["held"] is False
+
+
+def test_a_held_target_with_a_still_held_current_ledger_gets_a_new_comment_review(
     monkeypatch, tmp_path
 ):
-    rows = [
-        review_row(4, ledger([], orange=FLAG), at="2026-10-01T00:00:00Z"),
-        review_row(5, ledger([]), state="APPROVED", at="2026-10-02T00:00:00Z"),
-    ]
-    calls, res, data = hold_run(monkeypatch, tmp_path, review_payload(CLEAN), reviews=rows)
+    led = ledger([finding("a", status="fixed")], orange=FLAG)
+    upd = {"review_id": 9, "body": "Quiet.\n\n" + block(led)}
+    payload = review_payload(led, decision="delta", review=None, ledger_update=upd)
+    row = review_row(9, ledger([finding("a")], orange=FLAG))
+    calls, res, data = hold_run(monkeypatch, tmp_path, payload, reviews=[row])
+    assert not [c for c in calls if "PUT" in c]
+    (posted,) = posts(calls)
+    assert posted["event"] == "COMMENT" and data["review_event"] == "COMMENT"
+
+
+def test_a_held_current_ledger_dismisses_a_stale_approval_then_comments(monkeypatch, tmp_path):
+    rows = [review_row(5, ledger([]), state="APPROVED", at="2026-10-02T00:00:00Z")]
+    calls, res, data = hold_run(
+        monkeypatch, tmp_path, review_payload(ledger([], orange=FLAG)), reviews=rows
+    )
     assert calls[0] == DISMISS
     assert posts(calls)[0]["event"] == "COMMENT" and data["dismissed_review_id"] == 5
-    calls, res, data = hold_run(
-        monkeypatch, tmp_path, review_payload(CLEAN), reviews=[review_row(4, ledger([]))]
-    )
-    assert posts(calls)[0]["event"] == "APPROVE"
 
 
-def test_a_held_update_target_is_never_edited_and_gets_a_new_comment_review(monkeypatch, tmp_path):
+def test_a_held_update_target_is_never_edited_and_gets_a_new_review(monkeypatch, tmp_path):
     led = ledger([finding("a", status="fixed")])
     upd = {"review_id": 9, "body": "Quiet.\n\n" + block(led)}
     payload = review_payload(led, decision="delta", review=None, ledger_update=upd)
@@ -1804,5 +1836,6 @@ def test_a_held_update_target_is_never_edited_and_gets_a_new_comment_review(monk
     calls, res, data = hold_run(monkeypatch, tmp_path, payload, reviews=[row])
     assert not [c for c in calls if "PUT" in c]
     (posted,) = posts(calls)
-    assert posted["event"] == "COMMENT" and "Quiet." in posted["body"]
-    assert res.exit_code == 0 and data["review_event"] == "COMMENT"
+    # the cleared current ledger approves, but as a new review: the held target stays untouched
+    assert posted["event"] == "APPROVE" and "Quiet." in posted["body"]
+    assert res.exit_code == 0 and data["review_event"] == "APPROVE"
