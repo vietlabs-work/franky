@@ -65,6 +65,7 @@ class SkillPolicy:
     blocking_values: tuple[str, ...] = ("blocking",)
     cleared_statuses: tuple[str, ...] = ("fixed", "resolved", "wontfix")
     open_statuses: tuple[str, ...] = ("open",)
+    hold_field: str | None = None
 
 
 def is_bot_login(login: object, policy: SkillPolicy) -> bool:
@@ -123,6 +124,7 @@ _OPTIONAL = (
     "blocking_values",
     "cleared_statuses",
     "open_statuses",
+    "hold_field",
 )
 
 
@@ -178,6 +180,7 @@ def parse_policy(raw: object) -> SkillPolicy:
         blocking_values=tuple(values),
         cleared_statuses=sets["cleared_statuses"],
         open_statuses=sets["open_statuses"],
+        hold_field=_str(raw, "hold_field", 40) if "hold_field" in raw else None,
     )
 
 
@@ -576,11 +579,21 @@ def prior_settled(priors: list[dict], new: dict, policy: SkillPolicy) -> bool:
     return True
 
 
+def held(ledger: dict | None, policy: SkillPolicy) -> bool:
+    """The ledger carries a non-empty `hold_field` list: the skill asks for a human review.
+    Absent or `[]` is not held; any other value is held (fail closed)."""
+    if policy.hold_field is None or not isinstance(ledger, dict):
+        return False
+    value = ledger.get(policy.hold_field, [])
+    return not (isinstance(value, list) and not value)
+
+
 def approval_eligible(payload: SkillPayload, priors: list[dict], policy: SkillPolicy) -> bool:
     """A clean review round may be approved: a review (not terminal) that carries a validated
     body or ledger update, a clean ledger, no open or blocking finding, no inline comment, and no
     earlier open finding left open or dropped (`prior_settled` over every prior bot ledger from a
-    successful read of the PR reviews)."""
+    successful read of the PR reviews). With a policy `hold_field`, no round approves while this
+    ledger or any prior bot ledger holds a non-empty hold list."""
     led = payload.ledger or {}
     return (
         payload.kind == "review"
@@ -589,6 +602,8 @@ def approval_eligible(payload: SkillPayload, priors: list[dict], policy: SkillPo
         and ledger_counts(led, policy) == (0, 0)
         and not payload.comments
         and prior_settled(priors, led, policy)
+        and not held(led, policy)
+        and not any(held(p, policy) for p in priors)
     )
 
 
