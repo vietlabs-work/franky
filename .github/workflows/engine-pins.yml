@@ -1,0 +1,70 @@
+name: Engine pins
+
+# Opens one pull request that bumps the Dockerfile engine pins to the npm latest versions.
+# The PR is opened with ENGINE_PINS_TOKEN, a fine-grained PAT (see docs/releasing.md), because
+# a PR opened with GITHUB_TOKEN does not start the CI and footprint workflows.
+on:
+  schedule:
+    - cron: "23 2 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: engine-pins
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ secrets.ENGINE_PINS_TOKEN }}
+    steps:
+      - name: Require the bump token
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::Set the ENGINE_PINS_TOKEN secret (docs/releasing.md#engine-pin-bumps)."
+            exit 1
+          fi
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          token: ${{ secrets.ENGINE_PINS_TOKEN }}
+      - name: Open a bump pull request
+        run: |
+          set -euo pipefail
+          python3 scripts/engine_pins.py bump > "$RUNNER_TEMP/changes.txt"
+          if [ ! -s "$RUNNER_TEMP/changes.txt" ]; then
+            echo "Every engine pin is current."
+            exit 0
+          fi
+          # One branch per pin set, so a rerun never pushes the same bump twice.
+          branch="engine-pins/$(git hash-object Dockerfile | cut -c1-12)"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+            echo "$branch already exists; its pull request is open or was handled."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git add Dockerfile CHANGELOG.md
+          git commit -q -m "build: bump engine pins" -m "$(cat "$RUNNER_TEMP/changes.txt")"
+          git push -q origin "$branch"
+          {
+            echo "Weekly engine pin bump from the npm latest versions:"
+            echo
+            sed 's/^/- /' "$RUNNER_TEMP/changes.txt"
+            echo
+            echo "If the footprint check fails on image size, raise the budget in"
+            echo "scripts/footprint-budgets.json in this PR, with the measured sizes."
+          } > "$RUNNER_TEMP/body.md"
+          url="$(gh pr create --base main --head "$branch" --title "build: bump engine pins" --body-file "$RUNNER_TEMP/body.md")"
+          echo "Opened $url"
+          # Close older bump PRs that this one replaces.
+          gh pr list --state open --limit 50 --json number,headRefName \
+            --jq ".[] | select(.headRefName | startswith(\"engine-pins/\")) | select(.headRefName != \"$branch\") | .number" |
+            while read -r number; do
+              gh pr close "$number" --delete-branch --comment "Replaced by $url"
+            done
