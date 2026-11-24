@@ -24,6 +24,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           ref: main
+          fetch-depth: 0
           persist-credentials: false
       # Runs without the token: it only reads npm and edits two files.
       - name: Bump the pins
@@ -49,16 +50,33 @@ jobs:
           owner="$(gh api user --jq .login)"
           # One branch per pin set: a rerun reuses it and only fills in the missing steps.
           branch="engine-pins/$(git hash-object Dockerfile | cut -c1-12)"
-          if ! git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git switch -c "$branch"
-            git add Dockerfile CHANGELOG.md
-            git commit -q -m "build: bump engine pins" -m "$(cat "$RUNNER_TEMP/changes.txt")"
-            git push -q origin "$branch"
+          # Only same-repo PRs from the token owner count, so a fork branch cannot stand in.
+          owned_pr() {
+            gh pr list --head "$branch" --author "$owner" --state "$1" --limit 10 \
+              --json state,url,isCrossRepository --jq "[.[] | select(.isCrossRepository | not)][0].$2 // \"\""
+          }
+          state="$(owned_pr all state)"
+          if [ -n "$state" ] && [ "$state" != OPEN ]; then
+            echo "The pull request for $branch is $state; a person decided on it, so nothing is reopened."
+            exit 0
           fi
-          state="$(gh pr list --head "$branch" --state all --limit 1 --json state --jq '.[0].state // ""')"
           if [ -z "$state" ]; then
+            if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+              # Never open a PR for branch content this run did not produce.
+              git fetch -q origin "$branch"
+              extra="$(git diff --name-only origin/main...FETCH_HEAD | grep -vxE 'Dockerfile|CHANGELOG\.md' || true)"
+              if [ -n "$extra" ] || [ "$(git rev-parse FETCH_HEAD:Dockerfile)" != "$(git hash-object Dockerfile)" ]; then
+                echo "::error::$branch exists with content this run did not produce. Delete it and rerun."
+                exit 1
+              fi
+            else
+              git config user.name "github-actions[bot]"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              git switch -c "$branch"
+              git add Dockerfile CHANGELOG.md
+              git commit -q -m "build: bump engine pins" -m "$(cat "$RUNNER_TEMP/changes.txt")"
+              git push -q origin "$branch"
+            fi
             {
               echo "Weekly engine pin bump from the npm latest versions:"
               echo
@@ -68,11 +86,8 @@ jobs:
               echo "scripts/footprint-budgets.json in this PR, with the measured sizes."
             } > "$RUNNER_TEMP/body.md"
             gh pr create --base main --head "$branch" --title "build: bump engine pins" --body-file "$RUNNER_TEMP/body.md"
-          elif [ "$state" != OPEN ]; then
-            echo "The pull request for $branch is $state; a person decided on it, so nothing is reopened."
-            exit 0
           fi
-          url="$(gh pr list --head "$branch" --state open --limit 1 --json url --jq '.[0].url')"
+          url="$(owned_pr open url)"
           echo "Bump pull request: $url"
           # Close older bump PRs from the same token owner. Their branches stay, so no commit is lost.
           gh pr list --state open --author "$owner" --limit 1000 --json number,headRefName,isCrossRepository \
