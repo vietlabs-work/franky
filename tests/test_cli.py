@@ -32,6 +32,12 @@ def test_apparmor_profile_prints_packaged_policy():
     assert res.output == cli.TASK_APPARMOR.read_text()
 
 
+def test_version_flag_prints_version_only():
+    res = CliRunner().invoke(cli.main, ["--version"])
+    assert res.exit_code == 0
+    assert res.output == f"franky {__version__}\n"
+
+
 def test_version_prints_version():
     res = CliRunner().invoke(cli.main, ["version"])
     assert res.exit_code == 0

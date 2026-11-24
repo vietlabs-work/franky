@@ -393,6 +393,7 @@ def _emit_result(
 
 
 @click.group()
+@click.version_option(franky_version(), "--version", message="franky %(version)s")
 def main() -> None:
     """Franky - a lean personal coding agent that builds in a container and opens a PR."""
 

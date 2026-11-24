@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- `franky --version` prints the installed version and exits.
+
 ## [0.4.2] - 2026-11-23
 
 - Skill reviews now read the final Codex message after oversized command output and generate the review's ledger block on the host.
