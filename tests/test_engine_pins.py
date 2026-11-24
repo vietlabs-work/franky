@@ -58,13 +58,28 @@ def test_bump_changes_nothing_when_every_pin_is_current(tmp_path):
     assert (repo / "CHANGELOG.md").read_text() == CHANGELOG
 
 
-@pytest.mark.parametrize("bad", ["2.2.0-beta.1", "latest", "2.2.0\nRUN curl evil", ""])
+@pytest.mark.parametrize(
+    "bad", ["2.2.0-beta.1", "latest", "2.2.0\nRUN curl evil", "", "\u0661.2.3", "1.02.3"]
+)
 def test_bump_refuses_a_version_that_is_not_plain_and_writes_nothing(tmp_path, bad):
     repo = _repo(tmp_path)
     with pytest.raises(SystemExit):
         engine_pins.bump(repo, (CURRENT | {"@openai/codex": bad}).__getitem__)
     assert (repo / "Dockerfile").read_text() == DOCKERFILE
     assert (repo / "CHANGELOG.md").read_text() == CHANGELOG
+
+
+def test_bump_skips_a_downgrade(tmp_path):
+    repo = _repo(tmp_path)
+    assert engine_pins.bump(repo, (CURRENT | {"@openai/codex": "0.171.9"}).__getitem__) == []
+    assert (repo / "Dockerfile").read_text() == DOCKERFILE
+
+
+def test_bump_refuses_a_pin_that_appears_twice(tmp_path):
+    repo = _repo(tmp_path)
+    (repo / "Dockerfile").write_text(DOCKERFILE + "ARG CODEX_VERSION=0.172.0\n")
+    with pytest.raises(SystemExit):
+        engine_pins.bump(repo, (CURRENT | {"@openai/codex": "0.173.0"}).__getitem__)
 
 
 def test_bump_refuses_a_dockerfile_without_every_pin(tmp_path):

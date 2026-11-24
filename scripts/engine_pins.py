@@ -26,9 +26,16 @@ PINS = {
     "CODEX_VERSION": "@openai/codex",
     "OPENCODE_VERSION": "opencode-ai",
 }
-# Plain releases only: the registry answer is untrusted input written into the Dockerfile.
-VERSION = re.compile(r"\d+\.\d+\.\d+")
+# Plain ASCII releases only: the registry answer is untrusted input written into the Dockerfile.
+VERSION = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 UNRELEASED = "## [Unreleased]\n"
+
+
+def _key(version: str) -> tuple[int, ...]:
+    match = VERSION.fullmatch(version)
+    if not match:
+        raise SystemExit(f"engine_pins.py: not a plain x.y.z version: {version!r}")
+    return tuple(int(part) for part in match.groups())
 
 
 def npm_latest(package: str) -> str:
@@ -51,11 +58,13 @@ def bump(root: Path, fetch: Callable[[str], str] = npm_latest) -> list[str]:
     changes = []
     for arg, old in current_pins(dockerfile).items():
         new = fetch(PINS[arg])
-        if not VERSION.fullmatch(new):
-            raise SystemExit(f"engine_pins.py: {PINS[arg]} latest is not x.y.z: {new!r}")
-        if new != old:
-            dockerfile = dockerfile.replace(f"ARG {arg}={old}\n", f"ARG {arg}={new}\n")
-            changes.append(f"{PINS[arg]} {old} -> {new}")
+        if _key(new) <= _key(old):
+            continue  # never propose a downgrade when npm moves `latest` back
+        line = f"ARG {arg}={old}\n"
+        if dockerfile.count(line) != 1:
+            raise SystemExit(f"engine_pins.py: Dockerfile needs exactly one {line.strip()!r}")
+        dockerfile = dockerfile.replace(line, f"ARG {arg}={new}\n")
+        changes.append(f"{PINS[arg]} {old} -> {new}")
     if not changes:
         return []
     changelog_path = root / "CHANGELOG.md"

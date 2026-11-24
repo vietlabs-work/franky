@@ -19,52 +19,64 @@ jobs:
   bump:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    env:
-      GH_TOKEN: ${{ secrets.ENGINE_PINS_TOKEN }}
     steps:
-      - name: Require the bump token
+      # Pinned by commit because a repo-write token runs in this job.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
+          persist-credentials: false
+      # Runs without the token: it only reads npm and edits two files.
+      - name: Bump the pins
+        id: bump
         run: |
+          python3 scripts/engine_pins.py bump > "$RUNNER_TEMP/changes.txt"
+          if [ -s "$RUNNER_TEMP/changes.txt" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Every engine pin is current."
+          fi
+      - name: Open the bump pull request
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.ENGINE_PINS_TOKEN }}
+        run: |
+          set -euo pipefail
           if [ -z "$GH_TOKEN" ]; then
             echo "::error::Set the ENGINE_PINS_TOKEN secret (docs/releasing.md#engine-pin-bumps)."
             exit 1
           fi
-      - uses: actions/checkout@v7
-        with:
-          ref: main
-          token: ${{ secrets.ENGINE_PINS_TOKEN }}
-      - name: Open a bump pull request
-        run: |
-          set -euo pipefail
-          python3 scripts/engine_pins.py bump > "$RUNNER_TEMP/changes.txt"
-          if [ ! -s "$RUNNER_TEMP/changes.txt" ]; then
-            echo "Every engine pin is current."
-            exit 0
-          fi
-          # One branch per pin set, so a rerun never pushes the same bump twice.
+          gh auth setup-git --hostname github.com
+          owner="$(gh api user --jq .login)"
+          # One branch per pin set: a rerun reuses it and only fills in the missing steps.
           branch="engine-pins/$(git hash-object Dockerfile | cut -c1-12)"
-          if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
-            echo "$branch already exists; its pull request is open or was handled."
+          if ! git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git switch -c "$branch"
+            git add Dockerfile CHANGELOG.md
+            git commit -q -m "build: bump engine pins" -m "$(cat "$RUNNER_TEMP/changes.txt")"
+            git push -q origin "$branch"
+          fi
+          state="$(gh pr list --head "$branch" --state all --limit 1 --json state --jq '.[0].state // ""')"
+          if [ -z "$state" ]; then
+            {
+              echo "Weekly engine pin bump from the npm latest versions:"
+              echo
+              sed 's/^/- /' "$RUNNER_TEMP/changes.txt"
+              echo
+              echo "If the footprint check fails on image size, raise the budget in"
+              echo "scripts/footprint-budgets.json in this PR, with the measured sizes."
+            } > "$RUNNER_TEMP/body.md"
+            gh pr create --base main --head "$branch" --title "build: bump engine pins" --body-file "$RUNNER_TEMP/body.md"
+          elif [ "$state" != OPEN ]; then
+            echo "The pull request for $branch is $state; a person decided on it, so nothing is reopened."
             exit 0
           fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git switch -c "$branch"
-          git add Dockerfile CHANGELOG.md
-          git commit -q -m "build: bump engine pins" -m "$(cat "$RUNNER_TEMP/changes.txt")"
-          git push -q origin "$branch"
-          {
-            echo "Weekly engine pin bump from the npm latest versions:"
-            echo
-            sed 's/^/- /' "$RUNNER_TEMP/changes.txt"
-            echo
-            echo "If the footprint check fails on image size, raise the budget in"
-            echo "scripts/footprint-budgets.json in this PR, with the measured sizes."
-          } > "$RUNNER_TEMP/body.md"
-          url="$(gh pr create --base main --head "$branch" --title "build: bump engine pins" --body-file "$RUNNER_TEMP/body.md")"
-          echo "Opened $url"
-          # Close older bump PRs that this one replaces.
-          gh pr list --state open --limit 50 --json number,headRefName \
-            --jq ".[] | select(.headRefName | startswith(\"engine-pins/\")) | select(.headRefName != \"$branch\") | .number" |
+          url="$(gh pr list --head "$branch" --state open --limit 1 --json url --jq '.[0].url')"
+          echo "Bump pull request: $url"
+          # Close older bump PRs from the same token owner. Their branches stay, so no commit is lost.
+          gh pr list --state open --author "$owner" --limit 1000 --json number,headRefName,isCrossRepository \
+            --jq ".[] | select(.isCrossRepository | not) | select(.headRefName | startswith(\"engine-pins/\")) | select(.headRefName != \"$branch\") | .number" |
             while read -r number; do
-              gh pr close "$number" --delete-branch --comment "Replaced by $url"
+              gh pr close "$number" --comment "Replaced by $url"
             done
