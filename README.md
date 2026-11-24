@@ -52,7 +52,7 @@ Select an engine with `--engine`, then `FRANKY_ENGINE`. The default is `pi`.
 | `franky jobs` | List runs. `--stats` adds success, hang, duration, and cost data. |
 | `franky gh ARGS...` | Run the host `gh` CLI with Franky's token. |
 | `franky schema` | Print the full machine-readable CLI contract. |
-| `franky version` | Print version, install source, engine, and image. |
+| `franky version` | Print version, install source, engine, and image. `franky --version` prints the version only. |
 | `franky update` | Install the latest release through the detected installer. |
 | `franky apparmor-profile` | Print the native Linux task profile. |
 
