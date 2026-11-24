@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.5] - 2026-11-24
+
 - Changed: the skill `hold_field` is decided by the current round's ledger only. An earlier held ledger no longer blocks approval, so a PR whose flag a human cleared (the skill then emits an empty list) can be approved. A held review is still never edited.
 
 - Added: `held` (bool) in the review result's `ledger` object.

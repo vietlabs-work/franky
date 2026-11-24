@@ -76,4 +76,4 @@ Select an engine with `--engine`, then `FRANKY_ENGINE`. The default is `pi`.
 
 ## Status
 
-v0.4.4. Live end-to-end runs require operator-supplied credentials.
+v0.4.5. Live end-to-end runs require operator-supplied credentials.
