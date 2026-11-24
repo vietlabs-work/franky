@@ -38,6 +38,14 @@ def test_version_flag_prints_version_only():
     assert res.output == f"franky {__version__}\n"
 
 
+def test_version_flag_resolves_the_version_when_used(monkeypatch):
+    # A skewed install warns through franky.cli, so the version must not be read at import time.
+    monkeypatch.setattr(cli, "franky_version", lambda: "9.9.9")
+    res = CliRunner().invoke(cli.main, ["--version"])
+    assert res.exit_code == 0
+    assert res.output == "franky 9.9.9\n"
+
+
 def test_version_prints_version():
     res = CliRunner().invoke(cli.main, ["version"])
     assert res.exit_code == 0

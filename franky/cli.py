@@ -392,8 +392,22 @@ def _emit_result(
         )
 
 
+def _print_version(ctx: click.Context, _param: click.Parameter, value: bool) -> None:
+    # Resolved on use, not at import: franky_version() can import this module to warn on skew.
+    if value and not ctx.resilient_parsing:
+        click.echo(f"franky {franky_version()}")
+        ctx.exit()
+
+
 @click.group()
-@click.version_option(franky_version(), "--version", message="franky %(version)s")
+@click.option(
+    "--version",
+    is_flag=True,
+    expose_value=False,
+    is_eager=True,
+    callback=_print_version,
+    help="Show the version and exit.",
+)
 def main() -> None:
     """Franky - a lean personal coding agent that builds in a container and opens a PR."""
 
