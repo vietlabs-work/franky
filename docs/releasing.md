@@ -78,6 +78,24 @@ PyPI publishing uses Trusted Publishing with OIDC. The repository stores no PyPI
 
 The workflow derives its namespace from `github.repository_owner`. Set `FRANKY_GHCR_REPO` during a namespace migration.
 
+## Engine pin bumps
+
+The `Dockerfile` pins each engine to an exact npm version. Every Monday the `Engine pins` workflow runs `scripts/engine_pins.py bump`. If an engine has a newer npm `latest` release, it opens one PR that updates the pins and adds a changelog line. It closes the older bump PRs that the new one replaces, and keeps their branches. A version lower than the current pin is never proposed. If a person closes a bump PR, the workflow does not reopen it. It proposes again when npm publishes a newer version.
+
+The PR runs the full CI and footprint checks. If an image exceeds its budget, raise the budget in that PR with the measured size. Merge it, and the next release ships the new engines.
+
+To run the workflow now, use `gh workflow run engine-pins.yml`.
+
+The workflow needs the `ENGINE_PINS_TOKEN` secret, because a PR opened with `GITHUB_TOKEN` does not start other workflows. To create it:
+
+1. Open GitHub **Settings > Developer settings > Fine-grained personal access tokens** and select **Generate new token**.
+2. Set the resource owner to the repository owner. Under **Only select repositories**, select only this repository.
+3. Grant **Contents: Read and write** and **Pull requests: Read and write**. Leave every other permission at **No access**.
+4. Set an expiration date, for example 90 days.
+5. Run `gh secret set ENGINE_PINS_TOKEN -R <owner>/franky` and paste the token at the prompt.
+
+When the token expires, the workflow fails at its first step. Create a new token and set the secret again.
+
 ## Image trust
 
 The CLI uses version-pinned image tags, never `latest`. Treat each published version tag as immutable.
