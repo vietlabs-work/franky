@@ -102,7 +102,7 @@ A well-formed id that does not exist still fails inside the engine.
 
 ## Images
 
-Release runs use an engine-specific image. The unsuffixed image contains all engines for cross-engine tasks.
+Release runs use an engine-specific image. The unsuffixed image contains all engines for cross-engine tasks. Each Franky release pins its engine versions, so a new engine version arrives with a Franky release.
 
 | Setting | Purpose |
 |---------|---------|

@@ -24,6 +24,9 @@ SCRATCH="$(mktemp -d)"
 # Derive policy from the production modules.
 ALLOW="$(python3 -c 'from franky.egress import DOCKER_REGISTRY_DOMAINS, GITHUB_DOMAINS; print(",".join(DOCKER_REGISTRY_DOMAINS + GITHUB_DOMAINS))')"
 
+# The proxy log shows whether a 403 came from the proxy (TCP_DENIED) or from the registry.
+# It holds host names only: HTTPS is tunneled, never decrypted.
+proxy_log() { echo "-- proxy access log (last 20 lines) --"; docker exec "$PROXY" tail -n 20 /run/squid-access.log 2>&1 || true; }
 cleanup() { docker rm -f -v "$TASK" "$PROXY" >/dev/null 2>&1 || true; docker network rm "$NET" >/dev/null 2>&1 || true; }
 trap 'cleanup; rm -f "$SCRATCH/compose.log" "$SCRATCH/build.log" "$SCRATCH/denial.log"; rmdir "$SCRATCH"' EXIT
 fail() { echo "SMOKE FAIL: $*" >&2; exit 1; }
@@ -70,7 +73,7 @@ services:
     healthcheck: { test: ["CMD-SHELL","pg_isready -U postgres"], interval: 2s, retries: 20 }
 EOF
 cd /tmp/p && timeout 85 docker compose up -d --wait' >"$SCRATCH/compose.log" 2>&1 || {
-  tail -c 4096 "$SCRATCH/compose.log"; fail "compose up failed";
+  tail -c 4096 "$SCRATCH/compose.log"; proxy_log; fail "compose up failed";
 }
 docker exec "$TASK" sh -c 'cd /tmp/p && docker compose exec -T db psql -U postgres -tAc "select 1"' | grep -q 1 || fail "psql query failed"
 docker exec "$TASK" sh -c 'cd /tmp/p && docker compose down -v' >/dev/null 2>&1
@@ -81,7 +84,7 @@ docker exec "$TASK" sh -ec 'mkdir -p /tmp/positive
 printf "FROM alpine:3.20\nRUN echo build-ok > /proof\n" > /tmp/positive/Dockerfile
 timeout 85 docker build -t smoke-proof /tmp/positive
 timeout 10 docker run --rm --hostname smoke-proof smoke-proof sh -ec "test \"\$(cat /proof)\" = build-ok; test \"\$(hostname)\" = smoke-proof"' >"$SCRATCH/build.log" 2>&1 || {
-  tail -c 4096 "$SCRATCH/build.log"; fail "nested build or container failed";
+  tail -c 4096 "$SCRATCH/build.log"; proxy_log; fail "nested build or container failed";
 }
 echo "   OK"
 

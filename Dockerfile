@@ -24,14 +24,23 @@ COPY install-codex-native-launcher.sh /tmp/install-codex-native-launcher.sh
 #   claude   -> @anthropic-ai/claude-code        (bin: claude)
 #   codex    -> @openai/codex                    (bin: codex)
 #   opencode -> opencode-ai                      (bin: opencode)
+# Engine versions are pinned so a new engine release changes no image until a pin is bumped.
 ARG FRANKY_ENGINE=all
+ARG PI_VERSION=1.6.0
+ARG CLAUDE_CODE_VERSION=2.1.331
+ARG CODEX_VERSION=0.172.0
+ARG OPENCODE_VERSION=1.19.6
 RUN set -eux; \
+    pi="@earendil-works/pi-coding-agent@$PI_VERSION"; \
+    claude="@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"; \
+    codex="@openai/codex@$CODEX_VERSION"; \
+    opencode="opencode-ai@$OPENCODE_VERSION"; \
     case "$FRANKY_ENGINE" in \
-        pi) packages="@earendil-works/pi-coding-agent" ;; \
-        claude) packages="@anthropic-ai/claude-code" ;; \
-        codex) packages="@openai/codex" ;; \
-        opencode) packages="opencode-ai" ;; \
-        all) packages="@earendil-works/pi-coding-agent @anthropic-ai/claude-code @openai/codex opencode-ai" ;; \
+        pi) packages="$pi" ;; \
+        claude) packages="$claude" ;; \
+        codex) packages="$codex" ;; \
+        opencode) packages="$opencode" ;; \
+        all) packages="$pi $claude $codex $opencode" ;; \
         *) echo "unsupported FRANKY_ENGINE" >&2; exit 2 ;; \
     esac; \
     npm install -g --prefix /out/usr/local $packages; \

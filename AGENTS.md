@@ -109,6 +109,7 @@ Keep policy code pure where practical. Keep subprocess calls injectable so tests
 - Keep shared runtime layers separate from engine payloads. Do not add a tool to every image without need.
 - Keep the proxy user as numeric `13:13` across image bases.
 - Keep the Codex native launcher, platform package, companion executable, and managed-package metadata.
+- Pin every engine package to an exact version in the `Dockerfile` ARGs. Bump a pin in its own PR, measure the images, and update the budgets there.
 
 Resource defaults and their settings live in [`docs/resources.md`](docs/resources.md).
 
