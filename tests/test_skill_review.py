@@ -1737,3 +1737,72 @@ def test_an_approve_body_that_does_not_fit_with_its_marker_is_posted_as_a_commen
     (posted,) = posts(calls)
     assert posted["event"] == "COMMENT" and MARK not in posted["body"]
     assert data["skill_notes"] == ["approve_body_cap:1"]
+
+
+# --- hold field ---------------------------------------------------------------------------
+
+HOLD = {"hold_field": "orange"}
+FLAG = [{"file": "pay/X.java", "trigger": "auth", "reason": "r"}]
+
+
+def test_hold_field_is_an_optional_trimmed_string():
+    assert policy().hold_field is None
+    assert policy(hold_field="orange").hold_field == "orange"
+    for bad in ("", " orange", 3, None, "x" * 41):
+        with pytest.raises(ValueError):
+            policy(hold_field=bad)
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [(None, False), ([], False), (FLAG, True), ({}, True), ("auth", True), (0, True)],
+)
+def test_held_is_a_non_empty_list_and_fails_closed_on_any_other_value(value, expected):
+    led = ledger([]) if value is None else ledger([], orange=value)
+    assert skillreview.held(led, policy(**HOLD)) is expected
+    assert skillreview.held(led, policy()) is False  # no hold_field: the key means nothing
+
+
+def hold_run(monkeypatch, tmp_path, payload, policy_over=HOLD, **kw):
+    calls, _ = setup_run(monkeypatch, tmp_path, payload, **kw)
+    res, data = run(tmp_path, "--allow-approve", policy_over=policy_over)
+    return calls, res, data
+
+
+def test_a_clean_round_with_a_hold_comments_and_without_the_policy_key_approves(
+    monkeypatch, tmp_path
+):
+    held = review_payload(ledger([], orange=FLAG))
+    calls, res, data = hold_run(monkeypatch, tmp_path, held)
+    (posted,) = posts(calls)
+    assert posted["event"] == "COMMENT" and data["review_event"] == "COMMENT"
+    calls, res, data = hold_run(monkeypatch, tmp_path, held, policy_over={})
+    assert posts(calls)[0]["event"] == "APPROVE"
+
+
+def test_a_hold_in_any_earlier_ledger_blocks_approval_and_dismisses_an_approval(
+    monkeypatch, tmp_path
+):
+    rows = [
+        review_row(4, ledger([], orange=FLAG), at="2026-10-01T00:00:00Z"),
+        review_row(5, ledger([]), state="APPROVED", at="2026-10-02T00:00:00Z"),
+    ]
+    calls, res, data = hold_run(monkeypatch, tmp_path, review_payload(CLEAN), reviews=rows)
+    assert calls[0] == DISMISS
+    assert posts(calls)[0]["event"] == "COMMENT" and data["dismissed_review_id"] == 5
+    calls, res, data = hold_run(
+        monkeypatch, tmp_path, review_payload(CLEAN), reviews=[review_row(4, ledger([]))]
+    )
+    assert posts(calls)[0]["event"] == "APPROVE"
+
+
+def test_a_held_update_target_is_never_edited_and_gets_a_new_comment_review(monkeypatch, tmp_path):
+    led = ledger([finding("a", status="fixed")])
+    upd = {"review_id": 9, "body": "Quiet.\n\n" + block(led)}
+    payload = review_payload(led, decision="delta", review=None, ledger_update=upd)
+    row = review_row(9, ledger([finding("a")], orange=FLAG))
+    calls, res, data = hold_run(monkeypatch, tmp_path, payload, reviews=[row])
+    assert not [c for c in calls if "PUT" in c]
+    (posted,) = posts(calls)
+    assert posted["event"] == "COMMENT" and "Quiet." in posted["body"]
+    assert res.exit_code == 0 and data["review_event"] == "COMMENT"

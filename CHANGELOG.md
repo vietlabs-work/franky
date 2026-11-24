@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Added: the skill policy key `hold_field`. A skill round never approves while its ledger, or any earlier bot ledger on the PR, holds a non-empty list under that key, and a held review is never edited by a `ledger_update`.
+
 - Fixed: every command failed at import with a circular-import error when the installed package metadata and the source version differed (a stale editable install after a version bump).
 
 - Task images pin each engine to an exact version (pi 1.6.0, Claude Code 2.1.331, Codex 0.172.0, OpenCode 1.19.6). A new engine version now arrives with a Franky release.

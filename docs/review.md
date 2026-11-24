@@ -75,7 +75,7 @@ franky review-pr --skill NAME --skill-policy ~/policy.json --thread --expected-h
 
 ### Approval
 
-A skill round is approvable when all of these hold: it is a review round (not terminal) that carries a body or a `ledger_update` (a round that writes nothing never approves), its ledger is `clean` with no open or blocking finding, it has no inline comment, the PR reviews were readable, and no earlier finding is still open. Every prior ledger of the bot counts: a finding's latest-known state is the one in the newest ledger that lists it, and one that is open there must be in the new ledger (matched by `id`) with a cleared status, so a finding dropped by an intermediate round stays owed. A dropped finding, or an unreadable review list, is not approvable. No prior ledger is fine.
+A skill round is approvable when all of these hold: it is a review round (not terminal) that carries a body or a `ledger_update` (a round that writes nothing never approves), its ledger is `clean` with no open or blocking finding, it has no inline comment, the PR reviews were readable, and no earlier finding is still open. Every prior ledger of the bot counts: a finding's latest-known state is the one in the newest ledger that lists it, and one that is open there must be in the new ledger (matched by `id`) with a cleared status, so a finding dropped by an intermediate round stays owed. A dropped finding, or an unreadable review list, is not approvable. No prior ledger is fine. With a policy `hold_field`, a held ledger (this round or any earlier bot ledger) is not approvable.
 
 For an approvable round the host always computes the human sign-off floor, with or without `--allow-approve`:
 
@@ -107,6 +107,7 @@ A JSON object. Unknown, missing or mistyped keys refuse the run (exit `2`).
 | `blocking_values` | 1 to 10 strings, default `["blocking"]` | The values of that field that count as blocking. |
 | `open_statuses` | 1 to 10 strings, default `["open"]` | Finding statuses that count as open. A missing `status` is open. |
 | `cleared_statuses` | 1 to 10 strings, default `["fixed","resolved","wontfix"]` | Finding statuses that count as cleared. Must not overlap `open_statuses`. |
+| `hold_field` | string, optional | A ledger key that holds the round for a human. When this ledger or any earlier bot ledger on the PR has that key with a value other than an empty list, the round never approves, and a `ledger_update` of a held review is posted as a new review instead of an edit. Absent means no hold. |
 
 The ledger convention Franky reads is small: an object with `schema`, `reviewed_sha`, `state` (`clean` or `findings`), an optional integer `round` (at least 1), and `findings[]` of objects with a string `id`, a `loc` (`path:line`) and an optional `status`. A missing `status` means open. A status in neither `open_statuses` nor `cleared_statuses` refuses the ledger (`skill_ledger_findings`). Status comparison is exact, so case matters. Finding `id` must be a non-empty unique string and `loc` must match `^[^\s`<>]+:[1-9][0-9]*$`, else `skill_ledger_findings`.
 

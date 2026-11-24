@@ -1773,6 +1773,8 @@ def _publish_skill_review(
                 "skill review payload refused (skill_update_target)",
                 EXIT_AGENT,
             )
+        # A held review is never edited either: its hold must stay visible on the PR.
+        approved_target = approved_target or skillreview.held(ledgers[-1][1], policy)
     if eligible:
         signoff = _skill_signoff(gh, repo, pr_number, pinned_sha, base_sha)
         if stale():
