@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.4] - 2026-11-24
+
 - Added: the skill policy key `hold_field`. A skill round never approves while its ledger, or any earlier bot ledger on the PR, holds a non-empty list under that key, and a held review is never edited by a `ledger_update`.
 
 - Fixed: every command failed at import with a circular-import error when the installed package metadata and the source version differed (a stale editable install after a version bump).
