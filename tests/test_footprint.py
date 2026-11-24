@@ -2,6 +2,7 @@
 
 import importlib.util
 import math
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -544,6 +545,29 @@ def test_image_key_covers_every_dockerfile_input(tmp_path):
         (tmp_path / name).write_text(original)
     (tmp_path / "proxy/entrypoint.sh").unlink()
     assert _image_key(tmp_path).returncode != 0
+
+
+def test_every_engine_package_is_pinned_to_an_exact_version():
+    dockerfile = (footprint.ROOT / "Dockerfile").read_text()
+    pins = dict(re.findall(r"^ARG (\w+_VERSION)=(\S+)$", dockerfile, re.M))
+    packages = re.findall(r'^\s+\w+="([^"$]+)@\$(\w+)"; \\$', dockerfile, re.M)
+    assert {name for name, _ in packages} == {
+        "@earendil-works/pi-coding-agent",
+        "@anthropic-ai/claude-code",
+        "@openai/codex",
+        "opencode-ai",
+    }
+    for _, arg in packages:
+        assert re.fullmatch(r"\d+\.\d+\.\d+", pins[arg]), arg
+    # Every engine choice installs only the pinned variables above.
+    arms = dict(re.findall(r'^\s+(\w+)\) packages="([^"]*)" ;;', dockerfile, re.M))
+    assert arms == {
+        "pi": "$pi",
+        "claude": "$claude",
+        "codex": "$codex",
+        "opencode": "$opencode",
+        "all": "$pi $claude $codex $opencode",
+    }
 
 
 def test_image_key_lists_every_file_the_dockerfiles_copy():
