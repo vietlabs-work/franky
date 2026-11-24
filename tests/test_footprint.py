@@ -559,6 +559,15 @@ def test_every_engine_package_is_pinned_to_an_exact_version():
     }
     for _, arg in packages:
         assert re.fullmatch(r"\d+\.\d+\.\d+", pins[arg]), arg
+    # Every engine choice installs only the pinned variables above.
+    arms = dict(re.findall(r'^\s+(\w+)\) packages="([^"]*)" ;;', dockerfile, re.M))
+    assert arms == {
+        "pi": "$pi",
+        "claude": "$claude",
+        "codex": "$codex",
+        "opencode": "$opencode",
+        "all": "$pi $claude $codex $opencode",
+    }
 
 
 def test_image_key_lists_every_file_the_dockerfiles_copy():
