@@ -580,26 +580,39 @@ def prior_settled(priors: list[dict], new: dict, policy: SkillPolicy) -> bool:
 
 
 _PRIOR_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,40}$")
+# Stricter than _LOC_RE: the loc is quoted in a host note, so no free text rides along.
+_PRIOR_LOC_RE = re.compile(r"^[A-Za-z0-9_./@+-]{1,200}:[1-9][0-9]{0,6}$")
 MAX_PRIOR_OPEN = 20
 
 
 def open_prior_findings(priors: list[dict], policy: SkillPolicy) -> list[tuple[str, str | None]]:
     """(id, loc) of findings whose latest-known state is open (same rule as `prior_settled`).
-    Feeds the PROMPT only, never an approval decision. Unsafe ids are dropped, a bad loc is None."""
+    Feeds the PROMPT only, never an approval decision. Malformed history is skipped, unsafe ids
+    are dropped, a bad loc is None."""
     latest: dict = {}
     for led in priors:
-        for f in led.get("findings") or []:
-            if isinstance(f, dict):
-                latest[f.get("id")] = f
+        findings = led.get("findings") if isinstance(led, dict) else None
+        for f in findings if isinstance(findings, list) else []:
+            if isinstance(f, dict) and isinstance(f.get("id"), str):
+                latest[f["id"]] = f
     out: list[tuple[str, str | None]] = []
     for fid, f in latest.items():
-        if not isinstance(fid, str) or not _PRIOR_ID_RE.match(fid):
-            continue
-        if finding_state(f, policy) != "open":
+        if not _PRIOR_ID_RE.match(fid) or finding_state(f, policy) != "open":
             continue
         loc = f.get("loc")
-        out.append((fid, loc if isinstance(loc, str) and _LOC_RE.match(loc) else None))
+        out.append((fid, loc if isinstance(loc, str) and _PRIOR_LOC_RE.match(loc) else None))
     return out[:MAX_PRIOR_OPEN]
+
+
+def prior_round(priors: list[dict]) -> int | None:
+    """The highest integer round of the bot's earlier ledgers (a ledger update keeps an older
+    review's timestamp, so the newest review is not always the newest round)."""
+    rounds = [
+        led.get("round")
+        for led in priors
+        if isinstance(led, dict) and type(led.get("round")) is int and led["round"] >= 1
+    ]
+    return max(rounds) if rounds else None
 
 
 def held(ledger: dict | None, policy: SkillPolicy) -> bool:

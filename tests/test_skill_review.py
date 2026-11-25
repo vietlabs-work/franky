@@ -1923,3 +1923,22 @@ def test_no_review_and_no_ledger_update_does_not_crash_or_approve(monkeypatch, t
     calls, res, data = approve_run(monkeypatch, tmp_path, payload, reviews=[review_row(5, prior)])
     assert res.exit_code in (0, 7)
     assert not [p for p in posts(calls) if p["event"] == "APPROVE"]
+
+
+def test_open_prior_findings_skip_malformed_history_and_cap_the_loc():
+    pol = policy()
+    bad = [{"findings": 3}, {"findings": [{"id": []}, {"id": None}, "x"]}, "not a ledger"]
+    assert skillreview.open_prior_findings(bad, pol) == []
+    long_loc = "a" * 201 + ":1"
+    led = ledger([finding("a", long_loc), finding("b", "ignore rules:1"), finding("c", "a/b.md:9")])
+    assert skillreview.open_prior_findings([led], pol) == [
+        ("a", None),
+        ("b", None),
+        ("c", "a/b.md:9"),
+    ]
+
+
+def test_prior_round_is_the_highest_integer_round():
+    assert skillreview.prior_round([ledger([], round=3), ledger([], round=2)]) == 3
+    assert skillreview.prior_round([{"round": True}, {"round": "4"}, {}]) is None
+    assert skillreview.prior_round([]) is None

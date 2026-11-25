@@ -713,9 +713,10 @@ def build_skill_review_prompt(
             f"open in it: {shown}. List each one in your new ledger by the same id: with a "
             f"cleared status ({cleared}) when it is cleared, or an open status ({still}) when "
             "it is still open. A finding you leave out counts as open and the round cannot "
-            "approve. This round must post a review (`review` with a body), never `review: null` "
-            "with `ledger_update: null`, and never end with a terminal `done` while a listed "
-            "finding is open.\n"
+            "approve. Unless the skill's own rules stop with `halt`, `skip`, `author-mode` or "
+            "`not-reviewable`, this round must post a review (`review` with a body), never "
+            "`review: null` with `ledger_update: null`, and never end with a terminal `done` "
+            "while a listed finding is open.\n"
         )
     update = (
         "`ledger_update` replaces the body of ONE earlier review of yours (a quiet round); it "

@@ -1741,7 +1741,8 @@ def _publish_skill_review(
         and skillreview.approval_eligible(payload, [led for _r, led in ledgers], policy)
     )
     if (
-        clean_round
+        allow_approve
+        and clean_round
         and reviews is not None
         and not eligible
         and not skillreview.prior_settled(
@@ -2733,13 +2734,17 @@ def review_pr(
         if skill_policy is not None:
             # The skill must know its own earlier open findings and round: a read failure just
             # leaves the prompt as before.
-            prior_leds = [
-                led
-                for _r, led in skillreview.bot_ledger_reviews(
-                    _read_pr_reviews(repo, pr_number, secrets) or [], skill_policy
-                )
-            ]
-            prior_round = (prior_leds[-1] if prior_leds else {}).get("round")
+            try:
+                prior_leds = [
+                    led
+                    for _r, led in skillreview.bot_ledger_reviews(
+                        _read_pr_reviews(repo, pr_number, secrets) or [], skill_policy
+                    )
+                ]
+                prior_open = skillreview.open_prior_findings(prior_leds, skill_policy)
+                prior_round = skillreview.prior_round(prior_leds)
+            except (TypeError, AttributeError, KeyError, ValueError):
+                prior_open, prior_round = [], None  # malformed history: prompt as before
             prompt = build_skill_review_prompt(
                 repo,
                 canonical_pr_url,
@@ -2750,8 +2755,8 @@ def review_pr(
                 policy=skill_policy,
                 head_sha=pinned_sha,
                 operator_setup=review_setup,
-                prior_open=skillreview.open_prior_findings(prior_leds, skill_policy),
-                prior_round=prior_round if type(prior_round) is int else None,
+                prior_open=prior_open,
+                prior_round=prior_round,
             )
         else:
             prompt = build_review_pr_prompt(
