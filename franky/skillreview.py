@@ -579,6 +579,29 @@ def prior_settled(priors: list[dict], new: dict, policy: SkillPolicy) -> bool:
     return True
 
 
+_PRIOR_ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,40}$")
+MAX_PRIOR_OPEN = 20
+
+
+def open_prior_findings(priors: list[dict], policy: SkillPolicy) -> list[tuple[str, str | None]]:
+    """(id, loc) of findings whose latest-known state is open (same rule as `prior_settled`).
+    Feeds the PROMPT only, never an approval decision. Unsafe ids are dropped, a bad loc is None."""
+    latest: dict = {}
+    for led in priors:
+        for f in led.get("findings") or []:
+            if isinstance(f, dict):
+                latest[f.get("id")] = f
+    out: list[tuple[str, str | None]] = []
+    for fid, f in latest.items():
+        if not isinstance(fid, str) or not _PRIOR_ID_RE.match(fid):
+            continue
+        if finding_state(f, policy) != "open":
+            continue
+        loc = f.get("loc")
+        out.append((fid, loc if isinstance(loc, str) and _LOC_RE.match(loc) else None))
+    return out[:MAX_PRIOR_OPEN]
+
+
 def held(ledger: dict | None, policy: SkillPolicy) -> bool:
     """The ledger carries a non-empty `hold_field` list: the skill asks for a human review.
     Absent or `[]` is not held; any other value is held (fail closed)."""

@@ -112,7 +112,8 @@ _RESULT_SCHEMA: dict = {
     },
     "skill_notes": "array of `code:count` strings; present ONLY for `review-pr --skill` when the "
     "host dropped thread ids or replies (resolve_not_ours, resolve_not_cleared, reply_not_due, "
-    "reply_refused, threads_unreadable, anchors_folded)",
+    "reply_refused, threads_unreadable, anchors_folded) or an approval was withheld "
+    "(prior_open: an earlier open finding was left open or dropped; approval_unverified)",
     # Present on every `review-pr` result; [] when no JIRA key was found or in frozen
     # (--at-sha/--diff-base) mode, which never fetches tickets. Never ticket text.
     "context_sources": [
