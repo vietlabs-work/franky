@@ -1338,7 +1338,9 @@ def test_a_round_that_is_not_clean_or_drops_a_prior_finding_never_approves(
 
 
 def test_unreadable_pr_reviews_never_approve(monkeypatch, tmp_path):
-    calls, res, data = approve_run(monkeypatch, tmp_path, review_reads=[(1, "", "boom")])
+    calls, res, data = approve_run(
+        monkeypatch, tmp_path, review_reads=[(0, "[[]]", ""), (1, "", "boom")]
+    )
     (posted,) = posts(calls)
     assert posted["event"] == "COMMENT" and "signoff" not in data
 
@@ -1458,7 +1460,7 @@ def test_an_unknown_approval_outcome_is_uncertain_and_never_reposted(monkeypatch
         monkeypatch,
         tmp_path,
         post=(1, "", "timed out"),
-        review_reads=[(0, "[[]]", ""), (1, "", "boom")],
+        review_reads=[(0, "[[]]", ""), (0, "[[]]", ""), (1, "", "boom")],
     )
     assert len(posts(calls)) == 1 and posts(calls)[0]["event"] == "APPROVE"
     assert res.exit_code == 8 and data["status"] == "publish_uncertain"
@@ -1650,7 +1652,7 @@ def test_a_head_that_moved_before_the_dismissal_writes_nothing(monkeypatch, tmp_
 
 def test_unreadable_reviews_cannot_dismiss_and_say_so(monkeypatch, tmp_path):
     calls, res, data = approve_run(
-        monkeypatch, tmp_path, review_payload(OPEN), review_reads=[(1, "", "boom")]
+        monkeypatch, tmp_path, review_payload(OPEN), review_reads=[(0, "[[]]", ""), (1, "", "boom")]
     )
     assert posts(calls)[0]["event"] == "COMMENT" and not dismissals(calls)
     assert data["skill_notes"] == ["approval_unverified:1"]
@@ -1839,3 +1841,104 @@ def test_a_held_update_target_is_never_edited_and_gets_a_new_review(monkeypatch,
     # the cleared current ledger approves, but as a new review: the held target stays untouched
     assert posted["event"] == "APPROVE" and "Quiet." in posted["body"]
     assert res.exit_code == 0 and data["review_event"] == "APPROVE"
+
+
+# --- prior open findings in the prompt ------------------------------------------------------------
+
+F1_PRIOR = {
+    "id": "F1",
+    "sev": "blocking",
+    "loc": "docs/history.md:316",
+    "status": "open",
+}
+
+
+def test_open_prior_findings_use_latest_state_validate_and_cap():
+    pol = policy()
+    older = ledger([finding("a", "x.py:1"), finding("b", "y.py:2"), finding("bad id", "z.py:3")])
+    newer = ledger([finding("a", status="fixed"), finding("c", loc="no loc")])
+    assert skillreview.open_prior_findings([older, newer], pol) == [("b", "y.py:2"), ("c", None)]
+    many = ledger([finding(f"f{i}") for i in range(30)])
+    assert len(skillreview.open_prior_findings([many], pol)) == 20
+    assert skillreview.open_prior_findings([], pol) == []
+
+
+def _prompt(**kw):
+    return prompt.build_skill_review_prompt(
+        "me/repo", PR_URL, "", NONCE, skill="s", where="/w", policy=policy(), head_sha=SHA, **kw
+    )
+
+
+def test_prior_block_uses_policy_words_and_is_absent_without_priors():
+    base = _prompt()
+    assert _prompt(prior_open=[], prior_round=None) == base
+    text = _prompt(prior_open=[("F1", "a.md:316"), ("F2", None)], prior_round=1)
+    assert text != base
+    for needle in ("round 1", "round 2", "`F1 (a.md:316)`", "`F2`", "fixed/resolved/wontfix",
+                   "(open)", "never `review: null`", "terminal `done`"):  # fmt: skip
+        assert needle in text, needle
+
+
+def test_cli_passes_prior_open_findings_into_the_prompt(monkeypatch, tmp_path):
+    prior = ledger([F1_PRIOR], round=1)
+    calls, seen = setup_run(
+        monkeypatch, tmp_path, review_payload(ledger([])), reviews=[review_row(5, prior)]
+    )
+    res, data = run(tmp_path)
+    assert res.exit_code == 0, res.output
+    assert "`F1 (docs/history.md:316)`" in " ".join(seen["prompt"])
+    assert "this run is round 2" in " ".join(seen["prompt"])
+
+
+def test_cli_tolerates_a_review_read_failure_for_the_prompt(monkeypatch, tmp_path):
+    calls, seen = setup_run(
+        monkeypatch, tmp_path, review_payload(ledger([])), review_reads=[(1, "", "boom")]
+    )
+    res, data = run(tmp_path)
+    assert res.exit_code == 0, res.output
+    assert "Host note (trusted)" not in " ".join(seen["prompt"])
+
+
+def test_dropped_prior_round_two_listing_f1_as_fixed_approves(monkeypatch, tmp_path):
+    prior = ledger([F1_PRIOR], round=1)
+    new = ledger([{**F1_PRIOR, "status": "fixed"}], state="clean", round=2)
+    payload = review_payload(new, decision="delta")
+    calls, res, data = approve_run(monkeypatch, tmp_path, payload, reviews=[review_row(5, prior)])
+    assert posts(calls)[0]["event"] == "APPROVE"
+    assert "skill_notes" not in data or not data["skill_notes"]
+
+
+def test_dropped_prior_round_two_dropping_f1_is_refused_with_prior_open(monkeypatch, tmp_path):
+    prior = ledger([F1_PRIOR], round=1)
+    calls, res, data = approve_run(
+        monkeypatch, tmp_path, review_payload(ledger([])), reviews=[review_row(5, prior)]
+    )
+    assert posts(calls)[0]["event"] == "COMMENT"
+    assert "prior_open:1" in data["skill_notes"]
+
+
+def test_no_review_and_no_ledger_update_does_not_crash_or_approve(monkeypatch, tmp_path):
+    prior = ledger([F1_PRIOR], round=1)
+    payload = review_payload(ledger([]), review=None, ledger_update=None)
+    calls, res, data = approve_run(monkeypatch, tmp_path, payload, reviews=[review_row(5, prior)])
+    assert res.exit_code in (0, 7)
+    assert not [p for p in posts(calls) if p["event"] == "APPROVE"]
+
+
+def test_open_prior_findings_skip_malformed_history_and_cap_the_loc():
+    pol = policy()
+    bad = [{"findings": 3}, {"findings": [{"id": []}, {"id": None}, "x"]}, "not a ledger"]
+    assert skillreview.open_prior_findings(bad, pol) == []
+    long_loc = "a" * 201 + ":1"
+    led = ledger([finding("a", long_loc), finding("b", "ignore rules:1"), finding("c", "a/b.md:9")])
+    assert skillreview.open_prior_findings([led], pol) == [
+        ("a", None),
+        ("b", None),
+        ("c", "a/b.md:9"),
+    ]
+
+
+def test_prior_round_is_the_highest_integer_round():
+    assert skillreview.prior_round([ledger([], round=3), ledger([], round=2)]) == 3
+    assert skillreview.prior_round([{"round": True}, {"round": "4"}, {}]) is None
+    assert skillreview.prior_round([]) is None

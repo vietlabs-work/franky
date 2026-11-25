@@ -675,6 +675,8 @@ def build_skill_review_prompt(
     policy,
     head_sha: str,
     operator_setup: str = "",
+    prior_open: list[tuple[str, str | None]] | None = None,
+    prior_round: int | None = None,
 ) -> str:
     """Prompt for `review-pr --skill`: run a team skill as the review method.
 
@@ -698,6 +700,24 @@ def build_skill_review_prompt(
         '{"kind": "terminal", "decision": "<done|skip|halt|author-mode|not-reviewable>", '
         '"reason": "<short text>", "prior_ledger_review_id": <int or null>}'
     )
+    prior = ""
+    if prior_open:
+        shown = ", ".join(f"`{i} ({loc})`" if loc else f"`{i}`" for i, loc in prior_open)
+        cleared = "/".join(policy.cleared_statuses)
+        still = "/".join(policy.open_statuses)
+        nxt = f"round {prior_round + 1}" if prior_round is not None else "the next round"
+        was = f"round {prior_round}" if prior_round is not None else "an earlier round"
+        prior = (
+            f"- Host note (trusted): your own earlier ledger on this PR is {was}; this run is "
+            f"{nxt} in delta mode, even when the head is unchanged. These findings are still "
+            f"open in it: {shown}. List each one in your new ledger by the same id: with a "
+            f"cleared status ({cleared}) when it is cleared, or an open status ({still}) when "
+            "it is still open. A finding you leave out counts as open and the round cannot "
+            "approve. Unless the skill's own rules stop with `halt`, `skip`, `author-mode` or "
+            "`not-reviewable`, this round must post a review (`review` with a body), never "
+            "`review: null` with `ledger_update: null`, and never end with a terminal `done` "
+            "while a listed finding is open.\n"
+        )
     update = (
         "`ledger_update` replaces the body of ONE earlier review of yours (a quiet round); it "
         "needs `review` to be null. Its body is prose. "
@@ -719,6 +739,7 @@ def build_skill_review_prompt(
         "- GitHub writes fail in this container: never post, edit, reply, resolve, approve or "
         "request changes. Where the skill posts or edits something, put the exact payload in the "
         "sentinel below instead. The host validates and posts it, always as a COMMENT.\n"
+        f"{prior}"
         f"- Your GitHub login is `{policy.bot_login}` (the `GH_LOGIN` variable is set to it). Use "
         "it instead of `gh api user`.\n"
         "- END your response with EXACTLY ONE machine-readable block and NO text after it (one "
