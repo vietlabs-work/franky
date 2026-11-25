@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Fixed: a `review-pr --skill` ledger finding whose `loc` is not `path:line` (for example a PR-description finding) no longer refuses the whole round with `skill_ledger_findings`. The ledger keeps it; only a `path:line` loc anchors a thread resolve.
+
 ## [0.4.6] - 2026-11-25
 
 - Fixed: a `review-pr --skill` round no longer drops an earlier open finding. The prompt now names the bot's own earlier round and the findings still open in it, and a clean round refused only for that reason reports `prior_open:1` in `skill_notes`.

@@ -8,7 +8,7 @@ host wrapper shapes as every other review.
 Everything skill-specific comes from the caller's JSON policy (`SkillPolicy`); nothing here names
 a team, a repository or a skill. The ledger convention Franky reads is deliberately small: a JSON
 object with `schema`, `reviewed_sha`, `state` (`clean` or `findings`), an optional integer
-`round`, and `findings[]` of objects with a string `id`, a `loc` (`path:line`), an optional
+`round`, and `findings[]` of objects with a string `id`, a `loc` (normally `path:line`), an optional
 `status` (absent means `open`; any other value counts as cleared) and the policy's blocking field.
 
 Every refusal is a fixed `SkillError.code`; the payload text never reaches an error message.
@@ -33,6 +33,9 @@ SIDES = frozenset({"LEFT", "RIGHT"})
 SKILL_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _LOGIN_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\[bot\]$")
 _LOC_RE = re.compile(r"^[^\s`<>]+:[1-9][0-9]*$")
+# Any ledger loc: one short line. Only a `_LOC_RE` loc anchors a thread; others (a PR-description
+# finding) are kept but never anchored.
+_LEDGER_LOC_RE = re.compile(r"^[^\x00-\x1f\x7f`<>]{1,200}$")
 # A repo-relative path that is inert inside a markdown code span and an HTML attribute.
 _PATH_RE = re.compile(r"^[A-Za-z0-9._@+=~,\-][A-Za-z0-9._@+=~,/\-]*$")
 MAX_REASON_CHARS = 300
@@ -320,7 +323,7 @@ def validate_ledger(ledger: object, policy: SkillPolicy, pinned_sha: str) -> dic
     if not all(isinstance(i, str) and i for i in ids) or len(set(ids)) != len(ids):
         raise SkillError("skill_ledger_findings")
     for f in findings:
-        if not isinstance(f.get("loc"), str) or not _LOC_RE.match(f["loc"]):
+        if not isinstance(f.get("loc"), str) or not _LEDGER_LOC_RE.match(f["loc"]):
             raise SkillError("skill_ledger_findings")
         if finding_state(f, policy) is None:
             raise SkillError("skill_ledger_findings")
