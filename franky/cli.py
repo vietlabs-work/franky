@@ -1769,8 +1769,9 @@ def _publish_skill_review(
         # Only the newest ledger review of the bot may be edited.
         latest = ledgers[-1][0] if ledgers else None
         row = latest if latest is not None and latest.get("id") == target else None
-        # An approval cannot be edited: its body goes out as a new review instead.
-        approved_target = row is not None and row.get("state") == "APPROVED"
+        # An approval, or one branch protection dismissed after a push, is not edited:
+        # its body goes out as a new review instead.
+        approved_target = row is not None and row.get("state") in ("APPROVED", "DISMISSED")
         if row is None or not (
             approved_target
             or (

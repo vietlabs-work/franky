@@ -1153,12 +1153,9 @@ def test_the_head_is_checked_right_before_each_review_write(monkeypatch, tmp_pat
 
 @pytest.mark.parametrize(
     "row",
-    [
-        review_row(9, ledger(), state="DISMISSED"),
-        review_row(9, ledger(), body=block(ledger()) + "\n<!-- bot-review:abc -->"),
-    ],
+    [review_row(9, ledger(), body=block(ledger()) + "\n<!-- bot-review:abc -->")],
 )
-def test_a_ledger_update_never_edits_an_approval_or_a_marked_review(monkeypatch, tmp_path, row):
+def test_a_ledger_update_never_edits_a_marked_review(monkeypatch, tmp_path, row):
     led = ledger([finding("a", status="fixed")])
     upd = {"review_id": 9, "body": "Q.\n\n" + block(led)}
     calls, _ = setup_run(
@@ -1532,6 +1529,21 @@ def test_an_approved_update_target_is_replaced_by_a_new_comment_review(monkeypat
     (posted,) = posts(calls)
     assert posted["event"] == "COMMENT" and "Quiet." in posted["body"]
     assert res.exit_code == 0 and data["review_event"] == "COMMENT"
+
+
+def test_a_dismissed_update_target_is_replaced_by_a_new_review(monkeypatch, tmp_path):
+    # branch protection dismissed the approval when a stacked PR's base moved
+    led = ledger([finding("a", status="fixed")])
+    upd = {"review_id": 9, "body": "Quiet.\n\n" + block(led)}
+    payload = review_payload(led, decision="delta", review=None, ledger_update=upd)
+    rows = [review_row(9, ledger([finding("a")]), state="DISMISSED")]
+    for extra, event in ((("--allow-approve",), "APPROVE"), ((), "COMMENT")):
+        calls, res, data = approve_run(monkeypatch, tmp_path, payload, extra=extra, reviews=rows)
+        assert res.exit_code == 0, res.output
+        assert not [c for c in calls if "PUT" in c]
+        (posted,) = posts(calls)
+        assert posted["event"] == event and "Quiet." in posted["body"]
+        assert data["review_event"] == event
 
 
 def test_prior_settled_needs_every_open_prior_finding_cleared_by_id():
