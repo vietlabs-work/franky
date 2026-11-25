@@ -90,7 +90,7 @@ With `--allow-approve`, every review round that writes a review but does not pos
 
 Before the run, the host reads the PR reviews and tells the skill, in a host-written prompt note, its own earlier round and the findings still open in it (up to 20, by id and location), so it lists each one with a cleared or open status instead of dropping it. A clean round that still cannot approve because an earlier open finding was left open or dropped carries note `prior_open:1`. This only informs the prompt; approval stays fail closed.
 
-A `ledger_update` may edit only the bot's newest ledger review (else `skill_update_target`). A quiet round that is approvable, has no floor and has `--allow-approve` posts a new `APPROVE` review carrying the update body instead of the PUT. When the update target is an `APPROVED` review, which cannot be edited, the update body is posted as a new `COMMENT` review instead of failing `skill_update_target`.
+A `ledger_update` may edit only the bot's newest ledger review (else `skill_update_target`). A quiet round that is approvable, has no floor and has `--allow-approve` posts a new `APPROVE` review carrying the update body instead of the PUT. When the update target is an `APPROVED` review, which cannot be edited, or a `DISMISSED` one (an approval that branch protection dismissed after a push, such as a stacked PR whose base moved), the update body is posted as a new review (`COMMENT`, or `APPROVE` under the rule above) instead of failing `skill_update_target`.
 
 ### Policy file
 
@@ -150,7 +150,7 @@ The host refuses the whole payload and posts nothing on any miss. The result is 
 | `skill_ledger_state` | `state` is not `clean` or `findings`, or disagrees with the findings (clean means zero open findings, findings means at least one). |
 | `skill_body_block` | The body contains a conflicting, duplicate or malformed ledger block, the ledger contains a known secret, or the final body fails to round-trip exactly one marked ledger. |
 | `skill_body_cap`, `skill_comment_cap` | A cap is exceeded. Caps are measured on the FINAL text, after redaction, `<!--` neutralization and the footer. |
-| `skill_update_refused`, `skill_update_with_review`, `skill_update_target` | `ledger_update` is not allowed by the policy, is combined with a review, or does not name one of the bot's own ledger reviews on this PR in state `COMMENTED` with none of the approve markers in its body (an `APPROVED` target is replaced by a new `COMMENT` review instead). |
+| `skill_update_refused`, `skill_update_with_review`, `skill_update_target` | `ledger_update` is not allowed by the policy, is combined with a review, or does not name one of the bot's own ledger reviews on this PR in state `COMMENTED` with none of the approve markers in its body (an `APPROVED` or `DISMISSED` target is replaced by a new review instead). |
 
 Every `<!--` in a body, comment, reply or update becomes `&lt;!--`, so agent text cannot forge the marker that `--allow-approve` reconciliation trusts. Text is redacted with the run's secrets.
 
