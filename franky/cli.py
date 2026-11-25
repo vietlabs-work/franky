@@ -153,6 +153,7 @@ from .reviewpr import (
     render_review_body,
     reply_body,
     review_event,
+    footer_version,
     review_footer,
     signoff_reason,
     signoff_text,
@@ -1485,12 +1486,12 @@ def _finish_skill_review(
     reply: bool,
     allow_approve: bool = False,
     base_sha: str | None = None,
+    footer: str = "",
 ):
     """Validate a skill run's payload and post it. Returns (status, reason, exit code, review
     url, review id, event, threads resolved, threads replied, ledger, notes, review text,
     sign-off, payload_ok)."""
     try:
-        footer = review_footer()
         payload = skillreview.build_payload(
             skillreview.parse_skill_payload(output, nonce, engine=engine),
             policy,
@@ -2018,6 +2019,7 @@ def _publish_review(
     reply_prior: bool = False,
     prior_url: str | None = None,
     base_sha: str | None = None,
+    footer: str | None = None,
 ) -> tuple[str, str, int, str | None, int | None, str | None, int | None, int | None]:
     """Post the review as inline comments on the pinned commit; returns the result fields
     (status, reason, exit code, review url, review id, event posted, threads resolved,
@@ -2105,9 +2107,11 @@ def _publish_review(
 
     def build(allow: bool, body_only: bool = False) -> dict:
         if body_only:
-            p = build_body_only_payload(shaped, pinned_sha, secrets, allow, prior_url)
+            p = build_body_only_payload(shaped, pinned_sha, secrets, allow, prior_url, footer)
         else:
-            p = build_review_payload(shaped, commentable, pinned_sha, secrets, allow, prior_url)
+            p = build_review_payload(
+                shaped, commentable, pinned_sha, secrets, allow, prior_url, footer
+            )
         if p["event"] == "APPROVE":
             p["body"] += f"\n\n{marker}"
         return p
@@ -2689,6 +2693,14 @@ def review_pr(
                 f"--skill {skill!r} is not in the profile's team setup "
                 "(needs [setups] team with skills/<name>/SKILL.md)"
             )
+        try:
+            footer = review_footer(
+                model=cfg.model,
+                skill=skill or "review",
+                version=_skill_version(team_sink.get("root"), skill),
+            )
+        except ValueError as exc:  # too long once the placeholders are filled in
+            raise ConfigError(str(exc)) from exc
         if not frozen and skill is None:
             # After the profile bundle: MCP env values are in `secrets` before ticket text is
             # redacted. Frozen (eval) mode never fetches tickets.
@@ -2867,6 +2879,7 @@ def review_pr(
                 reply=reply_prior,
                 allow_approve=allow_approve,
                 base_sha=pr_meta.get("base_sha"),
+                footer=footer,
             )
             if skill_ok:
                 # A minimal shape so a threaded run still commits its session; the skill reads
@@ -2911,7 +2924,7 @@ def review_pr(
                 checks = shaped["checks"]
                 if no_publish:
                     review_body = render_review_body(
-                        shaped, pinned_sha, (prior_handoff or {}).get("review_url")
+                        shaped, pinned_sha, (prior_handoff or {}).get("review_url"), footer
                     )
                     if (
                         len(review_body) > 8000
@@ -2965,6 +2978,7 @@ def review_pr(
                             reply_prior=reply_prior,
                             prior_url=(prior_handoff or {}).get("review_url"),
                             base_sha=pr_meta.get("base_sha"),
+                            footer=footer,
                         )
 
         thread_result = handoff = None
@@ -4224,6 +4238,7 @@ def _load_profile_bundle(
     if team is not None and team_sink is not None:
         team_sink["where"] = container_path(team.root)
         team_sink["skills"] = _team_skill_names(team)
+        team_sink["root"] = team.root
         team_sink["roots"] = [r.resolve() for r in spec.setup_roots().values()]
         team_sink["files"] = {Path(f).resolve() for f in spec.all_files() if isinstance(f, Path)}
     if getattr(spec, "team_scan", None) is not None and repo_setup_ref is not None:
@@ -4253,6 +4268,22 @@ def _load_profile_bundle(
         )
     except ValueError as exc:
         raise ConfigError(redact(str(exc), secrets)) from exc
+
+
+def _skill_version(root: Path | None, skill: str | None) -> str:
+    """`v<version>` of the team plugin that holds `skill`, from the setup's MANIFEST.json
+    (`skills[].plugin`, `installed.<plugin>.version`); empty when unknown. Never raises."""
+    if root is None or skill is None:
+        return ""
+    try:
+        manifest = setups.read_team_manifest(root) or {}
+        plugin = next(
+            (s.get("plugin") for s in manifest.get("skills", []) if s.get("name") == skill), None
+        )
+        version = ((manifest.get("installed") or {}).get(plugin) or {}).get("version")
+    except (ValueError, AttributeError, TypeError):
+        return ""
+    return footer_version(version if isinstance(version, str) else "")
 
 
 def _team_skill_names(team) -> set[str]:

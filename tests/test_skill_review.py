@@ -1964,3 +1964,40 @@ def test_prior_round_is_the_highest_integer_round():
     assert skillreview.prior_round([ledger([], round=3), ledger([], round=2)]) == 3
     assert skillreview.prior_round([{"round": True}, {"round": "4"}, {}]) is None
     assert skillreview.prior_round([]) is None
+
+
+def test_the_footer_names_the_skill_its_plugin_version_and_the_model(monkeypatch, tmp_path):
+    calls, _ = setup_run(monkeypatch, tmp_path, review_payload(CLEAN))
+    team = tmp_path / "team"
+    team.mkdir()
+    manifest = {
+        "schema": 1,
+        "source": "s",
+        "commit": "c",
+        "plugins": ["p"],
+        "skills": [{"name": "deep-review", "plugin": "p", "path": "skills/deep-review"}],
+        "installed": {"p": {"version": "2.3.4", "commit": "x"}},
+    }
+    (team / "MANIFEST.json").write_text(json.dumps(manifest))
+    plain = cli._load_profile_bundle
+
+    def bundle(*a, team_sink=None, **k):
+        out = plain(*a, team_sink=team_sink, **k)
+        team_sink["root"] = team
+        return out
+
+    monkeypatch.setattr(cli, "_load_profile_bundle", bundle)
+    cli.os.environ["FRANKY_REVIEW_FOOTER"] = "<sub>G · {skill} {version} · {model}</sub>"
+    cli.os.environ["FRANKY_MODEL"] = "moonshotai/kimi-k3"
+    res, data = run(tmp_path)
+    (posted,) = posts(calls)
+    assert posted["body"].endswith("\n\n<sub>G · deep-review v2.3.4 · moonshotai/kimi-k3</sub>")
+    assert data["status"] == "review_published"
+
+
+def test_an_unknown_plugin_version_leaves_no_dangling_separator(monkeypatch, tmp_path):
+    calls, _ = setup_run(monkeypatch, tmp_path, review_payload(CLEAN))
+    cli.os.environ["FRANKY_REVIEW_FOOTER"] = "<sub>G · {skill} · {version}</sub>"
+    res, data = run(tmp_path)
+    (posted,) = posts(calls)
+    assert posted["body"].endswith("\n\n<sub>G · deep-review</sub>")

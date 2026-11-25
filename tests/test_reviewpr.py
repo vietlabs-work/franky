@@ -19,6 +19,7 @@ from franky.reviewpr import (
     commentable_lines,
     match_prior_threads,
     match_resolved_threads,
+    footer_version,
     review_footer,
     reply_body,
     thread_reply_target,
@@ -1467,3 +1468,65 @@ def test_body_has_one_fixed_line_for_verified_accepted_risks_above_nit():
     assert "Accepted risk:" not in render_review_body(_shaped(_f(severity="nit")))
     only_nit = _shaped(_f(severity="nit", status="accepted", accepted_by="nit-z"))
     assert "Accepted risk:" not in render_review_body(only_nit)
+
+
+def _footer(monkeypatch, value, **kw):
+    monkeypatch.setenv("FRANKY_REVIEW_FOOTER", value)
+    return review_footer(**kw)
+
+
+def test_footer_placeholders_are_substituted(monkeypatch):
+    tpl = "<sub>Bot · {skill} {version} · {model}</sub>"
+    out = _footer(monkeypatch, tpl, model="opus-5", skill="fb-review-pr", version="v1.4.2")
+    assert out == "<sub>Bot · fb-review-pr v1.4.2 · opus-5</sub>"
+
+
+def test_footer_unknown_model_reads_default_and_plain_review_skill(monkeypatch):
+    assert _footer(monkeypatch, "{skill}/{model}") == "review/default"
+
+
+def test_footer_empty_version_collapses_separators(monkeypatch):
+    out = _footer(monkeypatch, "<sub>G · {skill} · {version}</sub>", skill="review-pr")
+    assert out == "<sub>G · review-pr</sub>"
+    out = _footer(monkeypatch, "<sub>G · {version} · {model}</sub>", model="m")
+    assert out == "<sub>G · m</sub>"
+    out = _footer(monkeypatch, "<sub>G · {skill} {version} · {model}</sub>", skill="s", model="m")
+    assert out == "<sub>G · s · m</sub>"
+
+
+def test_footer_empty_field_at_either_edge_leaves_no_separator(monkeypatch):
+    assert _footer(monkeypatch, "<sub>{version} · {model}</sub>", model="m") == "<sub>m</sub>"
+    assert _footer(monkeypatch, "G · {version}") == "G"
+    assert _footer(monkeypatch, "{version} · G") == "G"
+
+
+def test_footer_values_are_sanitized(monkeypatch):
+    out = _footer(monkeypatch, "<sub>{model}|{skill}</sub>", model="a b<script>", skill="x" * 81)
+    assert out == "<sub>|</sub>"
+    ok = _footer(monkeypatch, "{model}", model="moonshotai/kimi-k3:free+1@x_y".replace("_", "-"))
+    assert ok == "moonshotai/kimi-k3:free+1@x-y"
+
+
+def test_footer_leaves_other_braces_and_no_placeholder_alone(monkeypatch):
+    assert _footer(monkeypatch, "a {x} {0} {model!r}", model="m") == "a {x} {0} {model!r}"
+    assert _footer(monkeypatch, "Custom line", model="m") == "Custom line"
+
+
+def test_footer_length_rechecked_after_substitution(monkeypatch):
+    monkeypatch.setenv("FRANKY_REVIEW_FOOTER", "{model}" * 70)  # 490 chars raw
+    with pytest.raises(ValueError):
+        review_footer(model="m" * 80)
+
+
+def test_footer_version_accepts_only_dotted_numbers():
+    assert footer_version("1.4.2") == "v1.4.2"
+    assert footer_version("1") == "v1"
+    for bad in ("", "v1.2", "1.2-rc1", "1..2", None, "1.2.x"):
+        assert footer_version(bad) == ""
+
+
+def test_payload_and_no_publish_body_use_the_given_footer(monkeypatch):
+    shaped = build_review_findings({})
+    p = build_review_payload(shaped, {}, "s", [], footer="<sub>F1</sub>")
+    assert p["body"].endswith("\n\n<sub>F1</sub>")
+    assert render_review_body(shaped, "s", footer="").endswith("no findings above nit.")
