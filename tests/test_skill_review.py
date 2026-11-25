@@ -401,10 +401,11 @@ def test_finding_identity_and_statuses_are_strict():
         [finding("a"), finding("a", "b.py:1")],
         [finding("")],
         [{"loc": "a.py:1"}],
-        [finding("a", "a.py")],
-        [finding("a", "a.py:0")],
-        [finding("a", "a b.py:3")],
+        [finding("a", "")],
         [finding("a", "a<b>.py:3")],
+        [finding("a", "a`b`.py:3")],
+        [finding("a", "a.py:3\nx")],
+        [finding("a", "x" * 201)],
         [finding("a", status="dismissed")],
         [finding("a", status="Fixed")],
     ]
@@ -415,6 +416,15 @@ def test_finding_identity_and_statuses_are_strict():
     custom = policy(cleared_statuses=["dismissed"], open_statuses=["open", "todo"])
     led = ledger([finding("a", status="todo"), finding("b", status="dismissed")], state="findings")
     assert build(review_payload(led), pol=custom).ledger["state"] == "findings"
+
+
+def test_a_loc_that_is_not_path_line_is_kept_but_never_anchored():
+    pol = policy()
+    locs = ["PR description:Solution diagram", "a.py", "a.py:0", "a b.py:3"]
+    prior = ledger([finding(str(i), loc) for i, loc in enumerate(locs)], state="findings")
+    assert build(review_payload(prior)).ledger["findings"][0]["loc"] == locs[0]
+    new = ledger([finding(str(i), loc, "fixed") for i, loc in enumerate(locs)])
+    assert skillreview.cleared_locs(prior, new, pol) == set()
 
 
 def node(
