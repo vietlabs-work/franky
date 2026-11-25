@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.7] - 2026-11-25
+
 - Fixed: a skill `ledger_update` whose target is the bot's `DISMISSED` review (an approval that branch protection dismissed after a push, for example a stacked PR whose base moved) is posted as a new review instead of failing `skill_update_target`.
 - Fixed: a `review-pr --skill` ledger finding whose `loc` is not `path:line` (for example a PR-description finding) no longer refuses the whole round with `skill_ledger_findings`. The ledger keeps it; only a `path:line` loc anchors a thread resolve.
 
