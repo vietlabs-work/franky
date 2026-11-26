@@ -36,10 +36,12 @@ REGISTRY_DOMAINS = ["registry.npmjs.org", "pypi.org", "files.pythonhosted.org"]
 # family appears in exactly one form. Many registries redirect layer BLOBS to a separate CDN;
 # those backends are included too (and verified/trimmed empirically - see the issue-12 plan).
 DOCKER_REGISTRY_DOMAINS = [
-    # Docker Hub: registry-1/auth/index (.docker.io), Hub web + CDN (.docker.com), R2 blobs.
+    # Docker Hub: registry-1/auth/index (.docker.io), Hub web + CDN (.docker.com), R2 blobs,
+    # and the S3 bucket Hub now redirects layer blobs to (exact host, never .amazonaws.com).
     ".docker.io",
     ".docker.com",
     ".cloudflarestorage.com",
+    "docker-images-prod.s3.dualstack.us-east-1.amazonaws.com",
     # GitHub Container Registry. ghcr.io blobs come from *.githubusercontent.com, already
     # covered by GITHUB_DOMAINS above.
     "ghcr.io",
