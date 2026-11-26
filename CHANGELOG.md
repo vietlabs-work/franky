@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.9] - 2026-11-26
+
 - Fixed: a nested `docker pull` from Docker Hub works again. Hub now serves layer blobs from `docker-images-prod.s3.dualstack.us-east-1.amazonaws.com`, which the egress proxy refused; that one host is now in the default allowlist.
 
 ## [0.4.8] - 2026-11-26
