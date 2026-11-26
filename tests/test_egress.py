@@ -146,6 +146,9 @@ def test_docker_registries_always_allowlisted():
         assert d in allow
     # Docker Hub is the load-bearing one (proven in the spike).
     assert ".docker.io" in allow
+    # Hub redirects layer blobs to this S3 bucket; only the exact host, never all of AWS.
+    assert "docker-images-prod.s3.dualstack.us-east-1.amazonaws.com" in allow
+    assert ".amazonaws.com" not in allow
 
 
 def test_docker_registries_use_dot_forms_without_apex_overlap():
