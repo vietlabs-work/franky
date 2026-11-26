@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.8] - 2026-11-26
+
 - Added: `FRANKY_REVIEW_FOOTER` placeholders `{model}`, `{skill}` and `{version}`, so a review can name the skill, its plugin version and the model that ran. See [docs/review.md](docs/review.md).
 
 ## [0.4.7] - 2026-11-25
