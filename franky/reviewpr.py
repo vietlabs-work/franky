@@ -91,11 +91,49 @@ REVIEW_FOOTER_VAR = "FRANKY_REVIEW_FOOTER"
 MAX_FOOTER_CHARS = 500  # fits inside _TAIL_RESERVE with the APPROVE marker
 
 
-def review_footer() -> str:
-    """Unset: the default footer. Empty: no footer. Otherwise the operator's value as is."""
+_FIELD_RE = re.compile(r"[A-Za-z0-9._:/@+-]+")
+_VERSION_RE = re.compile(r"\d+(\.\d+)*")
+MAX_FOOTER_FIELD_CHARS = 80
+
+
+def _footer_field(value: str | None) -> str:
+    """A placeholder value: a short token of safe characters, else dropped (empty)."""
+    value = (value or "").strip()
+    ok = len(value) <= MAX_FOOTER_FIELD_CHARS and _FIELD_RE.fullmatch(value)
+    return value if ok else ""
+
+
+def footer_version(version: str | None) -> str:
+    """`v<version>` for a plain dotted number, else empty."""
+    v = (version or "").strip()
+    return f"v{v}" if _VERSION_RE.fullmatch(v) else ""
+
+
+def review_footer(*, model: str | None = None, skill: str | None = None, version: str = "") -> str:
+    """Unset: the default footer. Empty: no footer. Otherwise the operator's value, with the
+    literal placeholders `{model}`, `{skill}` and `{version}` replaced (no other `{...}` is
+    read). A value that is empty after sanitizing is dropped and its separator collapsed.
+    `version` is already `v<n>` (see `footer_version`); an unknown model reads `default`."""
     value = os.environ.get(REVIEW_FOOTER_VAR)
     if value is None:
         return _FOOTER
+    if len(value) > MAX_FOOTER_CHARS:
+        raise ValueError(f"{REVIEW_FOOTER_VAR} is longer than {MAX_FOOTER_CHARS} characters")
+    fields = {
+        "{model}": _footer_field(model or "default"),
+        "{skill}": _footer_field(skill or "review"),
+        "{version}": _footer_field(version),
+    }
+    dropped = False
+    for key, text in fields.items():
+        if key in value:
+            dropped = dropped or not text
+            value = value.replace(key, text)
+    if dropped:
+        value = re.sub(r" {2,}", " ", value)
+        value = re.sub(r"(?: ·){2,}", " ·", value)
+        value = re.sub(r"^(<sub>)?[ ·]+", r"\1", value)
+        value = re.sub(r"[ ·]+(</sub>)?\s*$", r"\1", value)
     if len(value) > MAX_FOOTER_CHARS:
         raise ValueError(f"{REVIEW_FOOTER_VAR} is longer than {MAX_FOOTER_CHARS} characters")
     return value
@@ -459,6 +497,7 @@ def _body(
     sha: str = "",
     prior_url: str | None = None,
     prior_nits: bool = True,
+    footer: str | None = None,
 ) -> str:
     """Summary line visible, everything else collapsed under <details>. The whole body stays
     under REVIEW_BODY_BUDGET (room is left for the footer and the APPROVE marker)."""
@@ -516,7 +555,7 @@ def _body(
             blocks[key] = _block(title, items, sep, room)
             room -= len(blocks[key]) + 2
     parts += [blocks[k] for k in ("rows", "prior", "verified", "failed") if k in blocks]
-    if footer := review_footer():
+    if footer := (review_footer() if footer is None else footer):
         parts.append(footer)
     return "\n\n".join(parts)
 
@@ -540,6 +579,7 @@ def build_review_payload(
     secrets: Iterable[str],
     allow_approve: bool = False,
     prior_url: str | None = None,
+    footer: str | None = None,
 ) -> dict:
     """The `POST pulls/{n}/reviews` body: anchored findings inline, the rest in a short body.
 
@@ -554,7 +594,7 @@ def build_review_payload(
     rest = _not_nit([f for f in new if f not in inline])
     payload = {
         "event": review_event(shaped, allow_approve),
-        "body": _body(shaped, rest, commit_id, prior_url, prior_nits=False),
+        "body": _body(shaped, rest, commit_id, prior_url, prior_nits=False, footer=footer),
         "commit_id": commit_id,
         "comments": [_comment(f) for f in inline],
     }
@@ -567,11 +607,14 @@ def build_body_only_payload(
     secrets: Iterable[str],
     allow_approve: bool = False,
     prior_url: str | None = None,
+    footer: str | None = None,
 ) -> dict:
     """Fallback when GitHub rejects the inline anchors: every new non-nit finding goes in the body."""
     payload = {
         "event": review_event(shaped, allow_approve),
-        "body": _body(shaped, _not_nit(_new(shaped)), commit_id, prior_url, prior_nits=False),
+        "body": _body(
+            shaped, _not_nit(_new(shaped)), commit_id, prior_url, prior_nits=False, footer=footer
+        ),
         "commit_id": commit_id,
         "comments": [],
     }
@@ -586,9 +629,11 @@ def _redacted(payload: dict, secrets: Iterable[str]) -> dict:
     return payload
 
 
-def render_review_body(shaped: dict, sha: str = "", prior_url: str | None = None) -> str:
+def render_review_body(
+    shaped: dict, sha: str = "", prior_url: str | None = None, footer: str | None = None
+) -> str:
     """Review body for `--no-publish`: same layout as the posted one, no inline split."""
-    return _body(shaped, _new(shaped), sha, prior_url)
+    return _body(shaped, _new(shaped), sha, prior_url, footer=footer)
 
 
 def _signoff_regex(pattern: str) -> re.Pattern:
