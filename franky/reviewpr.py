@@ -47,7 +47,8 @@ from .sentinel import scan_sentinel_json
 
 SIGNOFF_FILE = ".github/human-signoff-paths"
 CONTENT_FILE = ".github/human-signoff-content"
-MAX_CONTENT_FILES = 20  # files a content rule may read before the floor applies unread
+# Files a content rule may read (at most two reads each); more is a floor with reason `too_many`.
+MAX_CONTENT_FILES = 100
 _FILES_API_CAP = 3000  # the PR files API never lists more than this many files
 
 _VALID_SEVERITIES = frozenset({"blocking", "normal", "question", "nit"})
@@ -408,6 +409,11 @@ def signoff_text(info: dict) -> str:
         why = f"{_code(info['path'])}{extra} matches {_code(info['rule'])} in {_code(SIGNOFF_FILE)}"
     elif reason == "list_changed":
         why = f"it changes {_code(info.get('path') or SIGNOFF_FILE)}"
+    elif reason == "too_many":
+        why = (
+            f"more than {MAX_CONTENT_FILES} changed files match a rule in {_code(CONTENT_FILE)}, "
+            "too many to check"
+        )
     elif reason == "content":
         more = info.get("more") or 0
         extra = f" (and {more} more file{'s' if more != 1 else ''})" if more else ""
@@ -765,9 +771,10 @@ def content_signoff(
     `files` is a readable PR file list (the caller ran `signoff_reason` first); `rules` are
     (glob, string) pairs; `read_file(path, "base" | "head")` returns the bytes (b"" for an absent
     file) or None when unreadable. A rename is matched and read under both names. Fails closed:
-    a negated glob, more than MAX_CONTENT_FILES matching files, or any unreadable file gives
-    `{"reason": "unreadable", ...}`. A hit gives `{"reason": "content", "path", "rule", "more"}`
-    (the first hit in file order, the rule that matched, and how many other files hit).
+    a negated glob or any unreadable file gives `{"reason": "unreadable", ...}`, and more than
+    MAX_CONTENT_FILES matching files gives `{"reason": "too_many", ...}` (nothing is read). A hit
+    gives `{"reason": "content", "path", "rule", "more"}` (the first hit in file order, the rule
+    that matched, and how many other files hit).
     Returns None when nothing matches.
     """
     unreadable = {"reason": "unreadable", "path": None, "rule": None, "more": 0}
@@ -782,7 +789,7 @@ def content_signoff(
         if hit:
             matched.append((entry, name, old, hit))
     if len(matched) > MAX_CONTENT_FILES:
-        return unreadable
+        return {**unreadable, "reason": "too_many"}
     hits = []
     for entry, name, old, rules_hit in matched:
         reads = []

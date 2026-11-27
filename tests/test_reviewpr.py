@@ -1113,7 +1113,17 @@ def test_content_signoff_fails_closed():
     assert content_signoff(files, [("!x", "y")], _content({})) == unread
     many = [_pf(f"src/main/F{i}.java") for i in range(MAX_CONTENT_FILES)]
     assert content_signoff(many, RULES, _content({})) is None
-    assert content_signoff([*many, _pf("src/main/Z.java")], RULES, _content({})) == unread
+    over = content_signoff([*many, _pf("src/main/Z.java")], RULES, lambda p, s: None)
+    assert over == {"reason": "too_many", "path": None, "rule": None, "more": 0}
+
+
+def test_signoff_text_names_the_content_file_cap():
+    text = signoff_text({"reason": "too_many", "path": None, "rule": None, "more": 0})
+    assert text.endswith(
+        f"because more than {MAX_CONTENT_FILES} changed files match a rule in "
+        f"`{CONTENT_FILE}`, too many to check."
+    )
+    assert "could not be read" not in text
 
 
 _AGREE_CASES = [

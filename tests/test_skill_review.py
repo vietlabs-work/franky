@@ -1436,10 +1436,22 @@ def test_content_rules_floor_on_a_string_at_base_or_head(monkeypatch, tmp_path, 
     assert set(calls.reads.values()) == {cli.CONTENT_FILE_MAX_BYTES}
 
 
+def test_a_large_deletion_with_no_content_hit_approves(monkeypatch, tmp_path):
+    # A broad content rule matches every removed main file; each is read at base only.
+    gone = [pf(f"src/main/F{i}.java", status="removed") for i in range(59)]
+    old = {(f["filename"], "base"): b"class F {}" for f in gone}
+    calls, res, data = approve_run(monkeypatch, tmp_path, files=gone, rules=CRULES, contents=old)
+    assert posts(calls)[0]["event"] == "APPROVE" and "signoff" not in data
+    assert len(calls.reads) == 59
+
+
 def test_content_rules_over_the_file_cap_or_with_a_failed_read_are_a_floor(monkeypatch, tmp_path):
-    many = [pf(f"src/main/F{i}.java") for i in range(21)]
+    many = [pf(f"src/main/F{i}.java") for i in range(101)]
     calls, res, data = approve_run(monkeypatch, tmp_path, files=many, rules=CRULES)
-    assert data["signoff"]["reason"] == "unreadable" and posts(calls)[0]["event"] == "COMMENT"
+    (posted,) = posts(calls)
+    assert data["signoff"]["reason"] == "too_many" and posted["event"] == "COMMENT"
+    assert "more than 100 changed files match" in posted["body"]
+    assert "could not be read" not in posted["body"] and not calls.reads
     calls, res, data = approve_run(
         monkeypatch,
         tmp_path,
