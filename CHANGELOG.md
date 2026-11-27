@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.10] - 2026-11-27
+
 - Fixed: a skill review whose PR changes more than 20 files that match a `.github/human-signoff-content` glob no longer loses its approval with the false reason that a list could not be read. The content check now reads up to 100 matching files; above that the floor has its own reason, `too_many`, and the review says so. See [docs/review.md](docs/review.md).
 
 ## [0.4.9] - 2026-11-26
