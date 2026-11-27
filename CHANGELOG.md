@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Fixed: a skill review whose PR changes more than 20 files that match a `.github/human-signoff-content` glob no longer loses its approval with the false reason that a list could not be read. The content check now reads up to 100 matching files; above that the floor has its own reason, `too_many`, and the review says so. See [docs/review.md](docs/review.md).
+
 ## [0.4.9] - 2026-11-26
 
 - Fixed: a nested `docker pull` from Docker Hub works again. Hub now serves layer blobs from `docker-images-prod.s3.dualstack.us-east-1.amazonaws.com`, which the egress proxy refused; that one host is now in the default allowlist.
